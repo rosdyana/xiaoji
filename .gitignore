@@ -1,0 +1,7 @@
+build/
+*.img
+*.zip
+*.apex
+*.capex
+.DS_Store
+node_modules/
