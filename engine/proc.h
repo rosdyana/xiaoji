@@ -25,6 +25,12 @@ typedef struct proc {
     int zombie;      /* ended and not reaped: wait4 and waitid report it */
     int vfork;       /* made by vfork: shares its parent's address space */
     int nthreads;
+    /* Accounting for getrusage. Instructions and syscalls are this process's own;
+     * the cu_ fields are the totals of its reaped children (and their children). */
+    uint64_t dead_icount; /* instructions of its threads already reaped */
+    uint64_t nsys;        /* syscalls made */
+    uint64_t maxrss_kib;  /* peak resident set, as recorded at exit or getrusage */
+    uint64_t cu_icount, cu_nsys, cu_maxrss_kib;
     struct proc *parent, *first_child, *next_sibling;
     struct proc *all_next; /* every process made since start, for lookup by pid */
 } proc_t;
@@ -56,7 +62,8 @@ int proc_is_initial(const proc_t *p);
 /* Moves the children of p to init (orphans). */
 void proc_reparent_children(proc_t *p, proc_t *init);
 
-/* Frees a reaped zombie. */
+/* Frees a reaped zombie. Its usage (and its children's) is added to its parent's
+ * cu_ totals first. */
 void proc_free(proc_t *p);
 
 #endif

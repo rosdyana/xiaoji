@@ -8,7 +8,6 @@
 #include <string.h>
 
 #include "cpu_a64.h"
-#include "elf.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include "jit.h"
@@ -18,6 +17,7 @@
 EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); });
 #endif
 #include "host.h"
+#include "linux.h"
 #include "loader.h"
 #include "mem.h"
 #include "proc.h"
@@ -28,8 +28,6 @@ EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); 
 #include "vfs.h"
 
 #define MAX_ENV 256
-#define DYN_BASE 0x555555550000ull   /* ET_DYN programs */
-#define INTERP_BASE 0x7FF000000000ull /* PT_INTERP interpreters */
 
 static const char *g_root = NULL; /* NULL: the host root "/" */
 
@@ -139,39 +137,23 @@ int main(int argc, char **argv)
     }
     vfs_set_prog(canon);
 
-    elf_info ei;
-    rc = elf_load(img, len, path, DYN_BASE, &ei);
+    uint64_t entry = 0, sp = 0;
+    rc = loader_load(img, len, path, gargc, gargv, nenv, envs, &entry, &sp);
     free(img);
-    if (rc)
-        return rc;
-
-    uint64_t entry = ei.entry, at_base = 0;
-    if (ei.interp[0]) {
-        uint8_t *iimg = NULL;
-        size_t ilen = 0;
-        char icanon[VFS_PATH_MAX];
-        if (vfs_load_file(ei.interp, &iimg, &ilen, icanon, sizeof icanon) < 0) {
-            fprintf(stderr, "xiaoji: cannot read interpreter %s\n", ei.interp);
-            return 127;
-        }
-        elf_info ii;
-        rc = elf_load(iimg, ilen, ei.interp, INTERP_BASE, &ii);
-        free(iimg);
-        if (rc)
-            return rc;
-        entry = ii.entry;
-        at_base = ii.base;
+    if (rc == -LE_NOENT)
+        return 127;
+    if (rc == -LE_NOEXEC) {
+        fprintf(stderr, "xiaoji: %s: cannot execute\n", path);
+        return 126;
     }
+    if (rc < 0)
+        return 126; /* the loader has printed why */
 
-    syscall_init(ei.brk);
     syscall_set_comm(gargv[0]);
     static cpu_t cpu;
     cpu_t *c = &cpu;
     c->trace = trace;
-    if (loader_setup_stack(c, &ei, at_base, gargc, gargv, nenv, envs) < 0) {
-        fprintf(stderr, "xiaoji: cannot set up the guest stack\n");
-        return 126;
-    }
+    c->sp = sp;
     c->pc = entry;
 
     const char *stats_env = getenv("XIAOJI_STATS");

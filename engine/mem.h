@@ -29,6 +29,8 @@ mm_t *mem_mm_new(void);
 void mem_mm_switch(mm_t *m);
 /* A new address space for fork: the private pages of m become copy-on-write in both. */
 mm_t *mem_mm_fork(mm_t *m);
+/* The resident set of m in KiB (getrusage's maxrss). */
+uint64_t mem_mm_rss_kib(mm_t *m);
 /* A process starts (or stops) using m. unref frees m with its last user. */
 void mem_mm_ref(mm_t *m);
 void mem_mm_unref(mm_t *m);

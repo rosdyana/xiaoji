@@ -1,14 +1,23 @@
-/* Linux initial stack: strings, then argc, argv, envp and auxv (see plan). */
+/* Program loading: the image and its interpreter, then the Linux initial stack with
+ * argv, envp and auxv (see plan). */
 #include "loader.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "elf.h"
 #include "host.h"
+#include "linux.h"
 #include "mem.h"
+#include "proc.h"
+#include "syscall.h"
+#include "vfs.h"
 
 #define STACK_TOP 0x7FFFFFFF0000ull
 #define STACK_SIZE (8ull << 20)
+#define DYN_BASE 0x555555550000ull    /* ET_DYN programs */
+#define INTERP_BASE 0x7FF000000000ull /* PT_INTERP interpreters */
 
 #define AT_NULL 0
 #define AT_PHDR 3
@@ -32,38 +41,47 @@
 
 #define MAX_AUX 32
 
-static int push_bytes(uint64_t *sp, const void *data, size_t len, uint64_t *va_out)
+/* Copies data below *sp and moves *sp down. The stack's lowest address is base. */
+static int push_bytes(uint64_t *sp, uint64_t base, const void *data, size_t len, uint64_t *va_out)
 {
+    if (*sp - base < len)
+        return -LE_2BIG;
     *sp -= len;
     if (mem_copy_in(*sp, data, len) < 0)
-        return -1;
+        return -LE_NOMEM;
     *va_out = *sp;
     return 0;
 }
 
-int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc, char **argv, int envc,
+/* Maps the stack and writes the initial frame; *sp_out is the initial sp. */
+static int setup_stack(uint64_t *sp_out, const elf_info *ei, uint64_t at_base, int argc, char **argv, int envc,
                        char **envp)
 {
     uint64_t base = STACK_TOP - STACK_SIZE;
     if (mem_map(base, STACK_SIZE, MEM_PROT_R | MEM_PROT_W) < 0)
-        return -1;
+        return -LE_NOMEM;
 
     uint64_t sp = STACK_TOP;
     uint8_t rnd[16];
     uint64_t random_va, platform_va;
-    uint64_t argv_va[argc > 0 ? argc : 1], env_va[envc > 0 ? envc : 1];
+    uint64_t *argv_va = calloc(argc > 0 ? argc : 1, sizeof *argv_va);
+    uint64_t *env_va = calloc(envc > 0 ? envc : 1, sizeof *env_va);
+    uint64_t *buf = NULL;
+    int rc = -LE_NOMEM;
+    if (!argv_va || !env_va)
+        goto out;
 
     host_random(rnd, sizeof rnd);
-    if (push_bytes(&sp, rnd, sizeof rnd, &random_va) < 0)
-        return -1;
-    if (push_bytes(&sp, "aarch64", 8, &platform_va) < 0)
-        return -1;
+    if ((rc = push_bytes(&sp, base, rnd, sizeof rnd, &random_va)) < 0)
+        goto out;
+    if ((rc = push_bytes(&sp, base, "aarch64", 8, &platform_va)) < 0)
+        goto out;
     for (int i = envc - 1; i >= 0; i--)
-        if (push_bytes(&sp, envp[i], strlen(envp[i]) + 1, &env_va[i]) < 0)
-            return -1;
+        if ((rc = push_bytes(&sp, base, envp[i], strlen(envp[i]) + 1, &env_va[i])) < 0)
+            goto out;
     for (int i = argc - 1; i >= 0; i--)
-        if (push_bytes(&sp, argv[i], strlen(argv[i]) + 1, &argv_va[i]) < 0)
-            return -1;
+        if ((rc = push_bytes(&sp, base, argv[i], strlen(argv[i]) + 1, &argv_va[i])) < 0)
+            goto out;
 
     uint64_t aux[MAX_AUX * 2];
     unsigned n = 0;
@@ -89,7 +107,7 @@ int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc,
     AUX(AT_SECURE, 0);
     AUX(AT_RANDOM, random_va);
     AUX(AT_HWCAP2, 0);
-    AUX(AT_EXECFN, argv_va[0]);
+    AUX(AT_EXECFN, argc > 0 ? argv_va[0] : platform_va);
     AUX(AT_NULL, 0);
 #undef AUX
 
@@ -97,12 +115,14 @@ int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc,
     uint64_t words = 1 + (uint64_t)argc + 1 + (uint64_t)envc + 1 + n;
     sp &= ~15ull;
     uint64_t frame = (sp - words * 8) & ~15ull;
-    if (frame < base)
-        return -1;
+    if (frame < base) {
+        rc = -LE_2BIG;
+        goto out;
+    }
 
-    uint64_t *buf = calloc(words, sizeof *buf);
+    buf = calloc(words, sizeof *buf);
     if (!buf)
-        return -1;
+        goto out;
     uint64_t *p = buf;
     *p++ = (uint64_t)argc;
     for (int i = 0; i < argc; i++)
@@ -113,11 +133,52 @@ int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc,
     *p++ = 0;
     memcpy(p, aux, n * sizeof(uint64_t));
 
-    int rc = mem_copy_in(frame, buf, words * 8);
+    if (mem_copy_in(frame, buf, words * 8) < 0)
+        goto out;
+    *sp_out = frame;
+    rc = 0;
+out:
     free(buf);
+    free(argv_va);
+    free(env_va);
+    return rc;
+}
+
+int loader_load(const uint8_t *img, size_t len, const char *path, int argc, char **argv, int envc, char **envp,
+                uint64_t *entry, uint64_t *sp)
+{
+    if (len < 4 || memcmp(img, "\177ELF", 4) != 0)
+        return -LE_NOEXEC;
+
+    elf_info ei;
+    if (elf_load(img, len, path, DYN_BASE, &ei))
+        return -LE_NOEXEC; /* elf_load has printed why */
+
+    uint64_t start = ei.entry, at_base = 0;
+    if (ei.interp[0]) {
+        uint8_t *iimg = NULL;
+        size_t ilen = 0;
+        char icanon[VFS_PATH_MAX];
+        if (vfs_load_file(ei.interp, &iimg, &ilen, icanon, sizeof icanon) < 0) {
+            fprintf(stderr, "xiaoji: cannot read interpreter %s\n", ei.interp);
+            return -LE_NOENT;
+        }
+        elf_info ii;
+        int rc = elf_load(iimg, ilen, ei.interp, INTERP_BASE, &ii);
+        free(iimg);
+        if (rc)
+            return -LE_NOEXEC;
+        start = ii.entry;
+        at_base = ii.base;
+    }
+
+    syscall_init(ei.brk);
+    int rc = setup_stack(sp, &ei, at_base, argc, argv, envc, envp);
+    if (rc == -LE_NOMEM)
+        fprintf(stderr, "xiaoji: cannot set up the guest stack\n");
     if (rc < 0)
-        return -1;
-    c->sp = frame;
+        return rc;
+    *entry = start;
     return 0;
 }
 

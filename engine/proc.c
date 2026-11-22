@@ -133,6 +133,11 @@ proc_t *proc_find(int pid)
 
 void proc_release(proc_t *p)
 {
+    if (p->mm) {
+        uint64_t rss = mem_mm_rss_kib(p->mm);
+        if (rss > p->maxrss_kib)
+            p->maxrss_kib = rss;
+    }
     if (p->fds) {
         vfs_fdtab_release(p->fds);
         p->fds = NULL;
@@ -157,6 +162,14 @@ void proc_reparent_children(proc_t *p, proc_t *init)
 
 void proc_free(proc_t *p)
 {
+    proc_t *par = p->parent;
+    if (par) {
+        par->cu_icount += p->dead_icount + p->cu_icount;
+        par->cu_nsys += p->nsys + p->cu_nsys;
+        uint64_t rss = p->maxrss_kib > p->cu_maxrss_kib ? p->maxrss_kib : p->cu_maxrss_kib;
+        if (rss > par->cu_maxrss_kib)
+            par->cu_maxrss_kib = rss;
+    }
     unlink_child(p);
     proc_t **pp = &all_procs;
     while (*pp && *pp != p)

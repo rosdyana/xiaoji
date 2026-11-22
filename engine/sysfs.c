@@ -20,7 +20,11 @@
 #define SYS_DUP3 24
 #define SYS_PIPE2 59
 #define SYS_FCNTL 25
+#define SYS_MKDIRAT 34
+#define SYS_UNLINKAT 35
 #define SYS_FACCESSAT 48
+#define SYS_FCHMOD 52
+#define SYS_FCHMODAT 53
 #define SYS_CHDIR 49
 #define SYS_FCHDIR 50
 #define SYS_OPENAT 56
@@ -474,6 +478,61 @@ static int64_t sys_faccessat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
     return host_access(r.host, (uint32_t)a2);
 }
 
+#define LAT_REMOVEDIR 0x200
+
+static int64_t sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t mode)
+{
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    int rc = get_path(a1, path, sizeof path);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(a0), path, 0, &r);
+    if (rc)
+        return rc;
+    if (r.exists || r.is_link)
+        return -LE_EXIST;
+    if (r.syn != SYN_NONE)
+        return -LE_PERM;
+    return host_mkdir(r.host, (uint32_t)mode & ~proc_cur()->umask);
+}
+
+static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
+{
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    int rc = get_path(a1, path, sizeof path);
+    if (rc)
+        return rc;
+    if (flags & ~(uint64_t)LAT_REMOVEDIR)
+        return -LE_INVAL;
+    rc = vfs_resolve(dirfd_of(a0), path, 0, &r);
+    if (rc)
+        return rc;
+    if (!r.exists && !r.is_link)
+        return -LE_NOENT;
+    if (r.syn != SYN_NONE)
+        return -LE_PERM;
+    return (flags & LAT_REMOVEDIR) ? host_rmdir(r.host) : host_unlink(r.host);
+}
+
+static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
+{
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    int rc = get_path(a1, path, sizeof path);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(a0), path, 1, &r);
+    if (rc)
+        return rc;
+    if (!r.exists)
+        return -LE_NOENT;
+    if (r.syn != SYN_NONE)
+        return -LE_PERM;
+    return host_chmod(r.host, (uint32_t)mode);
+}
+
 static int64_t sys_statfs(uint64_t a0, uint64_t a1)
 {
     static char path[VFS_PATH_MAX];
@@ -631,6 +690,10 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_STATX: *ret = sys_statx(a[0], a[1], a[2], a[3], a[4]); return 1;
     case SYS_READLINKAT: *ret = sys_readlinkat(a[0], a[1], a[2], a[3]); return 1;
     case SYS_FACCESSAT: *ret = sys_faccessat(a[0], a[1], a[2], 0); return 1;
+    case SYS_MKDIRAT: *ret = sys_mkdirat(a[0], a[1], a[2]); return 1;
+    case SYS_UNLINKAT: *ret = sys_unlinkat(a[0], a[1], a[2]); return 1;
+    case SYS_FCHMODAT: *ret = sys_fchmodat(a[0], a[1], a[2]); return 1;
+    case SYS_FCHMOD: *ret = vfs_fchmod((int)(int32_t)a[0], (uint32_t)a[1]); return 1;
     case SYS_FACCESSAT2: *ret = sys_faccessat(a[0], a[1], a[2], a[3]); return 1;
     case SYS_GETDENTS64: *ret = sys_getdents64(a[0], a[1], a[2]); return 1;
     case SYS_FSTATFS: *ret = sys_fstatfs(a[0], a[1]); return 1;

@@ -121,6 +121,22 @@ static uint32_t altstack_flags(const cpu_t *c)
  * thread of another process). */
 static sigtab_t *tab_of(const cpu_t *c) { return sched_proc_of(c)->sig; }
 
+/* execve: a caught signal goes back to the default action, an ignored one stays
+ * ignored, and the mask and the pending set stay. The alternate stack is disabled, and
+ * the return trampoline is forgotten (it lives in the old address space and is mapped
+ * again when needed). */
+void sig_exec_reset(cpu_t *c)
+{
+    sigtab_t *t = tab_of(c);
+    for (int sig = 1; sig <= SIG_MAX; sig++)
+        if (t->act[sig].handler > SIG_IGN_H)
+            t->act[sig] = (guest_sigaction){SIG_DFL_H, 0, 0, 0};
+    t->tramp_va = 0;
+    c->alt_sp = 0;
+    c->alt_size = 0;
+    c->alt_flags = 0;
+}
+
 /* A signal that is ignored when raised is dropped, unless it is blocked. */
 static int ignored_for(const cpu_t *c, int sig)
 {

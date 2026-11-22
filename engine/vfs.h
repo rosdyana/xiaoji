@@ -77,6 +77,10 @@ const uint8_t *vfs_cmdline_bytes(const fdtab_t *t, size_t *len);
 
 /* Sets the guest path of the program (what /proc/self/exe reads as). */
 void vfs_set_prog(const char *guest);
+/* Sets the argv bytes of the running process (what /proc/self/cmdline reads). */
+void vfs_set_argv(int argc, char **argv);
+/* execve: closes every descriptor of the running table that has FD_CLOEXEC. */
+void vfs_close_cloexec(void);
 
 int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode);
 /* memfd_create: a new read-write memfd. mflags bit 0 is MFD_CLOEXEC. Returns the fd or -LE_*. */
@@ -107,6 +111,8 @@ int vfs_fchdir(int fd);
 
 int vfs_stat_res(const vfs_res *r, host_stat *out);
 int vfs_stat_fd(int fd, host_stat *out);
+/* chmod of an open file (pipes and memfds accept and ignore it). */
+int vfs_fchmod(int fd, uint32_t mode);
 int vfs_statfs_fd(int fd, host_statfs *out);
 
 /* Reads a program or interpreter through the guest namespace. canon receives

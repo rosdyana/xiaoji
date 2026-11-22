@@ -1002,6 +1002,25 @@ mm_t *mem_mm_fork(mm_t *src)
     return dst;
 }
 
+/* Resident set of m in KiB: the pages with a host page (shared views included). */
+uint64_t mem_mm_rss_kib(mm_t *m)
+{
+    uint64_t n = 0;
+    if (!m || !m->l1)
+        return 0;
+    for (uint32_t i = 0; i < L1_COUNT; i++) {
+        uint64_t *l2 = m->l1[i];
+        if (!l2)
+            continue;
+        for (uint32_t j = 0; j < L2_COUNT; j++) {
+            uint64_t e = l2[j];
+            if ((e & PTE_MAPPED) && (e & ~(uint64_t)PTE_FLAGS))
+                n++;
+        }
+    }
+    return n * (MEM_PAGE_SIZE / 1024);
+}
+
 /* Frees an address space when its last process lets go of it. If it is the running
  * one, the running pointer is cleared and the TLBs flushed (the next switch does not
  * flush). */

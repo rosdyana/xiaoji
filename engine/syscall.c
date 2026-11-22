@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "exec.h"
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
@@ -56,6 +57,9 @@
 #define SYS_CLOCK_NANOSLEEP 115
 #define SYS_GETTIMEOFDAY 169
 #define SYS_CLONE 220
+#define SYS_EXECVE 221
+#define SYS_EXECVEAT 281
+#define SYS_GETRUSAGE 165
 #define SYS_BRK 214
 #define SYS_MUNMAP 215
 #define SYS_MREMAP 216
@@ -134,6 +138,7 @@ const char *syscall_name(uint64_t nr)
     case 141: return "getpriority";
     case 155: return "getpgid";
     case 160: return "uname";
+    case 165: return "getrusage";
     case 166: return "umask";
     case 167: return "prctl";
     case 172: return "getpid";
@@ -144,6 +149,8 @@ const char *syscall_name(uint64_t nr)
     case 177: return "getegid";
     case 178: return "gettid";
     case 214: return "brk";
+    case 221: return "execve";
+    case 281: return "execveat";
     case 215: return "munmap";
     case 216: return "mremap";
     case 222: return "mmap";
@@ -654,11 +661,23 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t tim
     }
 }
 
+/* read_timespec for a sleep: Linux rejects a negative or out-of-range field with EINVAL. */
+static int read_sleep_timespec(uint64_t va, uint64_t *ns)
+{
+    uint64_t ts[2];
+    if (mem_copy_out(ts, va, sizeof ts) < 0)
+        return -LE_FAULT;
+    if ((int64_t)ts[0] < 0 || (int64_t)ts[1] < 0 || ts[1] >= 1000000000ull)
+        return -LE_INVAL;
+    return read_timespec(va, ns) < 0 ? -LE_FAULT : 0;
+}
+
 static int64_t sys_nanosleep(uint64_t req)
 {
     uint64_t ns;
-    if (read_timespec(req, &ns) < 0)
-        return -LE_FAULT;
+    int rc = read_sleep_timespec(req, &ns);
+    if (rc)
+        return rc;
     sched_sleep_until(deadline_of(ns, 0, 0));
     return 0;
 }
@@ -668,8 +687,9 @@ static int64_t sys_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req)
     if (clk != LCLOCK_REALTIME && clk != LCLOCK_MONOTONIC)
         return -LE_INVAL;
     uint64_t ns;
-    if (read_timespec(req, &ns) < 0)
-        return -LE_FAULT;
+    int rc = read_sleep_timespec(req, &ns);
+    if (rc)
+        return rc;
     sched_sleep_until(deadline_of(ns, (flags & LTIMER_ABSTIME) != 0, clk == LCLOCK_REALTIME));
     return 0;
 }
@@ -917,6 +937,49 @@ static int64_t sys_setsid(void)
     return me->pid;
 }
 
+/* ---------- resource usage ---------- */
+
+#define LRUSAGE_SELF 0
+#define LRUSAGE_CHILDREN (-1)
+#define LRUSAGE_THREAD 1
+#define RUSAGE_SIZE 144 /* struct rusage on arm64: two timevals, then 14 longs */
+
+/* getrusage. The times are derived from the counts so they are deterministic: an
+ * instruction is 1 ns of user time, and a syscall is 10 us of system time. maxrss is the
+ * peak resident set (in KiB), as seen at exit or here. Children's totals come from the
+ * reaped children (proc_free). */
+static int64_t sys_getrusage(int64_t who, uint64_t va)
+{
+    proc_t *me = proc_cur();
+    uint64_t icount, nsys, maxrss;
+    if (who == LRUSAGE_SELF || who == LRUSAGE_THREAD) {
+        icount = sched_icount_of(me);
+        if (who == LRUSAGE_THREAD && sched_cur_cpu())
+            icount = sched_cur_cpu()->icount;
+        nsys = me->nsys;
+        uint64_t rss = mem_mm_rss_kib(me->mm);
+        if (rss > me->maxrss_kib)
+            me->maxrss_kib = rss;
+        maxrss = me->maxrss_kib;
+    } else if (who == LRUSAGE_CHILDREN) {
+        icount = me->cu_icount;
+        nsys = me->cu_nsys;
+        maxrss = me->cu_maxrss_kib;
+    } else {
+        return -LE_INVAL;
+    }
+    uint64_t utime_us = icount / 1000, stime_us = nsys * 10;
+    uint64_t out[RUSAGE_SIZE / 8] = {0};
+    out[0] = utime_us / 1000000;
+    out[1] = utime_us % 1000000;
+    out[2] = stime_us / 1000000;
+    out[3] = stime_us % 1000000;
+    out[4] = maxrss;
+    if (mem_copy_in(va, out, sizeof out) < 0)
+        return -LE_FAULT;
+    return 0;
+}
+
 /* ---------- dispatch ---------- */
 
 static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
@@ -973,6 +1036,15 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_CLONE:
         *ret = sched_clone(c, a[0], a[1], a[2], a[3], a[4]);
+        return;
+    case SYS_EXECVE:
+        *ret = exec_run(c, LAT_FDCWD, a[0], a[1], a[2], 0);
+        return;
+    case SYS_EXECVEAT:
+        *ret = exec_run(c, (int)(int32_t)a[0], a[1], a[2], a[3], a[4]);
+        return;
+    case SYS_GETRUSAGE:
+        *ret = sys_getrusage((int32_t)a[0], a[1]);
         return;
     case SYS_NANOSLEEP:
         *ret = sys_nanosleep(a[0]);
@@ -1101,6 +1173,7 @@ void syscall_dispatch(cpu_t *c)
     uint64_t nr = c->x[8];
     uint64_t a[6] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5]};
     int64_t ret = 0;
+    proc_cur()->nsys++;
     dispatch(c, nr, a, &ret);
     if (prof_on)
         prof_syscall(c->tid, nr, a, ret, c->blocked);

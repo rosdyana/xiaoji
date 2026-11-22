@@ -560,21 +560,7 @@ int vfs_init(const char *host_root, const char *prog_guest, int argc, char **arg
     if (strlen(prog_guest) >= sizeof cur_fdt->prog)
         return -LE_NAMETOOLONG;
     strcpy(cur_fdt->prog, prog_guest);
-
-    size_t total = 0;
-    for (int i = 0; i < argc; i++)
-        total += strlen(argv[i]) + 1;
-    free(cur_fdt->cmdline);
-    cur_fdt->cmdline = malloc(total ? total : 1);
-    if (!cur_fdt->cmdline)
-        die_oom();
-    size_t o = 0;
-    for (int i = 0; i < argc; i++) {
-        size_t n = strlen(argv[i]) + 1;
-        memcpy(cur_fdt->cmdline + o, argv[i], n);
-        o += n;
-    }
-    cur_fdt->cmdline_len = total;
+    vfs_set_argv(argc, argv);
 
     static const char *std_names[3] = {"/dev/stdin", "/dev/stdout", "/dev/stderr"};
     for (int i = 0; i < 3; i++) {
@@ -595,6 +581,31 @@ void vfs_set_prog(const char *guest)
         n = sizeof cur_fdt->prog - 1;
     memcpy(cur_fdt->prog, guest, n);
     cur_fdt->prog[n] = 0;
+}
+
+void vfs_set_argv(int argc, char **argv)
+{
+    size_t total = 0;
+    for (int i = 0; i < argc; i++)
+        total += strlen(argv[i]) + 1;
+    free(cur_fdt->cmdline);
+    cur_fdt->cmdline = malloc(total ? total : 1);
+    if (!cur_fdt->cmdline)
+        die_oom();
+    size_t o = 0;
+    for (int i = 0; i < argc; i++) {
+        size_t n = strlen(argv[i]) + 1;
+        memcpy(cur_fdt->cmdline + o, argv[i], n);
+        o += n;
+    }
+    cur_fdt->cmdline_len = total;
+}
+
+void vfs_close_cloexec(void)
+{
+    for (int fd = 0; fd < VFS_MAX_FD; fd++)
+        if (cur_fdt->slots[fd].desc && cur_fdt->slots[fd].cloexec)
+            vfs_close(fd);
 }
 
 int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
@@ -1084,4 +1095,18 @@ const uint8_t *vfs_cmdline_bytes(const fdtab_t *t, size_t *len)
     static const uint8_t none[1] = {0};
     *len = t ? t->cmdline_len : 0;
     return t && t->cmdline ? t->cmdline : none;
+}
+
+int vfs_fchmod(int fd, uint32_t mode)
+{
+    vfs_fd *f = vfs_get(fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind == VFS_PIPE || f->kind == VFS_MEMFD)
+        return 0;
+    if (f->hfd >= 0)
+        return host_fchmod(f->hfd, mode);
+    if (f->host)
+        return host_chmod(f->host, mode);
+    return -LE_PERM;
 }

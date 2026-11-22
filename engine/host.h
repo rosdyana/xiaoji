@@ -43,6 +43,12 @@ int host_stat_path(const char *path, int follow, host_stat *out);
 int host_stat_fd(int fd, host_stat *out);
 int host_statfs_path(const char *path, host_statfs *out);
 int host_access(const char *path, uint32_t mode);
+/* Filesystem changes; each returns 0 or -linux_errno. */
+int host_chmod(const char *path, uint32_t mode);
+int host_fchmod(int fd, uint32_t mode);
+int host_mkdir(const char *path, uint32_t mode);
+int host_unlink(const char *path);
+int host_rmdir(const char *path);
 /* Returns the link length (truncated to cap) or -LE_*. */
 int64_t host_readlink(const char *path, char *buf, size_t cap);
 

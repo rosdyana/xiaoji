@@ -54,7 +54,7 @@ rootfs_argv() {
 ROOTFS_CASES="toybox-echo toybox-ls toybox-uname toybox-wc toybox-sha toybox-lsdir toybox-cat sh-arith hello-int hello-jit sh-pipe sh-pipeline sh-subshell sh-bg sh-loop sh-script"
 # Rootfs cases the engine does not pass yet (multiple processes, B1): a failure is
 # XFAIL, not FAIL. Remove a name here once it passes.
-ROOTFS_PENDING="sh-pipe sh-pipeline sh-subshell sh-loop sh-script"
+ROOTFS_PENDING=""
 
 # The guest environment of the ART cases, from tools/guest-env.sh, as --env
 # arguments (the same variables the oracle exports with . /data/env.sh).

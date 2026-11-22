@@ -7,6 +7,8 @@
 
 #include "cpu_a64.h"
 
+struct proc;
+
 #define SCHED_SLICE 200000u /* instructions per scheduling slice */
 
 /* Runs the process from main_cpu until its last thread exits or the process
@@ -43,6 +45,10 @@ const char *sched_name(void);
 
 /* Instructions executed by all threads. */
 uint64_t sched_icount(void);
+/* Instructions executed by the threads of process p (reaped threads included). */
+uint64_t sched_icount_of(const struct proc *p);
+/* execve: the calling thread is left alone in its process (see sched.c). */
+void sched_exec_threads(cpu_t *self);
 
 /* Signal waits. A thread in rt_sigtimedwait blocks as SW_SIGWAIT. sched_wake ends
  * any wait with the given x0 (a no-op for a runnable thread). sched_threads lists

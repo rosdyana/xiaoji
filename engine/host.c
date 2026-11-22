@@ -181,6 +181,31 @@ int host_access(const char *path, uint32_t mode)
     return 0;
 }
 
+int host_chmod(const char *path, uint32_t mode)
+{
+    return chmod(path, (mode_t)(mode & 07777)) == 0 ? 0 : neg_errno();
+}
+
+int host_fchmod(int fd, uint32_t mode)
+{
+    return fchmod(fd, (mode_t)(mode & 07777)) == 0 ? 0 : neg_errno();
+}
+
+int host_mkdir(const char *path, uint32_t mode)
+{
+    return mkdir(path, (mode_t)(mode & 07777)) == 0 ? 0 : neg_errno();
+}
+
+int host_unlink(const char *path)
+{
+    return unlink(path) == 0 ? 0 : neg_errno();
+}
+
+int host_rmdir(const char *path)
+{
+    return rmdir(path) == 0 ? 0 : neg_errno();
+}
+
 int64_t host_readlink(const char *path, char *buf, size_t cap)
 {
     ssize_t n = readlink(path, buf, cap);

@@ -112,6 +112,7 @@ static void reap(int slot)
     if (prof_on)
         prof_thread_end(threads[slot]->cpu.tid, threads[slot]->cpu.icount);
     dead_icount += threads[slot]->cpu.icount;
+    threads[slot]->proc->dead_icount += threads[slot]->cpu.icount;
     threads[slot]->proc->nthreads--;
     free(threads[slot]);
     threads[slot] = NULL;
@@ -622,6 +623,37 @@ void sched_set_name(const char *name)
 const char *sched_name(void)
 {
     return cur() ? cur()->comm : init_name;
+}
+
+/* execve: the calling thread (self) is the only thread left in its process. The others
+ * are reaped; the caller takes the process's id as its tid (it may have been a
+ * non-leader thread), and its per-thread wait state is cleared. */
+void sched_exec_threads(cpu_t *self)
+{
+    thread_t *me = NULL;
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (threads[i] && &threads[i]->cpu == self)
+            me = threads[i];
+    if (!me)
+        return;
+    proc_t *p = me->proc;
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (threads[i] && threads[i] != me && threads[i]->proc == p)
+            reap(i);
+    me->clear_child_tid = 0; /* the new image's exit must not clear the old word */
+    me->settid_pending = 0;
+    me->has_deadline = 0;
+    me->state = TS_RUNNABLE;
+    self->tid = (uint64_t)p->pid;
+}
+
+uint64_t sched_icount_of(const proc_t *p)
+{
+    uint64_t n = p->dead_icount;
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (threads[i] && threads[i]->proc == p)
+            n += threads[i]->cpu.icount;
+    return n;
 }
 
 uint64_t sched_icount(void)
