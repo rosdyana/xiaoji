@@ -1336,12 +1336,12 @@ int vfs_stat_props(host_stat *out)
     return 0;
 }
 
-int vfs_socket(int cloexec)
+int vfs_socket(int cloexec, int dgram)
 {
     int slot = free_fd_from(0);
     if (slot < 0)
         return -LE_MFILE;
-    sock_t *s = sock_new();
+    sock_t *s = sock_new(dgram);
     if (!s)
         die_oom();
     vfs_fd *f = desc_new();

@@ -519,21 +519,27 @@ the source matches it.
 
 ## B3: the binder driver, servicemanager, epoll, eventfd and timerfd
 
-Status: **done up to the checkpoints.** The real `/system/bin/servicemanager` runs as the
-binder context manager. `service list` shows `manager`, and `service check manager` finds it.
-`binderDriverInterfaceTest` passes all 17 cases with servicemanager running, in the engine and
-in Node. `binderLibTest` runs case by case with servicemanager and its forked servers:
-48 gtest cases in the report: 26 pass, 7 fail, 1 is skipped (Freeze), 10 pass their test body and then hang in TearDown until the watchdog kills them, and 4 parameterized RPC names match no test ("0 tests", counted as passed by the script, not real passes). `binderSafeInterfaceTest` and `binderThroughputTest` were not run
-in this pass. Nothing is committed.
+Status: **B3 steps 1 to 4 are in the engine, uncommitted.** Step 1 is the logd sink
+(Android log lines reach a stderr sink). Step 2 fixes the binderLibTest TearDown hang (its
+cause was a driver bug in buffer release, below). Step 3 fixes FreedBinder, OnewayQueueing,
+GotSid, SchedPolicySet and InheritRt, and adds the scheduler syscalls. SetRpcClientDebug
+and SetRpcClientDebugTwice still fail (they need AF_INET, see Gaps). Step 4 ran
+binderSafeInterfaceTest and binderThroughputTest once each.
+
+The real `/system/bin/servicemanager` runs as the binder context manager. `service list`
+shows `manager`, and `service check manager` finds it. `binderDriverInterfaceTest` passes all
+17 cases with servicemanager running, in the engine and in Node.
 
 ### Design as built
 
 - **Files.** `engine/binder.c` and `binder.h` (the driver), `engine/poll.c` and `poll.h`
   (readiness, ppoll, epoll), `engine/fdobj.c` and `fdobj.h` (eventfd and timerfd),
-  `engine/selinuxfs.c` and `selinuxfs.h` (the synthetic selinuxfs). Hooks: `engine/vfs.c`
-  and `vfs.h` (fd kinds, synthetic directories and files, `vfs_resolve`), `engine/sysfs.c`
-  (ioctl, statfs, the new syscalls), `engine/syscall.c`, `engine/signals.c` and `signals.h`
-  (sigqueue, the per-signal value), `engine/procfs.c` (`attr/current`), `engine/sched.c`,
+  `engine/selinuxfs.c` and `selinuxfs.h` (the synthetic selinuxfs), `engine/logd.c` and
+  `logd.h` (the logd sink). Hooks: `engine/vfs.c` and `vfs.h` (fd kinds, synthetic directories
+  and files, `vfs_resolve`, `vfs_socket(cloexec, dgram)`), `engine/sysfs.c` (ioctl, statfs, the
+  new syscalls, datagram sends), `engine/sock.c` and `sock.h` (stream and datagram sockets),
+  `engine/syscall.c`, `engine/signals.c` and `signals.h`, `engine/procfs.c` (`attr/current`),
+  `engine/sched.c` and `sched.h` (scheduling policy per thread), `engine/main.c` (`--logcat`),
   `engine/pipe.c`.
 - **Devices.** `/dev/binder`, `/dev/hwbinder` and `/dev/vndbinder` are synthetic
   (`SYN_BINDER`). Each is a separate context with its own context manager. Each `open` is a
@@ -573,11 +579,40 @@ in this pass. Nothing is committed.
   items (it does not start the buffer) sends none. `BC_REGISTER_LOOPER` clears the pending
   spawn and counts a started looper. A spawn was observed once in the `binderLibTest`
   PtrSize run (the spawn log line, checked with a temporary print that has been removed).
+- **Which work a read takes.** A read takes its own queued work first. It takes proc work
+  only if the thread is not waiting for a reply and had no own work when the read started
+  (`may_take_proc`, as the kernel's `wait_for_proc_work`, decided once per read).
 - **ppoll, epoll, eventfd, timerfd** (`fdobj.c`, `poll.c`). One key serves every poll
   waiter, and each readiness change calls `poll_notify`. epoll is level-triggered, with a
   16-byte `epoll_event`. eventfd2 supports EFD_SEMAPHORE, EFD_NONBLOCK and EFD_CLOEXEC.
   timerfd supports CLOCK_MONOTONIC and CLOCK_BOOTTIME, relative and absolute, and intervals.
   Both clocks are the host's monotonic clock.
+
+### The logd sink (B3 step 1)
+
+liblog writes its text log lines to `/dev/socket/logdw`, an AF_UNIX SOCK_DGRAM socket
+(`system/logging/liblog/logd_writer.cpp` on the remote tree). The engine now serves that path
+as an endpoint, as it does the property service (`engine/logd.c`).
+
+- **Socket layer.** `socket(AF_UNIX, SOCK_DGRAM)` is accepted. `connect` to `/dev/socket/logdw`
+  succeeds on a datagram socket, and any other path is ENOENT. A datagram write (`write`,
+  `sendto`, `writev`) is one message: the iovecs are gathered into one buffer (at most 64 KiB,
+  EMSGSIZE beyond it) and written with one call to the endpoint.
+- **Format.** liblog's datagram is `struct android_log_header_t` (id, tid, realtime sec and
+  nsec: 11 bytes packed), then the priority (1 byte), the tag and the message, each
+  NUL-terminated. Text buffers are decoded: MAIN (0), RADIO (1), SYSTEM (3) and CRASH (4).
+  The binary buffers (EVENTS 2, STATS 5, SECURITY 6, KERNEL 7) are not printed.
+- **Output.** `<letter>/<tag>(<pid>): <message>` on stderr, one line per message. The letter
+  is the Android priority (V D I W E F, `?` otherwise). The pid is the guest process that made
+  the write (the datagram carries no pid, so the engine uses the calling process).
+- **Switch.** Off by default: messages are dropped silently. `--logcat` or `XIAOJI_LOGCAT=1`
+  turns the output on. Default test output does not change (the 124 cases and their stdout
+  are as before).
+- **Check.** `xiaoji --logcat --root build/rootfs -- /system/bin/log -p w -t mytag "hello"`
+  prints `W/mytag(1000): hello`. A `sh -c` that prints `$$` and then runs `log` shows the
+  `log` child's pid.
+- **Not modelled.** No logd buffers, no `SCM_CREDENTIALS` (the pid is the engine's own), no
+  pmsg. A message with an embedded NUL is cut at the NUL.
 
 ### The SELinux decision (permissive, with a synthetic selinuxfs)
 
@@ -625,6 +660,28 @@ SELinux magic (only the path form does). There is no policy: every check is allo
 
 ### Binder fixes found while running servicemanager and binderLibTest
 
+- **Buffer release dropped the wrong count (the TearDown hang).** `buf_release_refs` read
+  8 bytes of each object and took the handle from offset 4, which is the object's `flags`
+  word. The handle is at offset 8 (`xl_object` reads it there). So when a transaction buffer
+  was freed (`BC_FREE_BUFFER`), the strong count that the translation had given the
+  receiver's ref was never dropped, or the wrong ref was dropped. The owner's node then kept
+  `int_strong` above zero forever: no `BR_RELEASE` went to the owner, its `BBinder` was not
+  destroyed, and `exit(EXIT_SUCCESS)` in `BinderLibTestService::~BinderLibTestService` never
+  ran. The main server's `EXIT` handler waits for its children, so every TearDown after an
+  `addServer` hung. The fix reads 24 bytes (one `flat_binder_object`) and uses the handle at
+  offset 8. The per-node count trace (incs and decs by proc, removed) showed the test
+  process's ref to the child's node with no decrement at its buffer free.
+- **A strong handle needs a strong ref** (`binder_get_ref_olocked` with need_strong). A
+  sender's strong HANDLE whose ref holds no strong count is rejected (`FAILED_TRANSACTION`).
+  This is what FreedBinder expects once the count above is released. (FreedBinder)
+- **Requests carry the sender's security context when the node asks for it.** A node whose
+  flags have `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (0x1000, from `setRequestingSid`) gets
+  `BR_TRANSACTION_SEC_CTX` with the context. Before, only the context manager with
+  `SET_CONTEXT_MGR_EXT` got it, and it was sent with the wrong command code. (GotSid)
+- **A read takes one proc-work decision** (see Design). A oneway `BC_TRANSACTION` makes
+  libbinder wait for `BR_TRANSACTION_COMPLETE`. The driver's read then also took the next
+  proc request, which libbinder ran inside the callback send, so the second oneway callback
+  was delayed past the test's timeout. (OnewayQueueing)
 - **The context manager's counts are acknowledged at creation** (`mgr_counts_acked`). The
   driver's `binder_become_context_manager` sets `has_strong_ref` and `has_weak_ref`. Without
   this, a reference to the manager's node sent `BR_INCREFS` with ptr and cookie 0, and
@@ -642,6 +699,23 @@ SELinux magic (only the path form does). There is no policy: every check is allo
   the reply.
 - **Handles** are written as the whole 64-bit field, with the cookie zero, as
   `CheckHandleZeroBinderHighBitsZeroCookie` expects.
+- **Real-time priority** (`sched_raise`, SchedPolicySet and InheritRt). A sync request to a
+  node whose flags give a minimum real-time policy (2 bits at 9, priority in the low byte),
+  or that has inherit-RT (0x800) from a real-time sender, runs its receiving thread at that
+  policy and priority. The thread's own policy is restored when the request ends
+  (`txn_free`, which runs at the reply). Oneway requests are not raised.
+
+### Scheduling (sched_setscheduler 119, sched_getscheduler 120, sched_getparam 121)
+
+- The policy and priority are stored per thread (`thread_t.policy` and `prio`, in
+  `engine/sched.c`), keyed by tid. pid 0 is the calling thread. A new thread or process copies
+  its creator's values, as Linux does on clone and fork.
+- `sched_setscheduler`: validated as in Linux (OTHER, BATCH and IDLE need priority 0; FIFO and
+  RR need 1..99; the SCHED_RESET_ON_FORK flag is accepted and ignored). Policy -1 keeps the
+  policy (sched_setparam). EINVAL for a bad policy or priority, ESRCH for an unknown tid.
+- `sched_getscheduler` and `sched_getparam` report what is stored.
+- The engine does not schedule by these values. They are reported to the guest and used by
+  binder's `sched_raise`. There are no permission checks (the guest is root).
 
 ### Signals: rt_sigqueueinfo (138) and rt_tgsigqueueinfo (240)
 
@@ -668,56 +742,77 @@ path exercised is `abort()` (a `rt_tgsigqueueinfo` with `SI_QUEUE`, which is del
   watchdog (LIMIT seconds, then SIGKILL), with servicemanager running. Its per-case lines go
   to `build/tests/out/binderlib.txt`. The run is **report only** and off by default:
   `XIAOJI_BINDERLIB=1 tests/run.sh` turns it on. It never changes the fail count.
+- `binderSafeInterfaceTest` and `binderThroughputTest` were run once each by hand (below), not
+  in `tests/run.sh`.
 
 ### Results (B3)
 
-- `make test`: **124 passed, 0 failed** (122 before, minus the 14-case binder entry, plus the
-  17-case entry and `binder-sm`, each in engine and Node).
+- `make test`: **124 passed, 0 failed**, with and without `XIAOJI_BINDERLIB=1` (122 before this
+  pass, minus the 14-case binder entry, plus the 17-case entry and `binder-sm`, each in engine
+  and Node).
 - `XIAOJI_JIT=0 tests/run.sh`: **124 passed, 0 failed**.
-- `make test-web`: all checks passed.
-- binderLibTest (report run, engine): 
-  - **Pass (26):** CannotUseBinderAfterFork, WasParceled, NopTransaction, NopTransactionOneway,
-    NopTransactionClear, SetError, GetId, CallBack, BinderCallContextGuard,
-    DeathNotificationStrongRef, PassFile, PassParcelFileDescriptor, PromoteLocal,
-    LocalGetExtension, CheckHandleZeroBinderHighBitsZeroCookie, CheckNoHeaderMappedInUser,
-    WorkSourceUnsetByDefault, WorkSourceSet, WorkSourceSetWithoutPropagation,
-    WorkSourceCleared, WorkSourceRestored, PropagateFlagSet, PropagateFlagCleared,
-    PropagateFlagRestored, WorkSourcePropagatedForAllFollowingBinderCalls,
+- `make test-web`: all web checks passed.
+- binderLibTest (`XIAOJI_BINDERLIB=1`, engine, one guest process per case): **41 pass**, 1
+  skipped, 2 fail, 0 hang. Before this pass it was 26 pass, 10 hang, 7 fail.
+  - **Pass (41):** CannotUseBinderAfterFork, WasParceled, NopTransaction, NopTransactionOneway,
+    NopTransactionClear, SetError, GetId, PtrSize, IndirectGetId2, IndirectGetId3, CallBack,
+    BinderCallContextGuard, AddServer, DeathNotificationStrongRef, DeathNotificationMultiple,
+    DeathNotificationThread, PassFile, PassParcelFileDescriptor, PromoteLocal,
+    LocalGetExtension, RemoteGetExtension, CheckHandleZeroBinderHighBitsZeroCookie, FreedBinder,
+    CheckNoHeaderMappedInUser, OnewayQueueing, WorkSourceUnsetByDefault, WorkSourceSet,
+    WorkSourceSetWithoutPropagation, WorkSourceCleared, WorkSourceRestored, PropagateFlagSet,
+    PropagateFlagCleared, PropagateFlagRestored, WorkSourcePropagatedForAllFollowingBinderCalls,
+    SchedPolicySet, InheritRt, VectorSent, BufRejected, WeakRejected, GotSid,
     ServiceNotifications.Unregister.
   - **Skipped (1):** Freeze (the cgroup freezer file is absent, so the test skips itself).
-  - **Body ok, hangs in TearDown (10):** PtrSize, IndirectGetId2, IndirectGetId3, AddServer,
-    DeathNotificationMultiple, DeathNotificationThread, RemoteGetExtension, VectorSent,
-    BufRejected, WeakRejected. Cause: see Gaps.
-  - **Fail (7):**
-    - SchedPolicySet and InheritRt: the engine does not implement `sched_getparam` (121) and
-      `sched_setscheduler` (119). Cause known; not implemented in this pass.
-    - FreedBinder: an earlier run gave `FAILED_TRANSACTION` (-2147483646) where the test
-      expects -32, and a SIGSEGV at address 0x4 in libutils. Not investigated further.
-    - OnewayQueueing: fails and is killed by the watchdog. Not investigated.
-    - GotSid: fails. Not investigated (the sender's security context is `u:r:kernel:s0`).
-    - SetRpcClientDebug and SetRpcClientDebugTwice: binder RPC needs sockets the engine does
-      not provide (`BinderLibRpcTest`). Not investigated.
-  - **Matches no test (4):** the `BinderLibTest/BinderLibRpcTestP.*` names, which the per-case
-    filter does not match.
-- Warnings: `clang -Wall -Wextra -Wno-unused-parameter -c` on each changed engine file
-  (`binder.c`, `signals.c`, `vfs.c`, `selinuxfs.c`, `procfs.c`, `sysfs.c`, `syscall.c`): 0
-  warnings. `emcc -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -c` on the same files:
-  0 warnings.
+  - **Fail (2):** BinderLibRpcTest.SetRpcClientDebug and SetRpcClientDebugTwice. The test
+    starts an inet server on 127.0.0.1 (`setupInetServer`), and `socket(AF_INET)` returns
+    EAFNOSUPPORT (logged by the test's `RpcServer`: "Could not create socket: Address family
+    not supported by protocol"). An AF_UNIX socketpair would not change this.
+  - **Matches no test (4):** the `BinderLibTest/BinderLibRpcTestP.*` names. They run 0 tests
+    and the report counts them as passed. They are not real passes.
+- binderSafeInterfaceTest (run once, `/data/nativetest64/binderSafeInterfaceTest`): **9 pass,
+  1 fail, 1 crash, 6 not run** (17 in all). Failure: `TestIncrementNativeHandle`
+  (`fdsAreEquivalent` compares `st_dev` and `st_ino`; the engine's synthetic inode is
+  `0x4000 + fd`, so a received fd, with a new number, does not match). Crash: `TestCallMeBack`
+  takes SIGSEGV at address 0x4 in the test process, but only in the full run: alone it passes.
+  The six cases after it did not run.
+- binderThroughputTest (run once): exit 0. `iterations per sec: 11074.3`, average 0.165 ms,
+  worst 2.008 ms.
+- Warnings: `clang -Wall -Wextra -Wno-unused-parameter -c` and `emcc -O2 -std=c11 -Wall -Wextra
+  -Wno-unused-parameter -c`, per file, on `binder.c`, `logd.c`, `sock.c`, `sysfs.c`,
+  `syscall.c`, `sched.c`, `main.c` and `vfs.c`: 0 warnings, 0 errors.
 
 ### Gaps (B3)
 
-- **binderLibTest is not fully green.** The per-case list above is the state; the causes
-  are listed under it. A case whose body passes and then hangs in TearDown is the largest
-  group. TearDown sends `EXIT` (oneway) to the main server, then waits for the server's pid.
-  The server's `EXIT` handler waits for its children, which are the servers that `addServer`
-  forked. Those children exit only when their last strong ref is released. A temporary log
-  of node count changes (removed) showed decrements reaching zero for some nodes, but I did
-  not find which child's count is kept. This is the known cause for that group, not fixed.
-- **Not run:** `binderSafeInterfaceTest`, `binderThroughputTest`.
-- **Not verified by any run:** oneway queueing order, fd passing (FD and FDA), PTR
-  scatter-gather (`BC_TRANSACTION_SG`), `BR_TRANSACTION_SEC_CTX` beyond the fixed context,
-  death notifications beyond the request and clear pair, the count acknowledgements
-  (`BC_ACQUIRE_DONE`, `BC_INCREFS_DONE`) in general, and the sigqueue EPERM path.
+- **RPC (SetRpcClientDebug, SetRpcClientDebugTwice)** need `AF_INET` stream sockets on
+  loopback (the inet server), which the engine does not provide. Not attempted: AF_UNIX
+  socketpair and listen/accept do not cover this test.
+- **Guest-to-guest AF_UNIX stream sockets** (socketpair, bind, listen, accept, blocking
+  connect) are not implemented. The `sock.c` table serves only engine endpoints (the property
+  service, logd). B4 (zygote) needs them: the work is a listener table, blocking reads,
+  poll integration and fd passing, so it is a step of its own.
+- **binderSafeInterfaceTest** has the two failures above. `TestIncrementNativeHandle` needs
+  the fstat inode of a file description, not of the fd number (`vfs.c`'s `out->ino`). Not
+  changed here. `TestCallMeBack` crashes only after the earlier cases in the same guest
+  process. Not diagnosed. What the code shows: `node_maybe_free` frees only dead nodes, and
+  `xl_object` reuses the node that `node_by_ptr` finds for a pointer without comparing its
+  cookie. So a node of a live owner is never freed, and a new object at a reused address can
+  be given that old node. The plan's rule (node death once strong reaches zero and the owner
+  has acknowledged) is not implemented for live owners. Whether this is the TestCallMeBack
+  crash is unverified. The count paths were not changed for this.
+- **DeathNotificationMultiple** failed once in the first of about 16 runs (its callbacks
+  timed out after 5 s). It passed 10 of 10 later runs. Not diagnosed.
+- **Not in default `make test`**: binderLibTest stays report-only. One full pass (48 cases,
+  each a guest process) took about 3 minutes here, so the passing subset is far over the 30 s
+  budget. One run in about 16 also failed (DeathNotificationMultiple).
+- **Scheduling is not enforced.** The policies are stored and used only by binder's
+  `sched_raise`. There is no CFS or RT effect, and no permission checks.
+- **Not verified by any run:** oneway ordering beyond the OnewayQueueing case, fd passing (FD and FDA
+  through binder), PTR scatter-gather (`BC_TRANSACTION_SG`), `BR_TRANSACTION_SEC_CTX` beyond the
+  fixed context, death notifications beyond the request and clear pair, the count
+  acknowledgements (`BC_ACQUIRE_DONE`, `BC_INCREFS_DONE`) in general, and the sigqueue EPERM
+  path.
 - **Reply path counts.** Only the sender's thread is used for a transaction's counts. The
   reply path uses the same rule, but no test here checks a reply that carries a binder.
 - `BC_ATTEMPT_ACQUIRE` and `BC_ACQUIRE_RESULT` are accepted and ignored.
@@ -725,6 +820,7 @@ path exercised is `abort()` (a `rt_tgsigqueueinfo` with `SI_QUEUE`, which is del
   its signal mask. epoll is level-triggered only.
 - Threads leave the proc when `BINDER_THREAD_EXIT` runs or when the proc closes.
 - The clock is the host's monotonic clock. `CLOCK_REALTIME` timers are EINVAL.
-- The engine's AF_UNIX DGRAM sockets (liblog's logd path) are refused (EPROTONOSUPPORT), so
-  Android log lines from servicemanager and binderLibTest do not reach a log. Errors that
-  servicemanager logs are therefore invisible, and the CHECK messages are lost.
+- logd output is stderr only, and it is off by default. The pid printed is the engine's guest
+  pid, not a kernel credential.
+- The engine's `SYS_SOCKET` case in `syscall.c` (EACCES) is dead code: `sysfs_call` handles
+  socket(2) first. Left as it was.

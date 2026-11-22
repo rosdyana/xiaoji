@@ -3,6 +3,7 @@
  * dirent64); host structs are never copied to the guest. */
 #include "sysfs.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "binder.h"
@@ -17,6 +18,7 @@
 #include "syscall.h"
 #include "props.h"
 #include "selinuxfs.h"
+#include "sock.h"
 #include "vfs.h"
 
 #define SYS_GETCWD 17
@@ -233,6 +235,35 @@ out:
     return res;
 }
 
+/* A datagram socket: the cnt segments (va, len pairs in ent) are gathered into one
+ * message, which is written with one sock_write. The size is capped (a datagram is one
+ * unit for the endpoint). */
+#define DGRAM_MAX 65536
+static int64_t dgram_send(int fd, const uint64_t *ent, uint64_t cnt)
+{
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        total += ent[2 * i + 1];
+        if (total > DGRAM_MAX)
+            return -LE_MSGSIZE;
+    }
+    uint8_t *msg = malloc(total ? (size_t)total : 1);
+    if (!msg)
+        return -LE_NOMEM;
+    uint64_t off = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        size_t len = (size_t)ent[2 * i + 1];
+        if (len && mem_copy_out(msg + off, ent[2 * i], len) < 0) {
+            free(msg);
+            return -LE_FAULT;
+        }
+        off += len;
+    }
+    int64_t w = vfs_write(fd, msg, (size_t)total);
+    free(msg);
+    return w;
+}
+
 static int64_t fs_write(int fd, uint64_t buf, uint64_t n)
 {
     vfs_fd *f = vfs_get(fd);
@@ -240,6 +271,10 @@ static int64_t fs_write(int fd, uint64_t buf, uint64_t n)
         seg_va[0] = buf;
         seg_len[0] = n;
         return pipe_write_segs(fd, 1);
+    }
+    if (f && f->kind == VFS_SOCK && sock_is_dgram(f->sock)) {
+        uint64_t one[2] = {buf, n};
+        return dgram_send(fd, one, 1);
     }
     uint64_t done = 0;
     do {
@@ -300,12 +335,13 @@ static int64_t pipe_writev(int fd, uint64_t iov, uint64_t cnt)
     return pipe_write_segs(fd, cnt);
 }
 
-/* Sockets (sock.h): AF_UNIX stream sockets that the engine serves. socket makes an
- * unconnected one. connect takes a sockaddr_un path, which only an engine endpoint
- * answers. sendto and recvfrom take no address on a connected stream, so they are
- * read and write. */
+/* Sockets (sock.h): AF_UNIX stream and datagram sockets that the engine serves. socket
+ * makes an unconnected one. connect takes a sockaddr_un path, which only an engine
+ * endpoint answers. sendto and recvfrom take no address on a connected socket, so they
+ * are read and write. A datagram write is one message (see dgram_send). */
 #define SOCK_AF_UNIX 1
 #define SOCK_STREAM_TYPE 1
+#define SOCK_DGRAM_TYPE 2
 #define SOCK_TYPE_MASK 0xF
 #define SOCK_CLOEXEC_FLAG 0x80000
 #define SOCK_NONBLOCK_FLAG 0x800
@@ -314,10 +350,11 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
 {
     if (domain != SOCK_AF_UNIX)
         return -LE_AFNOSUPPORT;
-    if ((type & SOCK_TYPE_MASK) != SOCK_STREAM_TYPE || proto != 0)
+    uint64_t kind = type & SOCK_TYPE_MASK;
+    if ((kind != SOCK_STREAM_TYPE && kind != SOCK_DGRAM_TYPE) || proto != 0)
         return -LE_PROTONOSUPPORT;
     /* SOCK_NONBLOCK is accepted and ignored: the endpoints never block. */
-    return vfs_socket((type & SOCK_CLOEXEC_FLAG) != 0);
+    return vfs_socket((type & SOCK_CLOEXEC_FLAG) != 0, kind == SOCK_DGRAM_TYPE);
 }
 
 static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t alen)
@@ -400,6 +437,22 @@ static int64_t fs_writev(int fd, uint64_t iov, uint64_t cnt)
     vfs_fd *pf = vfs_get(fd);
     if (pf && pf->kind == VFS_PIPE)
         return pipe_writev(fd, iov, cnt);
+    if (pf && pf->kind == VFS_SOCK && sock_is_dgram(pf->sock)) {
+        if (cnt == 0)
+            return dgram_send(fd, NULL, 0);
+        uint64_t *ent = malloc((size_t)cnt * 2 * sizeof *ent);
+        if (!ent)
+            return -LE_NOMEM;
+        for (uint64_t i = 0; i < cnt; i++) {
+            if (mem_copy_out(ent + 2 * i, iov + i * 16, 16) < 0) {
+                free(ent);
+                return -LE_FAULT;
+            }
+        }
+        int64_t w = dgram_send(fd, ent, cnt);
+        free(ent);
+        return w;
+    }
     int64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
         uint64_t ent[2];

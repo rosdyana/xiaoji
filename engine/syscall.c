@@ -26,7 +26,9 @@
 #define SYS_FUTEX 98
 #define SYS_SET_ROBUST_LIST 99
 #define SYS_NANOSLEEP 101
+#define SYS_SCHED_SETSCHEDULER 119
 #define SYS_SCHED_GETSCHEDULER 120
+#define SYS_SCHED_GETPARAM 121
 #define SYS_SCHED_YIELD 124
 #define SYS_SCHED_GETAFFINITY 123
 #define SYS_KILL 129
@@ -725,6 +727,60 @@ static int64_t sys_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req)
     return 0;
 }
 
+/* The scheduling policy and priority of a thread (sched.h): pid is a tid, 0 is the calling
+ * thread. The policies are Linux's: OTHER 0, FIFO 1, RR 2, BATCH 3, IDLE 5 (SCHED_RESET_ON_FORK,
+ * a flag, is accepted). A real-time priority is 1..99, the others 0. */
+#define SCHED_RESET_ON_FORK_FLAG 0x40000000
+static uint64_t sched_target(uint64_t pid)
+{
+    return (int32_t)pid == 0 ? sched_tid() : pid;
+}
+
+static int64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy_arg, uint64_t param)
+{
+    uint8_t raw[4];
+    if (mem_copy_out(raw, param, sizeof raw) < 0)
+        return -LE_FAULT;
+    int32_t prio = (int32_t)(raw[0] | (raw[1] << 8) | (raw[2] << 16) | ((uint32_t)raw[3] << 24));
+    int policy = (int32_t)policy_arg;
+    uint64_t tid = sched_target(pid);
+    int cur_pol = 0, cur_pri = 0;
+    if (sched_policy_get(tid, &cur_pol, &cur_pri) != 0)
+        return -LE_SRCH;
+    if (policy == -1) /* sched_setparam: keep the policy */
+        policy = cur_pol;
+    int base = policy & ~SCHED_RESET_ON_FORK_FLAG;
+    int ok;
+    switch (base) {
+    case 0: case 3: case 5: ok = prio == 0; break;
+    case 1: case 2: ok = prio >= 1 && prio <= 99; break;
+    default: ok = 0; break;
+    }
+    if (!ok)
+        return -LE_INVAL;
+    return sched_policy_set(tid, policy, prio) == 0 ? 0 : -LE_SRCH;
+}
+
+static int64_t sys_sched_getscheduler(uint64_t pid)
+{
+    int policy = 0, prio = 0;
+    if (sched_policy_get(sched_target(pid), &policy, &prio) != 0)
+        return -LE_SRCH;
+    return policy;
+}
+
+static int64_t sys_sched_getparam(uint64_t pid, uint64_t param)
+{
+    int policy = 0, prio = 0;
+    if (sched_policy_get(sched_target(pid), &policy, &prio) != 0)
+        return -LE_SRCH;
+    uint8_t raw[4] = {(uint8_t)prio, (uint8_t)((uint32_t)prio >> 8), (uint8_t)((uint32_t)prio >> 16),
+                      (uint8_t)((uint32_t)prio >> 24)};
+    if (mem_copy_in(param, raw, sizeof raw) < 0)
+        return -LE_FAULT;
+    return 0;
+}
+
 static int64_t sys_sched_getaffinity(uint64_t len, uint64_t mask)
 {
     if (len < SIGSET_SIZE)
@@ -1119,8 +1175,16 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_GETPRIORITY:
     case SYS_SETPRIORITY:
-    case SYS_SCHED_GETSCHEDULER:
         *ret = 0;
+        return;
+    case SYS_SCHED_SETSCHEDULER:
+        *ret = sys_sched_setscheduler(a[0], a[1], a[2]);
+        return;
+    case SYS_SCHED_GETSCHEDULER:
+        *ret = sys_sched_getscheduler(a[0]);
+        return;
+    case SYS_SCHED_GETPARAM:
+        *ret = sys_sched_getparam(a[0], a[1]);
         return;
     case SYS_SCHED_GETAFFINITY:
         *ret = sys_sched_getaffinity(a[1], a[2]);

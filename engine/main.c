@@ -18,6 +18,7 @@ EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); 
 #endif
 #include "host.h"
 #include "linux.h"
+#include "logd.h"
 #include "loader.h"
 #include "mem.h"
 #include "proc.h"
@@ -62,6 +63,7 @@ static int usage(FILE *out)
           "  --prop K=V   set a system property (after the guest's build.prop files)\n"
           "  --trace      print each syscall and its result to stderr\n"
           "  --stats      print the instruction count and rate on exit (as XIAOJI_STATS=1)\n"
+          "  --logcat     print the guest's log messages (logd) to stderr (as XIAOJI_LOGCAT=1)\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
           out);
     return out == stdout ? 0 : 2;
@@ -71,7 +73,7 @@ int main(int argc, char **argv)
 {
     char *envs[MAX_ENV];
     const char *props[MAX_PROP];
-    int nenv = 0, nprop = 0, trace = 0, stats = 0, root_given = 0;
+    int nenv = 0, nprop = 0, trace = 0, stats = 0, logcat = 0, root_given = 0;
     int i = 1;
 
     for (; i < argc; i++) {
@@ -103,6 +105,10 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--trace")) {
             trace = 1;
+            continue;
+        }
+        if (!strcmp(a, "--logcat")) {
+            logcat = 1;
             continue;
         }
         if (!strcmp(a, "--stats")) {
@@ -173,6 +179,8 @@ int main(int argc, char **argv)
 
     const char *stats_env = getenv("XIAOJI_STATS");
     stats_on = stats || (stats_env && stats_env[0] == '1');
+    const char *logcat_env = getenv("XIAOJI_LOGCAT");
+    logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
     const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
     sig_set_debug_faults(faults_env && faults_env[0] == '1');
     stats_t0 = host_monotonic_ns();

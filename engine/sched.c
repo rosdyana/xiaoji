@@ -58,6 +58,7 @@ typedef struct thread {
     uint64_t settid_va;
     int64_t vfork_ret;   /* TS_VFORK: the x0 the parent gets when its child execs or exits */
     char comm[16];
+    int policy, prio;    /* scheduling policy and priority (sched_policy_get/set) */
     proc_t *proc; /* the process this thread belongs to */
 } thread_t;
 
@@ -261,6 +262,35 @@ cpu_t *sched_find_thread(uint64_t tid)
         if (threads[i] && threads[i]->cpu.tid == tid)
             return &threads[i]->cpu;
     return NULL;
+}
+
+/* A new thread (clone, fork) starts with its parent's policy and priority, as in Linux.
+ * parent is the calling thread's cpu, the first member of its thread_t. */
+static void inherit_sched(thread_t *t, const cpu_t *parent)
+{
+    const thread_t *pt = (const thread_t *)parent;
+    t->policy = pt->policy;
+    t->prio = pt->prio;
+}
+
+int sched_policy_get(uint64_t tid, int *policy, int *prio)
+{
+    cpu_t *c = sched_find_thread(tid);
+    if (!c)
+        return -1;
+    *policy = ((thread_t *)c)->policy;
+    *prio = ((thread_t *)c)->prio;
+    return 0;
+}
+
+int sched_policy_set(uint64_t tid, int policy, int prio)
+{
+    cpu_t *c = sched_find_thread(tid);
+    if (!c)
+        return -1;
+    ((thread_t *)c)->policy = policy;
+    ((thread_t *)c)->prio = prio;
+    return 0;
 }
 
 int64_t sched_futex_wake(uint64_t key, uint64_t obj, uint64_t count, uint32_t bitset)
@@ -525,6 +555,7 @@ static int64_t clone_thread(cpu_t *parent, uint64_t flags, uint64_t newsp, uint6
     thread_t *t = add_thread(parent, tid, me->proc);
     if (!t)
         return -LE_NOMEM;
+    inherit_sched(t, parent);
     next_tid++;
     t->cpu.x[0] = 0;
     /* The child keeps the mask but starts with no pending signals, no alternate
@@ -569,6 +600,7 @@ static int64_t clone_process(cpu_t *parent, uint64_t flags, uint64_t newsp, uint
     thread_t *t = add_thread(parent, pid, child);
     if (!t) /* not reached: live_count left a free slot */
         return -LE_NOMEM;
+    inherit_sched(t, parent);
     next_tid++;
     t->cpu.x[0] = 0;
     t->cpu.sig_pending = 0;

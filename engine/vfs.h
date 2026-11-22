@@ -94,8 +94,9 @@ int vfs_memfd_create(const char *name, uint32_t mflags);
 int vfs_close(int fd);
 /* pipe2: two descriptors, read end in out[0] and write end in out[1]. Returns 0 or -LE_*. */
 int vfs_pipe2(int out[2], uint32_t flags);
-/* A new unconnected AF_UNIX stream socket in a free slot. Returns the fd, or -LE_*. */
-int vfs_socket(int cloexec);
+/* A new unconnected AF_UNIX socket (dgram: SOCK_DGRAM, else SOCK_STREAM) in a free slot.
+ * Returns the fd, or -LE_*. */
+int vfs_socket(int cloexec, int dgram);
 /* Blocks the running thread if the read or write on fd would block on a pipe (and
  * the descriptor is not O_NONBLOCK). The call is then restarted. Returns 1 if it blocked. */
 int vfs_pipe_block(int fd);

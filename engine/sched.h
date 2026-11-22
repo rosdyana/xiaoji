@@ -62,6 +62,11 @@ sched_wait_t sched_wait_kind(const cpu_t *c);
 void sched_wake(cpu_t *c, int64_t ret);
 int sched_threads(cpu_t **out, int max);
 cpu_t *sched_find_thread(uint64_t tid);
+/* The scheduling policy and priority of a thread (sched_setscheduler and friends). The engine
+ * does not schedule by them: they are stored and reported, and binder raises them for a
+ * request. Both return 0, or -1 when there is no such thread. */
+int sched_policy_get(uint64_t tid, int *policy, int *prio);
+int sched_policy_set(uint64_t tid, int policy, int prio);
 struct proc;
 /* The threads of one process, in slot order. */
 int sched_threads_of(const struct proc *p, cpu_t **out, int max);

@@ -99,6 +99,15 @@
 #define OBJ_FDA BOBJ('f', 'd', 'a')
 #define OBJ_PTR BOBJ('p', 't', '*')
 
+/* flat_binder_object flags: the owner wants the sender's security context per request. */
+#define FLAT_BINDER_FLAG_TXN_SECURITY_CTX 0x1000
+/* The node's minimum scheduling policy (2 bits at 9) and priority (the low byte), and whether
+ * a request raises the receiving thread to a real-time sender's policy. */
+#define FLAT_BINDER_FLAG_INHERIT_RT 0x800
+#define FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT 9
+#define FLAT_BINDER_FLAG_PRIORITY_MASK 0xff
+#define SCHED_FIFO_POLICY 1
+#define SCHED_RR_POLICY 2
 #define TF_ONE_WAY 0x01u
 
 /* A transaction as userspace gives it (binder_transaction_data, 64 bytes). */
@@ -157,6 +166,9 @@ struct btxn {
     int32_t sender_pid;
     int oneway, reply, secctx;
     uint64_t secctx_at;
+    /* A sync request raised its receiving thread's priority: restored when the request ends. */
+    int prio_saved, prio_policy, prio_prio;
+    uint64_t prio_tid;
     bfdref_t *fds;
     uint32_t nfds;
     btxn_t *sent_next;  /* in from->sent */
@@ -286,6 +298,13 @@ static bwork_t *q_pop(bq_t *q)
             q->tail = NULL;
     }
     return w;
+}
+
+/* The command that delivers a request: BR_TRANSACTION_SEC_CTX when its buffer carries the
+ * sender's security context (the target node asked for it), else BR_TRANSACTION. */
+static uint32_t txn_br(const btxn_t *x)
+{
+    return x->secctx ? BR_TRANSACTION_SEC_CTX : BR_TRANSACTION;
 }
 
 static bwork_t *work_new(wk_t kind, uint32_t br, uint64_t a, uint64_t b, btxn_t *txn)
@@ -574,12 +593,13 @@ static int buf_read(bproc_t *b, uint64_t off, void *p, size_t n)
 static void buf_release_refs(bproc_t *b, balloc_t *a)
 {
     for (uint32_t i = 0; i < a->noffs; i++) {
-        uint8_t hdr[8];
-        if (a->offsets[i] + 8 > a->data_size || buf_read(b, a->off + a->offsets[i], hdr, 8) < 0)
+        /* A flat_binder_object: type, flags, then the handle (or binder) at offset 8. */
+        uint8_t obj[24];
+        if (a->offsets[i] + 24 > a->data_size || buf_read(b, a->off + a->offsets[i], obj, 24) < 0)
             continue;
-        uint32_t type = ld32(hdr);
+        uint32_t type = ld32(obj);
         if (type == OBJ_HANDLE || type == OBJ_WEAK_HANDLE) {
-            bref_t *r = ref_by_handle(b, ld32(hdr + 4));
+            bref_t *r = ref_by_handle(b, ld32(obj + 8));
             if (r)
                 ref_dec(r, type == OBJ_HANDLE);
         }
@@ -588,8 +608,47 @@ static void buf_release_refs(bproc_t *b, balloc_t *a)
 
 /* ---------- transactions ---------- */
 
+/* A sync request to a node with a minimum real-time policy, or with inherit-RT and a real-time
+ * sender, runs its thread at that policy and priority until the request ends (the kernel's
+ * binder_transaction_priority). Only real-time policies are raised; oneway requests are not. */
+static void sched_raise(btxn_t *x, bthread_t *t)
+{
+    if (x->oneway || !x->node)
+        return;
+    uint32_t f = x->node->flags;
+    int have = 0, pol = 0, pri = 0;
+    int node_pol = (int)((f >> FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT) & 3);
+    int node_pri = (int)(f & FLAT_BINDER_FLAG_PRIORITY_MASK);
+    if (node_pol == SCHED_FIFO_POLICY || node_pol == SCHED_RR_POLICY) {
+        pol = node_pol;
+        pri = node_pri;
+        have = 1;
+    }
+    if ((f & FLAT_BINDER_FLAG_INHERIT_RT) && x->from) {
+        int sp = 0, sq = 0;
+        if (sched_policy_get(x->from->tid, &sp, &sq) == 0 &&
+            (sp == SCHED_FIFO_POLICY || sp == SCHED_RR_POLICY) && (!have || sq > pri)) {
+            pol = sp;
+            pri = sq;
+            have = 1;
+        }
+    }
+    if (!have)
+        return;
+    int op = 0, oq = 0;
+    if (sched_policy_get(t->tid, &op, &oq) != 0 || (op == pol && oq == pri))
+        return;
+    x->prio_tid = t->tid;
+    x->prio_policy = op;
+    x->prio_prio = oq;
+    x->prio_saved = 1;
+    sched_policy_set(t->tid, pol, pri);
+}
+
 static void txn_free(btxn_t *t)
 {
+    if (t->prio_saved)
+        sched_policy_set(t->prio_tid, t->prio_policy, t->prio_prio); /* the thread's own policy back */
     for (uint32_t i = 0; i < t->nfds; i++)
         vfs_desc_drop(t->fds[i].d);
     free(t->fds);
@@ -736,6 +795,9 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
             return -LE_INVAL;
         bref_t *r = ref_for_handle(x->src, ld32(obj + 8));
         if (!r)
+            return -LE_INVAL;
+        /* A weak-only ref cannot be sent as a strong one (the driver's need_strong_ref). */
+        if (type == OBJ_HANDLE && r->strong == 0)
             return -LE_INVAL;
         if (r->node->proc == x->dst) {
             st32(obj, type == OBJ_HANDLE ? OBJ_BINDER : OBJ_WEAK_BINDER);
@@ -1018,7 +1080,7 @@ static void free_buffer(bproc_t *b, balloc_t *a)
         n->async = nx->async_next;
         if (!n->async)
             n->async_tail = NULL;
-        bwork_t *w = work_new(WK_TXN, BR_TRANSACTION, 0, 0, nx);
+        bwork_t *w = work_new(WK_TXN, txn_br(nx), 0, 0, nx);
         if (w && n->proc)
             queue_proc(n->proc, w);
         else
@@ -1099,6 +1161,7 @@ static int emit(bproc_t *b, bthread_t *t, bwork_t *w, uint64_t va)
         txn_install_fds(b, x);
         if (w->kind == WK_TXN) {
             x->to = t;
+            sched_raise(x, t);
             if (!x->oneway) {
                 x->recv_next = t->recv;
                 t->recv = x;
@@ -1114,12 +1177,20 @@ static int emit(bproc_t *b, bthread_t *t, bwork_t *w, uint64_t va)
     return mem_copy_in(va, out, work_size(w)) < 0 ? -LE_FAULT : 0;
 }
 
-static int proc_has_work(bproc_t *b, bthread_t *t, int *wait_proc)
+/* Whether the read may take proc work: the thread is not waiting for a reply, and it has
+ * none of its own queued. The kernel decides this once per read (wait_for_proc_work), so a
+ * oneway call's BR_TRANSACTION_COMPLETE in the thread's list keeps the rest of the read to
+ * the thread's own work. */
+static int may_take_proc(const bthread_t *t)
 {
-    *wait_proc = !t->sent && !t->recv;
+    return !t->sent && !t->recv && !t->todo.head;
+}
+
+static int proc_has_work(bproc_t *b, bthread_t *t, int proc_ok)
+{
     if (t->todo.head)
         return 1;
-    return *wait_proc && b->todo.head != NULL;
+    return proc_ok && b->todo.head != NULL;
 }
 
 /* The read half of BINDER_WRITE_READ for thread t. Returns 0 (with *consumed updated),
@@ -1140,9 +1211,9 @@ static int64_t bread(bproc_t *b, bthread_t *t, uint64_t buf, uint64_t size, uint
             return -LE_FAULT;
         cur = 4; /* counted only if an item follows */
     }
+    int proc_ok = may_take_proc(t);
     for (;;) {
-        int wait_proc = 0;
-        int have = proc_has_work(b, t, &wait_proc);
+        int have = proc_has_work(b, t, proc_ok);
         if (!have)
             break;
         bq_t *q = t->todo.head ? &t->todo : &b->todo;
@@ -1316,7 +1387,8 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
         return;
     }
     int oneway = (d->flags & TF_ONE_WAY) != 0;
-    int secctx = node == dst->ctx->mgr && dst->ctx->mgr_ext;
+    int secctx = (node->flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX) ||
+                 (node == dst->ctx->mgr && dst->ctx->mgr_ext);
     int err = 0;
     xl_sender = t;
     btxn_t *x = txn_build(b, dst, d, secctx, &err);
@@ -1345,7 +1417,7 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
             node->async_tail = x;
         } else {
             node->async_busy = 1;
-            bwork_t *w = work_new(WK_TXN, BR_TRANSACTION, 0, 0, x);
+            bwork_t *w = work_new(WK_TXN, txn_br(x), 0, 0, x);
             if (w)
                 queue_proc(dst, w);
             else
@@ -1362,7 +1434,7 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     for (btxn_t *s = x->sent_next; s && !tt; s = s->sent_next)
         if (s->to && s->to->proc == dst)
             tt = s->to;
-    bwork_t *w = work_new(WK_TXN, BR_TRANSACTION, 0, 0, x);
+    bwork_t *w = work_new(WK_TXN, txn_br(x), 0, 0, x);
     if (!w) {
         fail_to_sender(x, BR_FAILED_REPLY);
         txn_free(x);
