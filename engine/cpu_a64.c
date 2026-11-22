@@ -320,7 +320,8 @@ static int sysreg_read(cpu_t *c, unsigned op1, unsigned crn, unsigned crm, unsig
     /* 24 MHz virtual counter from host monotonic time. */
     if (op1 == 3 && crn == 14 && crm == 0 && op2 == 2) { *out = host_monotonic_ns() * 24 / 1000; return 1; }
     if (op1 == 3 && crn == 14 && crm == 0 && op2 == 0) { *out = 24000000; return 1; }
-    if (op1 == 3 && crn == 0 && crm == 0 && op2 == 7) { *out = 0x10; return 1; }
+    /* DCZID_EL0: log2 of the block size in words (4 = 64 bytes), DZP 0: DC ZVA is permitted. */
+    if (op1 == 3 && crn == 0 && crm == 0 && op2 == 7) { *out = 0x4; return 1; }
     if (op1 == 3 && crn == 0 && crm == 0 && op2 == 1) { *out = 0x8444C004; return 1; }
     if (op1 == 0 && crn == 0 && crm == 0 && op2 == 0) { *out = 0x410FD034; return 1; }
     return 0;
@@ -404,6 +405,19 @@ static int branch_sys(cpu_t *c, uint32_t insn, uint64_t pc)
                     c->excl_valid = 0;
                 return 0;
             }
+            return -1;
+        }
+        if (op0 == 1 && !L) { /* SYS: cache and TLB maintenance */
+            if (crn == 7 && op1 == 3 && crm == 4 && op2 == 1) { /* DC ZVA: zero one 64-byte block */
+                uint64_t va = rz(c, rt, 1) & ~(uint64_t)63;
+                for (unsigned i = 0; i < 64; i += 8)
+                    mem_write64(va + i, 0);
+                return 0;
+            }
+            /* No guest-visible caches or TLBs to maintain: the rest is a NOP. The
+             * interpreter fetches through the page table, so new code runs at once. */
+            if ((crn == 7 && (op1 == 0 || op1 == 3)) || crn == 8)
+                return 0;
             return -1;
         }
         if (op0 < 2)

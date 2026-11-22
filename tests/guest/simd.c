@@ -361,6 +361,9 @@ int main(int argc, char **argv)
     FPD("fdiv-d-rev", "fdiv d0, d2, d1");
     FPD("fadd-d", "fadd d0, d1, d2");
     FPD("fsub-d", "fsub d0, d1, d2");
+    /* ADDP (scalar) is the 64-bit integer pairwise add: no FP rules apply. */
+    FPD("addp-d-int", "addp d0, v1.2d");
+    FPD("addp-d-int-v2", "addp d0, v2.2d");
 
     /* Integer to floating point (SCVTF, UCVTF), round to nearest. */
     CASE("ucvtf-s-w", "ucvtf s0, w5");

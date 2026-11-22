@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "memfd.h"
+
 #define MEM_PAGE_SIZE 4096u
 #define MEM_PROT_R 1u
 #define MEM_PROT_W 2u
@@ -31,6 +33,13 @@ int mem_map(uint64_t va, uint64_t len, unsigned prot);
 /* As mem_map, and records the range as backed by host file path from offset
  * off (path NULL means anonymous). The path is copied. */
 int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint64_t off);
+/* Maps len bytes at va as a MAP_SHARED view of m from file offset off. The pages
+ * are m's own pages, so every view of the same memfd sees the same bytes. Any
+ * existing mapping in the range is replaced. Returns 0 or -1. */
+int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_t off);
+/* The memfd backing the region that contains va, or NULL. *start and *off are
+ * the region start and its file offset at that start. */
+memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off);
 void mem_unmap(uint64_t va, uint64_t len);
 /* Returns -1 (and changes nothing) if any page in the range is unmapped. */
 int mem_protect(uint64_t va, uint64_t len, unsigned prot);

@@ -258,17 +258,51 @@ libc, then checked):
 - The region list (`engine/mem.c`) replaces the page walk in `mem_find_free`.
   Without it, each `mmap(NULL)` would scan the allocator's multi-GiB reservations.
 
-## M2+M3 progress (in progress, not committed)
+## M2+M3 results
 
-Stages, as in the M2+M3 plan. Status at the time of writing:
+Stages, as in the M2+M3 plan:
 
 | Stage | Status |
 |---|---|
 | 1. Deterministic Hello, sh-arith, gettimeofday, root uids | done: `sh-arith` PASS natively and in Node |
 | 2. Green threads, clone, futex, sleeps, `tests/guest/threads.c` | done: `threads-O0/O2` PASS natively and in Node; deadlock path checked by hand (exit 134) |
-| 3. Signals and synchronous faults | not started |
-| 4. ART syscalls, /proc, instructions | not started; hello-int stops at FMOV d, #imm (0x1e6c1009) |
-| 5. JIT run, memfd dual mapping | not started |
+| 3. Signals and synchronous faults | done (commit `5ff89b8`): `signals-O0/O2` PASS natively and in Node |
+| 4. ART syscalls, /proc, instructions for `-Xint` | done (commit `45a9f28`): `hello-int` PASS natively and in Node |
+| 5. JIT run, memfd dual mapping | done: `hello-jit` PASS natively and in Node; `memfd-O0/O2` PASS |
+
+`make test` (`tests/run.sh`) after stage 5: **58 passed, 0 failed, 0 xfail**. Before stage 5 it was 52 passed and 2 failed (`hello-jit`, native and Node).
+
+Stage 5 changes:
+- `engine/memfd.c`, `engine/memfd.h`: a memfd object. Its pages are host pages, materialized on first use (a 64 MiB memfd costs only the pages that are touched). The object is refcounted: one reference per open guest fd and one per mapped region that names it. The pages are freed only when the last reference goes, so `close()` with live mappings is safe.
+- `memfd_create` [279] and `ftruncate` [46] (`engine/sysfs.c`). memfd fds support read, write, pread, lseek, fstat, dup and close (`engine/vfs.c`, new `VFS_MEMFD` kind). MFD_CLOEXEC is accepted; sealing is not modelled.
+- `mmap` of a memfd (`engine/syscall.c`, `mmap_memfd`): MAP_SHARED maps the memfd's own pages. MAP_PRIVATE copies the contents. `mremap` growth of a shared view continues the same memfd at the next offset (`map_tail`).
+- `engine/mem.c`: shared page-table entries (`PTE_SHARED`) point at the memfd's host pages without owning them. The first touch of a shared entry with no host page yet takes the page from the memfd at the region's offset (`page_lookup`). `munmap` clears the entry and leaves the page to the memfd. `mprotect` keeps the shared bit. `madvise(MADV_DONTNEED)` (`mem_drop`) skips shared pages, so contents survive. Regions carry the memfd reference (`region_t.shm`), and `mem_move` (mremap) carries it too.
+- Cache maintenance (`engine/cpu_a64.c`, system-instruction space): DC ZVA is implemented (it zeroes the 64-byte block). DC and IC maintenance (CRn 7, op1 0 or 3) and TLBI (CRn 8) are NOPs. There is no decode cache, so freshly written code runs at once. `tests/guest/memfd.c` checks this with the dual-view pattern: write code through the RW view, maintain the caches, run through the RX view, rewrite, run again.
+- Refcounting is per memfd, not per host page. The memfd owns its pages and is refcounted by open fds plus mapped regions. Each page-table entry points at a page without owning it. The brief asked for refcounted host pages that several entries point at; this is the same sharing with one owner, which is simpler and frees everything in one place.
+- `madvise(MADV_DONTNEED)` on a memfd view: the region path is a display name (`/memfd:<name> (deleted)`), not a host file, so the refill step is skipped for memfd regions. Before this, the refill would have tried to open that name. The current hello-jit trace does not reach this case (all 578 madvise calls returned 0). `tests/guest/memfd.c` checks it against native.
+- `DCZID_EL0` now reports `0x4` (64-byte blocks, DZP 0), as the native arm64 VM does. It reported `0x10` (DC ZVA prohibited) before, which contradicted the DC ZVA implementation. `CTR_EL0` still differs from native in bit 28 (IDC) and was left as it was, since the plan said it already works.
+- `PR_SET_VMA` returns `-EINVAL`, as the oracle does, so the engine does not keep anonymous VMA names. The plan asked for those names in `/proc/self/maps`, which conflicts with the oracle kernel; this was left for the parent to decide.
+- Instruction family added: `ADDP Dd, Vn.2D` (`0x5E`, size 11, scalar pairwise). It is the 64-bit integer pairwise add, not a floating-point add. The first version treated it as FP, and the native probe showed the mismatch: `addp(1.0, 2.0)` gives `+Inf` on hardware because the bit patterns are added. Checked in `tests/guest/simd.c` (`addp-d-int`, `addp-d-int-v2`).
+- `XIAOJI_STATS=1` prints from an `atexit` handler (`engine/main.c`), so it also covers `exit()` calls (segfault without a handler, out-of-memory). Checked on these paths, natively and in Node: exit_group from a non-main thread (exit code 3, as native); a guest SIGILL handler that calls exit_group, and one that calls SYS_EXIT; normal exit of hello-int and hello-jit. Not verified: the path described under Known gaps (a crash-dump thread that ends silently), which the committed engine also fails to report.
+- Syscalls from the oracle trace: no `unimplemented syscall` message appeared in the four measured runs. The ART trace uses memfd_create, ftruncate, socket (`-EACCES`), flock, getrlimit, prctl PR_SET_VMA (`-EINVAL`, as the oracle returns), and others already handled. FP and SIMD instructions beyond ADDP were not needed by hello-jit.
+
+Measurements (`XIAOJI_STATS=1`, argv as in `tests/run.sh`, `pmset -g` at the time: AC Power, lowpowermode 0):
+
+| Case | Runner | Instructions | Time | Rate | Hello loop (stderr) |
+|---|---|---|---|---|---|
+| hello-int | native | 7,113,715,042 | 12.825 s | 555 M/s | 3.691 s |
+| hello-int | Node | 7,113,752,770 | 55.462 s | 128 M/s | 17.394 s |
+| hello-jit | native | 7,665,306,893 | 9.385 s | 817 M/s | 0.359 s |
+| hello-jit | Node | 7,665,237,414 | 38.391 s | 200 M/s | 1.514 s |
+
+These are from the final build (`make test`: 58 of 58). Earlier builds differed by less than 0.003% in instruction count. Counts differ slightly between runs because some timers and futex timeouts depend on the wall clock. Node is slower than native for both cases. The JIT run executes more guest instructions in total, but its timed loop is much shorter, which shows the JIT working.
+
+Known gaps:
+- memfd: no seals (`F_ADD_SEALS`), no `SIGBUS` past the end of the file (pages past `size` read as they were), no hugetlb.
+- File-backed `MAP_SHARED` of non-memfd files is still a copy. It is only read-only, as before.
+- FP/SIMD still uses the default FPCR only (round to nearest, no flush-to-zero, DN=0), and FPSR exception flags and QC are not tracked (from M1).
+- `fork` and `execve` are not implemented, and ART does not need them for Hello.
+- **Open: a silent exit in bionic's crash-dump flow.** In the committed engine (`45a9f28`), hello-jit's first failure (an unimplemented instruction, delivered as SIGILL to bionic's handler) ends with status 1 and no `XIAOJI_STATS` line. The trace shows bionic print `libc: Fatal signal 4`, create a thread (tid 1001) that waits on a futex, and then the main thread resumes at pc `0x7ff0000f2420`. The process ends there without any engine message, and neither the `exit`/`_exit` interposer nor the scheduler paths printed. The exact exit point is not found. The current build no longer takes this path for hello-jit, so this is the one path where the stats line is still missing, and it is not verified.
 
 Stage 1 and 2 changes:
 - `tests/hello/Hello.java` prints the deterministic line to stdout and the loop time to stderr. `tools/oracle.sh` writes stderr to `build/oracle/<case>.err`, so `.out` is stdout only.
@@ -278,9 +312,4 @@ Stage 1 and 2 changes:
 - `engine/syscall.c`: clone [220] (threads only; other clone returns -ENOSYS with a notice), futex [98], exit [93] per thread, exit_group [94] per process, set_tid_address, gettid, sched_yield, nanosleep [101], clock_nanosleep [115], gettimeofday [169], prctl PR_SET_NAME per thread. uid, gid and auxv ids are 0.
 - `engine/host.c`: `host_sleep_ns` (nanosleep). It works under Node.
 
-Results so far (`make test`, after stage 2): 46 passed, 4 failed. The 4 failures are the Hello cases (`hello-int`, `hello-jit`, native and Node), which stop at `unimplemented A64 instruction 0x1e6c1009` (FMOV, scalar immediate), as expected for stage 4.
-
-Current ART runs (`XIAOJI_STATS=1`, native engine, `pmset -g`: AC Power, lowpowermode 0). Neither run reaches Hello:
-- `dalvikvm64 -Xint Hello`: unimplemented syscall 198 (socket), then `unimplemented A64 instruction 0x1e6c1009` (FMOV d, #imm) at about 10.03 M instructions (0.152 s, 65.8 M instructions/s), exit 132.
-- `dalvikvm64 Hello` (JIT): the same two messages at about 9.95 M instructions (0.114 s, 87.1 M instructions/s), exit 132.
-The timings are not comparable to the oracle, and no Node timing exists yet because Hello does not finish.
+History: after stage 2, `make test` was 46 passed and 4 failed (the Hello cases stopped at FMOV, scalar immediate, `0x1e6c1009`). Stage 4 (commit `45a9f28`) brought `hello-int` to passing. Before stage 5 the `hello-jit` case stopped at `unimplemented syscall 279` (memfd_create) and then at `unimplemented A64 instruction 0x5ef1b800` (ADDP, scalar). Stage 5 fixed both, and then the JIT's DC CVAU, which the cache-maintenance NOPs cover.

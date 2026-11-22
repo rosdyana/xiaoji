@@ -8,11 +8,12 @@
 #include <stdint.h>
 
 #include "host.h"
+#include "memfd.h"
 
 #define VFS_PATH_MAX 4096
 #define VFS_MAX_FD 1024
 
-typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN } vfs_kind;
+typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD } vfs_kind;
 typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA } vfs_syn;
 
 typedef struct {
@@ -29,6 +30,7 @@ typedef struct {
     uint64_t dpos;
     void *dir;       /* DIR * for directories, opened by the first getdents64 */
     uint64_t nent;   /* directory entries returned so far */
+    memfd_t *mfd;    /* VFS_MEMFD: the file; dup shares it (dpos is per fd) */
 } vfs_fd;
 
 typedef struct {
@@ -52,6 +54,8 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out);
 void vfs_set_prog(const char *guest);
 
 int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode);
+/* memfd_create: a new read-write memfd. mflags bit 0 is MFD_CLOEXEC. Returns the fd or -LE_*. */
+int vfs_memfd_create(const char *name, uint32_t mflags);
 int vfs_close(int fd);
 int64_t vfs_read(int fd, void *buf, size_t n);
 int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off);

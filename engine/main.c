@@ -20,6 +20,24 @@
 
 static const char *g_root = NULL; /* NULL: the host root "/" */
 
+/* XIAOJI_STATS=1: the stats line is printed by an atexit handler, so it appears on
+ * every exit path (exit_group from any thread, fatal signals, main's return). */
+static int stats_on;
+static uint64_t stats_t0;
+
+static void print_stats(void)
+{
+    if (!stats_on)
+        return;
+    uint64_t dt = host_monotonic_ns() - stats_t0;
+    fflush(stdout);
+    double secs = (double)dt / 1e9;
+    uint64_t icount = sched_icount();
+    double rate = secs > 0 ? (double)icount / secs / 1e6 : 0.0;
+    fprintf(stderr, "xiaoji: %llu instructions in %.3f s (%.2f M instructions/s)\n",
+            (unsigned long long)icount, secs, rate);
+}
+
 static int usage(FILE *out)
 {
     fputs("usage: xiaoji [--root DIR] [--env K=V]... [--trace] [--] /path/in/guest [args...]\n"
@@ -132,19 +150,11 @@ int main(int argc, char **argv)
     c->pc = entry;
 
     const char *stats_env = getenv("XIAOJI_STATS");
-    int stats = stats_env && stats_env[0] == '1';
+    stats_on = stats_env && stats_env[0] == '1';
     const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
     sig_set_debug_faults(faults_env && faults_env[0] == '1');
-    uint64_t t0 = host_monotonic_ns();
-    int status = sched_run(c);
-    uint64_t dt = host_monotonic_ns() - t0;
-    fflush(stdout);
-    if (stats) {
-        double secs = (double)dt / 1e9;
-        uint64_t icount = sched_icount();
-        double rate = secs > 0 ? (double)icount / secs / 1e6 : 0.0;
-        fprintf(stderr, "xiaoji: %llu instructions in %.3f s (%.2f M instructions/s)\n",
-                (unsigned long long)icount, secs, rate);
-    }
-    return status;
+    stats_t0 = host_monotonic_ns();
+    if (stats_on)
+        atexit(print_stats);
+    return sched_run(c);
 }

@@ -29,7 +29,8 @@
 #define PTE_W 2u
 #define PTE_X 4u
 #define PTE_MAPPED 8u
-#define PTE_FLAGS 0xFu
+#define PTE_SHARED 0x10u /* the host page belongs to a memfd; this entry does not own it */
+#define PTE_FLAGS 0xFFu  /* host pages are 4 KiB aligned, so the low 12 bits hold flags */
 
 #define VA_MASK 0x00FFFFFFFFFFFFFFull /* top byte is a tag */
 #define VPN_LIMIT (1ull << 36)        /* 48-bit address space in 4 KiB pages */
@@ -48,7 +49,11 @@ typedef struct {
     uint64_t start, end; /* [start, end), page aligned */
     char *path;          /* host file backing, or NULL for anonymous memory */
     uint64_t off;        /* file offset of start */
+    memfd_t *shm;        /* memfd backing (MAP_SHARED), or NULL; path is then display-only */
 } region_t;
+
+/* A region with no file or memfd behind it. Only these merge with neighbours. */
+static int reg_anon(const region_t *r) { return !r->path && !r->shm; }
 
 static uint64_t **l1;
 static tlb_ent tlb_rd[TLB_SIZE];
@@ -196,6 +201,8 @@ static void reg_clear(uint64_t a, uint64_t b)
         keep[nk].end = a;
         keep[nk].path = dup_path(first.path);
         keep[nk].off = first.off;
+        keep[nk].shm = first.shm;
+        memfd_ref(first.shm);
         nk++;
     }
     if (last.end > b) {
@@ -203,36 +210,52 @@ static void reg_clear(uint64_t a, uint64_t b)
         keep[nk].end = last.end;
         keep[nk].path = dup_path(last.path);
         keep[nk].off = last.off + (b - last.start);
+        keep[nk].shm = last.shm;
+        memfd_ref(last.shm);
         nk++;
     }
-    for (size_t k = i; k < j; k++)
+    for (size_t k = i; k < j; k++) {
         free(regs[k].path);
+        memfd_unref(regs[k].shm);
+    }
     reg_splice(i, j, keep, nk);
 }
 
-/* Inserts [a, b) with the given backing, replacing whatever was there. */
-static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off)
+/* Inserts [a, b) with the given backing, replacing whatever was there. shm
+ * (may be NULL) takes a reference for the new region. */
+static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off, memfd_t *shm)
 {
     reg_clear(a, b);
     size_t i = reg_lower(a);
-    if (!path) {
+    if (!path && !shm) {
         /* Merge with anonymous neighbours so long-lived ranges stay one entry. */
-        if (i > 0 && regs[i - 1].end == a && !regs[i - 1].path) {
+        if (i > 0 && regs[i - 1].end == a && reg_anon(&regs[i - 1])) {
             regs[i - 1].end = b;
-            if (i < nregs && regs[i].start == b && !regs[i].path) {
+            if (i < nregs && regs[i].start == b && reg_anon(&regs[i])) {
                 regs[i - 1].end = regs[i].end;
                 free(regs[i].path);
                 reg_splice(i, i + 1, NULL, 0);
             }
             return;
         }
-        if (i < nregs && regs[i].start == b && !regs[i].path) {
+        if (i < nregs && regs[i].start == b && reg_anon(&regs[i])) {
             regs[i].start = a;
             return;
         }
     }
-    region_t r = {a, b, dup_path(path), off};
+    region_t r = {a, b, dup_path(path), off, shm};
+    memfd_ref(shm);
     reg_splice(i, i, &r, 1);
+}
+
+memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off)
+{
+    size_t i = reg_lower(va);
+    if (i >= nregs || regs[i].start > va || !regs[i].shm)
+        return NULL;
+    *start = regs[i].start;
+    *off = regs[i].off;
+    return regs[i].shm;
 }
 
 unsigned mem_prot_at(uint64_t va)
@@ -270,6 +293,16 @@ static uint8_t *page_lookup(uint64_t vpn, unsigned need)
     if (!(e & PTE_MAPPED) || !(e & need))
         return NULL;
     uint8_t *p = (uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS);
+    if (!p && (e & PTE_SHARED)) {
+        /* First touch of a shared view: take the page from the memfd at this offset. */
+        uint64_t start, off;
+        memfd_t *m = mem_region_memfd(vpn << 12, &start, &off);
+        p = m ? memfd_page(m, ((vpn << 12) - start + off) >> 12) : NULL;
+        if (!p)
+            die_oom();
+        *slot = (uint64_t)(uintptr_t)p | (e & PTE_FLAGS);
+        return p;
+    }
     if (!p) {
         p = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
         if (!p)
@@ -396,10 +429,12 @@ int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint6
         return -1;
     uint64_t first = va >> 12;
     uint64_t n = len >> 12;
-    reg_set(va, va + len, path, off);
+    reg_set(va, va + len, path, off, NULL);
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 1);
         uint64_t e = *slot;
+        if (e & PTE_SHARED)
+            e = 0; /* a private mapping replaces a shared view; it does not keep its pages */
         *slot = (e & ~(uint64_t)PTE_FLAGS) | PTE_MAPPED | (prot & PTE_FLAGS & 7u);
     }
     tlb_flush();
@@ -407,6 +442,25 @@ int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint6
 }
 
 int mem_map(uint64_t va, uint64_t len, unsigned prot) { return mem_map_ex(va, len, prot, NULL, 0); }
+
+int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_t off)
+{
+    if (!range_ok(va, len) || !m)
+        return -1;
+    mem_unmap(va, len);
+    char path[96];
+    snprintf(path, sizeof path, "/memfd:%s (deleted)", memfd_name(m));
+    reg_set(va, va + len, path, off, m);
+    uint64_t first = va >> 12;
+    uint64_t n = len >> 12;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t *slot = pte_slot(first + i, 1);
+        /* No host page yet: page_lookup takes it from the memfd on first touch. */
+        *slot = PTE_SHARED | PTE_MAPPED | (prot & 7u);
+    }
+    tlb_flush();
+    return 0;
+}
 
 void mem_unmap(uint64_t va, uint64_t len)
 {
@@ -420,8 +474,8 @@ void mem_unmap(uint64_t va, uint64_t len)
         if (!slot)
             continue;
         uint64_t e = *slot;
-        uint8_t *p = (uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS);
-        free(p);
+        if (!(e & PTE_SHARED)) /* shared pages stay with the memfd */
+            free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
         *slot = 0;
     }
     tlb_flush();
@@ -453,7 +507,7 @@ int mem_protect(uint64_t va, uint64_t len, unsigned prot)
     uint64_t n = len >> 12;
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 0);
-        *slot = (*slot & ~(uint64_t)PTE_FLAGS) | PTE_MAPPED | (prot & 7u);
+        *slot = (*slot & ~(uint64_t)PTE_FLAGS) | (*slot & PTE_SHARED) | PTE_MAPPED | (prot & 7u);
     }
     tlb_flush();
     return 0;
@@ -503,6 +557,8 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
             pieces[k].end = e - from + to;
             pieces[k].path = dup_path(r->path);
             pieces[k].off = r->off + (s - r->start);
+            pieces[k].shm = r->shm;
+            memfd_ref(r->shm);
         }
     }
     uint64_t first_src = from >> 12, first_dst = to >> 12, n = len >> 12;
@@ -516,8 +572,9 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
     }
     reg_clear(from, from + len);
     for (size_t k = 0; k < np; k++) {
-        reg_set(pieces[k].start, pieces[k].end, pieces[k].path, pieces[k].off);
+        reg_set(pieces[k].start, pieces[k].end, pieces[k].path, pieces[k].off, pieces[k].shm);
         free(pieces[k].path);
+        memfd_unref(pieces[k].shm);
     }
     free(pieces);
     tlb_flush();
@@ -529,7 +586,8 @@ void mem_drop(uint64_t va, uint64_t len)
     uint64_t first = va >> 12, n = len >> 12;
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 0);
-        if (!slot || !(*slot & PTE_MAPPED))
+        /* Shared pages belong to the memfd: dropping a view keeps its contents. */
+        if (!slot || !(*slot & PTE_MAPPED) || (*slot & PTE_SHARED))
             continue;
         uint64_t e = *slot;
         free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));

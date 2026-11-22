@@ -1495,8 +1495,23 @@ static uint64_t to_int_sat(double x, unsigned mode, unsigned bits, int uns)
     return bits == 64 ? (uint64_t)(int64_t)r : (uint64_t)(uint32_t)(int32_t)r;
 }
 
+/* ADDP (scalar), size 11, U 0: Dd = Vn.D[0] + Vn.D[1] as 64-bit integers. This is
+ * the integer pairwise add, not a floating-point operation: no NaN or zero rules
+ * apply, and the result is the sum modulo 2^64. */
+static int scalar_addp(cpu_t *c, uint32_t insn)
+{
+    if (((insn >> 29) & 1) || ((insn >> 22) & 3) != 3)
+        return -1;
+    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+    put_fd(c, rd, c->v[rn][0] + c->v[rn][1]);
+    return 0;
+}
+
 static int scalar_simd(cpu_t *c, uint32_t insn)
 {
+    /* Pairwise scalar (bits 21:17 = 11000, bits 16:12 = 11011, bits 11:10 = 10): ADDP. */
+    if (((insn >> 17) & 0x1F) == 0x18 && ((insn >> 12) & 0x1F) == 0x1B && ((insn >> 10) & 3) == 2)
+        return scalar_addp(c, insn);
     /* Only the two-register miscellaneous form (bits 21:17 = 10000, bits 11:10 = 10). */
     if (!((insn >> 21) & 1) || ((insn >> 17) & 0x1F) != 0x10 || ((insn >> 10) & 3) != 2)
         return -1;

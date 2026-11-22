@@ -343,8 +343,31 @@ static void fd_reset(vfs_fd *f)
     free(f->data);
     if (f->dir)
         closedir((DIR *)f->dir);
+    memfd_unref(f->mfd);
     memset(f, 0, sizeof *f);
     f->hfd = -1;
+}
+
+int vfs_memfd_create(const char *name, uint32_t mflags)
+{
+    int slot = free_fd_from(0);
+    if (slot < 0)
+        return -LE_MFILE;
+    memfd_t *m = memfd_new(name);
+    if (!m)
+        return -LE_NOMEM;
+    char guest[128];
+    snprintf(guest, sizeof guest, "/memfd:%s (deleted)", name ? name : "");
+    vfs_fd *d = &fds[slot];
+    memset(d, 0, sizeof *d);
+    d->used = 1;
+    d->cloexec = (mflags & 1u) != 0;
+    d->kind = VFS_MEMFD;
+    d->hfd = -1;
+    d->lflags = LO_RDWR;
+    d->mfd = m;
+    d->guest = xstrdup(guest);
+    return slot;
 }
 
 int vfs_close(int fd)
@@ -534,6 +557,11 @@ int vfs_dup(int oldfd, int minfd, int exact, int cloexec)
     d->lflags = src->lflags;
     d->guest = xstrdup(src->guest);
     d->host = src->host ? xstrdup(src->host) : NULL;
+    if (src->kind == VFS_MEMFD) {
+        d->mfd = src->mfd;
+        memfd_ref(d->mfd);
+        d->dpos = src->dpos;
+    }
     if (src->data) {
         d->data = malloc(src->dlen ? src->dlen : 1);
         if (!d->data)
@@ -583,6 +611,12 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     case VFS_PATH: return -LE_BADF;
     case VFS_DIR: return -LE_ISDIR;
     case VFS_SYN: return syn_read(f, buf, n, 0, 0);
+    case VFS_MEMFD: {
+        int64_t r = memfd_pread(f->mfd, buf, n, f->dpos);
+        if (r > 0)
+            f->dpos += (uint64_t)r;
+        return r;
+    }
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -599,6 +633,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_PATH: return -LE_BADF;
     case VFS_DIR: return -LE_ISDIR;
     case VFS_SYN: return syn_read(f, buf, n, off, 1);
+    case VFS_MEMFD: return memfd_pread(f->mfd, buf, n, off);
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -618,6 +653,13 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
         if (f->syn == SYN_DATA)
             return -LE_BADF;
         return (int64_t)n; /* /dev/null, /dev/zero and /dev/random discard writes */
+    case VFS_MEMFD: {
+        int64_t r = memfd_pwrite(f->mfd, buf, n, f->dpos);
+        if (r < 0)
+            return -LE_NOMEM;
+        f->dpos += (uint64_t)r;
+        return r;
+    }
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
@@ -646,6 +688,14 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
             return 0;
         int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->dpos : (int64_t)f->dlen;
         if (base + off < 0)
+            return -LE_INVAL;
+        f->dpos = (uint64_t)(base + off);
+        return (int64_t)f->dpos;
+    }
+    case VFS_MEMFD: {
+        int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->dpos
+                     : whence == 2 ? (int64_t)memfd_size(f->mfd) : -1;
+        if (base < 0 || base + off < 0)
             return -LE_INVAL;
         f->dpos = (uint64_t)(base + off);
         return (int64_t)f->dpos;
@@ -815,6 +865,17 @@ int vfs_stat_fd(int fd, host_stat *out)
     if (!f)
         return -LE_BADF;
     int rc;
+    if (f->kind == VFS_MEMFD) {
+        memset(out, 0, sizeof *out);
+        out->dev = 0x10;
+        out->ino = 0x3000u + (uint64_t)fd;
+        out->mode = LS_IFREG | 0600;
+        out->nlink = 1;
+        out->size = memfd_size(f->mfd);
+        out->blksize = 4096;
+        out->blocks = (out->size + 511) / 512;
+        return 0;
+    }
     if (f->kind == VFS_SYN) {
         synthetic_stat(f->syn, f->syn == SYN_DATA ? f->dlen : 0, out);
         rc = 0;

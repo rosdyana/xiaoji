@@ -12,6 +12,7 @@
 #include "vfs.h"
 
 #define SYS_GETCWD 17
+#define SYS_FTRUNCATE 46
 #define SYS_DUP 23
 #define SYS_DUP3 24
 #define SYS_FCNTL 25
@@ -35,6 +36,7 @@
 #define SYS_UMASK 166
 #define SYS_STATX 291
 #define SYS_FACCESSAT2 439
+#define SYS_MEMFD_CREATE 279
 
 #define IOV_MAX 1024
 #define IO_CHUNK 65536
@@ -444,9 +446,46 @@ static int64_t sys_chdir(uint64_t path)
     return vfs_chdir(p);
 }
 
+/* memfd_create(name, flags). Only MFD_CLOEXEC (bit 0) is accepted; sealing and
+ * hugetlb are not modelled. */
+static int64_t sys_memfd_create(uint64_t name_va, uint64_t flags)
+{
+    static char name[256];
+    if (flags & ~(uint64_t)1)
+        return -LE_INVAL;
+    int64_t n = mem_strlen(name_va);
+    if (n < 0)
+        return -LE_FAULT;
+    if (n > 249)
+        return -LE_INVAL;
+    if (mem_copy_out(name, name_va, (size_t)n) < 0)
+        return -LE_FAULT;
+    name[n] = 0;
+    return vfs_memfd_create(name, (uint32_t)flags);
+}
+
+/* ftruncate(fd, len) on a memfd. Other files are not resized (EINVAL). */
+static int64_t sys_ftruncate(uint64_t fd, uint64_t len)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_MEMFD)
+        return -LE_INVAL;
+    if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
+        return -LE_INVAL;
+    if (len > (1ull << 40))
+        return -LE_INVAL;
+    if (memfd_truncate(f->mfd, len) < 0)
+        return -LE_NOMEM;
+    return 0;
+}
+
 int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
 {
     switch (nr) {
+    case SYS_FTRUNCATE: *ret = sys_ftruncate(a[0], a[1]); return 1;
+    case SYS_MEMFD_CREATE: *ret = sys_memfd_create(a[0], a[1]); return 1;
     case SYS_OPENAT: *ret = sys_openat(a[0], a[1], a[2], a[3]); return 1;
     case SYS_CLOSE: *ret = vfs_close((int)(int32_t)a[0]); return 1;
     case SYS_READ: *ret = fs_read((int)(int32_t)a[0], a[1], a[2]); return 1;

@@ -92,6 +92,7 @@ static const char *syscall_name(uint64_t nr)
     case 29: return "ioctl";
     case 43: return "statfs";
     case 44: return "fstatfs";
+    case 46: return "ftruncate";
     case 48: return "faccessat";
     case 49: return "chdir";
     case 50: return "fchdir";
@@ -150,6 +151,7 @@ static const char *syscall_name(uint64_t nr)
     case 233: return "madvise";
     case 261: return "prlimit64";
     case 278: return "getrandom";
+    case 279: return "memfd_create";
     case 291: return "statx";
     case 293: return "rseq";
     case 439: return "faccessat2";
@@ -222,6 +224,10 @@ static int map_tail(uint64_t va, uint64_t len, uint64_t last)
     unsigned prot = mem_prot_at(last);
     uint64_t s, e, off;
     const char *path;
+    uint64_t shm_start;
+    memfd_t *shm = mem_region_memfd(last, &shm_start, &off);
+    if (shm) /* the tail continues the same memfd view */
+        return mem_map_shared(va, len, prot, shm, off + (last - shm_start) + MEM_PAGE_SIZE) < 0 ? -1 : 0;
     if (mem_region_next(last, &s, &e, &path, &off) && path && s <= last) {
         uint64_t toff = off + (last - s) + MEM_PAGE_SIZE;
         if (mem_map_ex(va, len, prot, path, toff) < 0)
@@ -234,6 +240,43 @@ static int map_tail(uint64_t va, uint64_t len, uint64_t last)
         return rc;
     }
     return mem_map(va, len, prot);
+}
+
+/* mmap of a memfd. MAP_SHARED views the memfd's own pages, so views of the same
+ * memfd alias each other. MAP_PRIVATE takes a copy of the contents. */
+static int64_t mmap_memfd(uint64_t addr, uint64_t len, unsigned p, uint64_t type, uint64_t flags, vfs_fd *f,
+                          uint64_t off)
+{
+    uint64_t base;
+    if (flags & LMAP_FIXED) {
+        if (addr & PAGE_MASK)
+            return -LE_INVAL;
+        if (addr >= MEM_VA_LIMIT || len > MEM_VA_LIMIT - addr)
+            return -LE_NOMEM;
+        mem_unmap(addr, len);
+        base = addr;
+    } else {
+        base = mem_find_free(len, addr);
+        if (!base)
+            return -LE_NOMEM;
+    }
+    if (type == LMAP_SHARED)
+        return mem_map_shared(base, len, p, f->mfd, off) < 0 ? -LE_NOMEM : (int64_t)base;
+    if (mem_map(base, len, p) < 0)
+        return -LE_NOMEM;
+    static uint8_t chunk[IO_CHUNK];
+    for (uint64_t done = 0; done < len;) {
+        size_t want = len - done < IO_CHUNK ? (size_t)(len - done) : IO_CHUNK;
+        int64_t r = memfd_pread(f->mfd, chunk, want, off + done);
+        if (r <= 0)
+            break; /* past the end: the rest of the pages stay zero */
+        if (mem_poke(base + done, chunk, (size_t)r) < 0) {
+            mem_unmap(base, len);
+            return -LE_NOMEM;
+        }
+        done += want;
+    }
+    return (int64_t)base;
 }
 
 static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t off)
@@ -259,6 +302,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
             return -LE_BADF;
         if (f->kind == VFS_PATH)
             return -LE_BADF;
+        if (f->kind == VFS_MEMFD)
+            return mmap_memfd(addr, len, p, type, flags, f, off);
         if (f->kind == VFS_DIR || f->kind == VFS_SYN || !f->host)
             return -LE_NODEV;
         if (type == LMAP_SHARED && (prot & LPROT_WRITE))
@@ -402,7 +447,10 @@ static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice)
         uint64_t a = s > pos ? s : pos;
         uint64_t b = e < end ? e : end;
         mem_drop(a, b - a);
-        if (path) {
+        /* A memfd view keeps its contents (mem_drop skips shared pages), and its
+         * region path is a display name, not a host file, so there is nothing to refill. */
+        uint64_t ms, moff;
+        if (path && !mem_region_memfd(a, &ms, &moff)) {
             int hfd = host_open(path, LO_RDONLY, 0);
             if (hfd < 0)
                 return hfd;
@@ -645,8 +693,8 @@ static int64_t sys_rt_sigtimedwait(cpu_t *c, uint64_t set, uint64_t info, uint64
 static int64_t sys_prctl(uint64_t option, uint64_t arg2)
 {
     static int dumpable = 1; /* SUID_DUMP_USER: the default, and the only value kept */
-    if (option == LPR_SET_VMA)
-        return 0;
+    if (option == LPR_SET_VMA) /* anonymous VMA names are not kept; the oracle kernel returns EINVAL too */
+        return -LE_INVAL;
     if (option == LPR_GET_DUMPABLE)
         return dumpable;
     if (option == LPR_SET_DUMPABLE) {
