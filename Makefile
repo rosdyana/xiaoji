@@ -49,7 +49,7 @@ guest-tests:    ## freestanding test programs, built in the builder VM -> build/
 	    gcc -O2 -static -march=armv8-a -o build/tests/guest/glibc_hello-O2 tests/guest/glibc_hello.c \
 	    || echo "glibc_hello: stretch build failed"'
 
-test: engine guest-tests   ## run the guest tests natively and in Node (tests/run.sh)
+test: engine wasm-node guest-tests build/rootfs/data/hello.dex   ## run the guest tests natively and in Node (tests/run.sh)
 	tests/run.sh
 
 image:          ## download + extract the Android 13 arm64 guest -> build/rootfs
@@ -67,6 +67,10 @@ build/hello/classes.dex: tests/hello/Hello.java build/tools/r8.jar   ## test pro
 	@mkdir -p build/hello
 	javac --release 8 -nowarn -d build/hello $<
 	java -cp build/tools/r8.jar com.android.tools.r8.D8 --min-api 33 --output build/hello build/hello/Hello.class
+
+build/rootfs/data/hello.dex: build/hello/classes.dex   ## the test dex, where the guest's /data/hello.dex is read
+	@mkdir -p build/rootfs/data
+	cp $< $@
 
 clean:          ## remove engine builds (keeps build/rootfs and build/image)
 	rm -rf build/xiaoji build/wasm build/wasm-node build/tests build/hello

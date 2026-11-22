@@ -29,19 +29,30 @@ args_for() {
 }
 
 # Rootfs cases: the argv of each oracle case (tools/oracle.sh), without its
-# "exec". The oracle outputs are build/oracle/<case>.{out,rc}.
+# "exec". The oracle outputs are build/oracle/<case>.{out,rc}. rootfs_argv sets
+# the array ARGV (arrays keep quoted arguments such as sh -c 'echo $((6*7))').
 rootfs_argv() {
     case "$1" in
-    toybox-echo) echo "/system/bin/toybox echo hi from bionic" ;;
-    toybox-ls) echo "/system/bin/toybox ls /system/bin/linker64" ;;
-    toybox-uname) echo "/system/bin/toybox uname -m" ;;
-    toybox-wc) echo "/system/bin/toybox wc -c /system/build.prop" ;;
-    toybox-sha) echo "/system/bin/toybox sha256sum /apex/com.android.runtime/bin/linker64" ;;
-    toybox-lsdir) echo "/system/bin/toybox ls /apex/com.android.art/bin" ;;
-    toybox-cat) echo "/system/bin/toybox cat /system/etc/hosts" ;;
+    toybox-echo) ARGV=(/system/bin/toybox echo hi from bionic) ;;
+    toybox-ls) ARGV=(/system/bin/toybox ls /system/bin/linker64) ;;
+    toybox-uname) ARGV=(/system/bin/toybox uname -m) ;;
+    toybox-wc) ARGV=(/system/bin/toybox wc -c /system/build.prop) ;;
+    toybox-sha) ARGV=(/system/bin/toybox sha256sum /apex/com.android.runtime/bin/linker64) ;;
+    toybox-lsdir) ARGV=(/system/bin/toybox ls /apex/com.android.art/bin) ;;
+    toybox-cat) ARGV=(/system/bin/toybox cat /system/etc/hosts) ;;
+    sh-arith) ARGV=(/system/bin/sh -c 'echo $((6*7))') ;;
+    hello-int) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art -cp /data/hello.dex Hello) ;;
+    hello-jit) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art -cp /data/hello.dex Hello) ;;
     esac
 }
-ROOTFS_CASES="toybox-echo toybox-ls toybox-uname toybox-wc toybox-sha toybox-lsdir toybox-cat"
+ROOTFS_CASES="toybox-echo toybox-ls toybox-uname toybox-wc toybox-sha toybox-lsdir toybox-cat sh-arith hello-int hello-jit"
+
+# The guest environment of the ART cases, from tools/guest-env.sh, as --env
+# arguments (the same variables the oracle exports with . /data/env.sh).
+GUEST_ENV_ARGS=()
+while IFS= read -r kv; do
+    GUEST_ENV_ARGS+=(--env "$kv")
+done < <(bash -c '. "$1"; for v in ANDROID_ROOT ANDROID_DATA ANDROID_ART_ROOT ANDROID_I18N_ROOT ANDROID_TZDATA_ROOT BOOTCLASSPATH; do printf "%s=%s\n" "$v" "${!v}"; done' _ "$ROOT/tools/guest-env.sh")
 
 pass=0
 fail=0
@@ -145,7 +156,7 @@ fi
 # Runs one rootfs case through one runner and compares stdout and the exit code
 # with the oracle. The guest sees the root build/rootfs.
 check_rootfs() {
-    local label=$1 runner=$2 name=$3 args=$4
+    local label=$1 runner=$2 name=$3
     local tag="$name $label"
     local out="$OUT/$name.$label.out" err="$OUT/$name.$label.err"
     local expect_out="$O_ORACLE/$name.out" expect_rc_file="$O_ORACLE/$name.rc"
@@ -157,9 +168,9 @@ check_rootfs() {
     local expect_rc
     expect_rc=$(cat "$expect_rc_file")
     if [ "$runner" = engine ]; then
-        "$ENGINE" --root build/rootfs -- $args >"$out" 2>"$err"
+        "$ENGINE" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        node "$NODE_JS" --root build/rootfs -- $args >"$out" 2>"$err"
+        node "$NODE_JS" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect_out" && [ "$rc" = "$expect_rc" ]; then
@@ -181,11 +192,11 @@ rootfs_cases=0
 if [ -d build/rootfs/system/bin ]; then
     O_ORACLE=build/oracle
     for name in $ROOTFS_CASES; do
-        args=$(rootfs_argv "$name")
+        rootfs_argv "$name"
         rootfs_cases=$((rootfs_cases + 1))
-        check_rootfs engine engine "$name" "$args"
+        check_rootfs engine engine "$name"
         if [ -f "$NODE_JS" ]; then
-            check_rootfs node node "$name" "$args"
+            check_rootfs node node "$name"
         fi
     done
 else

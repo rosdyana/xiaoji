@@ -121,7 +121,16 @@
 /* futex(2) ops, after masking off FUTEX_PRIVATE_FLAG and the clock flag. */
 #define LFUTEX_WAIT 0
 #define LFUTEX_WAKE 1
+#define LFUTEX_REQUEUE 3
+#define LFUTEX_CMP_REQUEUE 4
+#define LFUTEX_WAIT_BITSET 9
+#define LFUTEX_WAKE_BITSET 10
 #define LFUTEX_OP_MASK 0x7F
+#define LFUTEX_CLOCK_REALTIME 256
+
+#define LCLOCK_REALTIME 0
+#define LCLOCK_MONOTONIC 1
+#define LTIMER_ABSTIME 1
 
 /* prctl(2) options. */
 #define LPR_SET_NAME 15

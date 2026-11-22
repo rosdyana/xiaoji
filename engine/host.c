@@ -270,6 +270,13 @@ uint64_t host_realtime_ns(void)
     return ns_of(&ts);
 }
 
+void host_sleep_ns(uint64_t ns)
+{
+    struct timespec ts = {(time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull)};
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+        ;
+}
+
 void host_random(void *buf, size_t len)
 {
     uint8_t *p = buf;

@@ -24,6 +24,7 @@ int host_linux_errno(int host_errno);
 
 uint64_t host_monotonic_ns(void);
 uint64_t host_realtime_ns(void);
+void host_sleep_ns(uint64_t ns);
 void host_random(void *buf, size_t len);
 
 /* Files. Flags are Linux open(2) flags. host_open returns a host fd or -LE_*. */

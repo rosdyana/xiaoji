@@ -6,6 +6,7 @@
 
 #include "host.h"
 #include "mem.h"
+#include "sched.h"
 #include "simd.h"
 #include "syscall.h"
 
@@ -976,7 +977,9 @@ static int exec(cpu_t *c, uint32_t insn, uint64_t pc)
 
 void cpu_run(cpu_t *c)
 {
-    while (!c->exited) {
+    uint64_t budget = c->budget;
+    while (!c->stop && budget) {
+        budget--;
         uint64_t pc = c->pc;
         mem_set_pc(pc);
         uint32_t insn = mem_fetch32(pc);
@@ -986,7 +989,9 @@ void cpu_run(cpu_t *c)
             fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,
                     (unsigned long long)pc);
             c->exited = 1;
-            c->exit_code = 132;
+            c->stop = 1;
+            sched_exit_process(132);
         }
     }
+    c->budget = budget;
 }

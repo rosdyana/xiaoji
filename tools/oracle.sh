@@ -40,7 +40,7 @@ run() {  # name, command run by the guest's /system/bin/sh
     case "${ONLY:-$name}" in "$name") ;; *) return 0 ;; esac
     vm "sudo python3 $ROOT/tools/fakelogd.py /dev/socket/logdw 5 > $O/$name.log &
         sleep 0.5
-        sudo strace -f -qq -o $O/$name.strace chroot $R /system/bin/sh -c '. /data/env.sh; $*' > $O/$name.out 2>&1; echo \$? > $O/$name.rc
+        sudo strace -f -qq -o $O/$name.strace chroot $R /system/bin/sh -c '. /data/env.sh; $*' > $O/$name.out 2> $O/$name.err; echo \$? > $O/$name.rc
         wait"
     printf '%-12s rc=%s  %s\n' "$name" "$(cat "$O/$name.rc")" "$(head -c 120 "$O/$name.out" | tr '\n' ' ')"
 }

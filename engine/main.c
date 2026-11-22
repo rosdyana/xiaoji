@@ -9,6 +9,7 @@
 #include "host.h"
 #include "loader.h"
 #include "mem.h"
+#include "sched.h"
 #include "syscall.h"
 #include "vfs.h"
 
@@ -132,14 +133,15 @@ int main(int argc, char **argv)
     const char *stats_env = getenv("XIAOJI_STATS");
     int stats = stats_env && stats_env[0] == '1';
     uint64_t t0 = host_monotonic_ns();
-    cpu_run(c);
+    int status = sched_run(c);
     uint64_t dt = host_monotonic_ns() - t0;
     fflush(stdout);
     if (stats) {
         double secs = (double)dt / 1e9;
-        double rate = secs > 0 ? (double)c->icount / secs / 1e6 : 0.0;
+        uint64_t icount = sched_icount();
+        double rate = secs > 0 ? (double)icount / secs / 1e6 : 0.0;
         fprintf(stderr, "xiaoji: %llu instructions in %.3f s (%.2f M instructions/s)\n",
-                (unsigned long long)c->icount, secs, rate);
+                (unsigned long long)icount, secs, rate);
     }
-    return c->exit_code;
+    return status;
 }

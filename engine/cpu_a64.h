@@ -16,13 +16,18 @@ typedef struct cpu {
     int excl_valid;     /* exclusive monitor */
     uint64_t excl_addr;
     uint64_t icount;    /* executed instructions */
-    int exited;
+    int exited;         /* this thread has exited */
     int exit_code;
     int trace;          /* print each syscall to stderr */
+    uint64_t tid;       /* guest thread id, set by the scheduler */
+    uint64_t budget;    /* instructions left in this scheduling slice */
+    int stop;           /* leave cpu_run after the current instruction */
+    int blocked;        /* a syscall blocked: x0 is written at wake-up, not now */
 } cpu_t;
 
-/* Runs until the guest exits. Unimplemented instructions print a message and
- * set exit_code to 132. */
+/* Runs the thread until it stops (exit, block, yield) or its slice budget is
+ * spent. Unimplemented instructions print a message and end the process with
+ * status 132 (sched_exit_process). */
 void cpu_run(cpu_t *c);
 
 #endif

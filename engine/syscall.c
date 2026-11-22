@@ -9,6 +9,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "sched.h"
 #include "sysfs.h"
 #include "vfs.h"
 
@@ -41,6 +42,9 @@
 #define SYS_GETEGID 177
 #define SYS_GETTID 178
 #define SYS_CLOCK_GETTIME 113
+#define SYS_CLOCK_NANOSLEEP 115
+#define SYS_GETTIMEOFDAY 169
+#define SYS_CLONE 220
 #define SYS_BRK 214
 #define SYS_MUNMAP 215
 #define SYS_MREMAP 216
@@ -55,6 +59,7 @@
 #define SYS_RSEQ 293
 
 #define GUEST_TID 1000
+#define GUEST_ROOT_ID 0 /* uid and gid: the oracle runs as root */
 #define GUEST_PPID 1
 #define GUEST_PGID 1000
 #define PAGE_MASK 4095ull
@@ -76,7 +81,6 @@ static uint64_t brk_cur;
 static uint64_t unimpl_seen[1024 / 64];
 static guest_sigaction sigactions[SIG_MAX + 1];
 static uint64_t altstack[3]; /* ss_sp, ss_flags, ss_size */
-static char comm[16] = "xiaoji";
 static uint8_t fill_buf[IO_CHUNK];
 
 static uint64_t page_up(uint64_t x) { return (x + PAGE_MASK) & ~PAGE_MASK; }
@@ -113,6 +117,7 @@ static const char *syscall_name(uint64_t nr)
     case 99: return "set_robust_list";
     case 101: return "nanosleep";
     case 113: return "clock_gettime";
+    case 169: return "gettimeofday";
     case 120: return "sched_getscheduler";
     case 123: return "sched_getaffinity";
     case 124: return "sched_yield";
@@ -162,9 +167,7 @@ void syscall_init(uint64_t base)
 void syscall_set_comm(const char *argv0)
 {
     const char *base = strrchr(argv0, '/');
-    base = base ? base + 1 : argv0;
-    memset(comm, 0, sizeof comm);
-    strncpy(comm, base, sizeof comm - 1);
+    sched_set_name(base ? base + 1 : argv0);
 }
 
 /* ---------- memory ---------- */
@@ -447,6 +450,21 @@ static int64_t sys_clock_gettime(uint64_t clk, uint64_t tp)
     return 0;
 }
 
+/* struct timeval: seconds and microseconds. The timezone argument is ignored
+ * (a zeroed struct is returned if asked for). */
+static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz)
+{
+    uint64_t ns = host_realtime_ns();
+    if (tv) {
+        uint64_t t[2] = {ns / 1000000000ull, (ns % 1000000000ull) / 1000ull};
+        if (mem_copy_in(tv, t, sizeof t) < 0)
+            return -LE_FAULT;
+    }
+    if (tz && mem_set(tz, 0, 8) < 0)
+        return -LE_FAULT;
+    return 0;
+}
+
 static int64_t sys_getrandom(uint64_t buf, uint64_t len)
 {
     uint8_t tmp[256];
@@ -473,22 +491,122 @@ static int64_t sys_prlimit64(uint64_t resource, uint64_t old)
     return 0;
 }
 
-static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val)
+/* ---------- threads, futexes and sleeps ---------- */
+
+static int read_u32(uint64_t va, uint32_t *out)
 {
-    /* One thread: a wait can never be woken, so it fails at once. */
-    switch ((uint32_t)op & LFUTEX_OP_MASK) {
-    case LFUTEX_WAIT: {
-        uint8_t b[4];
-        if (mem_copy_out(b, uaddr, 4) < 0)
+    uint8_t b[4];
+    if (mem_copy_out(b, va, sizeof b) < 0)
+        return -1;
+    *out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return 0;
+}
+
+/* Reads a struct timespec as nanoseconds. Seconds are capped at 10^9 (about 31
+ * years) so the sum cannot overflow. */
+static int read_timespec(uint64_t va, uint64_t *ns)
+{
+    uint64_t ts[2];
+    if (mem_copy_out(ts, va, sizeof ts) < 0)
+        return -1;
+    if (ts[0] > 1000000000ull)
+        ts[0] = 1000000000ull;
+    *ns = ts[0] * 1000000000ull + ts[1];
+    return 0;
+}
+
+/* Host monotonic deadline for a wait of ns: relative, or absolute on
+ * CLOCK_MONOTONIC or CLOCK_REALTIME. */
+static uint64_t deadline_of(uint64_t ns, int absolute, int realtime)
+{
+    uint64_t now = host_monotonic_ns();
+    if (!absolute)
+        return now + ns;
+    if (!realtime)
+        return ns;
+    uint64_t rt = host_realtime_ns();
+    return ns > rt ? now + (ns - rt) : now;
+}
+
+static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t timeout, uint64_t uaddr2, uint64_t val3)
+{
+    unsigned cmd = (unsigned)(op & LFUTEX_OP_MASK);
+    int realtime = (op & LFUTEX_CLOCK_REALTIME) != 0;
+    switch (cmd) {
+    case LFUTEX_WAIT:
+    case LFUTEX_WAIT_BITSET: {
+        uint32_t bits = 0xFFFFFFFFu;
+        if (cmd == LFUTEX_WAIT_BITSET) {
+            bits = (uint32_t)val3;
+            if (bits == 0)
+                return -LE_INVAL;
+        }
+        uint32_t cur;
+        if (read_u32(uaddr, &cur) < 0)
             return -LE_FAULT;
-        uint32_t cur = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-        return cur != (uint32_t)val ? -LE_AGAIN : -LE_TIMEDOUT;
+        if (cur != (uint32_t)val)
+            return -LE_AGAIN;
+        int has = 0;
+        uint64_t deadline = 0;
+        if (timeout) {
+            uint64_t ns;
+            if (read_timespec(timeout, &ns) < 0)
+                return -LE_FAULT;
+            deadline = deadline_of(ns, cmd == LFUTEX_WAIT_BITSET, realtime);
+            has = 1;
+        }
+        sched_block_futex(uaddr, bits, has, deadline); /* x0 is set on wake-up */
+        return 0;
     }
     case LFUTEX_WAKE:
-        return 0;
-    default:
+    case LFUTEX_WAKE_BITSET: {
+        uint32_t bits = 0xFFFFFFFFu;
+        if (cmd == LFUTEX_WAKE_BITSET) {
+            bits = (uint32_t)val3;
+            if (bits == 0)
+                return -LE_INVAL;
+        }
+        return sched_futex_wake(uaddr, val, bits);
+    }
+    case LFUTEX_REQUEUE: /* the timeout argument carries the requeue count */
+        return sched_futex_requeue(uaddr, uaddr2, val, timeout);
+    case LFUTEX_CMP_REQUEUE: {
+        uint32_t cur;
+        if (read_u32(uaddr, &cur) < 0)
+            return -LE_FAULT;
+        if (cur != (uint32_t)val3)
+            return -LE_AGAIN;
+        return sched_futex_requeue(uaddr, uaddr2, val, timeout);
+    }
+    default: {
+        static int notice;
+        if (!notice) {
+            notice = 1;
+            fprintf(stderr, "xiaoji: unimplemented futex op %u\n", cmd);
+        }
         return -LE_NOSYS;
     }
+    }
+}
+
+static int64_t sys_nanosleep(uint64_t req)
+{
+    uint64_t ns;
+    if (read_timespec(req, &ns) < 0)
+        return -LE_FAULT;
+    sched_sleep_until(deadline_of(ns, 0, 0));
+    return 0;
+}
+
+static int64_t sys_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req)
+{
+    if (clk != LCLOCK_REALTIME && clk != LCLOCK_MONOTONIC)
+        return -LE_INVAL;
+    uint64_t ns;
+    if (read_timespec(req, &ns) < 0)
+        return -LE_FAULT;
+    sched_sleep_until(deadline_of(ns, (flags & LTIMER_ABSTIME) != 0, clk == LCLOCK_REALTIME));
+    return 0;
 }
 
 static int64_t sys_sched_getaffinity(uint64_t len, uint64_t mask)
@@ -533,22 +651,33 @@ static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oact, uint6
     return 0;
 }
 
-static void die_by_signal(cpu_t *c, uint64_t sig)
+static void die_by_signal(uint64_t sig)
 {
     fflush(stdout);
     fprintf(stderr, "xiaoji: killed by signal %llu\n", (unsigned long long)sig);
-    c->exited = 1;
-    c->exit_code = (int)(128 + sig);
+    sched_exit_process(128 + sig);
 }
 
 static int64_t sys_prctl(uint64_t option, uint64_t arg2)
 {
-    if (option == LPR_SET_VMA || option == LPR_SET_NAME)
+    if (option == LPR_SET_VMA)
         return 0;
+    if (option == LPR_SET_NAME) {
+        char name[16];
+        int64_t n = mem_strlen(arg2);
+        if (n < 0)
+            return -LE_FAULT;
+        if (n > 15)
+            n = 15;
+        memset(name, 0, sizeof name);
+        if (n > 0 && mem_copy_out(name, arg2, (size_t)n) < 0)
+            return -LE_FAULT;
+        sched_set_name(name);
+        return 0;
+    }
     if (option == LPR_GET_NAME) {
         uint8_t name[16];
-        memset(name, 0, sizeof name);
-        memcpy(name, comm, sizeof comm);
+        memcpy(name, sched_name(), sizeof name);
         return mem_copy_in(arg2, name, sizeof name) < 0 ? -LE_FAULT : 0;
     }
     return -LE_INVAL;
@@ -562,9 +691,11 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     switch (nr) {
     case SYS_EXIT:
+        sched_thread_exit(c, a[0]);
+        *ret = 0;
+        return;
     case SYS_EXIT_GROUP:
-        c->exited = 1;
-        c->exit_code = (int)(a[0] & 0xFF);
+        sched_exit_process(a[0] & 0xFF);
         *ret = 0;
         return;
     case SYS_BRK:
@@ -591,7 +722,8 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = 0;
         return;
     case SYS_SET_TID_ADDRESS:
-        *ret = GUEST_TID;
+        sched_set_clear_child_tid(a[0]);
+        *ret = (int64_t)sched_tid();
         return;
     case SYS_SET_ROBUST_LIST:
         *ret = 0;
@@ -600,12 +732,28 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_uname(a[0]);
         return;
     case SYS_GETPID:
+        *ret = GUEST_TID;
+        return;
     case SYS_GETTID:
+        *ret = (int64_t)sched_tid();
+        return;
+    case SYS_CLONE:
+        *ret = sched_clone(c, a[0], a[1], a[2], a[3], a[4]);
+        return;
+    case SYS_NANOSLEEP:
+        *ret = sys_nanosleep(a[0]);
+        return;
+    case SYS_CLOCK_NANOSLEEP:
+        *ret = sys_clock_nanosleep(a[0], a[1], a[2]);
+        return;
     case SYS_GETUID:
     case SYS_GETEUID:
     case SYS_GETGID:
     case SYS_GETEGID:
-        *ret = GUEST_TID;
+        *ret = GUEST_ROOT_ID;
+        return;
+    case SYS_GETTIMEOFDAY:
+        *ret = sys_gettimeofday(a[0], a[1]);
         return;
     case SYS_GETPPID:
         *ret = GUEST_PPID;
@@ -613,9 +761,12 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_GETPGID:
         *ret = GUEST_PGID;
         return;
+    case SYS_SCHED_YIELD:
+        c->stop = 1; /* the rest of the slice goes to the next thread */
+        *ret = 0;
+        return;
     case SYS_GETPRIORITY:
     case SYS_SETPRIORITY:
-    case SYS_SCHED_YIELD:
     case SYS_SCHED_GETSCHEDULER:
         *ret = 0;
         return;
@@ -623,7 +774,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_sched_getaffinity(a[1], a[2]);
         return;
     case SYS_FUTEX:
-        *ret = sys_futex(a[0], a[1], a[2]);
+        *ret = sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
         return;
     case SYS_SIGALTSTACK:
         *ret = sys_sigaltstack(a[0], a[1]);
@@ -641,7 +792,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
             *ret = 0;
             return;
         }
-        die_by_signal(c, a[1]);
+        die_by_signal(a[1]);
         *ret = 0;
         return;
     case SYS_TGKILL:
@@ -649,7 +800,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
             *ret = 0;
             return;
         }
-        die_by_signal(c, a[2]);
+        die_by_signal(a[2]);
         *ret = 0;
         return;
     case SYS_PRCTL:
@@ -691,7 +842,8 @@ void syscall_dispatch(cpu_t *c)
     uint64_t a[6] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5]};
     int64_t ret = 0;
     dispatch(c, nr, a, &ret);
-    c->x[0] = (uint64_t)ret;
+    if (!c->blocked) /* a blocked call gets its x0 when it wakes */
+        c->x[0] = (uint64_t)ret;
     if (c->trace) {
         fprintf(stderr, "xiaoji: %s(%llu) (0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) = %lld\n",
                 syscall_name(nr), (unsigned long long)nr, (unsigned long long)a[0],

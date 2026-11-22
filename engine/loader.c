@@ -79,10 +79,10 @@ int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc,
     AUX(AT_BASE, at_base);
     AUX(AT_FLAGS, 0);
     AUX(AT_ENTRY, ei->entry);
-    AUX(AT_UID, 1000);
-    AUX(AT_EUID, 1000);
-    AUX(AT_GID, 1000);
-    AUX(AT_EGID, 1000);
+    AUX(AT_UID, 0); /* root, as the oracle runs */
+    AUX(AT_EUID, 0);
+    AUX(AT_GID, 0);
+    AUX(AT_EGID, 0);
     AUX(AT_PLATFORM, platform_va);
     AUX(AT_HWCAP, 0x3); /* FP | ASIMD */
     AUX(AT_CLKTCK, 100);

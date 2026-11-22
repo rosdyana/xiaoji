@@ -257,3 +257,30 @@ libc, then checked):
   table guards the second label.
 - The region list (`engine/mem.c`) replaces the page walk in `mem_find_free`.
   Without it, each `mmap(NULL)` would scan the allocator's multi-GiB reservations.
+
+## M2+M3 progress (in progress, not committed)
+
+Stages, as in the M2+M3 plan. Status at the time of writing:
+
+| Stage | Status |
+|---|---|
+| 1. Deterministic Hello, sh-arith, gettimeofday, root uids | done: `sh-arith` PASS natively and in Node |
+| 2. Green threads, clone, futex, sleeps, `tests/guest/threads.c` | done: `threads-O0/O2` PASS natively and in Node; deadlock path checked by hand (exit 134) |
+| 3. Signals and synchronous faults | not started |
+| 4. ART syscalls, /proc, instructions | not started; hello-int stops at FMOV d, #imm (0x1e6c1009) |
+| 5. JIT run, memfd dual mapping | not started |
+
+Stage 1 and 2 changes:
+- `tests/hello/Hello.java` prints the deterministic line to stdout and the loop time to stderr. `tools/oracle.sh` writes stderr to `build/oracle/<case>.err`, so `.out` is stdout only.
+- `tests/run.sh` rootfs cases use arrays for argv and pass the `tools/guest-env.sh` variables as `--env`. New cases: `sh-arith`, `hello-int`, `hello-jit`.
+- `Makefile`: `make test` depends on `wasm-node` (so a stale Node build cannot pass) and on `build/rootfs/data/hello.dex`.
+- `engine/sched.c`, `engine/sched.h`: one `cpu_t` per guest thread, 200,000-instruction slices, round-robin, futex wait/wake/requeue/cmp-requeue with timeouts, nanosleep and clock_nanosleep, deadlock report (exit 134), per-thread names and clear_child_tid.
+- `engine/syscall.c`: clone [220] (threads only; other clone returns -ENOSYS with a notice), futex [98], exit [93] per thread, exit_group [94] per process, set_tid_address, gettid, sched_yield, nanosleep [101], clock_nanosleep [115], gettimeofday [169], prctl PR_SET_NAME per thread. uid, gid and auxv ids are 0.
+- `engine/host.c`: `host_sleep_ns` (nanosleep). It works under Node.
+
+Results so far (`make test`, after stage 2): 46 passed, 4 failed. The 4 failures are the Hello cases (`hello-int`, `hello-jit`, native and Node), which stop at `unimplemented A64 instruction 0x1e6c1009` (FMOV, scalar immediate), as expected for stage 4.
+
+Current ART runs (`XIAOJI_STATS=1`, native engine, `pmset -g`: AC Power, lowpowermode 0). Neither run reaches Hello:
+- `dalvikvm64 -Xint Hello`: unimplemented syscall 198 (socket), then `unimplemented A64 instruction 0x1e6c1009` (FMOV d, #imm) at about 10.03 M instructions (0.152 s, 65.8 M instructions/s), exit 132.
+- `dalvikvm64 Hello` (JIT): the same two messages at about 9.95 M instructions (0.114 s, 87.1 M instructions/s), exit 132.
+The timings are not comparable to the oracle, and no Node timing exists yet because Hello does not finish.
