@@ -20,10 +20,27 @@
  */
 #include "mem.h"
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef __EMSCRIPTEN__
+#include "jit.h"
+#endif
+
+/* A host page is about to change (written through any mapping, freed, or moved):
+ * drop the translated code on it. Pages without code are not affected. */
+static inline void host_page_changed(uint8_t *p)
+{
+#ifdef __EMSCRIPTEN__
+    if (p)
+        jit_page_changed(p);
+#else
+    (void)p;
+#endif
+}
 
 #define PTE_R 1u
 #define PTE_W 2u
@@ -320,6 +337,14 @@ static inline uint8_t *tlb_page(uint64_t vpn, unsigned need)
         return t->page;
     uint8_t *p = page_lookup(vpn, need);
     if (p) {
+#ifdef __EMSCRIPTEN__
+        if (need == PTE_W && jit_page_is_code(p)) {
+            /* The write changes translated code: drop it. The page is no longer code,
+             * so the next write may be cached; it is not cached for this one. */
+            jit_page_changed(p);
+            return p;
+        }
+#endif
         t->tag = vpn + 1;
         t->page = p;
     }
@@ -414,6 +439,30 @@ uint32_t mem_fetch32(uint64_t va)
     return v;
 }
 
+#ifdef __EMSCRIPTEN__
+/* Host page of the instruction at va, with execute permission, or NULL. For the
+ * translator, which keys blocks by host address. */
+uint8_t *mem_exec_page(uint64_t va)
+{
+    uint64_t vpn = (va & VA_MASK) >> 12;
+    return page_lookup(vpn, PTE_X);
+}
+
+/* Layout of the TLBs for the translator's inline probe: the read and write arrays,
+ * the entry size, and the offset of the host page pointer in an entry (the tag is at 0). */
+void mem_jit_tlb(uintptr_t *rd, uintptr_t *wr, uint32_t *stride, uint32_t *page_off)
+{
+    *rd = (uintptr_t)tlb_rd;
+    *wr = (uintptr_t)tlb_wr;
+    *stride = (uint32_t)sizeof(tlb_ent);
+    *page_off = (uint32_t)offsetof(tlb_ent, page);
+}
+
+/* The translator's inline stores must miss, so it drops the write TLB whenever it
+ * starts treating a host page as code. */
+void mem_flush_write_tlb(void) { memset(tlb_wr, 0, sizeof tlb_wr); }
+#endif /* __EMSCRIPTEN__ */
+
 /* ---------- mapping ---------- */
 
 static int range_ok(uint64_t va, uint64_t len)
@@ -474,8 +523,10 @@ void mem_unmap(uint64_t va, uint64_t len)
         if (!slot)
             continue;
         uint64_t e = *slot;
-        if (!(e & PTE_SHARED)) /* shared pages stay with the memfd */
+        if (!(e & PTE_SHARED)) { /* shared pages stay with the memfd */
+            host_page_changed((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
             free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
+        }
         *slot = 0;
     }
     tlb_flush();
@@ -507,6 +558,7 @@ int mem_protect(uint64_t va, uint64_t len, unsigned prot)
     uint64_t n = len >> 12;
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 0);
+        host_page_changed((uint8_t *)(uintptr_t)(*slot & ~(uint64_t)PTE_FLAGS));
         *slot = (*slot & ~(uint64_t)PTE_FLAGS) | (*slot & PTE_SHARED) | PTE_MAPPED | (prot & 7u);
     }
     tlb_flush();
@@ -567,6 +619,7 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
         if (!src || !(*src & PTE_MAPPED))
             continue;
         uint64_t *dst = pte_slot(first_dst + p, 1);
+        host_page_changed((uint8_t *)(uintptr_t)(*src & ~(uint64_t)PTE_FLAGS));
         *dst = *src;
         *src = 0;
     }
@@ -590,6 +643,7 @@ void mem_drop(uint64_t va, uint64_t len)
         if (!slot || !(*slot & PTE_MAPPED) || (*slot & PTE_SHARED))
             continue;
         uint64_t e = *slot;
+        host_page_changed((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
         free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
         *slot = e & PTE_FLAGS;
     }
@@ -619,6 +673,7 @@ int mem_poke(uint64_t va, const void *src, size_t len)
         uint8_t *p = page_any(a >> 12);
         if (!p)
             return -1;
+        host_page_changed(p);
         memcpy(p + off, s, chunk);
         s += chunk;
         va += chunk;

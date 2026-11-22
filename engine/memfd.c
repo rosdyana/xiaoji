@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __EMSCRIPTEN__
+#include "jit.h"
+#endif
+
 #define MFD_PAGE 4096u
 
 struct memfd {
@@ -34,8 +38,13 @@ void memfd_unref(memfd_t *m)
 {
     if (!m || --m->refs > 0)
         return;
-    for (size_t i = 0; i < m->cap; i++)
+    for (size_t i = 0; i < m->cap; i++) {
+#ifdef __EMSCRIPTEN__
+        if (m->pages[i])
+            jit_page_changed(m->pages[i]);
+#endif
         free(m->pages[i]);
+    }
     free(m->pages);
     free(m);
 }
@@ -83,8 +92,12 @@ int memfd_truncate(memfd_t *m, uint64_t size)
             uint64_t end = (idx + 1) * MFD_PAGE;
             if (end > m->size)
                 end = m->size;
-            if (idx < m->cap && m->pages[idx])
+            if (idx < m->cap && m->pages[idx]) {
+#ifdef __EMSCRIPTEN__
+                jit_page_changed(m->pages[idx]);
+#endif
                 memset(m->pages[idx] + in, 0, (size_t)(end - off));
+            }
             off = end;
         }
     }
@@ -134,6 +147,9 @@ int64_t memfd_pwrite(memfd_t *m, const void *buf, size_t n, uint64_t off)
         uint8_t *p = memfd_page(m, idx);
         if (!p)
             return -1;
+#ifdef __EMSCRIPTEN__
+        jit_page_changed(p);
+#endif
         memcpy(p + in, s + done, chunk);
         done += chunk;
     }

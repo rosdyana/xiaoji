@@ -80,6 +80,15 @@ void mem_write128(uint64_t va, const uint64_t in[2]);
 uint32_t mem_fetch32(uint64_t va);
 /* The CPU records the current pc here so faults can report it. */
 void mem_set_pc(uint64_t pc);
+#ifdef __EMSCRIPTEN__
+/* The wasm build's block translator (engine/jit.c) uses these; see mem.c. */
+/* Host page of the page holding va, if it is mapped executable (NULL otherwise). */
+uint8_t *mem_exec_page(uint64_t va);
+/* Layout of the TLBs, for the translator's inline probe. */
+void mem_jit_tlb(uintptr_t *rd, uintptr_t *wr, uint32_t *stride, uint32_t *page_off);
+/* Empties the write TLB, so every later write goes through the slow path. */
+void mem_flush_write_tlb(void);
+#endif
 
 /* Non-faulting accessors for syscalls and the loader. They return 0 on
  * success and -1 if a page is unmapped or lacks the permission. */

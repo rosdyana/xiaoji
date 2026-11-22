@@ -6,6 +6,9 @@
 
 #include "cpu_a64.h"
 #include "elf.h"
+#ifdef __EMSCRIPTEN__
+#include "jit.h"
+#endif
 #include "host.h"
 #include "loader.h"
 #include "mem.h"
@@ -37,6 +40,9 @@ static void print_stats(void)
     double rate = secs > 0 ? (double)icount / secs / 1e6 : 0.0;
     fprintf(stderr, "xiaoji: %llu instructions in %.3f s (%.2f M instructions/s)\n",
             (unsigned long long)icount, secs, rate);
+#ifdef __EMSCRIPTEN__
+    jit_print_stats(icount);
+#endif
 }
 
 static int usage(FILE *out)

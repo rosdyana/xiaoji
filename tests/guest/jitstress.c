@@ -1,0 +1,493 @@
+/* JIT stress: hot loops that the block translator must run and get right, and code
+ * that rewrites itself after it has been translated.
+ *
+ * alu_kernel is one long block of inline assembly: ALU ops in every shifted, extended
+ * and immediate form, flag-setting ops, conditional selects and compares, multiplies,
+ * divides, bit operations, and every integer load and store form. Its results and the
+ * flags are folded into a checksum over thousands of iterations, so the block is
+ * translated and then run hot. Then the program rewrites a function it has already
+ * run hot in three ways (a store into an RWX page, mprotect RW then RX, and munmap then
+ * mmap at the same address) and calls it again. Output must match native. */
+#include "sys.h"
+
+#include <stdint.h>
+
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define PROT_EXEC 4
+#define MAP_PRIVATE 0x02
+#define MAP_ANONYMOUS 0x20
+
+/* Calls per hot loop. The translator waits for a batch of hot blocks before it
+ * compiles them, so each loop is long enough that its code is translated before the
+ * rewrite or the fault. */
+#define CALLS 12000
+
+static u64 seed = 88172645463325252ull;
+
+static u64 rnd(void)
+{
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    return seed;
+}
+
+/* r[0..7]: inputs and outputs in x0..x7. r[8..31]: scratch memory for the loads and
+ * stores. r[31] receives the flags. */
+static void alu_kernel(u64 *r)
+{
+    register u64 *p asm("x9") = r;
+    asm volatile(
+        "ldp x0, x1, [x9]\n"
+        "ldp x2, x3, [x9, #16]\n"
+        "ldp x4, x5, [x9, #32]\n"
+        "ldp x6, x7, [x9, #48]\n"
+        "adds x0, x0, x1\n"
+        "adcs x2, x2, x3\n"
+        "sbcs x4, x4, x5\n"
+        "subs w6, w6, w7\n"
+        "ccmp x0, x2, #5, ne\n"
+        "csel x1, x0, x2, lt\n"
+        "csinc x3, x4, x6, hi\n"
+        "csinv x5, x7, x0, ge\n"
+        "csneg x7, x1, x3, le\n"
+        "madd x0, x1, x2, x3\n"
+        "msub x2, x4, x5, x6\n"
+        "smaddl x4, w5, w7, x0\n"
+        "umaddl x6, w0, w1, x2\n"
+        "umulh x6, x0, x1\n"
+        "smulh x7, x2, x3\n"
+        "udiv x0, x1, x2\n"
+        "sdiv x3, x4, x5\n"
+        "lsl x1, x0, x2\n"
+        "lsr w2, w3, w4\n"
+        "asr x3, x4, x5\n"
+        "ror x4, x5, x6\n"
+        "ror w5, w6, w7\n"
+        "ubfx x5, x6, #3, #17\n"
+        "sbfx x6, x7, #5, #9\n"
+        "bfi x7, x0, #4, #12\n"
+        "extr x0, x1, x2, #13\n"
+        "clz x1, x2\n"
+        "cls w3, w4\n"
+        "rbit x5, x6\n"
+        "rev x7, x0\n"
+        "rev16 w1, w2\n"
+        "rev32 x3, x4\n"
+        "and x0, x0, #0xff00ff00ff00ff00\n"
+        "orr w1, w1, #0x0000ffff\n"
+        "eor x2, x2, x3, lsr #7\n"
+        "bics x4, x4, x5, asr #3\n"
+        "orn x5, x5, x6\n"
+        "eon x6, x6, x7, ror #9\n"
+        "add x7, x7, x0, sxtb #2\n"
+        "sub x0, x0, w1, uxth #1\n"
+        "adds x1, x1, w2, sxtw\n"
+        "add x2, x2, x3, lsl #5\n"
+        "subs x3, x3, x4, asr #9\n"
+        "movz x4, #0x1234, lsl #16\n"
+        "movk x5, #0xbeef\n"
+        "movn x6, #7\n"
+        "tst x7, #0x10\n"
+        "cset w8, eq\n"
+        "cinc x1, x1, cc\n"
+        "eor xzr, x1, x2\n"
+        "and wzr, w3, w4\n"
+        "orr xzr, x5, x6\n"
+        "mrs x8, nzcv\n"
+        "str x0, [x9, #64]\n"
+        "strb w1, [x9, #72]\n"
+        "strh w2, [x9, #74]\n"
+        "str w3, [x9, #76]\n"
+        "ldrb w4, [x9, #72]\n"
+        "ldrsb x5, [x9, #72]\n"
+        "ldrh w6, [x9, #74]\n"
+        "ldrsh x7, [x9, #74]\n"
+        "ldrsw x0, [x9, #76]\n"
+        "mov x10, x9\n"
+        "str x1, [x10, #80]!\n"
+        "ldr x2, [x10], #8\n"
+        "stur x3, [x9, #88]\n"
+        "ldur x4, [x9, #88]\n"
+        "mov x11, #8\n"
+        "str x5, [x9, x11, lsl #3]\n"
+        "ldr x6, [x9, x11, lsl #3]\n"
+        "stp x0, x1, [x9, #96]\n"
+        "ldp x2, x3, [x9, #96]\n"
+        "ldpsw x4, x5, [x9, #104]\n"
+        "stp x6, x7, [x10, #112]!\n"
+        "ldp x0, x1, [x10], #-16\n"
+        "adr x11, 1f\n"
+        "1:\n"
+        "adds x2, x2, x11\n"
+        "str x8, [x9, #248]\n"
+        "stp x0, x1, [x9]\n"
+        "stp x2, x3, [x9, #16]\n"
+        "stp x4, x5, [x9, #32]\n"
+        "stp x6, x7, [x9, #48]\n"
+        : "+r"(p)
+        :
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x10", "x11", "cc", "memory");
+}
+
+static int checks;
+
+/* ---------- a fault inside translated code ---------- */
+
+#define SIGSEGV 11
+#define SA_SIGINFO 0x4ull
+#define SA_RESTORER 0x04000000ull
+#define SYS_RT_SIGACTION 134
+
+typedef struct {
+    u64 handler, flags, restorer, mask;
+} ksigaction;
+
+typedef struct {
+    i32 signo, err, code, pad;
+    u64 w[14];
+} kinfo;
+
+typedef struct {
+    u64 fault_address;
+    u64 regs[31];
+    u64 sp, pc, pstate;
+    u8 reserved[4096] __attribute__((aligned(16)));
+} kmcontext;
+
+typedef struct {
+    u64 uc_flags;
+    u64 uc_link;
+    u64 uc_stack[3];
+    u64 uc_sigmask;
+    u8 unused[127];
+    kmcontext uc_mcontext;
+} kucontext;
+
+/* A leaf with no frame: one load, then return. The handler resumes it at its caller,
+ * so the fault is in a block that is translated after the loop runs hot. */
+__asm__(".text\n"
+        ".global jitstress_load\n"
+        "jitstress_load:\n"
+        "  ldr x0, [x0]\n"
+        "  ret\n"
+        ".global jitstress_restore\n"
+        "jitstress_restore:\n"
+        "  mov x8, #139\n"
+        "  svc #0\n");
+extern u64 jitstress_load(const u64 *p);
+extern void jitstress_restore(void);
+
+/* Leaves with a fault in the middle, after registers were written: the handler must
+ * see those values (x1..x3) and the faulting pc, and the post-index load must not have
+ * written back. */
+__asm__(".text\n"
+        ".global jitstress_mid_load\n"
+        "jitstress_mid_load:\n"
+        "  mov x1, #41\n"
+        "  add x1, x1, #1\n"
+        "  subs x2, x1, #43\n"
+        "  mov x3, #0x1234\n"
+        "  ldr x4, [x0], #8\n" /* offset 16 */
+        "  ret\n"
+        ".global jitstress_mid_store\n"
+        "jitstress_mid_store:\n"
+        "  mov x1, #41\n"
+        "  add x1, x1, #1\n"
+        "  mov x3, #0x77\n"
+        "  str x3, [x0]\n" /* offset 12 */
+        "  ret\n");
+extern u64 jitstress_mid_load(u64 *p);
+extern void jitstress_mid_store(u64 *p);
+
+static volatile int faults;
+static volatile u64 snap_pc, snap_addr, snap_x[5], snap_pstate;
+
+static void fault_handler(int sig, kinfo *info, kucontext *uc)
+{
+    (void)sig;
+    (void)info;
+    faults++;
+    snap_pc = uc->uc_mcontext.pc;
+    snap_addr = uc->uc_mcontext.fault_address;
+    for (int k = 0; k < 5; k++)
+        snap_x[k] = uc->uc_mcontext.regs[k];
+    snap_pstate = uc->uc_mcontext.pstate;
+    uc->uc_mcontext.regs[0] = 77;
+    uc->uc_mcontext.pc = uc->uc_mcontext.regs[30];
+}
+
+static void install_segv(void)
+{
+    ksigaction sa;
+    sa.handler = (u64)fault_handler;
+    sa.flags = SA_SIGINFO | SA_RESTORER;
+    sa.restorer = (u64)jitstress_restore;
+    sa.mask = 0;
+    sc6(SYS_RT_SIGACTION, SIGSEGV, (i64)&sa, 0, 8, 0, 0);
+}
+
+static void hot_fault(u64 *sum)
+{
+    static const u64 good = 5;
+    u64 s = *sum;
+    for (u64 i = 0; i < CALLS; i++)
+        s += jitstress_load(&good);
+    /* The last load faults. The handler makes it return 77 to here. */
+    s += jitstress_load((const u64 *)0x40);
+    *sum = s;
+}
+
+static void check(const char *label, int ok)
+{
+    put(label);
+    put(ok ? "=ok\n" : "=FAIL\n");
+    if (!ok)
+        checks++;
+}
+
+/* Branches and calls in C: conditional branches, compare-and-branch, bit tests, and a
+ * call through a pointer. */
+static u64 leaf(u64 x)
+{
+    return (x * 0x9E3779B97F4A7C15ull) >> 17;
+}
+
+static u64 branchy(u64 x)
+{
+    u64 acc = 0;
+    for (u64 i = 0; i < 16; i++) {
+        if (x & (1ull << i))
+            acc += leaf(x + i);
+        else if (i & 1)
+            acc ^= x >> i;
+        if (i == 7)
+            continue;
+        acc += (x >> 2) ? 3 : 5;
+    }
+    return acc;
+}
+
+typedef u64 (*fn_t)(u64);
+
+static void hot_branches(u64 *sum)
+{
+    fn_t fp = leaf;
+    u64 s = *sum;
+    for (u64 i = 0; i < 6000; i++) {
+        u64 x = rnd();
+        s += branchy(x);
+        s += fp(x);
+        if (!(x & 0x3))
+            s ^= 0x55;
+    }
+    *sum = s;
+}
+
+/* Self-modifying code. A function is "movz w0, #imm; ret". */
+#define RET_INSN 0xD65F03C0u
+static u32 movz_w0(u32 imm) { return 0x52800000u | (imm << 5); }
+
+typedef int (*gen_fn)(void);
+
+typedef int (*smc_fn)(u32 *, u32);
+
+static u64 call_many(void *code, u64 n)
+{
+    gen_fn f = (gen_fn)code;
+    u64 s = 0;
+    for (u64 i = 0; i < n; i++)
+        s += (u64)(unsigned)f();
+    return s;
+}
+
+/* __clear_cache, the routine __builtin___clear_cache calls on arm64. -nostdlib has no
+ * libgcc, so it is written here: clean the data cache to the point of unification and
+ * invalidate the instruction cache over the range. Lines are 64 bytes, at least the real
+ * size, so every line in the range is covered. The engine treats these as no-ops, since
+ * its guest caches are coherent. */
+void __clear_cache(void *begin, void *end)
+{
+    uintptr_t a = (uintptr_t)begin & ~(uintptr_t)63;
+    for (uintptr_t p = a; p < (uintptr_t)end; p += 64)
+        asm volatile("dc cvau, %0" : : "r"(p) : "memory");
+    asm volatile("dsb ish" : : : "memory");
+    for (uintptr_t p = a; p < (uintptr_t)end; p += 64)
+        asm volatile("ic ivau, %0" : : "r"(p) : "memory");
+    asm volatile("dsb ish\n\tisb" : : : "memory");
+}
+
+static void rewrite_code(void *code, u32 imm)
+{
+    u32 *w = (u32 *)code;
+    w[0] = movz_w0(imm);
+    w[1] = RET_INSN;
+    __builtin___clear_cache((char *)code, (char *)code + 8);
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    /* ALU, flags, shifts, bitfields, multiplies, divides and memory, from random
+     * inputs: the checksum covers every output register and the flags. */
+    u64 r[32];
+    u64 acc = 0;
+    for (u64 i = 0; i < 4000; i++) {
+        for (int k = 0; k < 8; k++)
+            r[k] = rnd();
+        for (int k = 8; k < 32; k++)
+            r[k] = rnd();
+        alu_kernel(r);
+        for (int k = 0; k < 8; k++)
+            acc = (acc ^ r[k]) * 0x100000001B3ull;
+        acc ^= r[8] + r[31];
+    }
+    put("alu_acc=");
+    putx(acc);
+    put("\n");
+
+    u64 bsum = 0;
+    hot_branches(&bsum);
+    put("branch_sum=");
+    putx(bsum);
+    put("\n");
+
+    /* 1. Rewrite a hot function in an RWX page. The rewrite is an ordinary store to a
+     * page that holds translated code. */
+    u8 *rwx = (u8 *)sys_mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    rewrite_code(rwx, 11);
+    u64 a = call_many(rwx, CALLS);
+    rewrite_code(rwx, 42);
+    u64 b = call_many(rwx, CALLS);
+    check("rwx_rewrite", a == CALLS * 11 && b == CALLS * 42);
+    put("rwx_sums=");
+    putd((i64)a);
+    put(" ");
+    putd((i64)b);
+    put("\n");
+
+    /* 2. Rewrite through mprotect: RW, write, RX, run. */
+    u8 *mp = (u8 *)sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    rewrite_code(mp, 7);
+    sys_mprotect((u64)mp, 4096, PROT_READ | PROT_EXEC);
+    u64 c = call_many(mp, CALLS);
+    sys_mprotect((u64)mp, 4096, PROT_READ | PROT_WRITE);
+    rewrite_code(mp, 99);
+    sys_mprotect((u64)mp, 4096, PROT_READ | PROT_EXEC);
+    u64 d = call_many(mp, CALLS);
+    check("mprotect_rewrite", c == CALLS * 7 && d == CALLS * 99);
+    put("mprotect_sums=");
+    putd((i64)c);
+    put(" ");
+    putd((i64)d);
+    put("\n");
+
+    /* 3. Unmap and map again at the same address, new code. */
+    sys_munmap((u64)mp, 4096);
+    u8 *mp2 = (u8 *)sys_mmap((u64)mp, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    rewrite_code(mp2, 5);
+    u64 e = call_many(mp2, CALLS);
+    sys_munmap((u64)mp2, 4096);
+    u8 *mp3 = (u8 *)sys_mmap((u64)mp2, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    rewrite_code(mp3, 123);
+    u64 f = call_many(mp3, CALLS);
+    check("remap_rewrite", e == CALLS * 5 && f == CALLS * 123);
+    put("remap_sums=");
+    putd((i64)e);
+    put(" ");
+    putd((i64)f);
+    put("\n");
+
+    /* 4. A fault in a hot function: the handler sees the faulting pc, which must be
+     * the load itself, and the function returns the value the handler chose. */
+    install_segv();
+    u64 fs = 0;
+    hot_fault(&fs);
+    check("fault_in_hot", faults == 1 && snap_pc == (u64)jitstress_load && snap_addr == 0x40 &&
+                              fs == CALLS * 5 + 77);
+    put("fault_hits=");
+    putd(faults);
+    put(" pc_off=");
+    putd((i64)(snap_pc - (u64)jitstress_load));
+    put(" addr=");
+    putx(snap_addr);
+    put(" sum=");
+    putd((i64)fs);
+    put("\n");
+
+    /* Faults in the middle of hot blocks: the load and the store each leave the registers
+     * written before them, and the pc of the faulting instruction. */
+    static u64 buf[16];
+    faults = 0;
+    for (u64 i = 0; i < CALLS; i++) {
+        jitstress_mid_load(&buf[0]);
+        jitstress_mid_store(&buf[1]);
+    }
+    check("hot_mid_store", buf[1] == 0x77 && faults == 0);
+    jitstress_mid_load((u64 *)0x40);
+    int ok_load = faults == 1 && snap_pc == (u64)jitstress_mid_load + 16 && snap_addr == 0x40 &&
+                  snap_x[0] == 0x40 && snap_x[1] == 42 && snap_x[2] == (u64)-1 && snap_x[3] == 0x1234 &&
+                  (snap_pstate >> 28) == 8; /* N: 42 - 43 */
+    check("fault_mid_load", ok_load);
+    put("mid_load=");
+    putd((i64)(snap_pc - (u64)jitstress_mid_load));
+    put(" x1=");
+    putd((i64)snap_x[1]);
+    put(" x2=");
+    putd((i64)snap_x[2]);
+    put(" x3=");
+    putx(snap_x[3]);
+    put(" nzcv=");
+    putx(snap_pstate >> 28);
+    put("\n");
+    faults = 0;
+    jitstress_mid_store((u64 *)0x40);
+    int ok_store = faults == 1 && snap_pc == (u64)jitstress_mid_store + 12 && snap_addr == 0x40 &&
+                   snap_x[0] == 0x40 && snap_x[1] == 42 && snap_x[3] == 0x77;
+    check("fault_mid_store", ok_store);
+    put("mid_store=");
+    putd((i64)(snap_pc - (u64)jitstress_mid_store));
+    put(" x1=");
+    putd((i64)snap_x[1]);
+    put(" x3=");
+    putx(snap_x[3]);
+    put("\n");
+
+    // 5. A translated block that stores into its own page. The store overwrites the
+    // movz at word 8, which is the instruction that sets the result. The block must
+    // leave after the store, so the new movz runs. The store is followed by the cache
+    // maintenance a real core needs before it executes modified code.
+    u32 *sm = (u32 *)sys_mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    sm[0] = 0xB9002001u; // str w1, [x0, #32]   (word 8)
+    sm[1] = 0x91002002u; // add x2, x0, #32
+    sm[2] = 0xD50B7B22u; // dc cvau, x2
+    sm[3] = 0xD5033B9Fu; // dsb ish
+    sm[4] = 0xD50B7522u; // ic ivau, x2
+    sm[5] = 0xD5033B9Fu; // dsb ish
+    sm[6] = 0xD5033FDFu; // isb
+    sm[7] = 0xD503201Fu; // nop
+    sm[8] = movz_w0(1);  // overwritten by the store before it runs
+    sm[9] = RET_INSN;
+    __builtin___clear_cache((char *)sm, (char *)sm + 40);
+    smc_fn sfn = (smc_fn)sm;
+    u64 smc_bad = 0;
+    for (u64 i = 0; i < CALLS; i++) {
+        u32 v = (i & 1) ? 3 : 2;
+        if ((u64)(unsigned)sfn(sm, movz_w0(v)) != v)
+            smc_bad++;
+    }
+    check("self_modify", smc_bad == 0);
+    put("self_modify_bad=");
+    putd((i64)smc_bad);
+    put("\n");
+
+    put(checks ? "jitstress=FAIL\n" : "jitstress=ok\n");
+    return checks ? 1 : 0;
+}

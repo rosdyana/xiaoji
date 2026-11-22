@@ -11,6 +11,9 @@
 #include "signals.h"
 #include "simd.h"
 #include "syscall.h"
+#ifdef __EMSCRIPTEN__
+#include "jit.h"
+#endif
 
 /* ---------- helpers ---------- */
 
@@ -1015,6 +1018,9 @@ static void mem_fault(cpu_t *c)
     int code;
     mem_fault_info(&addr, &code);
     c->pc = mem_cur_pc();
+#ifdef __EMSCRIPTEN__
+    jit_fault(c, c->pc);
+#endif
     if (sig_fault(c, SIGSEGV_N, code, addr & MEM_UNTAG_MASK))
         return;
     sig_segv_fatal(addr, c->pc);
@@ -1028,16 +1034,38 @@ static void mem_fault(cpu_t *c)
 __attribute__((noinline)) static void run_loop(cpu_t *c)
 {
     uint64_t budget = c->budget;
+#ifdef __EMSCRIPTEN__
+    /* The pc a sequential step reaches next. Anything else is a block entry, where
+     * the translator is asked for a block (wasm builds only). recheck: the last
+     * instruction was one the translator does not handle, so the next pc is asked
+     * about too, even if it is sequential. */
+    uint64_t expect = ~0ull;
+    int recheck = 0;
+#endif
     while (!c->stop && budget) {
         budget--;
         if (c->sig_pending & ~c->sig_mask) {
             sig_deliver_pending(c);
             continue;
         }
+#ifdef __EMSCRIPTEN__
+        if (c->pc != expect) {
+            int r = jit_dispatch(c, &budget);
+            if (r == 1) {
+                expect = ~0ull; /* the block's exit pc is a block entry too */
+                continue;
+            }
+            recheck = r == 2;
+        }
+#endif
         uint64_t pc = c->pc;
         mem_set_pc(pc);
         uint32_t insn = mem_fetch32(pc);
         c->pc = pc + 4;
+#ifdef __EMSCRIPTEN__
+        expect = recheck ? ~0ull : pc + 4;
+        recheck = 0;
+#endif
         c->icount++;
         if (exec(c, insn, pc) < 0)
             unimplemented(c, insn, pc);

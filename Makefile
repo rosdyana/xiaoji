@@ -10,6 +10,9 @@ GUEST_FLAGS := -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protecto
 
 ENGINE_SRC := $(wildcard engine/*.c)
 ENGINE_HDR := $(wildcard engine/*.h)
+# The block translator is wasm-only: the native build leaves engine/jit.c out.
+NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
+JIT_LIB := engine/jit_lib.js
 
 .PHONY: all engine wasm wasm-node guest-tests test image oracle clean help
 
@@ -20,23 +23,25 @@ help:           ## list targets
 
 engine: build/xiaoji          ## native engine -> build/xiaoji
 
-build/xiaoji: $(ENGINE_SRC) $(ENGINE_HDR)
+build/xiaoji: $(NATIVE_SRC) $(ENGINE_HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ $(ENGINE_SRC)
+	$(CC) $(CFLAGS) -o $@ $(NATIVE_SRC)
 
 wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 
-build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(ENGINE_HDR)
+build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
 	$(EMENV) emcc -O3 -std=c11 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=node,web \
-	    -sALLOW_MEMORY_GROWTH -sMAXIMUM_MEMORY=4GB -o $@ $(ENGINE_SRC)
+	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
+	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC)
 
 wasm-node: build/wasm-node/xiaoji.js   ## wasm engine for Node (reads host files directly)
 
-build/wasm-node/xiaoji.js: $(ENGINE_SRC) $(ENGINE_HDR)
+build/wasm-node/xiaoji.js: $(ENGINE_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm-node
 	$(EMENV) emcc -O3 -std=c11 -sNODERAWFS=1 -sENVIRONMENT=node -sALLOW_MEMORY_GROWTH \
-	    -sMAXIMUM_MEMORY=4GB -sEXIT_RUNTIME=1 -o $@ $(ENGINE_SRC)
+	    -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB -sEXIT_RUNTIME=1 \
+	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC)
 
 guest-tests:    ## freestanding test programs, built in the builder VM -> build/tests/guest
 	$(ORB) -m builder sh -c 'cd $(CURDIR) && mkdir -p build/tests/guest && \

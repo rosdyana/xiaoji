@@ -337,3 +337,52 @@ Hello timings after these fixes, on AC with Low Power Mode off:
 | hello-jit | native ARM64 (oracle, VM) | — | 0.39 s | 6–9 ms |
 
 The engine interprets about 105 M guest instructions/s. The remaining 7× gap to native on startup, and about 40× on JIT-compiled loops, is what the spike-1 translator targets. For hello-int, the profile shows ART's switch interpreter (`ExecuteSwitchImpl`) as the largest hot spot. The dynamic linker's symbol lookup costs about 130 M instructions on every start; a snapshot would remove it.
+
+
+## Spike 1: block translator, wasm build (T0 and T1)
+
+The wasm build translates hot A64 blocks to WebAssembly. Files: `engine/jit.c` (translator, wasm builds only), `engine/jit.h`, `engine/jit_lib.js` (`--js-library`: compiles each batch and installs its functions in the table). Hooks in `engine/cpu_a64.c`, `engine/mem.c`, `engine/memfd.c` and `engine/main.c` are `#ifdef __EMSCRIPTEN__`, and the native binary has no translator symbols. The Makefile leaves `jit.c` out of the native build and adds the JS library and `-sALLOW_TABLE_GROWTH` to both wasm targets. Tests: `tests/guest/jitstress.c`.
+
+Design as built:
+
+- **Blocks.** A block starts at a pc reached by a non-sequential step (a branch, a block exit, or the instruction after one the translator does not handle). It runs up to 64 instructions, never crosses a 4 KiB page, and ends at a branch, at an untranslated instruction (SVC, system, SIMD&FP, exclusive and ordered accesses, unknown encodings), or at the limit. Entries are counted in a lossy 4096-entry table; at 1000 entries the block is queued, and queued blocks are compiled in batches of up to 64 per module (or after 8192 later misses). A pc whose first instruction is untranslated is recorded as such, so it is not retried.
+- **Keys.** A block is keyed by the host address of its first instruction and the guest VA page. A host page mapped at two VAs (ART's memfd dual mapping) therefore gives two blocks. Each block is on its host page's list, for invalidation.
+- **Generated code.** One wasm function `(i32 cpu) -> i32` per block. It loads the guest registers it touches into locals on entry, keeps NZCV in a local (flags are computed eagerly), and stores the written registers back on exit. The return value packs the instruction count (bits 0 to 7) and an exit kind (bits 8 and up): NEXT (the pc is the next instruction to run: an untranslated one, or the length limit), JUMP (a branch, taken or not, or an indirect branch), SMC (a store changed translated code, and the block leaves after that store). The pc is in `cpu_t`.
+- **Memory.** Loads and stores probe the interpreter's own TLB inline (the same tag and page fields, read or write array), for accesses within one page, with the address untagged first. A miss, a page crossing, or a write to a page holding code goes to `jit_ld`/`jit_st`, which set the faulting pc and call the interpreter's `mem_*` functions. Code pages are never inserted in the write TLB, and the write TLB is flushed when a page first gets code.
+- **Faults.** A fault inside a block longjmps through the generated frames to `cpu_run`, which sets the pc from the helper's argument, as the interpreter does. The registers are stored before each helper call, so the state seen by a signal handler is exact. `jit_fault` charges the block's instructions up to and including the faulting one.
+- **Invalidation.** Every write path into a code page (the TLB slow path, `mem_poke`, memfd writes and truncation) and every unmap, drop, protect, move and memfd free calls `jit_page_changed` on the host page first. Invalidated blocks are marked and never reused, and no table slot is reclaimed.
+- **Dispatch.** The interpreter loop asks for a block at each non-sequential pc. A block that ran returns to the loop at its exit pc. If the instruction at the pc is untranslated, the interpreter runs it and the next pc is also asked about. A block translated during a dispatch runs at that dispatch.
+- **Budget and signals.** A block charges `icount` and the slice budget on exit. Pending signals are checked before each dispatch, so they are delivered at block boundaries.
+- **Switches.** `XIAOJI_JIT=0` disables dispatch. `XIAOJI_STATS=1` prints the translated fraction, blocks, modules, refused and untranslatable starts, compile failures, block runs, faults and self-modifying exits in translated code, and invalidations.
+
+Not in T0/T1: block chaining (T2), SIMD&FP and exclusives (interpreted; they end blocks), lazy flags, and register allocation beyond the entry and exit loads. Translation stops at 16384 blocks or 6144 host pages (further hot blocks are not translated), and there is no reclamation of invalidated blocks.
+
+Longjmp: this emcc (7.0.0) defaults to `SUPPORT_LONGJMP` in its `emscripten` mode when `-fwasm-exceptions` is not given, which this build does not use, so no flag was changed. The fault tests below, with faults inside translated code, show that the longjmp unwinds through the generated frames and `cpu_run` recovers the right pc.
+
+Verification (2026-11-22, AC power, Low Power Mode off):
+
+- `make && make wasm && make wasm-node && make test` from clean builds: **62 passed, 0 failed, 0 xfail** (the 58 cases plus jitstress at O0 and O2 on both runners).
+- `XIAOJI_JIT=0 tests/run.sh`: 62 passed.
+- Threshold-1 build (`-DJIT_HOT=1`): 62 passed. Every entry queues its block, and the batch compiles when 64 are queued (the periodic flush never fires in this build).
+- Instruction counts are identical with the JIT on, off, and at threshold 1 for jitstress, control, arith, memory, signals, simd, glibc_hello and hello. `threads` varies between runs even with the JIT off (1982409 to 1982427; the cause was not investigated), so its count is not a check.
+- `jitstress` covers: a hot inline-asm kernel of ALU ops, flags, shifts, bitfields, multiplies, divides and every integer load and store form, including logical forms with Rd = 31 (which write the zero register, not SP); hot branches and calls; rewrites of a hot function in an RWX page, after mprotect RW and RX, and after munmap and mmap; faults in the middle of hot blocks, where the handler checks the registers written before the fault, the saved NZCV, the pc offset, and the fault address (for a load and a store); a fault in a hot leaf; and a translated block that stores into its own page and then runs the new instruction. Output matches native. In the default build it records 3 faults in translated code, 1 self-modifying exit, and 5 pages and 5 blocks invalidated.
+- The native binary has no translator symbols; clang with `-Wall -Wextra` reports no warnings on the native build, and `emcc -c -Wall -Wextra` reports none for each engine file.
+
+Hello (in-engine time from `XIAOJI_STATS=1`; hello-int three runs per mode, hello-jit six per mode; instruction counts are the same with and without the JIT):
+
+| Case | JIT | Instructions | Engine time, runs in order | Median | Translated instructions | Blocks / modules |
+|---|---|---|---|---|---|---|
+| hello-int | on | 652.5 M | 3.94, 3.83, 3.66 s | 3.83 s | 91.5% | 1960–1973 / 354–356 |
+| hello-int | off | 652.4 M | 5.93, 6.55, 5.79 s | 5.93 s | 0% | — |
+| hello-jit | on | 297.5 M | 2.20 to 2.58 s (six runs) | 2.27 s | 84.0% | 1655–1658 / 323–327 |
+| hello-jit | off | 297.5 M | 2.88 to 3.58 s (six runs) | 3.15 s | 0% | — |
+
+Speedup, median against median: hello-int 1.55×, hello-jit 1.39×. Against the Node row of the profiling section above (5.64 s for hello-int and 2.90 s for hello-jit, measured before the translator), the gains are about 1.5× and 1.3×. Run-to-run spread on this machine is large, so treat these as a range of roughly 1.3× to 1.6×.
+
+Power state (`pmset -g batt`): "Now drawing from 'AC Power'". `pmset -g` shows lowpowermode 0 and displaysleep 120.
+
+Notes: at about 5.5 blocks per module, JS compilation is a visible cost (about 355 modules per hello-int run); larger batches and chaining are the next steps, not tuned here. Hello leaves about 150 to 190 starts untranslatable per run; most are HINT-space NOPs and barriers, which end a block, as the plan specifies.
+
+Not exercised by any test: `mremap` (it takes the same invalidation path through `mem_move`, but no test runs it on its own), the `XIAOJI_PROFILE` path (dispatch is skipped when the profiler is on), and the web build (`make wasm` compiles, but it has not been run in a browser).
+
+Left for T2: block chaining, translating the HINT-space NOPs and barriers instead of ending blocks there, a larger batch policy, lazy flags, SIMD&FP translation, register caching across blocks, and reclamation of invalidated blocks and table slots.
