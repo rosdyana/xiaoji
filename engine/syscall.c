@@ -9,6 +9,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "prof.h"
 #include "sched.h"
 #include "signals.h"
 #include "sysfs.h"
@@ -82,7 +83,7 @@ static uint8_t fill_buf[IO_CHUNK];
 
 static uint64_t page_up(uint64_t x) { return (x + PAGE_MASK) & ~PAGE_MASK; }
 
-static const char *syscall_name(uint64_t nr)
+const char *syscall_name(uint64_t nr)
 {
     switch (nr) {
     case 17: return "getcwd";
@@ -891,6 +892,8 @@ void syscall_dispatch(cpu_t *c)
     uint64_t a[6] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5]};
     int64_t ret = 0;
     dispatch(c, nr, a, &ret);
+    if (prof_on)
+        prof_syscall(c->tid, nr, a, ret, c->blocked);
     if (!c->blocked && !c->sig_restore) /* a blocked call gets its x0 when it wakes */
         c->x[0] = (uint64_t)ret;
     c->sig_restore = 0;

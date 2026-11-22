@@ -41,8 +41,8 @@ rootfs_argv() {
     toybox-lsdir) ARGV=(/system/bin/toybox ls /apex/com.android.art/bin) ;;
     toybox-cat) ARGV=(/system/bin/toybox cat /system/etc/hosts) ;;
     sh-arith) ARGV=(/system/bin/sh -c 'echo $((6*7))') ;;
-    hello-int) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art -cp /data/hello.dex Hello) ;;
-    hello-jit) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art -cp /data/hello.dex Hello) ;;
+    hello-int) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello) ;;
+    hello-jit) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello) ;;
     esac
 }
 ROOTFS_CASES="toybox-echo toybox-ls toybox-uname toybox-wc toybox-sha toybox-lsdir toybox-cat sh-arith hello-int hello-jit"

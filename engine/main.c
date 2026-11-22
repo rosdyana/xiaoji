@@ -9,6 +9,7 @@
 #include "host.h"
 #include "loader.h"
 #include "mem.h"
+#include "prof.h"
 #include "sched.h"
 #include "signals.h"
 #include "syscall.h"
@@ -156,5 +157,6 @@ int main(int argc, char **argv)
     stats_t0 = host_monotonic_ns();
     if (stats_on)
         atexit(print_stats);
+    prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit
     return sched_run(c);
 }

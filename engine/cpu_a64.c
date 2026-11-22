@@ -6,6 +6,7 @@
 
 #include "host.h"
 #include "mem.h"
+#include "prof.h"
 #include "sched.h"
 #include "signals.h"
 #include "simd.h"
@@ -1022,7 +1023,9 @@ static void mem_fault(cpu_t *c)
 /* The instruction loop. Pending signals are delivered at each instruction boundary.
  * A fault longjmps out of the instruction, so budget spent on that instruction is
  * not subtracted: the slice can run slightly long, which only affects fairness. */
-static void run_loop(cpu_t *c)
+/* noinline: cpu_run calls setjmp, and under Emscripten (wasm) every call in a function
+ * with setjmp is instrumented. Inlined here, the loop ran about 4x slower in Node. */
+__attribute__((noinline)) static void run_loop(cpu_t *c)
 {
     uint64_t budget = c->budget;
     while (!c->stop && budget) {
@@ -1042,12 +1045,40 @@ static void run_loop(cpu_t *c)
     c->budget = budget;
 }
 
+/* The profiling loop (XIAOJI_PROFILE=1): the same steps as run_loop, one unit of
+ * budget at a time, with the profiler hooks around each step. It is a driver around
+ * run_loop, not a copy of it, so run_loop is compiled the same with or without the
+ * profiler. */
+__attribute__((noinline)) static void run_loop_prof(cpu_t *c)
+{
+    uint64_t left = c->budget;
+    while (!c->stop && left) {
+        uint64_t pc = c->pc;
+        int hooked = !(c->sig_pending & ~c->sig_mask); /* no signal delivery this step */
+        uint32_t insn = 0;
+        if (hooked) {
+            mem_set_pc(pc);
+            insn = mem_fetch32(pc);
+            prof_pre(c, insn, pc);
+        }
+        c->budget = 1;
+        run_loop(c);
+        if (hooked)
+            prof_post(c, insn);
+        left--;
+    }
+    c->budget = left;
+}
+
 void cpu_run(cpu_t *c)
 {
     jmp_buf jb;
     jmp_buf *outer = mem_set_fault_jmp(&jb);
     if (setjmp(jb))
         mem_fault(c);
-    run_loop(c);
+    if (prof_on)
+        run_loop_prof(c);
+    else
+        run_loop(c);
     mem_set_fault_jmp(outer);
 }

@@ -14,6 +14,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "prof.h"
 
 #define MAX_THREADS SCHED_MAX_THREADS
 #define TID_MAIN 1000u
@@ -76,6 +77,7 @@ static thread_t *add_thread(const cpu_t *from, uint64_t tid)
         t->cpu.stop = 0;
         t->cpu.blocked = 0;
         t->cpu.exited = 0;
+        t->cpu.icount = 0; /* the copy is the parent: a new thread counts its own instructions */
         t->cpu.excl_valid = 0; /* a new thread never inherits the exclusive monitor */
         t->state = TS_RUNNABLE;
         threads[i] = t;
@@ -86,6 +88,8 @@ static thread_t *add_thread(const cpu_t *from, uint64_t tid)
 
 static void reap(int slot)
 {
+    if (prof_on)
+        prof_thread_end(threads[slot]->cpu.tid, threads[slot]->cpu.icount);
     dead_icount += threads[slot]->cpu.icount;
     free(threads[slot]);
     threads[slot] = NULL;
@@ -244,8 +248,11 @@ static int wait_for_timers(void)
     if (!any)
         return 0;
     uint64_t now = host_monotonic_ns();
-    if (earliest > now)
+    if (earliest > now) {
+        if (prof_on)
+            prof_idle(earliest - now);
         host_sleep_ns(earliest - now);
+    }
     return 1;
 }
 
@@ -274,6 +281,8 @@ int sched_run(cpu_t *main_cpu)
         return 1;
     }
     memcpy(m->comm, init_name, sizeof m->comm);
+    if (prof_on)
+        prof_thread_new(TID_MAIN, m->comm);
     cur_slot = 0;
     proc_done = 0;
 
@@ -290,7 +299,13 @@ int sched_run(cpu_t *main_cpu)
         }
         t->cpu.stop = 0;
         t->cpu.budget = SCHED_SLICE;
+        /* A context switch clears the exclusive monitor, as on hardware, so
+         * an LDXR from an earlier slice can't pair with a STXR after another
+         * thread has written the location. */
+        t->cpu.excl_valid = 0;
         cpu_run(&t->cpu);
+        if (prof_on)
+            prof_slice(t->cpu.tid, t->cpu.budget == 0);
         if (proc_done)
             break;
         if (t->cpu.exited) {
@@ -377,6 +392,8 @@ int64_t sched_clone(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid
     if (flags & CLONE_CHILD_CLEARTID)
         t->clear_child_tid = ctid;
     memcpy(t->comm, me->comm, sizeof t->comm);
+    if (prof_on)
+        prof_thread_new(tid, t->comm);
     return (int64_t)tid;
 }
 
@@ -396,8 +413,11 @@ void sched_set_name(const char *name)
     char buf[16];
     memset(buf, 0, sizeof buf);
     strncpy(buf, name, sizeof buf - 1);
-    if (cur())
+    if (cur()) {
         memcpy(cur()->comm, buf, sizeof buf);
+        if (prof_on)
+            prof_thread_name(cur()->cpu.tid, buf);
+    }
     else
         memcpy(init_name, buf, sizeof buf);
 }

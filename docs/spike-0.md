@@ -313,3 +313,27 @@ Stage 1 and 2 changes:
 - `engine/host.c`: `host_sleep_ns` (nanosleep). It works under Node.
 
 History: after stage 2, `make test` was 46 passed and 4 failed (the Hello cases stopped at FMOV, scalar immediate, `0x1e6c1009`). Stage 4 (commit `45a9f28`) brought `hello-int` to passing. Before stage 5 the `hello-jit` case stopped at `unimplemented syscall 279` (memfd_create) and then at `unimplemented A64 instruction 0x5ef1b800` (ADDP, scalar). Stage 5 fixed both, and then the JIT's DC CVAU, which the cache-maintenance NOPs cover.
+
+## Profiling and corrected numbers (2026-11-22)
+
+`XIAOJI_PROFILE=1` prints per-thread instruction and syscall counts, the top sampled hot spots (with the mapping's guest file and offset), and spin-like events.
+
+What it found:
+
+- **Earlier instruction counts and rates in this document are wrong.** A new thread copied its parent's instruction counter at clone time, so each of ART's seven threads restarted from about 950 M. The real count for hello-jit was 0.998 G, not 7.7 G, and the real rate is about 105 M instructions/s natively. Fixed in `sched.c`.
+- **No spinning.** The main thread runs 99.8% of instructions. There were zero WFE, YIELD or failed STXR events, and all futex waits blocked properly. The syscall counts match the native oracle within 3–5%.
+- **Most of the work was ART verifying framework DEX files.** 75% of samples were in `libdexfile.so` (`DexFileVerifier::CheckIntraStringDataItem`, `IsValidMemberName`). The cause was `-Ximage:/system/framework/boot.art`, which loads only the ART-module part of the boot image, so the framework jars on BOOTCLASSPATH had no compiled image and were verified from scratch. Booted Android loads the whole chain, so the harness now passes `-Ximage:/system/framework/boot.art:/system/framework/boot-framework.art`. The oracle was regenerated, and its output is unchanged.
+- **Under Emscripten, `cpu_run`'s `setjmp` slowed the inlined interpreter loop about 4×.** `run_loop` is now `noinline`; native code is unchanged.
+- **Exclusive monitor:** it is now cleared at every context switch, as on hardware.
+
+Hello timings after these fixes, on AC with Low Power Mode off:
+
+| Case | Runner | Instructions | Total | Java loop (1M iterations) |
+|---|---|---|---|---|
+| hello-jit | native engine | 297.5 M | 2.87 s | 342 ms |
+| hello-jit | Node | 297.6 M | 2.90 s | 309 ms |
+| hello-int | native engine | 652.4 M | 6.31 s | 3.71 s |
+| hello-int | Node | 652.4 M | 5.64 s | 3.07 s |
+| hello-jit | native ARM64 (oracle, VM) | — | 0.39 s | 6–9 ms |
+
+The engine interprets about 105 M guest instructions/s. The remaining 7× gap to native on startup, and about 40× on JIT-compiled loops, is what the spike-1 translator targets. For hello-int, the profile shows ART's switch interpreter (`ExecuteSwitchImpl`) as the largest hot spot. The dynamic linker's symbol lookup costs about 130 M instructions on every start; a snapshot would remove it.
