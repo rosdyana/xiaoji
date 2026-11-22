@@ -36,7 +36,9 @@
 #define SYS_RT_SIGACTION 134
 #define SYS_RT_SIGPROCMASK 135
 #define SYS_RT_SIGTIMEDWAIT 137
+#define SYS_RT_SIGQUEUEINFO 138
 #define SYS_RT_SIGRETURN 139
+#define SYS_RT_TGSIGQUEUEINFO 240
 #define SYS_SETPRIORITY 140
 #define SYS_GETPRIORITY 141
 #define SYS_GETPGID 155
@@ -139,6 +141,8 @@ const char *syscall_name(uint64_t nr)
     case 134: return "rt_sigaction";
     case 135: return "rt_sigprocmask";
     case 137: return "rt_sigtimedwait";
+    case 138: return "rt_sigqueueinfo";
+    case 240: return "rt_tgsigqueueinfo";
     case 139: return "rt_sigreturn";
     case 140: return "setpriority";
     case 141: return "getpriority";
@@ -1151,6 +1155,12 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_TGKILL:
         *ret = sig_tgkill(a[0], a[1], a[2]);
+        return;
+    case SYS_RT_SIGQUEUEINFO:
+        *ret = sig_rt_sigqueueinfo(a[0], a[1], a[2]);
+        return;
+    case SYS_RT_TGSIGQUEUEINFO:
+        *ret = sig_rt_tgsigqueueinfo(a[0], a[1], a[2], a[3]);
         return;
     case SYS_PRCTL:
         *ret = sys_prctl(a[0], a[1]);

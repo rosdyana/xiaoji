@@ -2,6 +2,7 @@
  * /sys/devices/system/cpu/online. Only these files are provided: they are what
  * the oracle run of ART opens. */
 #include "procfs.h"
+#include "selinuxfs.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -96,14 +97,22 @@ static proc_t *live_proc(const char *guest, const char **rest)
     return p && !p->zombie && !p->exited ? p : NULL;
 }
 
+/* The security context of the process (attr/current): the same for every process. */
+static int is_self_attr(const char *guest)
+{
+    return !strcmp(guest, "/proc/self/attr/current") || !strcmp(guest, "/proc/thread-self/attr/current");
+}
+
 int procfs_known(const char *guest)
 {
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/maps") ||
-        !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online"))
+        !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
+        is_self_attr(guest))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
-        return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline");
+        return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline") ||
+               !strcmp(rest, "/attr/current");
     return 0;
 }
 
@@ -111,9 +120,10 @@ int procfs_dir(const char *guest)
 {
     const char *rest;
     if (live_proc(guest, &rest))
-        return rest[0] == 0;
+        return rest[0] == 0 || !strcmp(rest, "/attr");
     return !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
-           !strcmp(guest, "/sys/devices/system/cpu");
+           !strcmp(guest, "/sys/devices/system/cpu") || !strcmp(guest, "/proc/self/attr") ||
+           !strcmp(guest, "/proc/thread-self") || !strcmp(guest, "/proc/thread-self/attr");
 }
 
 /* The last component of a process's program path (its name, when it is not the caller). */
@@ -212,6 +222,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
             size_t n = 0;
             const uint8_t *bytes = vfs_cmdline_bytes(target->fds, &n);
             sb_add(&b, (const char *)bytes, n);
+        } else if (!strcmp(rest, "/attr/current")) {
+            sb_fmt(&b, "%s", SELINUX_CTX);
         } else {
             return -1;
         }
@@ -223,6 +235,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         sb_fmt(&b, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\n\text4\n");
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
+    } else if (is_self_attr(guest)) {
+        sb_fmt(&b, "%s", SELINUX_CTX);
     } else {
         return -1;
     }

@@ -215,7 +215,7 @@ static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uin
         put64(f + 16, addr);
     } else {
         put32(f + 16, pid);
-        put32(f + 24, (uint32_t)c->sig_status[sig]); /* si_status: a SIGCHLD's child status */
+        put64(f + 24, c->sig_value[sig]); /* si_value (sigqueue) or si_status (SIGCHLD) */
     }
     put64(f + UC_STACK_OFF, c->alt_sp);
     put32(f + UC_STACK_OFF + 8, altstack_flags(c));
@@ -420,13 +420,14 @@ int64_t sig_sigaltstack(cpu_t *c, uint64_t ss, uint64_t oss)
 }
 
 /* siginfo for a signal that was waited for or delivered without a frame. */
-static int write_siginfo(uint64_t va, int sig, int code, uint32_t pid)
+static int write_siginfo(uint64_t va, int sig, int code, uint32_t pid, uint64_t value)
 {
     uint8_t b[128];
     memset(b, 0, sizeof b);
     put32(b, (uint32_t)sig);
     put32(b + 8, (uint32_t)code);
     put32(b + 16, pid);
+    put64(b + 24, value);
     return mem_copy_in(va, b, sizeof b);
 }
 
@@ -434,7 +435,7 @@ static int write_siginfo(uint64_t va, int sig, int code, uint32_t pid)
  * at once; otherwise it becomes pending, and an interruptible wait ends with EINTR.
  * SIGKILL on the running thread ends its process now. On another thread it is pending
  * (it cannot be blocked or caught) and the thread is woken to die. */
-static void raise_for(cpu_t *t, int sig, int code, uint32_t pid)
+static void raise_for(cpu_t *t, int sig, int code, uint32_t pid, uint64_t value)
 {
     if (sig == SIGKILL_N && t == sched_cur_cpu()) {
         die_by_signal(sig);
@@ -445,7 +446,7 @@ static void raise_for(cpu_t *t, int sig, int code, uint32_t pid)
     uint64_t b = bit(sig);
     if (sched_wait_kind(t) == SW_SIGWAIT && (t->sig_wait_set & b)) {
         if (t->sig_wait_info)
-            (void)write_siginfo(t->sig_wait_info, sig, code, pid);
+            (void)write_siginfo(t->sig_wait_info, sig, code, pid, value);
         t->sig_wait_set = 0;
         sched_wake(t, sig);
         return;
@@ -453,6 +454,7 @@ static void raise_for(cpu_t *t, int sig, int code, uint32_t pid)
     t->sig_pending |= b;
     t->sig_code[sig] = code;
     t->sig_pid[sig] = pid;
+    t->sig_value[sig] = value;
     if (!(t->sig_mask & b) && (sig == SIGKILL_N || sched_wait_kind(t) != SW_NONE))
         sched_wake(t, -(int64_t)LE_INTR);
 }
@@ -474,18 +476,18 @@ static cpu_t *process_target(proc_t *p, int sig)
 }
 
 /* A process-directed signal to process p. SIGKILL reaches every thread of it. */
-static void signal_process(proc_t *p, int sig, uint32_t sender)
+static void signal_process(proc_t *p, int sig, int code, uint32_t sender, uint64_t value)
 {
     if (sig == SIGKILL_N) {
         cpu_t *list[SCHED_MAX_THREADS];
         int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
         for (int i = 0; i < n; i++)
-            raise_for(list[i], sig, SI_USER, sender);
+            raise_for(list[i], sig, code, sender, value);
         return;
     }
     cpu_t *t = process_target(p, sig);
     if (t)
-        raise_for(t, sig, SI_USER, sender);
+        raise_for(t, sig, code, sender, value);
 }
 
 /* SIGCHLD (or another child-state signal) for a parent: code is CLD_EXITED or CLD_KILLED. */
@@ -494,8 +496,7 @@ void sig_child_event(proc_t *parent, int sig, int code, uint32_t pid, int status
     cpu_t *t = process_target(parent, sig);
     if (!t)
         return;
-    t->sig_status[sig] = status;
-    raise_for(t, sig, code, pid);
+    raise_for(t, sig, code, pid, (uint64_t)(uint32_t)status);
 }
 
 /* kill(2): pid > 0 is one process; 0 the caller's process group; -1 every process but
@@ -511,7 +512,7 @@ int64_t sig_kill(uint64_t pid64, uint64_t sig)
         if (!p || p->zombie || p->exited)
             return -LE_SRCH;
         if (sig)
-            signal_process(p, (int)sig, (uint32_t)me->pid);
+            signal_process(p, (int)sig, SI_USER, (uint32_t)me->pid, 0);
         return 0;
     }
     int64_t group = pid == 0 ? me->pgid : -(int64_t)pid;
@@ -523,7 +524,7 @@ int64_t sig_kill(uint64_t pid64, uint64_t sig)
             continue;
         any = 1;
         if (sig)
-            signal_process(p, (int)sig, (uint32_t)me->pid);
+            signal_process(p, (int)sig, SI_USER, (uint32_t)me->pid, 0);
     }
     return any ? 0 : -LE_SRCH;
 }
@@ -537,7 +538,7 @@ static int64_t thread_kill(uint64_t tid, uint64_t sig)
         return -LE_SRCH;
     if (sig == 0)
         return 0;
-    raise_for(t, (int)sig, SI_TKILL, proc_cur()->pid);
+    raise_for(t, (int)sig, SI_TKILL, proc_cur()->pid, 0);
     return 0;
 }
 
@@ -548,7 +549,7 @@ void sig_raise_current(int sig)
 {
     cpu_t *c = sched_cur_cpu();
     if (c)
-        raise_for(c, sig, SI_USER, (uint32_t)proc_cur()->pid);
+        raise_for(c, sig, SI_USER, (uint32_t)proc_cur()->pid, 0);
 }
 
 int64_t sig_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
@@ -556,6 +557,72 @@ int64_t sig_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
     if ((int32_t)tgid != proc_cur()->pid)
         return -LE_SRCH;
     return thread_kill(tid, sig);
+}
+
+/* rt_sigqueueinfo and rt_tgsigqueueinfo. The guest's siginfo gives si_code and si_value;
+ * the sender is the caller. Linux (do_rt_sigqueueinfo) refuses a non-negative si_code, and
+ * SI_TKILL, unless the target is the caller's own process: the kernel's own kinds of signal
+ * (kill(2), tgkill) cannot be forged for another process. */
+static int64_t sigqueue_args(uint64_t sig, uint64_t uinfo, int32_t *code, uint64_t *value)
+{
+    uint8_t b[128];
+    if (mem_copy_out(b, uinfo, sizeof b) < 0)
+        return -LE_FAULT;
+    if (sig > SIG_MAX)
+        return -LE_INVAL;
+    *code = (int32_t)get32(b + 8);
+    *value = get64(b + 24);
+    return 0;
+}
+
+static int forges_sender(int32_t code)
+{
+    return code >= 0 || code == SI_TKILL;
+}
+
+int64_t sig_rt_sigqueueinfo(uint64_t pid, uint64_t sig, uint64_t uinfo)
+{
+    int32_t code;
+    uint64_t value;
+    int64_t rc = sigqueue_args(sig, uinfo, &code, &value);
+    if (rc < 0)
+        return rc;
+    proc_t *me = proc_cur();
+    if ((int32_t)pid != me->pid && forges_sender(code))
+        return -LE_PERM;
+    proc_t *p = proc_find((int32_t)pid);
+    if (!p || p->zombie || p->exited)
+        return -LE_SRCH;
+    if (sig)
+        signal_process(p, (int)sig, code, (uint32_t)me->pid, value);
+    return 0;
+}
+
+int64_t sig_rt_tgsigqueueinfo(uint64_t tgid, uint64_t tid, uint64_t sig, uint64_t uinfo)
+{
+    int32_t code;
+    uint64_t value;
+    int64_t rc = sigqueue_args(sig, uinfo, &code, &value);
+    if (rc < 0)
+        return rc;
+    proc_t *me = proc_cur();
+    if ((int32_t)tgid != me->pid && forges_sender(code))
+        return -LE_PERM;
+    proc_t *p = proc_find((int32_t)tgid);
+    if (!p || p->zombie || p->exited)
+        return -LE_SRCH;
+    cpu_t *want = sched_find_thread((uint32_t)tid);
+    cpu_t *list[SCHED_MAX_THREADS];
+    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    int member = 0;
+    for (int i = 0; i < n && want; i++)
+        if (list[i] == want)
+            member = 1;
+    if (!want || !member)
+        return -LE_SRCH;
+    if (sig)
+        raise_for(want, (int)sig, code, (uint32_t)me->pid, value);
+    return 0;
 }
 
 /* rt_sigsuspend: replaces the mask with set and waits for a signal that is caught (or
@@ -585,7 +652,7 @@ int64_t sig_timedwait(cpu_t *c, uint64_t wanted, uint64_t info, int poll, int ha
     if (ready) {
         int sig = __builtin_ctzll(ready) + 1;
         c->sig_pending &= ~bit(sig);
-        if (info && write_siginfo(info, sig, c->sig_code[sig], c->sig_pid[sig]) < 0)
+        if (info && write_siginfo(info, sig, c->sig_code[sig], c->sig_pid[sig], c->sig_value[sig]) < 0)
             return -LE_FAULT;
         return sig;
     }

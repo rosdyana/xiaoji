@@ -21,6 +21,7 @@
 #include "poll.h"
 #include "procfs.h"
 #include "props.h"
+#include "selinuxfs.h"
 #include "proc.h"
 #include "sched.h"
 
@@ -135,6 +136,13 @@ static vfs_syn syn_of(const char *p)
     if (!strcmp(p, "/proc/self/cmdline")) return SYN_DATA;
     if (procfs_known(p)) return SYN_DATA; /* generated at open, see vfs_open */
     if (binder_device(p) >= 0) return SYN_BINDER;
+    switch (selinuxfs_kind(p)) {
+    case SELFS_FILE: return SYN_DATA;
+    case SELFS_DIR: return SYN_DIR;
+    case SELFS_STATUS: return SYN_SELFS_STATUS;
+    case SELFS_ACCESS: return SYN_SELFS_ACCESS;
+    default: break;
+    }
     return SYN_NONE;
 }
 
@@ -166,7 +174,7 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
         vfs_fd *f = vfs_get(dirfd);
         if (!f)
             return -LE_BADF;
-        if (f->kind != VFS_DIR && f->kind != VFS_PATH)
+        if (f->kind != VFS_DIR && f->kind != VFS_PATH && !(f->kind == VFS_SYN && f->syn == SYN_DIR))
             return -LE_NOTDIR;
         host_stat st;
         if (f->host) {
@@ -227,6 +235,15 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
         if (in_virtual(cand)) {
             /* Synthetic namespace: /dev, /proc and /sys are never read from the host. */
             vfs_syn s = syn_of(cand);
+            if (s == SYN_DIR) {
+                strcpy(cur, cand);
+                if (last) {
+                    out->exists = 1;
+                    out->syn = SYN_DIR;
+                    break;
+                }
+                continue;
+            }
             if (s != SYN_NONE) {
                 if (!last)
                     return -LE_NOTDIR;
@@ -236,6 +253,12 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 break;
             }
             if (procfs_dir(cand)) {
+                if (last)
+                    return -LE_NOENT;
+                strcpy(cur, cand);
+                continue;
+            }
+            if (!strcmp(cand, "/sys/fs")) { /* the parent of the selinux mount */
                 if (last)
                     return -LE_NOENT;
                 strcpy(cur, cand);
@@ -289,8 +312,9 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
             return -LE_NAMETOOLONG;
         host_stat st;
         int rc = host_stat_path(hp, 0, &st);
-        if (rc == -LE_NOENT && !last && !strcmp(cand, "/proc")) {
-            /* A host without /proc (macOS): the guest's /proc is synthetic. */
+        if (rc == -LE_NOENT && !last &&
+            (!strcmp(cand, "/proc") || !strcmp(cand, "/sys") || !strcmp(cand, "/sys/fs"))) {
+            /* A host without /proc or /sys (macOS): the guest's /proc and /sys are synthetic. */
             strcpy(cur, cand);
             continue;
         }
@@ -332,6 +356,12 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
             return -LE_NOTDIR;
         strcpy(cur, cand);
         out->exists = 1;
+    }
+
+    /* A path that ends in "." (perms/.) names the synthetic directory it was resolved to. */
+    if (out->syn == SYN_NONE && !out->is_link && selinuxfs_kind(cur) == SELFS_DIR) {
+        out->exists = 1;
+        out->syn = SYN_DIR;
     }
 
     /* Resolved: cur holds the canonical guest path. */
@@ -732,14 +762,36 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
+    if (r.syn == SYN_SELFS_STATUS) {
+        /* The selinux status page: a shared, read-only memfd (as the property area). */
+        memfd_t *m = selinuxfs_status_memfd();
+        if (!m)
+            return -LE_NOMEM;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_MEMFD;
+        f->mfd = m;
+        memfd_ref(m);
+        f->ro_area = 1;
+        f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
+        f->guest = xstrdup(r.guest);
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     if (r.syn != SYN_NONE) {
-        if (lflags & LO_DIRECTORY)
+        if (r.syn == SYN_DIR) {
+            if ((lflags & LO_ACCMODE) != LO_RDONLY)
+                return -LE_ISDIR;
+        } else if (lflags & LO_DIRECTORY) {
             return -LE_NOTDIR;
+        }
         /* Generated contents (/proc/self/stat and the like) are made before the slot is
          * taken, so a failure leaves the fd table alone. */
         uint8_t *gen = NULL;
         size_t glen = 0;
         if (r.syn == SYN_DATA && procfs_known(r.guest) && procfs_read(r.guest, &gen, &glen) < 0)
+            return -LE_NOMEM;
+        if (r.syn == SYN_DATA && selinuxfs_kind(r.guest) == SELFS_FILE &&
+            selinuxfs_read(r.guest, &gen, &glen) < 0)
             return -LE_NOMEM;
         vfs_fd *f = desc_new();
         f->kind = VFS_SYN;
@@ -839,7 +891,10 @@ static int64_t syn_read(vfs_fd *f, void *buf, size_t n, uint64_t off, int use_of
     case SYN_RANDOM:
         host_random(buf, n);
         return (int64_t)n;
-    case SYN_DATA: {
+    case SYN_DIR:
+        return -LE_ISDIR;
+    case SYN_DATA:
+    case SYN_SELFS_ACCESS: {
         uint64_t p = use_off ? off : f->dpos;
         if (p >= f->dlen)
             return 0;
@@ -918,6 +973,20 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     case VFS_PATH: return -LE_BADF;
     case VFS_DIR: return -LE_ISDIR;
     case VFS_SYN:
+        if (f->syn == SYN_DIR)
+            return -LE_ISDIR;
+        if (f->syn == SYN_SELFS_ACCESS) {
+            /* A request: the reply is what the next read returns, from the start. */
+            uint8_t *reply;
+            size_t rlen;
+            if (selinuxfs_access((const char *)buf, n, &reply, &rlen) < 0)
+                return -LE_INVAL;
+            free(f->data);
+            f->data = reply;
+            f->dlen = rlen;
+            f->dpos = 0;
+            return (int64_t)n;
+        }
         if (f->syn == SYN_DATA)
             return -LE_BADF;
         return (int64_t)n; /* /dev/null, /dev/zero and /dev/random discard writes */
@@ -970,6 +1039,11 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
         }
         return -LE_INVAL;
     case VFS_SYN: {
+        if (f->syn == SYN_DIR) {
+            if (whence == 0 && off == 0)
+                f->dpos = 0; /* rewinddir */
+            return 0;
+        }
         if (f->syn != SYN_DATA)
             return 0;
         int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->dpos : (int64_t)f->dlen;
@@ -1018,11 +1092,48 @@ static uint8_t child_dtype(const char *dir_host, const char *name)
     }
 }
 
+/* getdents of a synthetic directory: ".", "..", then its children. dpos is the index of
+ * the next entry. */
+static int64_t syn_getdents(vfs_fd *f, uint8_t *buf, size_t cap)
+{
+    size_t w = 0;
+    for (;;) {
+        const char *name;
+        int is_dir = 1;
+        if (f->dpos == 0) {
+            name = ".";
+        } else if (f->dpos == 1) {
+            name = "..";
+        } else if (!selinuxfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir)) {
+            break;
+        }
+        size_t nl = strlen(name);
+        size_t reclen = (19 + nl + 1 + 7) & ~(size_t)7;
+        if (w + reclen > cap) {
+            if (w == 0)
+                return -LE_INVAL;
+            break;
+        }
+        uint8_t *r = buf + w;
+        memset(r, 0, reclen);
+        put_u64(r, 0x1100 + f->dpos);
+        put_u64(r + 8, f->dpos + 1);
+        put_u16(r + 16, (uint16_t)reclen);
+        r[18] = (f->dpos < 2 || is_dir) ? 4 : 8; /* DT_DIR or DT_REG */
+        memcpy(r + 19, name, nl + 1);
+        w += reclen;
+        f->dpos++;
+    }
+    return (int64_t)w;
+}
+
 int64_t vfs_getdents(int fd, uint8_t *buf, size_t cap)
 {
     vfs_fd *f = vfs_get(fd);
     if (!f)
         return -LE_BADF;
+    if (f->kind == VFS_SYN && f->syn == SYN_DIR)
+        return syn_getdents(f, buf, cap);
     if (f->kind == VFS_PATH)
         return -LE_BADF;
     if (f->kind != VFS_DIR)
@@ -1123,6 +1234,7 @@ static void synthetic_stat(vfs_syn s, uint64_t size, host_stat *out)
     out->atime_s = out->mtime_s = out->ctime_s = 0;
     switch (s) {
     case SYN_NULL: out->mode = LS_IFCHR | 0666; out->rdev = 0x103; out->ino = 0x1001; break;
+    case SYN_DIR: out->mode = LS_IFDIR | 0555; out->ino = 0x1005; break;
     case SYN_ZERO: out->mode = LS_IFCHR | 0666; out->rdev = 0x105; out->ino = 0x1002; break;
     case SYN_RANDOM: out->mode = LS_IFCHR | 0666; out->rdev = 0x109; out->ino = 0x1003; break;
     default: out->mode = LS_IFREG | 0444; out->ino = 0x1004; break;

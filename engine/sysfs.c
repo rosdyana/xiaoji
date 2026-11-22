@@ -16,6 +16,7 @@
 #include "signals.h"
 #include "syscall.h"
 #include "props.h"
+#include "selinuxfs.h"
 #include "vfs.h"
 
 #define SYS_GETCWD 17
@@ -142,11 +143,11 @@ static int64_t copy_statx(uint64_t va, const host_stat *s)
 }
 
 /* struct statfs, 120 bytes. */
-static int64_t copy_statfs(uint64_t va, const host_statfs *s)
+static int64_t copy_statfs(uint64_t va, const host_statfs *s, uint64_t ftype)
 {
     uint8_t b[120];
     memset(b, 0, sizeof b);
-    put_u64(b + 0, STATFS_EXT4_MAGIC);
+    put_u64(b + 0, ftype);
     put_u64(b + 8, s->bsize);
     put_u64(b + 16, s->blocks);
     put_u64(b + 24, s->bfree);
@@ -623,7 +624,8 @@ static int64_t sys_statfs(uint64_t a0, uint64_t a1)
         if (rc)
             return rc;
     }
-    return copy_statfs(a1, &sf);
+    /* The selinux mount reports its own magic (libselinux checks it before using the mount). */
+    return copy_statfs(a1, &sf, selinuxfs_kind(r.guest) != SELFS_NONE ? SELINUX_MAGIC : STATFS_EXT4_MAGIC);
 }
 
 static int64_t sys_fstatfs(uint64_t fd, uint64_t buf)
@@ -632,7 +634,7 @@ static int64_t sys_fstatfs(uint64_t fd, uint64_t buf)
     int rc = vfs_statfs_fd((int)(int32_t)fd, &sf);
     if (rc)
         return rc;
-    return copy_statfs(buf, &sf);
+    return copy_statfs(buf, &sf, STATFS_EXT4_MAGIC);
 }
 
 static int64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t cnt)

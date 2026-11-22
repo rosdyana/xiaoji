@@ -23,6 +23,8 @@ int64_t sig_sigaltstack(cpu_t *c, uint64_t ss, uint64_t oss);
 int64_t sig_kill(uint64_t pid, uint64_t sig);
 int64_t sig_tkill(uint64_t tid, uint64_t sig);
 int64_t sig_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig);
+int64_t sig_rt_sigqueueinfo(uint64_t pid, uint64_t sig, uint64_t uinfo);
+int64_t sig_rt_tgsigqueueinfo(uint64_t tgid, uint64_t tid, uint64_t sig, uint64_t uinfo);
 /* execve, for the calling thread c: handlers reset to the default (ignored ones stay). */
 void sig_exec_reset(cpu_t *c);
 /* Raises sig for the running thread, as a kernel-generated signal (SIGPIPE). */

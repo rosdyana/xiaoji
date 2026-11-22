@@ -517,176 +517,214 @@ the source matches it.
   room for runtime properties.
 - `getprop -T`/`-Z` (needs `property_info`) and SELinux are not modelled.
 
-## B3: the binder driver, epoll, eventfd and timerfd
+## B3: the binder driver, servicemanager, epoll, eventfd and timerfd
 
-Status: **driver and event objects done (uncommitted); servicemanager does not run
-yet.** `binderDriverInterfaceTest` passes 14 of its 17 cases. The other three need a
-context manager, which only servicemanager provides on a device, and this engine cannot
-start servicemanager yet (see "What blocks servicemanager"). `evt`, a freestanding test of
-eventfd, epoll, timerfd and ppoll, matches Linux byte for byte.
+Status: **done up to the checkpoints.** The real `/system/bin/servicemanager` runs as the
+binder context manager. `service list` shows `manager`, and `service check manager` finds it.
+`binderDriverInterfaceTest` passes all 17 cases with servicemanager running, in the engine and
+in Node. `binderLibTest` runs case by case with servicemanager and its forked servers:
+48 gtest cases in the report: 26 pass, 7 fail, 1 is skipped (Freeze), 10 pass their test body and then hang in TearDown until the watchdog kills them, and 4 parameterized RPC names match no test ("0 tests", counted as passed by the script, not real passes). `binderSafeInterfaceTest` and `binderThroughputTest` were not run
+in this pass. Nothing is committed.
 
 ### Design as built
 
-- **Files.** `engine/binder.c` and `engine/binder.h` (the driver), `engine/poll.c` and
-  `engine/poll.h` (readiness, ppoll, epoll), `engine/fdobj.c` and `engine/fdobj.h`
-  (eventfd and timerfd objects). Hooks: `engine/vfs.c` and `vfs.h` (new fd kinds
-  `VFS_BINDER`, `VFS_EVENTFD`, `VFS_TIMERFD`, `VFS_EPOLL`, a synthetic device kind, the
-  generic `vfs_fd.obj` and `binder` fields, `vfs_obj_new`, and the fd-passing helpers
-  `vfs_desc_hold`, `vfs_desc_install` and `vfs_desc_drop`), `engine/sysfs.c` (ioctl and
-  the new syscalls), `engine/syscall.c` (the binder mmap), `engine/sched.c` (restart
-  waits with a deadline), `engine/pipe.c` (readiness and notification).
+- **Files.** `engine/binder.c` and `binder.h` (the driver), `engine/poll.c` and `poll.h`
+  (readiness, ppoll, epoll), `engine/fdobj.c` and `fdobj.h` (eventfd and timerfd),
+  `engine/selinuxfs.c` and `selinuxfs.h` (the synthetic selinuxfs). Hooks: `engine/vfs.c`
+  and `vfs.h` (fd kinds, synthetic directories and files, `vfs_resolve`), `engine/sysfs.c`
+  (ioctl, statfs, the new syscalls), `engine/syscall.c`, `engine/signals.c` and `signals.h`
+  (sigqueue, the per-signal value), `engine/procfs.c` (`attr/current`), `engine/sched.c`,
+  `engine/pipe.c`.
 - **Devices.** `/dev/binder`, `/dev/hwbinder` and `/dev/vndbinder` are synthetic
-  (`SYN_BINDER`). Each is a separate context with its own context manager. Each `open` is
-  a `bproc` (one per description), so the last close of a description (`desc_unref`) is
-  the proc's death. `fork` shares descriptions, as Linux does for any fd.
-- **Receive buffer.** `mmap` of a binder fd creates a memfd of the mapping's size (at
-  most 4 MiB) and maps it as a shared view, so the engine writes the buffer through the
-  memfd and the guest reads it. Only one mapping per proc (EBUSY). `PROT_WRITE` is EPERM.
-  A read-only `MAP_PRIVATE` mapping is served as the shared view: libbinder maps
-  `MAP_PRIVATE|PROT_READ`, and a read-only private view never copies, so it sees the same
-  bytes. Buffers come from a first-fit allocator over the mapping; `BC_FREE_BUFFER`
-  releases them and gives back the counts their HANDLE objects hold.
+  (`SYN_BINDER`). Each is a separate context with its own context manager. Each `open` is a
+  `bproc` (one per open description), and the last close of a description is the proc's
+  death. `fork` shares descriptions, as Linux does for any fd.
+- **Receive buffer.** `mmap` of a binder fd creates a memfd of the mapping's size (at most
+  4 MiB) and maps it as a shared view. Only one mapping per proc. `PROT_WRITE` is EPERM.
+  A read-only `MAP_PRIVATE` mapping is served as the shared view, as libbinder maps it.
+  Buffers come from a first-fit allocator; `BC_FREE_BUFFER` releases them.
 - **ioctl.** `BINDER_WRITE_READ`, `VERSION` (protocol 8), `SET_MAX_THREADS`,
   `SET_CONTEXT_MGR` and `SET_CONTEXT_MGR_EXT`, `THREAD_EXIT`, `GET_NODE_INFO_FOR_REF`,
   `GET_NODE_DEBUG_INFO`, `ENABLE_ONEWAY_SPAM_DETECTION` (accepted), `GET_FROZEN_INFO`
   (zeros). `SET_IDLE_TIMEOUT` and `SET_IDLE_PRIORITY` are EINVAL, as the test expects.
-  `FREEZE` is EINVAL (not modelled). This UAPI header has no `GET_EXTENDED_ERROR`, so
-  that call is ENOTTY. The ioctl numbers are computed from the arm64 encoding and match
+  `FREEZE` is EINVAL (not modelled). The ioctl numbers match
   `bionic/libc/kernel/uapi/linux/android/binder.h` on the remote AOSP tree.
-- **Commands and returns.** All `BC_` commands in the plan, the `_SG` variants
-  (their buffers are copied, see below), and the `BR_` returns in the plan. `BR_NOOP` leads
-  each read, as in the driver. A read that finds nothing returns EAGAIN with `read_consumed`
-  0, or waits.
-- **Blocking.** A read with no work waits with `sched_block_restart`: a thread with a
-  sent or received call waits on its own key, and any other thread waits on the proc's
-  key. The write half is consumed first, and `write_consumed` is written to guest memory
-  before the wait, so the restart skips it. `poll_notify` and the queue functions wake the
-  keys.
-- **Nodes, refs, counts.** A node belongs to the proc that created it. A ref maps a
-  handle in one proc to a node. Handle 0 is the context manager, and its ref is made on
-  first use. Counts follow the driver's model: a ref's strong and weak counts, the node's
-  internal counts, and the owner's `has_*` and `pend_*` acknowledgements, which produce
-  `BR_ACQUIRE`, `BR_INCREFS`, `BR_RELEASE` and `BR_DECREFS` to the owner.
-- **Transactions.** The data and the offsets are copied into the receiver's buffer. Each
-  object is translated: BINDER and WEAK_BINDER become handles in the receiver (or the
-  binder back, when the receiver owns the node); HANDLE and WEAK_HANDLE become binders in
-  the owner and handles elsewhere; FD holds the description, and the receiver installs it
-  (cloexec) when it reads the transaction; PTR copies its buffer into the receiver's buffer,
-  and FDA's fds are held the same way. Offsets must be 4-aligned, increasing and inside
-  the data. A synchronous call waits for its reply: `BR_TRANSACTION_COMPLETE` first, then
-  `BR_REPLY`. A nested call goes to the thread the caller is already serving in the target
-  proc, as the driver does. A oneway call queues on its node, one in flight at a time.
+- **Commands and returns.** The `BC_` and `BR_` commands in the plan. `BR_NOOP` leads each
+  read. A read with no work waits with `sched_block_restart`. A synchronous caller's read
+  waits on its own key, and an idle looper's read waits on the proc's key.
+- **Nodes, refs, counts.** A node belongs to the proc that created it. A ref maps a handle
+  in one proc to a node. Handle 0 is the context manager. Strong and weak counts follow the
+  driver's model: a ref's counts, the node's internal counts, and the owner's `has_*` and
+  `pend_*` acknowledgements, which produce `BR_ACQUIRE`, `BR_INCREFS`, `BR_RELEASE` and
+  `BR_DECREFS` to the owner.
+- **Transactions.** Data and offsets are copied into the receiver's buffer, and each object
+  is translated: BINDER and WEAK_BINDER become handles in the receiver (or the binder back,
+  when the receiver owns the node); HANDLE and WEAK_HANDLE become binders in the owner and
+  handles elsewhere; FD holds the description, which the receiver installs (cloexec); PTR
+  copies its buffer; FDA's fds are held the same way. A synchronous call waits for its
+  reply: `BR_TRANSACTION_COMPLETE` first, then `BR_REPLY`. A nested call goes to the thread
+  the caller is serving in the target proc. A oneway call queues on its node.
 - **Death.** A proc that closes marks its nodes dead. Refs holding a death notification get
-  `BR_DEAD_BINDER`. Requests it had in hand fail for their senders with `BR_DEAD_REPLY`.
-  `BC_CLEAR_DEATH_NOTIFICATION` answers `BR_CLEAR_DEATH_NOTIFICATION_DONE` on the thread.
+  `BR_DEAD_BINDER`. Requests it held fail for their senders with `BR_DEAD_REPLY`.
+- **Thread pool.** `BR_SPAWN_LOOPER` is sent when a looper's read returns items, no other
+  looper is idle (blocked for proc work), the proc has fewer started loopers than
+  `SET_MAX_THREADS`, and no spawn is pending. The read starts with a `BR_NOOP` word; the
+  spawn overwrites that word, so it arrives before the returns. A read that already returned
+  items (it does not start the buffer) sends none. `BC_REGISTER_LOOPER` clears the pending
+  spawn and counts a started looper. A spawn was observed once in the `binderLibTest`
+  PtrSize run (the spawn log line, checked with a temporary print that has been removed).
 - **ppoll, epoll, eventfd, timerfd** (`fdobj.c`, `poll.c`). One key serves every poll
-  waiter, and each readiness change calls `poll_notify`, so waiters re-check. A timed wait
-  stores its absolute deadline per thread, so a rerun keeps the timeout. A restart wait
-  has an optional deadline (`sched_block_restart_until`), and a timerfd read waits until
-  its next expiry. epoll is level-triggered, with a 16-byte `epoll_event` (u32 events, u64
-  data at offset 8). eventfd2 supports EFD_SEMAPHORE, EFD_NONBLOCK and EFD_CLOEXEC.
-  timerfd supports CLOCK_MONOTONIC and CLOCK_BOOTTIME, relative and absolute values, and
-  intervals. Both clocks are the host's monotonic clock, as `clock_gettime` is.
-- **Choices the tests forced.** The conformance test expects a context manager for handle 0,
-  and it expects a handle-0 ref for `REQUEST_DEATH_NOTIFICATION`, so handle 0 resolves
-  to the context manager and its ref is made on demand. The `MAP_PRIVATE|PROT_READ` view
-  described above. No Linux driver source is on the remote machine (`find` found none), so
-  the semantics come from the UAPI header and the test's expectations.
+  waiter, and each readiness change calls `poll_notify`. epoll is level-triggered, with a
+  16-byte `epoll_event`. eventfd2 supports EFD_SEMAPHORE, EFD_NONBLOCK and EFD_CLOEXEC.
+  timerfd supports CLOCK_MONOTONIC and CLOCK_BOOTTIME, relative and absolute, and intervals.
+  Both clocks are the host's monotonic clock.
 
-### Conformance: binderDriverInterfaceTest
+### The SELinux decision (permissive, with a synthetic selinuxfs)
 
-Run: `build/xiaoji --root build/rootfs -- /data/nativetest64/binderDriverInterfaceTest/binderDriverInterfaceTest --gtest_brief=1`
+servicemanager's `Access::Access` (`frameworks/native/cmds/servicemanager/Access.cpp:91`)
+does `CHECK(selinux_status_open(true) >= 0)`, and its checks go through `selinux_check_access`.
+The plan asked for "disabled" if libselinux would short-circuit on it. It would not:
 
-- **Passed without the three context-manager cases (14):** Version, OpenNoMmap,
-  WriteReadNull, SetIdleTimeoutNull, SetMaxThreadsNull, SetIdlePriorityNull, VersionNull,
-  SetIdleTimeoutNoTest, SetMaxThreads, SetIdlePriorityNoTest, ThreadExit, WriteReadEmpty,
-  Read and IncRefsAcquireReleaseDecRefs.
-- **Full run, in order: 14 passed, 3 failed.**
-  - `SetContextMgrBusy` (failed): the test expects another proc to be the context manager
-    (the device has servicemanager). With none, the call succeeds, so this process becomes
-    the context manager. Failure is EXPECT `ret == -1`, got 0.
-  - `IncRefsAcquireReleaseDecRefs` (failed): a knock-on effect. Once the test process is
-    its own context manager, its `BC_INCREFS` on handle 0 makes a ref to itself, and the
-    read then carries `BR_INCREFS`. Run on its own (filter below), it passes.
-  - `Transaction` (failed): needs a reply from the context manager to a PING on handle 0.
-    With none, the driver answers `BR_DEAD_REPLY`, and the test's poll times out after
-    10 s.
-- **Skipped in `tests/run.sh`, with the reason:** `SetContextMgrBusy`, `Transaction` and
-  `RequestDeathNotification` need a context manager. Run without them, the other 14 pass
-  (the filter `-*SetContextMgrBusy:*.Transaction:*.RequestDeathNotification`), in the
-  engine and in Node. The three are not verified against a context manager yet. In the
-  full run `RequestDeathNotification` passes only because the test process is its own
-  context manager.
+- `external/selinux/libselinux/src/enabled.c`: on Android, `is_selinux_enabled()` is
+  `selinux_mnt ? 1 : 0`.
+- `sestatus.c`: `selinux_status_open()` returns -1 with ENOENT when `selinux_mnt` is NULL, so
+  the CHECK fails unless the mount exists. Creating the mount makes `is_selinux_enabled()`
+  return 1.
+- `checkAccess.c`: `selinux_check_access` returns 0 (allow) only when
+  `is_selinux_enabled() != 1`. With the mount present, the check goes through the AVC.
 
-### Other binder binaries
+So SELinux is presented as **enabled, permissive (enforce 0), and allow-all**, through
+a synthetic selinuxfs at `/sys/fs/selinux`, with:
 
-- `binderLibTest`: every case hangs at setup (exit by the 240 s limit, no output). A trace
-  of `WasParceled` shows the test looping on `BINDER_WRITE_READ` with `nanosleep` and
-  `socket` (logd) calls between: libbinder's `defaultServiceManager` retrying until a
-  context manager answers. The same cause as above. 0 of 42 cases run.
-- `binderSafeInterfaceTest` and `binderThroughputTest`: both hang at the 60 s limit, the
-  same way (not diagnosed further).
+- `status`: the `struct selinux_kernel_status` page, a shared memfd: version 1, sequence 2
+  (even, stable), enforcing 0, policyload 0, deny_unknown 1.
+- `enforce` "0", `deny_unknown` "1", `reject_unknown` "0", `policyvers` "30",
+  `checkreqprot` "0", `mls` "0".
+- `access`: a write of `scon tcon kclass perm` is answered by a read of
+  `allowed decided auditallow auditdeny seqno flags`, with allowed = the requested bits.
+- `class/service_manager/index` "60", and `class/service_manager/perms/{add,find,list}` =
+  1, 2, 3 (libselinux maps value v to bit v-1). Its `discover_class` reads `readdir` entries,
+  including `.`, and opens `perms/.`, which must resolve to a directory.
+- Every process's context is `u:r:kernel:s0`: `/proc/<pid>/attr/current`,
+  `/proc/self/attr/current` and `/proc/thread-self/attr/current` report it (no newline), and
+  the binder secctx carries it (it was an empty string, which made every caller's context
+  empty).
+- The mount reports `SELINUX_MAGIC` from `statfs` on its path. verify_selinuxmnt needs the
+  magic and a mount that is not `ST_RDONLY`, so the mount is **read-write**, not read-only as
+  the plan said. Only `access` accepts writes; it is a request and reply file.
 
-### What blocks servicemanager
+**Evidence:** servicemanager stays up under `epoll_pwait` and registers `manager`. With the
+mount missing, the trace showed the two `statfs` calls for the SELinux mount returning ENOENT,
+which is why `/sys/fs` is a synthetic parent (the fix was in `vfs_resolve`). The
+`perms/.` case returned ENOENT before the trailing `.` fix. Guest `cat` and `ls -l` show the
+files with modes and owners. The `binder-sm` expectation shows `manager` listed and found.
 
-`/system/bin/servicemanager` gets as far as `ProcessState::initWithDriver`: its mmap of
-`/dev/binder` works now, and its `BINDER_SET_MAX_THREADS`, `ENABLE_ONEWAY_SPAM_DETECTION`
-and `VERSION` ioctls succeed. Then `Access::Access` (`frameworks/native/cmds/servicemanager/
-Access.cpp`) runs `CHECK(selinux_status_open(true) >= 0)`. The engine has no
-`/sys/fs/selinux`, and libselinux's netlink fallback is refused (`socket` returns
-EPROTONOSUPPORT), so the check fails. The fatal path calls `rt_tgsigqueueinfo` (240), which
-the engine does not implement. Nothing in the plan provides SELinux status, so it is not
-added here. The next step is a decision: either a read-only `/sys/fs/selinux/status` page
-that reports SELinux as disabled, or another route for libselinux. The `binder-sm` case
-(`servicemanager & sleep 1; service list; kill %1`) is therefore not in `tests/run.sh` yet.
+Known gaps in this choice: deny_unknown is 1, so an unknown class or permission is denied
+(only `service_manager` is defined). `fstatfs` on an fd of the mount does not report the
+SELinux magic (only the path form does). There is no policy: every check is allowed.
 
-### Tests added
+### Binder fixes found while running servicemanager and binderLibTest
 
-- `tests/guest/evt.c`: freestanding. eventfd (counter and semaphore modes, EAGAIN, EINVAL
-  for a short read), epoll (add, duplicate add, wait empty and ready, modify, delete, and
-  the errors), a timerfd (armed state, a timed `epoll_pwait` woken by its expiry, a
-  blocking read), `ppoll` (timeout and ready), and a blocking eventfd read woken by a
-  forked child. Its output is `tests/expect/evt.out`, which is the output of the same
-  binary on Linux (the builder VM). Both the engine and Node match.
-- `tests/run.sh`: the `evt` expectation (engine and Node), and the binder driver's 14
-  cases (engine and Node), plus the SKIP line for the three.
+- **The context manager's counts are acknowledged at creation** (`mgr_counts_acked`). The
+  driver's `binder_become_context_manager` sets `has_strong_ref` and `has_weak_ref`. Without
+  this, a reference to the manager's node sent `BR_INCREFS` with ptr and cookie 0, and
+  servicemanager's libbinder incremented a null weakref (`IPCThreadState::executeCommand`,
+  then `RefBase::weakref_type::incWeak` at `this` = 0). This fixed the crash that blocked
+  `service list`.
+- **A count a transaction gives to its sender's node goes to the sending thread**
+  (`xl_sender`, set around the send and the reply translation). The driver queues these to the
+  sender's `todo` list (`binder_inc_node` with the sender's list). The proc's list is not read
+  by a thread waiting for its reply, so `addService` of a server's local `BBinder` never gave
+  it a strong ref. The server's `sp` was then the last one, and its destructor
+  (`BinderLibTestService::~BinderLibTestService`, which calls `exit(0)`) ran at the end of
+  `run_server`.
+- **Replies carry their flags** (`TF_STATUS_CODE`). `SetError` expects the status in
+  the reply.
+- **Handles** are written as the whole 64-bit field, with the cookie zero, as
+  `CheckHandleZeroBinderHighBitsZeroCookie` expects.
+
+### Signals: rt_sigqueueinfo (138) and rt_tgsigqueueinfo (240)
+
+Both deliver the signal with the guest's `si_code` and `si_value` (offset 24 of the
+siginfo), and the caller as the sender. The per-signal value is stored and written in the
+handler frame and in `rt_sigtimedwait`'s siginfo, where it was `si_status` for SIGCHLD
+(the same offset). For `rt_sigqueueinfo`, a non-negative `si_code`, or `SI_TKILL`, to another
+process is EPERM, as I recall the rule from `do_rt_sigqueueinfo` in `kernel/signal.c`. No
+kernel source is on the remote machine to check it against, so this rule is unverified. The
+path exercised is `abort()` (a `rt_tgsigqueueinfo` with `SI_QUEUE`, which is delivered).
+
+### Conformance and tests
+
+- `binderDriverInterfaceTest`: **17 of 17**, with servicemanager running. In
+  `tests/run.sh` as `binder-driver 17 cases`, in the engine and in Node.
+- `binder-sm` (`tests/run.sh`, `PROP_CASES`, expected output `tests/expect/binder-sm.out`):
+  `servicemanager & wait-until-ready; service list; service check manager; kill; wait`.
+  Expected: `Found 1 services:`, `0<TAB>manager: [android.os.IServiceManager]`,
+  `Service manager: found`. The exit status is 0. Engine and Node.
+- The wait for readiness (`SM_WAIT` in `tests/run.sh`) polls `service check manager` for up
+  to about 10 s. servicemanager is stopped with SIGTERM (it has no handler) and `wait`ed. The
+  engine prints `killed by signal 15` on stderr for it; stdout is unaffected.
+- `binderLibTest`: `tests/binderlib.sh` runs each case in its own guest process under a
+  watchdog (LIMIT seconds, then SIGKILL), with servicemanager running. Its per-case lines go
+  to `build/tests/out/binderlib.txt`. The run is **report only** and off by default:
+  `XIAOJI_BINDERLIB=1 tests/run.sh` turns it on. It never changes the fail count.
 
 ### Results (B3)
 
-- `make test`: **122 passed, 0 failed, 0 xfail.** The 114 from B2, plus `evt-O0` and
-  `evt-O2` (engine and Node: 4), plus the `evt` expectation (2), plus the 14 binder cases
-  (2).
-- `XIAOJI_JIT=0 tests/run.sh`: **122 passed, 0 failed, 0 xfail.**
+- `make test`: **124 passed, 0 failed** (122 before, minus the 14-case binder entry, plus the
+  17-case entry and `binder-sm`, each in engine and Node).
+- `XIAOJI_JIT=0 tests/run.sh`: **124 passed, 0 failed**.
 - `make test-web`: all checks passed.
-- Warnings: `clang -Wall -Wextra -Wno-unused-parameter -c` on each changed or new engine
-  file: 0 warnings. `emcc -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -c` on
-  `binder.c`, `poll.c`, `fdobj.c`, `vfs.c`, `sysfs.c`, `syscall.c`, `sched.c` and `pipe.c`:
-  0 warnings. The `POLL_IN`/`POLL_OUT` names clashed with macOS `<sys/signal.h>`, so the
-  poll bits are `PX_*`.
+- binderLibTest (report run, engine): 
+  - **Pass (26):** CannotUseBinderAfterFork, WasParceled, NopTransaction, NopTransactionOneway,
+    NopTransactionClear, SetError, GetId, CallBack, BinderCallContextGuard,
+    DeathNotificationStrongRef, PassFile, PassParcelFileDescriptor, PromoteLocal,
+    LocalGetExtension, CheckHandleZeroBinderHighBitsZeroCookie, CheckNoHeaderMappedInUser,
+    WorkSourceUnsetByDefault, WorkSourceSet, WorkSourceSetWithoutPropagation,
+    WorkSourceCleared, WorkSourceRestored, PropagateFlagSet, PropagateFlagCleared,
+    PropagateFlagRestored, WorkSourcePropagatedForAllFollowingBinderCalls,
+    ServiceNotifications.Unregister.
+  - **Skipped (1):** Freeze (the cgroup freezer file is absent, so the test skips itself).
+  - **Body ok, hangs in TearDown (10):** PtrSize, IndirectGetId2, IndirectGetId3, AddServer,
+    DeathNotificationMultiple, DeathNotificationThread, RemoteGetExtension, VectorSent,
+    BufRejected, WeakRejected. Cause: see Gaps.
+  - **Fail (7):**
+    - SchedPolicySet and InheritRt: the engine does not implement `sched_getparam` (121) and
+      `sched_setscheduler` (119). Cause known; not implemented in this pass.
+    - FreedBinder: an earlier run gave `FAILED_TRANSACTION` (-2147483646) where the test
+      expects -32, and a SIGSEGV at address 0x4 in libutils. Not investigated further.
+    - OnewayQueueing: fails and is killed by the watchdog. Not investigated.
+    - GotSid: fails. Not investigated (the sender's security context is `u:r:kernel:s0`).
+    - SetRpcClientDebug and SetRpcClientDebugTwice: binder RPC needs sockets the engine does
+      not provide (`BinderLibRpcTest`). Not investigated.
+  - **Matches no test (4):** the `BinderLibTest/BinderLibRpcTestP.*` names, which the per-case
+    filter does not match.
+- Warnings: `clang -Wall -Wextra -Wno-unused-parameter -c` on each changed engine file
+  (`binder.c`, `signals.c`, `vfs.c`, `selinuxfs.c`, `procfs.c`, `sysfs.c`, `syscall.c`): 0
+  warnings. `emcc -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -c` on the same files:
+  0 warnings.
 
 ### Gaps (B3)
 
-- **servicemanager does not run** (see above). The `binder-sm` case and `service list` are
-  not done.
-- **Three conformance cases are unverified** (they need a context manager). The other
-  binderLibTest, binderSafeInterfaceTest and binderThroughputTest cases do not run.
-- **Not exercised by any test here:** oneway queueing, fd passing (FD and FDA), PTR
-  scatter-gather (`BC_TRANSACTION_SG`), the security context (`BR_TRANSACTION_SEC_CTX`),
-  death notifications beyond the request and clear pair, and the count acknowledgements
-  (`BC_ACQUIRE_DONE`, `BC_INCREFS_DONE`). They are implemented from the model, not checked.
-- `BR_SPAWN_LOOPER` is never sent (`SET_MAX_THREADS` is recorded and not used), so a proc
-  with no idle looper waits rather than asking for a new one.
-- `BC_ATTEMPT_ACQUIRE` and `BC_ACQUIRE_RESULT` are accepted and ignored. `BR_ATTEMPT_ACQUIRE`
-  is never sent.
-- Threads leave the proc when `BINDER_THREAD_EXIT` runs or when the proc closes. A guest
-  thread that exits without it keeps its (empty) entry until the proc closes.
-- A `REQUEST_DEATH` ref with no counts stays until the proc closes.
-- `eventfd` writes that would overflow return EAGAIN even on a blocking fd (a blocking
-  write is not modelled). Reads block.
-- `ppoll` ignores its signal mask. `epoll` is level-triggered only: EPOLLET and EPOLLONESHOT
-  are stored but behave as level-triggered. Nested epoll is not reported as readable.
-- Sockets are always reported readable and writable (their reads never block by design,
-  for the property service). A real readiness check for AF_UNIX is not written.
-- `timerfd` and `eventfd` on a fd that is `fstat`ed or `fchmod`ed are not checked (their
-  host fd is -1).
+- **binderLibTest is not fully green.** The per-case list above is the state; the causes
+  are listed under it. A case whose body passes and then hangs in TearDown is the largest
+  group. TearDown sends `EXIT` (oneway) to the main server, then waits for the server's pid.
+  The server's `EXIT` handler waits for its children, which are the servers that `addServer`
+  forked. Those children exit only when their last strong ref is released. A temporary log
+  of node count changes (removed) showed decrements reaching zero for some nodes, but I did
+  not find which child's count is kept. This is the known cause for that group, not fixed.
+- **Not run:** `binderSafeInterfaceTest`, `binderThroughputTest`.
+- **Not verified by any run:** oneway queueing order, fd passing (FD and FDA), PTR
+  scatter-gather (`BC_TRANSACTION_SG`), `BR_TRANSACTION_SEC_CTX` beyond the fixed context,
+  death notifications beyond the request and clear pair, the count acknowledgements
+  (`BC_ACQUIRE_DONE`, `BC_INCREFS_DONE`) in general, and the sigqueue EPERM path.
+- **Reply path counts.** Only the sender's thread is used for a transaction's counts. The
+  reply path uses the same rule, but no test here checks a reply that carries a binder.
+- `BC_ATTEMPT_ACQUIRE` and `BC_ACQUIRE_RESULT` are accepted and ignored.
+- `eventfd` writes that would overflow return EAGAIN even on a blocking fd. `ppoll` ignores
+  its signal mask. epoll is level-triggered only.
+- Threads leave the proc when `BINDER_THREAD_EXIT` runs or when the proc closes.
 - The clock is the host's monotonic clock. `CLOCK_REALTIME` timers are EINVAL.
+- The engine's AF_UNIX DGRAM sockets (liblog's logd path) are refused (EPROTONOSUPPORT), so
+  Android log lines from servicemanager and binderLibTest do not reach a log. Errors that
+  servicemanager logs are therefore invisible, and the CHECK messages are lost.

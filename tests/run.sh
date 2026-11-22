@@ -252,7 +252,11 @@ fi
 # so there is no oracle; stdout must equal tests/expect/<name>.out and the exit code
 # must be 0. Properties live in the engine process, so each case is one sh -c, where
 # setprop and getprop share the store.
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt"
+# Binder (B3): the real servicemanager is the context manager. A binder case starts it in
+# the background, waits until "service check manager" finds it (up to about 10 s), runs,
+# then kills it and waits, so the engine exits. $! is the servicemanager pid.
+SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -261,6 +265,7 @@ prop_argv() {
     prop-list) ARGV=(/system/bin/sh -c 'n=$(/system/bin/getprop | /system/bin/toybox grep -c "^\["); names=$(/system/bin/getprop | /system/bin/toybox sed "s/^\[\([^]]*\)\].*/\1/"); sorted=$(printf "%s\n" "$names" | /system/bin/toybox sort); if [ "$n" -gt 100 ] && [ "$names" = "$sorted" ]; then echo above 100 and sorted; fi') ;;
     prop-wait) ARGV=(/data/local/tmp/prop-wait) ;;
     evt) ARGV=(/data/local/tmp/evt) ;;
+    binder-sm) ARGV=(/system/bin/sh -c "/system/bin/servicemanager & $SM_WAIT; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0") ;;
     esac
 }
 
@@ -312,30 +317,52 @@ if [ -d build/rootfs/system/bin ]; then
     done
 fi
 
-# Binder (B3): the AOSP driver conformance test. Three cases need a context manager
-# (the device runs servicemanager as one); this engine cannot run servicemanager yet
-# (its Access constructor needs SELinux status, see docs/boot.md, B3), so they are
-# skipped here and reported. The other 14 must pass, in the engine and in Node.
+# Binder (B3): the AOSP driver conformance test, all cases, with the real servicemanager as
+# the context manager (SM_WAIT above). The engine and Node must both report 17 passed.
 BINDER_TEST=/data/nativetest64/binderDriverInterfaceTest/binderDriverInterfaceTest
-BINDER_FILTER='-*SetContextMgrBusy:*.Transaction:*.RequestDeathNotification'
+BINDER_SH="/system/bin/servicemanager & $SM_WAIT; $BINDER_TEST --gtest_brief=1; rc=\$?; kill \$!; wait; exit \$rc"
 if [ -f "build/rootfs$BINDER_TEST" ]; then
     for runner in engine node; do
         if [ "$runner" = engine ]; then
-            "$ENGINE" --root build/rootfs -- "$BINDER_TEST" --gtest_brief=1 --gtest_filter="$BINDER_FILTER" >"$OUT/binder.$runner.out" 2>&1
+            "$ENGINE" --root build/rootfs -- /system/bin/sh -c "$BINDER_SH" >"$OUT/binder.$runner.out" 2>&1
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --root build/rootfs -- "$BINDER_TEST" --gtest_brief=1 --gtest_filter="$BINDER_FILTER" >"$OUT/binder.$runner.out" 2>&1
+            node "$NODE_JS" --root build/rootfs -- /system/bin/sh -c "$BINDER_SH" >"$OUT/binder.$runner.out" 2>&1
         else
             continue
         fi
-        if grep -q '\[  PASSED  \] 14 tests\.' "$OUT/binder.$runner.out"; then
-            echo "PASS  binder-driver 14 cases $runner"
+        if grep -q '\[  PASSED  \] 17 tests\.' "$OUT/binder.$runner.out"; then
+            echo "PASS  binder-driver 17 cases $runner"
             pass=$((pass + 1))
         else
-            echo "FAIL  binder-driver 14 cases $runner"
+            echo "FAIL  binder-driver 17 cases $runner"
             fail=$((fail + 1))
         fi
     done
-    echo "SKIP  binder-driver SetContextMgrBusy, Transaction, RequestDeathNotification: need a context manager (servicemanager, docs/boot.md B3)"
+fi
+
+# binderLibTest (B3): libbinder end to end, with the real servicemanager and the forked
+# servers. Report only, not a gate (a stretch goal, docs/boot.md B3): each case runs in its
+# own process (tests/binderlib.sh), the per-case lines go to build/tests/out/binderlib.txt,
+# and the counts are printed. Engine only, and it never changes the fail count. Off by
+# default (XIAOJI_BINDERLIB=1 turns it on): a case that hangs in teardown is left to the
+# per-case watchdog, and the whole run takes long.
+BL_TEST=/data/nativetest64/binderLibTest/binderLibTest
+if [ -f "build/rootfs$BL_TEST" ] && [ "${XIAOJI_BINDERLIB:-0}" != 1 ]; then
+    echo "note  binderLibTest report skipped (set XIAOJI_BINDERLIB=1; it is slow, docs/boot.md B3)"
+elif [ -f "build/rootfs$BL_TEST" ]; then
+    mkdir -p build/rootfs/data/local/tmp
+    cp tests/binderlib.sh build/rootfs/data/local/tmp/binderlib.sh
+    BL_SH="/system/bin/servicemanager & $SM_WAIT; LIMIT=20 /system/bin/sh /data/local/tmp/binderlib.sh; kill \$!; wait \$!; exit 0"
+    "$ENGINE" --root build/rootfs -- /system/bin/sh -c "$BL_SH" >"$OUT/binderlib.txt" 2>&1
+    awk '/ rc=[0-9]+ /{
+            t++
+            if ($0 ~ / rc=0 \[  PASSED/) p++
+            else if ($0 ~ /\[  FAILED/) f++
+            else if ($0 ~ /\[  SKIPPED/) k++
+            else if ($0 ~ /body ok, no summary/) h++
+            else o++
+         }
+         END { printf "INFO  binderLibTest (report only): %d cases: %d passed, %d failed, %d skipped, %d body ok but no summary (hung after the body), %d no result\n", t, p, f, k, h, o }' "$OUT/binderlib.txt"
 fi
 
 echo

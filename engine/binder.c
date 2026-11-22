@@ -13,6 +13,7 @@
  *
  * The engine runs one guest thread at a time, so there are no locks. */
 #include "binder.h"
+#include "selinuxfs.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -83,6 +84,7 @@
 #define BR_RELEASE IOC_(IOC_R, 'r', 9, 16)
 #define BR_DECREFS IOC_(IOC_R, 'r', 10, 16)
 #define BR_NOOP IOC_(IOC_NONE, 'r', 12, 0)
+#define BR_SPAWN_LOOPER IOC_(IOC_NONE, 'r', 13, 0)
 #define BR_DEAD_BINDER IOC_(IOC_R, 'r', 15, 8)
 #define BR_CLEAR_DEATH_NOTIFICATION_DONE IOC_(IOC_R, 'r', 16, 8)
 #define BR_FAILED_REPLY IOC_(IOC_NONE, 'r', 17, 0)
@@ -199,6 +201,7 @@ struct bthread {
     uint64_t tid;
     bproc_t *proc;
     int looper;
+    int waiting_proc; /* blocked for proc work (an idle looper), as of its last read */
     bq_t todo;
     btxn_t *sent, *recv;
     bthread_t *next;
@@ -220,6 +223,8 @@ struct bproc {
     balloc_t *allocs;
     bq_t todo;
     uint32_t max_threads;
+    uint32_t requested_threads; /* BR_SPAWN_LOOPER sent, not yet registered */
+    uint32_t started_threads;   /* loopers registered with BC_REGISTER_LOOPER */
 };
 
 static bctx_t contexts[NDEV];
@@ -310,13 +315,23 @@ static void queue_proc(bproc_t *p, bwork_t *w)
     poll_notify();
 }
 
+/* The thread whose transaction is being translated, while it is (else NULL). A count the
+ * transaction gives to its own sender's node (the sender owns the binder it sends) goes to
+ * that thread: a thread waiting for its reply reads its own work, not the proc's, as the
+ * driver does (binder_inc_node with the sender's todo list). */
+static bthread_t *xl_sender;
+
 /* Tells a node's owner about a count (BR_INCREFS, BR_ACQUIRE, BR_RELEASE, BR_DECREFS). */
 static void node_notify_owner(bnode_t *n, uint32_t br)
 {
     if (!n->proc || n->proc->closing)
         return;
     bwork_t *w = work_new(WK_OBJREF, br, n->ptr, n->cookie, NULL);
-    if (w)
+    if (!w)
+        return;
+    if (xl_sender && xl_sender->proc == n->proc)
+        queue_thread(xl_sender, w);
+    else
         queue_proc(n->proc, w);
 }
 
@@ -425,6 +440,18 @@ static bref_t *ref_for_handle(bproc_t *b, uint32_t h)
 }
 
 /* ---------- counts ---------- */
+
+/* The context manager's node starts with its strong and weak counts acknowledged by its
+ * owner (the driver's binder_become_context_manager sets has_strong_ref and has_weak_ref).
+ * Without this, a reference to it would send BR_INCREFS with ptr and cookie 0 to the
+ * owner, and libbinder would increment a null weakref. */
+static void mgr_counts_acked(bnode_t *n)
+{
+    n->int_strong = 1;
+    n->int_weak = 1;
+    n->has_strong = 1;
+    n->has_weak = 1;
+}
 
 static void node_inc(bnode_t *n, int strong)
 {
@@ -663,7 +690,8 @@ static int xl_binder(xlate_t *x, uint8_t *obj, int strong, bnode_t *n)
     }
     ref_inc(r, strong);
     st32(obj, strong ? OBJ_HANDLE : OBJ_WEAK_HANDLE);
-    st32(obj + 8, r->desc);
+    st64(obj + 8, r->desc);
+    st64(obj + 16, 0);
     return 0;
 }
 
@@ -857,8 +885,9 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
     }
     uint64_t secctx_at = 0, total = x.sg_end;
     if (secctx) {
+        /* The context string (SELINUX_CTX and its NUL, 14 bytes) fits in 16. */
         secctx_at = ALIGN8(x.sg_end);
-        total = secctx_at + 8;
+        total = secctx_at + 16;
     }
     if (total < 8)
         total = 8;
@@ -898,8 +927,8 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
             goto out_t;
         }
     if (secctx) {
-        uint8_t zero = 0;
-        if (buf_write(dst, a->off + secctx_at, &zero, 1) < 0) {
+        /* The sender's context, as the driver supplies it: every process is SELINUX_CTX. */
+        if (buf_write(dst, a->off + secctx_at, SELINUX_CTX, sizeof SELINUX_CTX) < 0) {
             *err = -LE_NOMEM;
             goto out_t;
         }
@@ -1096,11 +1125,14 @@ static int proc_has_work(bproc_t *b, bthread_t *t, int *wait_proc)
 /* The read half of BINDER_WRITE_READ for thread t. Returns 0 (with *consumed updated),
  * -LE_AGAIN for a nonblocking fd with nothing to read, or -LE_* on an error. A call with
  * nothing to do and a blocking fd sets *block and the wait key instead. */
+static int spawn_wanted(bproc_t *b, bthread_t *t);
+
 static int64_t bread(bproc_t *b, bthread_t *t, uint64_t buf, uint64_t size, uint64_t *consumed,
                      int nonblock, int *block, uint64_t *key)
 {
     uint64_t start = *consumed, cur = start;
     int items = 0;
+    t->waiting_proc = 0; /* a rerun after a block starts again from here */
     if (start == 0 && size >= 4) {
         uint8_t noop[4];
         st32(noop, BR_NOOP);
@@ -1133,12 +1165,35 @@ static int64_t bread(bproc_t *b, bthread_t *t, uint64_t buf, uint64_t size, uint
         if (nonblock)
             return -LE_AGAIN;
         int wait_proc = !t->sent && !t->recv;
+        t->waiting_proc = wait_proc;
         *block = 1;
         *key = wait_proc ? key_of(b) : key_of(t);
         return 0;
     }
+    /* BR_SPAWN_LOOPER: a looper returns with the proc short of idle loopers, under its
+     * maximum, and no spawn pending. The driver writes it at the start of the buffer, over
+     * the leading BR_NOOP; a read that already returned items (start != 0) sends none. */
+    if (start == 0 && cur > 4 && spawn_wanted(b, t)) {
+        uint8_t sp[4];
+        st32(sp, BR_SPAWN_LOOPER);
+        if (mem_copy_in(buf, sp, 4) < 0)
+            return -LE_FAULT;
+        b->requested_threads++;
+    }
     *consumed = cur;
     return 0;
+}
+
+/* Whether a looper that is returning from a read should ask for a new looper: no other
+ * looper is idle, the proc is under its maximum, and no spawn is pending. */
+static int spawn_wanted(bproc_t *b, bthread_t *t)
+{
+    if (!t->looper || b->requested_threads || b->started_threads >= b->max_threads)
+        return 0;
+    for (bthread_t *o = b->threads; o; o = o->next)
+        if (o != t && o->waiting_proc)
+            return 0;
+    return 1;
 }
 
 /* The write half: each command in turn. Returns a -LE_* for a malformed buffer. */
@@ -1219,11 +1274,15 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
             sent_remove(s, orig);
         int err = 0;
         btxn_t *rep = NULL;
-        if (s && s->proc->mapped)
+        if (s && s->proc->mapped) {
+            xl_sender = t;
             rep = txn_build(b, s->proc, d, 0, &err);
+            xl_sender = NULL;
+        }
         if (s) {
             if (rep) {
                 rep->reply = 1;
+                rep->flags = d->flags;
                 rep->to = s;
                 rep->sender_pid = proc_cur()->pid;
                 bwork_t *w = work_new(WK_REPLY, BR_REPLY, 0, 0, rep);
@@ -1259,7 +1318,9 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     int oneway = (d->flags & TF_ONE_WAY) != 0;
     int secctx = node == dst->ctx->mgr && dst->ctx->mgr_ext;
     int err = 0;
+    xl_sender = t;
     btxn_t *x = txn_build(b, dst, d, secctx, &err);
+    xl_sender = NULL;
     if (!x) {
         queue_failed(t, BR_FAILED_REPLY);
         return;
@@ -1412,6 +1473,11 @@ static int bcmd(bproc_t *b, bthread_t *t, uint32_t cmd, const uint8_t *arg)
         return 0;
     }
     case BC_REGISTER_LOOPER:
+        if (b->requested_threads)
+            b->requested_threads--;
+        b->started_threads++;
+        t->looper = 1;
+        return 0;
     case BC_ENTER_LOOPER:
         t->looper = 1;
         return 0;
@@ -1495,6 +1561,7 @@ int64_t binder_ioctl(binder_proc_t *b, uint32_t cmd, uint64_t arg, int nonblock)
         bnode_t *n = node_new(b, 0, 0, 0);
         if (!n)
             return -LE_NOMEM;
+        mgr_counts_acked(n);
         b->ctx->mgr = n;
         b->ctx->mgr_ext = 0;
         return 0;
@@ -1507,6 +1574,7 @@ int64_t binder_ioctl(binder_proc_t *b, uint32_t cmd, uint64_t arg, int nonblock)
         bnode_t *n = node_new(b, ld64(buf + 8), ld64(buf + 16), ld32(buf + 4));
         if (!n)
             return -LE_NOMEM;
+        mgr_counts_acked(n);
         b->ctx->mgr = n;
         b->ctx->mgr_ext = 1;
         return 0;

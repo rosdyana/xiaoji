@@ -30,7 +30,8 @@ typedef struct cpu {
     uint64_t sig_pending;     /* raised for this thread, not yet delivered */
     int32_t sig_code[65];     /* si_code of each pending signal, by signal number */
     uint32_t sig_pid[65];     /* si_pid of each pending signal, by signal number */
-    int32_t sig_status[65];   /* si_status of each pending signal (SIGCHLD: the child's status) */
+    uint64_t sig_value[65];   /* the siginfo word at offset 24 of each pending signal: si_value
+                                 (sigqueue) or si_status (SIGCHLD: the child's status) */
     uint64_t sig_wait_set;    /* rt_sigtimedwait: the set being waited for */
     uint64_t sig_wait_info;   /* rt_sigtimedwait: guest siginfo pointer, or 0 */
     uint64_t alt_sp;          /* sigaltstack: ss_sp and ss_size (size 0 means none) */
