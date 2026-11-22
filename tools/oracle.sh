@@ -48,6 +48,11 @@ run() {  # name, command run by the guest's /system/bin/sh
 ONLY=${1:-}
 run toybox-echo "exec /system/bin/toybox echo hi from bionic"
 run toybox-ls   "exec /system/bin/toybox ls /system/bin/linker64"
+run toybox-uname "exec /system/bin/toybox uname -m"
+run toybox-wc   "exec /system/bin/toybox wc -c /system/build.prop"
+run toybox-sha  "exec /system/bin/toybox sha256sum /apex/com.android.runtime/bin/linker64"
+run toybox-lsdir "exec /system/bin/toybox ls /apex/com.android.art/bin"
+run toybox-cat  "exec /system/bin/toybox cat /system/etc/hosts"
 run sh-arith    'echo $((6*7))'
 run hello-int   "exec /apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art -cp /data/hello.dex Hello"
 run hello-jit   "exec /apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art -cp /data/hello.dex Hello"

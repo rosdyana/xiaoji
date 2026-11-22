@@ -1,4 +1,5 @@
-/* xiaoji engine entry point: parse arguments, load a static AArch64 program, run it. */
+/* xiaoji engine entry point: parse arguments, load an AArch64 program (static,
+ * or dynamic with its interpreter), run it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,17 +8,20 @@
 #include "elf.h"
 #include "host.h"
 #include "loader.h"
+#include "mem.h"
 #include "syscall.h"
+#include "vfs.h"
 
 #define MAX_ENV 256
+#define DYN_BASE 0x555555550000ull   /* ET_DYN programs */
+#define INTERP_BASE 0x7FF000000000ull /* PT_INTERP interpreters */
 
-/* Accepted for the M1 rootfs mapping; not used in M0. */
-static const char *g_root = "build/rootfs";
+static const char *g_root = NULL; /* NULL: the host root "/" */
 
 static int usage(FILE *out)
 {
     fputs("usage: xiaoji [--root DIR] [--env K=V]... [--trace] [--] /path/in/guest [args...]\n"
-          "  --root DIR   guest root directory (default build/rootfs; unused until M1)\n"
+          "  --root DIR   guest root directory (default: the host root /)\n"
           "  --env K=V    add a guest environment variable\n"
           "  --trace      print each syscall and its result to stderr\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
@@ -28,7 +32,7 @@ static int usage(FILE *out)
 int main(int argc, char **argv)
 {
     char *envs[MAX_ENV];
-    int nenv = 0, trace = 0;
+    int nenv = 0, trace = 0, root_given = 0;
     int i = 1;
 
     for (; i < argc; i++) {
@@ -43,6 +47,7 @@ int main(int argc, char **argv)
             if (i + 1 >= argc)
                 return usage(stderr);
             g_root = argv[++i];
+            root_given = 1;
             continue;
         }
         if (!strcmp(a, "--env")) {
@@ -61,33 +66,68 @@ int main(int argc, char **argv)
     }
     if (i >= argc)
         return usage(stderr);
-    (void)g_root; /* read by the M1 rootfs mapping */
 
     char **gargv = &argv[i];
     int gargc = argc - i;
     const char *path = gargv[0];
 
+    if (vfs_init(g_root, path, gargc, gargv) < 0) {
+        fprintf(stderr, "xiaoji: root path too long\n");
+        return 2;
+    }
+
+    /* With no --root, a relative program path is a host path (the M0 tests). */
     uint8_t *img = NULL;
     size_t len = 0;
-    if (host_read_file(path, &img, &len) < 0) {
+    char canon[VFS_PATH_MAX];
+    int rc;
+    if (!root_given && path[0] != '/') {
+        if (host_read_file(path, &img, &len) < 0) {
+            fprintf(stderr, "xiaoji: cannot read %s\n", path);
+            return 127;
+        }
+        strncpy(canon, path, sizeof canon - 1);
+        canon[sizeof canon - 1] = 0;
+    } else if (vfs_load_file(path, &img, &len, canon, sizeof canon) < 0) {
         fprintf(stderr, "xiaoji: cannot read %s\n", path);
         return 127;
     }
+    vfs_set_prog(canon);
+
     elf_info ei;
-    int rc = elf_load(img, len, path, &ei);
+    rc = elf_load(img, len, path, DYN_BASE, &ei);
     free(img);
     if (rc)
         return rc;
 
+    uint64_t entry = ei.entry, at_base = 0;
+    if (ei.interp[0]) {
+        uint8_t *iimg = NULL;
+        size_t ilen = 0;
+        char icanon[VFS_PATH_MAX];
+        if (vfs_load_file(ei.interp, &iimg, &ilen, icanon, sizeof icanon) < 0) {
+            fprintf(stderr, "xiaoji: cannot read interpreter %s\n", ei.interp);
+            return 127;
+        }
+        elf_info ii;
+        rc = elf_load(iimg, ilen, ei.interp, INTERP_BASE, &ii);
+        free(iimg);
+        if (rc)
+            return rc;
+        entry = ii.entry;
+        at_base = ii.base;
+    }
+
     syscall_init(ei.brk);
+    syscall_set_comm(gargv[0]);
     static cpu_t cpu;
     cpu_t *c = &cpu;
     c->trace = trace;
-    if (loader_setup_stack(c, &ei, gargc, gargv, nenv, envs) < 0) {
+    if (loader_setup_stack(c, &ei, at_base, gargc, gargv, nenv, envs) < 0) {
         fprintf(stderr, "xiaoji: cannot set up the guest stack\n");
         return 126;
     }
-    c->pc = ei.entry;
+    c->pc = entry;
 
     const char *stats_env = getenv("XIAOJI_STATS");
     int stats = stats_env && stats_env[0] == '1';

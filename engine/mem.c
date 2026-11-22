@@ -1,4 +1,5 @@
-/* Guest memory: two-level software page table with a direct-mapped TLB.
+/* Guest memory: two-level software page table with a direct-mapped TLB, and a
+ * sorted list of mapped regions.
  *
  * A guest address is first masked to 56 bits (the top byte is an ignored tag).
  * Bits 48..55 must then be zero, otherwise the access is a segfault.
@@ -8,6 +9,10 @@
  * host page pointer (4 KiB aligned, so the low 12 bits are free) ORed with the
  * flags R=1, W=2, X=4, MAPPED=8. A MAPPED page with a NULL pointer has no
  * backing yet; it gets a zeroed host page on first permitted access.
+ *
+ * The region list is the source of truth for occupancy (mem_find_free is a walk
+ * over regions, not pages) and records file backing per range. Regions are
+ * disjoint and sorted by start. Adjacent anonymous regions are merged.
  *
  * Tables store the host pointer as a uint64 so the layout is the same on
  * 32-bit wasm and 64-bit hosts. Host pages are read and written with memcpy,
@@ -32,11 +37,18 @@
 #define L2_COUNT (1u << 18)
 #define TLB_SIZE 256u
 #define MMAP_TOP 0x700000000000ull
+#define MMAP_LOW 0x10000ull
 
 typedef struct {
     uint64_t tag; /* vpn + 1; 0 means empty */
     uint8_t *page;
 } tlb_ent;
+
+typedef struct {
+    uint64_t start, end; /* [start, end), page aligned */
+    char *path;          /* host file backing, or NULL for anonymous memory */
+    uint64_t off;        /* file offset of start */
+} region_t;
 
 static uint64_t **l1;
 static tlb_ent tlb_rd[TLB_SIZE];
@@ -44,6 +56,9 @@ static tlb_ent tlb_wr[TLB_SIZE];
 static uint64_t fetch_tag;
 static uint8_t *fetch_page;
 static uint64_t cur_pc;
+
+static region_t *regs;
+static size_t nregs, cregs;
 
 static void die_oom(void)
 {
@@ -89,6 +104,132 @@ static void mem_segv(uint64_t va)
             (unsigned long long)cur_pc);
     exit(139);
 }
+
+/* ---------- region list ---------- */
+
+/* Index of the first region with end > va. */
+static size_t reg_lower(uint64_t va)
+{
+    size_t lo = 0, hi = nregs;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (regs[mid].end <= va)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static char *dup_path(const char *p)
+{
+    if (!p)
+        return NULL;
+    size_t n = strlen(p) + 1;
+    char *d = malloc(n);
+    if (!d)
+        die_oom();
+    memcpy(d, p, n);
+    return d;
+}
+
+/* Replaces regions[i..j) with n entries from src (n <= 2 is typical, but any n works). */
+static void reg_splice(size_t i, size_t j, const region_t *src, size_t n)
+{
+    size_t removed = j - i;
+    size_t want = nregs - removed + n;
+    if (want > cregs) {
+        size_t nc = cregs ? cregs : 64;
+        while (nc < want)
+            nc *= 2;
+        region_t *nr = realloc(regs, nc * sizeof *regs);
+        if (!nr)
+            die_oom();
+        regs = nr;
+        cregs = nc;
+    }
+    memmove(&regs[i + n], &regs[j], (nregs - j) * sizeof *regs);
+    for (size_t k = 0; k < n; k++)
+        regs[i + k] = src[k];
+    nregs = want;
+}
+
+/* Removes [a, b) from the region list, keeping the parts outside it. */
+static void reg_clear(uint64_t a, uint64_t b)
+{
+    size_t i = reg_lower(a), j = i;
+    while (j < nregs && regs[j].start < b)
+        j++;
+    if (i == j)
+        return;
+    region_t keep[2];
+    size_t nk = 0;
+    region_t first = regs[i], last = regs[j - 1];
+    if (first.start < a) {
+        keep[nk].start = first.start;
+        keep[nk].end = a;
+        keep[nk].path = dup_path(first.path);
+        keep[nk].off = first.off;
+        nk++;
+    }
+    if (last.end > b) {
+        keep[nk].start = b;
+        keep[nk].end = last.end;
+        keep[nk].path = dup_path(last.path);
+        keep[nk].off = last.off + (b - last.start);
+        nk++;
+    }
+    for (size_t k = i; k < j; k++)
+        free(regs[k].path);
+    reg_splice(i, j, keep, nk);
+}
+
+/* Inserts [a, b) with the given backing, replacing whatever was there. */
+static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off)
+{
+    reg_clear(a, b);
+    size_t i = reg_lower(a);
+    if (!path) {
+        /* Merge with anonymous neighbours so long-lived ranges stay one entry. */
+        if (i > 0 && regs[i - 1].end == a && !regs[i - 1].path) {
+            regs[i - 1].end = b;
+            if (i < nregs && regs[i].start == b && !regs[i].path) {
+                regs[i - 1].end = regs[i].end;
+                free(regs[i].path);
+                reg_splice(i, i + 1, NULL, 0);
+            }
+            return;
+        }
+        if (i < nregs && regs[i].start == b && !regs[i].path) {
+            regs[i].start = a;
+            return;
+        }
+    }
+    region_t r = {a, b, dup_path(path), off};
+    reg_splice(i, i, &r, 1);
+}
+
+unsigned mem_prot_at(uint64_t va)
+{
+    uint64_t *slot = pte_slot((va & VA_MASK) >> 12, 0);
+    if (!slot || !(*slot & PTE_MAPPED))
+        return 0;
+    return (unsigned)(*slot & 7u);
+}
+
+int mem_region_next(uint64_t va, uint64_t *start, uint64_t *end, const char **path, uint64_t *off)
+{
+    size_t i = reg_lower(va);
+    if (i >= nregs)
+        return 0;
+    *start = regs[i].start;
+    *end = regs[i].end;
+    *path = regs[i].path;
+    *off = regs[i].off;
+    return 1;
+}
+
+/* ---------- page access ---------- */
 
 /* Host page for vpn with the given permission, allocating backing if needed.
  * Returns NULL if the page is unmapped or lacks the permission. */
@@ -214,14 +355,22 @@ uint32_t mem_fetch32(uint64_t va)
     return v;
 }
 
-int mem_map(uint64_t va, uint64_t len, unsigned prot)
+/* ---------- mapping ---------- */
+
+static int range_ok(uint64_t va, uint64_t len)
 {
     if (va & (MEM_PAGE_SIZE - 1) || len & (MEM_PAGE_SIZE - 1))
-        return -1;
-    if (va >= MEM_VA_LIMIT || len > MEM_VA_LIMIT - va)
+        return 0;
+    return va < MEM_VA_LIMIT && len <= MEM_VA_LIMIT - va;
+}
+
+int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint64_t off)
+{
+    if (!range_ok(va, len))
         return -1;
     uint64_t first = va >> 12;
     uint64_t n = len >> 12;
+    reg_set(va, va + len, path, off);
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 1);
         uint64_t e = *slot;
@@ -231,10 +380,15 @@ int mem_map(uint64_t va, uint64_t len, unsigned prot)
     return 0;
 }
 
+int mem_map(uint64_t va, uint64_t len, unsigned prot) { return mem_map_ex(va, len, prot, NULL, 0); }
+
 void mem_unmap(uint64_t va, uint64_t len)
 {
+    if (!len)
+        return;
     uint64_t first = va >> 12;
     uint64_t n = len >> 12;
+    reg_clear(va, va + len);
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 0);
         if (!slot)
@@ -249,26 +403,20 @@ void mem_unmap(uint64_t va, uint64_t len)
 
 int mem_is_mapped(uint64_t va, uint64_t len)
 {
-    uint64_t first = va >> 12;
-    uint64_t n = len >> 12;
-    for (uint64_t i = 0; i < n; i++) {
-        uint64_t *slot = pte_slot(first + i, 0);
-        if (!slot || !(*slot & PTE_MAPPED))
+    uint64_t pos = va, end = va + len;
+    while (pos < end) {
+        size_t i = reg_lower(pos);
+        if (i >= nregs || regs[i].start > pos)
             return 0;
+        pos = regs[i].end;
     }
     return 1;
 }
 
 int mem_range_free(uint64_t va, uint64_t len)
 {
-    uint64_t first = va >> 12;
-    uint64_t n = len >> 12;
-    for (uint64_t i = 0; i < n; i++) {
-        uint64_t *slot = pte_slot(first + i, 0);
-        if (slot && (*slot & PTE_MAPPED))
-            return 0;
-    }
-    return 1;
+    size_t i = reg_lower(va);
+    return !(i < nregs && regs[i].start < va + len);
 }
 
 int mem_protect(uint64_t va, uint64_t len, unsigned prot)
@@ -292,25 +440,107 @@ uint64_t mem_find_free(uint64_t len, uint64_t hint)
     if (hint && !(hint & (MEM_PAGE_SIZE - 1)) && hint < MEM_VA_LIMIT && len <= MEM_VA_LIMIT - hint &&
         mem_range_free(hint, len))
         return hint;
+    /* Walk the gaps between regions, from the top down. */
     uint64_t top = MMAP_TOP;
-    for (;;) {
-        if (top < len)
-            return 0;
-        uint64_t start = top - len;
-        /* Find the highest mapped page inside [start, top). */
-        uint64_t conflict = 0;
-        for (uint64_t p = top - MEM_PAGE_SIZE;; p -= MEM_PAGE_SIZE) {
-            if (!mem_range_free(p, MEM_PAGE_SIZE)) {
-                conflict = p;
-                break;
-            }
-            if (p == start)
-                break;
-        }
-        if (!conflict)
-            return start;
-        top = conflict;
+    for (size_t i = nregs; i > 0; i--) {
+        region_t *r = &regs[i - 1];
+        if (r->start >= top)
+            continue;
+        if (r->end < top && top - r->end >= len)
+            return top - len;
+        top = r->start;
     }
+    if (top >= MMAP_LOW + len)
+        return top - len;
+    return 0;
+}
+
+int mem_move(uint64_t from, uint64_t to, uint64_t len)
+{
+    if (!range_ok(from, len) || !range_ok(to, len) || !mem_range_free(to, len))
+        return -1;
+    /* Region pieces inside the source range, clipped to it. */
+    size_t i = reg_lower(from), j = i;
+    while (j < nregs && regs[j].start < from + len)
+        j++;
+    size_t np = j - i;
+    region_t *pieces = NULL;
+    if (np) {
+        pieces = calloc(np, sizeof *pieces);
+        if (!pieces)
+            die_oom();
+        for (size_t k = 0; k < np; k++) {
+            region_t *r = &regs[i + k];
+            uint64_t s = r->start < from ? from : r->start;
+            uint64_t e = r->end > from + len ? from + len : r->end;
+            pieces[k].start = s - from + to;
+            pieces[k].end = e - from + to;
+            pieces[k].path = dup_path(r->path);
+            pieces[k].off = r->off + (s - r->start);
+        }
+    }
+    uint64_t first_src = from >> 12, first_dst = to >> 12, n = len >> 12;
+    for (uint64_t p = 0; p < n; p++) {
+        uint64_t *src = pte_slot(first_src + p, 0);
+        if (!src || !(*src & PTE_MAPPED))
+            continue;
+        uint64_t *dst = pte_slot(first_dst + p, 1);
+        *dst = *src;
+        *src = 0;
+    }
+    reg_clear(from, from + len);
+    for (size_t k = 0; k < np; k++) {
+        reg_set(pieces[k].start, pieces[k].end, pieces[k].path, pieces[k].off);
+        free(pieces[k].path);
+    }
+    free(pieces);
+    tlb_flush();
+    return 0;
+}
+
+void mem_drop(uint64_t va, uint64_t len)
+{
+    uint64_t first = va >> 12, n = len >> 12;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t *slot = pte_slot(first + i, 0);
+        if (!slot || !(*slot & PTE_MAPPED))
+            continue;
+        uint64_t e = *slot;
+        free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
+        *slot = e & PTE_FLAGS;
+    }
+    tlb_flush();
+}
+
+/* ---------- non-faulting copies ---------- */
+
+/* Host page for vpn, allocating backing, ignoring protection. NULL if unmapped. */
+static uint8_t *page_any(uint64_t vpn)
+{
+    uint64_t *slot = pte_slot(vpn, 0);
+    if (!slot || !(*slot & PTE_MAPPED))
+        return NULL;
+    return page_lookup(vpn, PTE_MAPPED);
+}
+
+int mem_poke(uint64_t va, const void *src, size_t len)
+{
+    const uint8_t *s = src;
+    while (len) {
+        uint64_t a = va & VA_MASK;
+        size_t off = (size_t)(a & (MEM_PAGE_SIZE - 1));
+        size_t chunk = MEM_PAGE_SIZE - off;
+        if (chunk > len)
+            chunk = len;
+        uint8_t *p = page_any(a >> 12);
+        if (!p)
+            return -1;
+        memcpy(p + off, s, chunk);
+        s += chunk;
+        va += chunk;
+        len -= chunk;
+    }
+    return 0;
 }
 
 int mem_copy_in(uint64_t va, const void *src, size_t len)

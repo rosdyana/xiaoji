@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "mem.h"
 
@@ -17,7 +18,6 @@
 #define PF_W 2
 #define PF_R 4
 #define PHDR_SIZE 56
-#define DYN_BASE 0x555555550000ull
 #define EXIT_LOAD_FAILED 126
 
 #define PAGE_DOWN(x) ((x) & ~(uint64_t)(MEM_PAGE_SIZE - 1))
@@ -54,8 +54,9 @@ static unsigned prot_of(uint32_t flags)
     return p;
 }
 
-int elf_load(const uint8_t *img, size_t len, const char *path, elf_info *info)
+int elf_load(const uint8_t *img, size_t len, const char *path, uint64_t dyn_base, elf_info *info)
 {
+    info->interp[0] = 0;
     if (len < 64 || img[0] != 0x7f || img[1] != 'E' || img[2] != 'L' || img[3] != 'F')
         return fail(path, "not an ELF file");
     if (img[4] != 2 || img[5] != 1)
@@ -88,23 +89,19 @@ int elf_load(const uint8_t *img, size_t len, const char *path, elf_info *info)
         ph[i].filesz = rd(p + 32, 8);
         ph[i].memsz = rd(p + 40, 8);
         if (ph[i].type == PT_INTERP) {
-            char interp[256] = "";
             uint64_t off = ph[i].offset;
+            size_t n = 0;
             if (off < len) {
-                size_t n = 0;
-                while (n + 1 < sizeof interp && off + n < len && img[off + n]) {
-                    interp[n] = (char)img[off + n];
+                while (n + 1 < sizeof info->interp && off + n < len && img[off + n]) {
+                    info->interp[n] = (char)img[off + n];
                     n++;
                 }
-                interp[n] = 0;
             }
-            fprintf(stderr, "xiaoji: dynamic executables need M1: PT_INTERP %s\n", interp);
-            free(ph);
-            return 126;
+            info->interp[n] = 0;
         }
     }
 
-    /* Load bias: 0 for ET_EXEC, otherwise the lowest segment goes to DYN_BASE. */
+    /* Load bias: 0 for ET_EXEC, otherwise the lowest segment goes to dyn_base. */
     uint64_t bias = 0;
     uint64_t lowest = ~0ull;
     for (unsigned i = 0; i < phnum; i++)
@@ -115,7 +112,7 @@ int elf_load(const uint8_t *img, size_t len, const char *path, elf_info *info)
             free(ph);
             return fail(path, "no loadable segments");
         }
-        bias = DYN_BASE - (lowest & ~0xFFFFull);
+        bias = dyn_base - (lowest & ~0xFFFFull);
     }
 
     uint64_t top = 0;
@@ -180,5 +177,6 @@ int elf_load(const uint8_t *img, size_t len, const char *path, elf_info *info)
     info->phent = PHDR_SIZE;
     info->phnum = phnum;
     info->brk = top;
+    info->base = bias;
     return 0;
 }

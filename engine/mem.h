@@ -1,4 +1,5 @@
-/* Guest memory: a software page table over host pages (see plan, "Memory model"). */
+/* Guest memory: a software page table over host pages, plus a sorted list of
+ * mapped regions (occupancy and file backing). */
 #ifndef XIAOJI_MEM_H
 #define XIAOJI_MEM_H
 
@@ -14,6 +15,9 @@
 /* Mapping. Addresses and lengths must be page aligned. Pages that are already
  * mapped keep their contents and get the new protection. Return 0 or -1. */
 int mem_map(uint64_t va, uint64_t len, unsigned prot);
+/* As mem_map, and records the range as backed by host file path from offset
+ * off (path NULL means anonymous). The path is copied. */
+int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint64_t off);
 void mem_unmap(uint64_t va, uint64_t len);
 /* Returns -1 (and changes nothing) if any page in the range is unmapped. */
 int mem_protect(uint64_t va, uint64_t len, unsigned prot);
@@ -24,6 +28,18 @@ int mem_range_free(uint64_t va, uint64_t len);
 /* Returns a free, page-aligned range of len bytes, preferring hint if it is free.
  * Searches downward from 0x7000_0000_0000. Returns 0 if nothing fits. */
 uint64_t mem_find_free(uint64_t len, uint64_t hint);
+/* Moves mapped pages (host pages and region records) from one free range to
+ * another without copying. The source range becomes unmapped. Returns 0 or -1. */
+int mem_move(uint64_t from, uint64_t to, uint64_t len);
+/* Releases the host backing of mapped pages in the range; they read as zero
+ * (or are refilled by the caller for file-backed pages). */
+void mem_drop(uint64_t va, uint64_t len);
+/* Protection bits (MEM_PROT_*) of the page at va, or 0 if it is unmapped. */
+unsigned mem_prot_at(uint64_t va);
+/* First region with end > va. Fills the region bounds, its file path (NULL if
+ * anonymous; valid until the next mapping change) and its file offset at start.
+ * Returns 0 if there is none. */
+int mem_region_next(uint64_t va, uint64_t *start, uint64_t *end, const char **path, uint64_t *off);
 
 /* Guest-side accesses. These never return on a fault: they print the segfault
  * message and exit with status 139. Little-endian, unaligned and page-crossing
@@ -48,6 +64,9 @@ void mem_set_pc(uint64_t pc);
 int mem_copy_in(uint64_t va, const void *src, size_t len);
 int mem_copy_out(void *dst, uint64_t va, size_t len);
 int mem_set(uint64_t va, uint8_t byte, size_t len);
+/* Writes ignoring page protection (the pages must be mapped). The loader and
+ * file-backed mappings use it before the final protection is applied. */
+int mem_poke(uint64_t va, const void *src, size_t len);
 /* Length of the NUL-terminated string at va, or -1 on a fault. */
 int64_t mem_strlen(uint64_t va);
 

@@ -1,0 +1,79 @@
+/* Guest filesystem: path resolution inside the guest root, the guest fd table,
+ * and synthetic files. Every function returns a Linux errno as -LE_* on failure.
+ * Only host.c translates host errno values. */
+#ifndef XIAOJI_VFS_H
+#define XIAOJI_VFS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "host.h"
+
+#define VFS_PATH_MAX 4096
+#define VFS_MAX_FD 1024
+
+typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN } vfs_kind;
+typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA } vfs_syn;
+
+typedef struct {
+    int used;
+    int cloexec;
+    vfs_kind kind;
+    vfs_syn syn;
+    int hfd;         /* host fd, or -1 (O_PATH without access, and synthetic files) */
+    uint32_t lflags; /* Linux open flags, as F_GETFL reports them */
+    char *guest;     /* canonical guest path */
+    char *host;      /* host path, or NULL for fds 0 to 2 and synthetic files */
+    uint8_t *data;   /* SYN_DATA contents */
+    size_t dlen;
+    uint64_t dpos;
+    void *dir;       /* DIR * for directories, opened by the first getdents64 */
+    uint64_t nent;   /* directory entries returned so far */
+} vfs_fd;
+
+typedef struct {
+    int exists;          /* the final component exists on the host or is synthetic */
+    int is_link;         /* the final component is a symlink that was not followed */
+    vfs_syn syn;         /* SYN_NONE for host files */
+    char guest[VFS_PATH_MAX]; /* canonical guest path (or the link itself) */
+    char host[VFS_PATH_MAX];  /* host path for guest[] */
+    char target[VFS_PATH_MAX]; /* link target when is_link */
+} vfs_res;
+
+/* host_root NULL means the host root "/". prog is the guest path of the
+ * program (for /proc/self/exe) and argv its arguments (for /proc/self/cmdline). */
+int vfs_init(const char *host_root, const char *prog, int argc, char **argv);
+
+/* Resolves path (relative to dirfd, or the guest cwd for LAT_FDCWD) component by
+ * component inside the root. follow=0 leaves a final symlink unresolved. */
+int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out);
+
+/* Sets the guest path of the program (what /proc/self/exe reads as). */
+void vfs_set_prog(const char *guest);
+
+int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode);
+int vfs_close(int fd);
+int64_t vfs_read(int fd, void *buf, size_t n);
+int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off);
+int64_t vfs_write(int fd, const void *buf, size_t n);
+int64_t vfs_lseek(int fd, int64_t off, int whence);
+/* dup: exact=0 takes the lowest free fd >= minfd; exact=1 uses minfd and closes it. */
+int vfs_dup(int oldfd, int minfd, int exact, int cloexec);
+vfs_fd *vfs_get(int fd);
+/* Linux dirent64 records into buf. Returns the byte count or -LE_*. */
+int64_t vfs_getdents(int fd, uint8_t *buf, size_t cap);
+
+/* The guest cwd, copied with its NUL. Returns the length or -LE_RANGE. */
+int vfs_getcwd(char *buf, size_t cap);
+int vfs_chdir(const char *path);
+int vfs_fchdir(int fd);
+
+int vfs_stat_res(const vfs_res *r, host_stat *out);
+int vfs_stat_fd(int fd, host_stat *out);
+int vfs_statfs_fd(int fd, host_statfs *out);
+
+/* Reads a program or interpreter through the guest namespace. canon receives
+ * its canonical guest path. */
+int vfs_load_file(const char *path, uint8_t **data, size_t *len, char *canon, size_t cap);
+
+#endif

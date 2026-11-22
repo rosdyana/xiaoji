@@ -41,7 +41,8 @@ static int push_bytes(uint64_t *sp, const void *data, size_t len, uint64_t *va_o
     return 0;
 }
 
-int loader_setup_stack(cpu_t *c, const elf_info *ei, int argc, char **argv, int envc, char **envp)
+int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc, char **argv, int envc,
+                       char **envp)
 {
     uint64_t base = STACK_TOP - STACK_SIZE;
     if (mem_map(base, STACK_SIZE, MEM_PROT_R | MEM_PROT_W) < 0)
@@ -75,7 +76,7 @@ int loader_setup_stack(cpu_t *c, const elf_info *ei, int argc, char **argv, int 
     AUX(AT_PHENT, ei->phent);
     AUX(AT_PHNUM, ei->phnum);
     AUX(AT_PAGESZ, 4096);
-    AUX(AT_BASE, 0);
+    AUX(AT_BASE, at_base);
     AUX(AT_FLAGS, 0);
     AUX(AT_ENTRY, ei->entry);
     AUX(AT_UID, 1000);

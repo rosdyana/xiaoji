@@ -121,3 +121,139 @@ Notes from bringing up M0:
 - Guest tests are built with `-mno-outline-atomics`. Without it gcc 14 emits calls to `__aarch64_ldadd*` helpers that `-nostdlib` cannot link.
 - Test loops are written so gcc emits no NEON code (volatile indices and volatile byte accesses). The engine rejects vector data processing.
 - Accesses with address bits 48 to 55 set (after masking the top byte) are a segfault, exit 139.
+
+## M1 results
+
+M1 adds the guest filesystem (`engine/vfs.c`), the fd table, PT_INTERP loading,
+file mappings, the M1 syscalls (`engine/sysfs.c`, `engine/syscall.c`) and the
+AdvSIMD and FP instructions that bionic and toybox execute. The exit check passes:
+`build/xiaoji --root build/rootfs -- /system/bin/toybox echo hi from bionic`
+prints `hi from bionic` and exits 0.
+
+Conditions for the timings: `pmset -g` showed `lowpowermode 1`, and the Mac was on
+"Battery Power" (about 52%, discharging).
+
+### Test summary (`make test`: 40 passed, 0 failed, 0 xfail)
+
+| Case | Engine (macOS) | Node (wasm) |
+|---|---|---|
+| M0 programs: `args`, `arith`, `control`, `hello`, `memory` (O0, O2) | PASS | PASS |
+| `glibc_hello-O2` (XFAIL in M0; the SIMD it needed is now implemented) | PASS | PASS |
+| `simd-O0`, `simd-O2` (787 result lines each, identical to native) | PASS | PASS |
+| `toybox-echo`, `-ls`, `-uname`, `-wc`, `-sha`, `-lsdir`, `-cat` | PASS | PASS |
+
+Per runner: 20 passed, 0 failed. The 20 are 10 M0 programs, `glibc_hello-O2`,
+the two SIMD programs and the seven rootfs cases. `sh-arith` (M2) and the `hello`
+cases (M3) are not in the pass list.
+
+The `-Wall -Wextra` check: `clang` and `emcc` both build every engine file with no
+warnings (`-std=c11`). The Makefile's emcc lines do not pass `-Wall -Wextra`, so the
+check was run by hand per file.
+
+### `toybox sha256sum` (`XIAOJI_STATS=1`, linker64, 3 runs each)
+
+| Runner | Instructions | Time | Rate |
+|---|---|---|---|
+| Native (macOS arm64, `build/xiaoji`) | 67,592,270 to 67,592,781 | 0.758 to 0.759 s | 89.0 to 89.1 M instructions/s |
+| Node (`build/wasm-node/xiaoji.js`) | 67,592,310 to 67,594,690 | 1.270 to 1.295 s | 52.2 to 53.2 M instructions/s |
+
+The output matches the oracle hash `8b01da90...`. The instruction counts vary by a
+few hundred because of `getrandom` and the allocator's randomized placement.
+
+### Syscall trace against the oracle
+
+Both `toybox echo` and `toybox sha256sum` were traced with `--trace` and compared
+with the oracle straces, by name and by the sign of the return value, after the
+toybox `execve`:
+
+- The file-related syscalls (`openat`, `close`, `fstat`, `newfstatat`, `readlinkat`,
+  `read`, `pread64`, `write`) match the oracle, except as listed below.
+- `prctl(PR_SET_VMA)` returns 0 in the engine and -EINVAL in the oracle. The plan
+  specifies 0. It does not change output.
+- `prctl(PR_GET_DUMPABLE)` (10 calls) and `prctl(PR_SET_TAGGED_ADDR_CTRL)` (1 call)
+  return -EINVAL, which is the plan's rule for other options. The oracle returns 1 and
+  0. Output does not change.
+- The oracle opens `/proc/filesystems`, which the engine answers with ENOENT (the
+  plan says every `/proc`, `/sys` and `/dev` path other than the listed synthetic
+  files returns ENOENT). Output does not change.
+- Two anonymous `mmap` calls fall in a different order, and one `munmap(addr, 0)`
+  is EINVAL in the oracle while the engine's matching call has a non-zero length.
+  This is allocator ordering (scudo), not a wrong result, and was not chased
+  further.
+
+### AdvSIMD and FP families implemented
+
+Each family follows the Arm ARM encoding fields and has a case in
+`tests/guest/simd.c`, which `make test` compares with native.
+
+Listed in the plan:
+- LD1/ST1 multiple structures (one to four registers, immediate and register
+  post-index).
+- DUP (element and general), INS (element and general), UMOV, SMOV.
+- MOVI, MVNI, ORR and BIC (vector immediate). FMOV (vector immediate, cmode 1111)
+  is not implemented.
+- AND, BIC, ORR, ORN, EOR, BSL, BIT, BIF.
+- ADD and SUB (vector).
+- CMEQ, CMGT, CMGE, CMHI, CMHS, CMTST (register); CMEQ, CMGE, CMGT, CMLE, CMLT
+  (zero).
+- ADDP, UMAXP, UMINP.
+- ADDV, UMAXV, UMINV, UADDLV.
+- SHRN and SHRN2, USHR, SSHR, SHL.
+- XTN and XTN2.
+- UZP1/2, TRN1/2, ZIP1/2, EXT, TBL and TBX (one or two table registers).
+- REV64, CNT, NOT.
+- Scalar FMOV between general and SIMD registers (S, D, and the D[1] lanes).
+
+Added on demand, beyond the plan's expected list (each hit by toybox, the linker or
+libc, then checked):
+- Scalar floating point, default FPCR only: FADD, FSUB, FMUL, FDIV, FCMP and FCMPE
+  (register and zero), SCVTF and UCVTF (from W or X to S or D), FCVTNS, FCVTNU,
+  FCVTPS, FCVTPU, FCVTMS, FCVTMU, FCVTZS and FCVTZU (to W or X from S or D). NaN
+  operands propagate (the first NaN, quieted) and generated NaNs use the default
+  NaN. Saturation and NaN-to-zero follow the Arm ARM. A non-default FPCR (rounding
+  mode, FZ, DN or AHP) returns -1.
+- SSHLL, USHLL, SXTL, UXTL and their 2 forms.
+- MUL, MLA and MLS (vector).
+- UMLAL and UMLAL2 (widening multiply-accumulate).
+- PMULL and PMULL2, 8-bit polynomial form only. The 64-bit form (crypto extension)
+  is not implemented.
+- SADDLP and UADDLP.
+- SMAX, SMIN, UMAX and UMIN (vector).
+- LD1 and ST1 of one lane (B, H, S, D, with or without post-index), and LD1R.
+- CRC32 and CRC32C (eight forms, integer). They are not in the plan, and
+  AT_HWCAP does not advertise them, but bionic's allocator (scudo) uses CRC32C
+  unconditionally.
+
+### Notable findings
+
+- **AT_HWCAP does not advertise CRC32.** AT_HWCAP has only FP and ASIMD. CRC32C is
+  not baseline (it is FEAT_CRC32), but scudo's allocator uses CRC32C unconditionally,
+  so it was implemented as hit. The 8-bit PMULL is baseline AdvSIMD; the 64-bit form
+  needs FEAT_PMULL and is not implemented. The 8-bit PMULL was hit in GHASH code in
+  `libcrypto`, which runs while the library loads (toybox loads it).
+- **FPSR cumulative flags are not updated** by the scalar FP ops. I did not check
+  whether any path reads FPSR. FPCR is honoured only in its default configuration;
+  any other setting returns -1.
+- **The decoder accepted some encodings from neighbouring groups.** A review found
+  that scalar AdvSIMD (under the scalar FP prefix), vector-by-element (under the shift
+  group) and copies with non-zero size bits reached the wrong handlers. Reproduced
+  with `.inst` in a scratch guest (`sqxtun b0, h1` ran as FADD), then fixed: those
+  now return -1.
+- **Some paths are not exercised by any test case.** The seven rootfs cases never
+  dispatch `madvise`, `statx`, `faccessat2`, `readv`, `lseek`, `getcwd`, `chdir`,
+  `fchdir`, `dup3`, `kill`, `tgkill`, `tkill`, `msync`, `mlock`, `munlock`,
+  `sched_yield`, `getpriority`, `setpriority`, `getpgid`, `getppid` or `set_robust_list`.
+  The synthetic `/dev` files, `/proc/self/cmdline` and the `seekdir` resume in
+  getdents64 are also untested. They are implemented and reviewed but not run.
+- **uid mismatch.** `getuid` (and `getpid` and the other ids) return 1000 as in M0,
+  while stat reports uid and gid 0 as the plan asks. The sign-only trace comparison
+  cannot see this.
+- **Host calls outside the plan's list.** `vfs.c` uses `telldir`, `seekdir` and
+  `rewinddir` (and `_XOPEN_SOURCE 700` for them). They work on macOS and Emscripten
+  but are not in the plan's list and sit outside `host.c`.
+- The linker's `std::unordered_map` rehash computes a float load factor. That is
+  why scalar FP was needed before `toybox echo` could run at all.
+- Under emscripten, `ENOTSUP` and `EOPNOTSUPP` are the same value, so the errno
+  table guards the second label.
+- The region list (`engine/mem.c`) replaces the page walk in `mem_find_free`.
+  Without it, each `mmap(NULL)` would scan the allocator's multi-GiB reservations.

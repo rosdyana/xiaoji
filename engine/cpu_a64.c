@@ -6,6 +6,7 @@
 
 #include "host.h"
 #include "mem.h"
+#include "simd.h"
 #include "syscall.h"
 
 /* ---------- helpers ---------- */
@@ -656,6 +657,10 @@ static int ldst(cpu_t *c, uint32_t insn, uint64_t pc)
         return ldst_pair(c, insn);
     if (((insn >> 27) & 7) == 7)
         return ldst_single(c, insn);
+    if (((insn >> 24) & 0x3F) == 0x0C) /* LD1/ST1 multiple structures (AdvSIMD) */
+        return simd_ldst_multi(c, insn);
+    if (((insn >> 24) & 0x3F) == 0x0D) /* LD1/ST1 single structure, and LD1R */
+        return simd_ldst_single(c, insn);
     return -1;
 }
 
@@ -780,12 +785,35 @@ static int csel(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* CRC32 and CRC32C (Arm ARM, FEAT_CRC32). Reflected polynomials, no initial or
+ * final inversion: the accumulator is Wn and the data is the low 8, 16, 32 or 64
+ * bits of Wm or Xm, least significant byte first. Bionic's allocator uses CRC32C
+ * unconditionally, so these are needed although AT_HWCAP does not advertise them. */
+static int crc32_op(cpu_t *c, unsigned sf, unsigned opcode, unsigned rm, unsigned rn, unsigned rd)
+{
+    unsigned sz = opcode & 3, castagnoli = (opcode >> 2) & 1;
+    if ((sf && sz != 3) || (!sf && sz == 3))
+        return -1;
+    uint32_t poly = castagnoli ? 0x82F63B78u : 0xEDB88320u;
+    uint32_t crc = (uint32_t)rz(c, rn, 0);
+    uint64_t data = rz(c, rm, sf);
+    for (unsigned i = 0; i < (1u << sz); i++) {
+        crc ^= (uint8_t)(data >> (8 * i));
+        for (unsigned k = 0; k < 8; k++)
+            crc = (crc & 1) ? (crc >> 1) ^ poly : crc >> 1;
+    }
+    wz(c, rd, crc, 0);
+    return 0;
+}
+
 static int dp_2src(cpu_t *c, uint32_t insn)
 {
     unsigned sf = insn >> 31, S = (insn >> 29) & 1, opcode = (insn >> 10) & 0x3F;
     unsigned rm = (insn >> 16) & 31, rn = (insn >> 5) & 31, rd = insn & 31;
     if (S)
         return -1;
+    if ((opcode >> 3) == 2)
+        return crc32_op(c, sf, opcode, rm, rn, rd);
     unsigned w = sf ? 64 : 32;
     int64_t minv = (w == 64) ? INT64_MIN : -2147483648LL;
     uint64_t a = rz(c, rn, sf), b = rz(c, rm, sf), r;
@@ -941,7 +969,9 @@ static int exec(cpu_t *c, uint32_t insn, uint64_t pc)
         return ldst(c, insn, pc);
     if ((op0 & 0x7) == 0x5)
         return dp_reg(c, insn);
-    return -1; /* reserved, SVE, and FP/SIMD data processing */
+    if ((op0 & 0x7) == 0x7) /* data processing: scalar FP and Advanced SIMD */
+        return simd_exec(c, insn);
+    return -1; /* reserved and SVE */
 }
 
 void cpu_run(cpu_t *c)
