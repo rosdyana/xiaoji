@@ -23,6 +23,8 @@ typedef struct {
 
 #define PROC_CAP_LAST 40 /* CAP_LAST_CAP of the oracle kernel (CAP_CHECKPOINT_RESTORE) */
 #define PROC_CAPS_ALL ((1ull << (PROC_CAP_LAST + 1)) - 1)
+#define PROC_RLIM_N 16   /* RLIM_NLIMITS on Linux arm64 */
+#define PROC_ATTR_MAX 128 /* the SELinux context of a process (attr/current) */
 
 typedef struct proc {
     int pid, ppid, pgid, sid;
@@ -43,6 +45,8 @@ typedef struct proc {
     int zombie;      /* ended and not reaped: wait4 and waitid report it */
     int vfork;       /* made by vfork: shares its parent's address space */
     int nthreads;
+    uint64_t rlim[PROC_RLIM_N][2]; /* soft and hard limit per resource (prlimit64, setrlimit) */
+    char attr_current[PROC_ATTR_MAX]; /* attr/current: the context, which setcon writes */
     /* Accounting for getrusage. Instructions and syscalls are this process's own;
      * the cu_ fields are the totals of its reaped children (and their children). */
     uint64_t dead_icount; /* instructions of its threads already reaped */

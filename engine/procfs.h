@@ -22,5 +22,9 @@ int procfs_task_dir(const char *guest);
 /* Generates the contents of a synthetic file (malloc'd, the caller frees it).
  * Returns 0, or -1 if the path is not synthetic or the memory is short. */
 int procfs_read(const char *guest, uint8_t **data, size_t *len);
+/* attr/current of the caller (self and thread-self) or of a live process: its context is what setcon
+ * writes. procfs_attr_write stores a context (the n bytes, its NUL dropped) and returns n, or -LE_*. */
+int procfs_is_attr_current(const char *guest);
+int64_t procfs_attr_write(const char *guest, const uint8_t *buf, size_t n);
 
 #endif

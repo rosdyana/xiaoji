@@ -18,7 +18,7 @@ on early-init
     mkdir /data/dalvik-cache 0771
     mkdir /data/dalvik-cache/arm64 0771
     # The user storage tree that zygote prepares for system_server (init.rc's on-init block makes
-    # these). The mounts themselves are not made: zygote's bind mounts are refused (engine/syscall.c).
+    # these). zygote's bind mounts (/storage) are made in its own mount namespace (engine/mntns.c, B4c).
     mkdir /mnt/user 0755
     mkdir /mnt/user/0 0755
 
@@ -34,6 +34,21 @@ service servicemanager /system/bin/servicemanager
     onrestart class_restart --only-enabled hal
     onrestart class_restart --only-enabled early_hal
     task_profiles ServiceCapacityLow
+    shutdown critical
+
+# The HIDL service manager (B4c): system_server's HIDL lookups wait for the property it sets,
+# hwservicemanager.ready (the engine serves /dev/hwbinder). The Android 13 block, verbatim, without
+# "disabled" (B4a left it out; the engine ignores the options it does not model).
+service hwservicemanager /system/bin/hwservicemanager
+    user system
+    group system readproc
+    critical
+    onrestart setprop hwservicemanager.ready false
+    onrestart class_restart --only-enabled main
+    onrestart class_restart --only-enabled hal
+    onrestart class_restart --only-enabled early_hal
+    task_profiles ServiceCapacityLow HighPerformance
+    class animation
     shutdown critical
 
 service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-system-server

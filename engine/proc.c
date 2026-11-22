@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "mem.h"
+#include "selinuxfs.h"
 #include "signals.h"
 #include "vfs.h"
 
@@ -34,6 +35,10 @@ proc_t *proc_init(void)
     p->umask = INIT_UMASK;
     p->dumpable = 1;       /* SUID_DUMP_USER, as Linux starts a process */
     p->timerslack = 50000; /* the default timer slack, in ns */
+    for (int r = 0; r < PROC_RLIM_N; r++)
+        p->rlim[r][0] = p->rlim[r][1] = ~0ull; /* RLIM_INFINITY */
+    p->rlim[3][0] = 8ull << 20; /* RLIMIT_STACK: the soft limit is 8 MiB, as before */
+    strcpy(p->attr_current, SELINUX_CTX);
     p->capbset = PROC_CAPS_ALL;
     p->mm = mem_mm_new();
     p->fds = vfs_fdtab_new();
@@ -93,6 +98,8 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     c->sid = parent->sid;
     c->umask = parent->umask;
     c->cred = parent->cred;
+    memcpy(c->rlim, parent->rlim, sizeof c->rlim);
+    memcpy(c->attr_current, parent->attr_current, sizeof c->attr_current);
     c->dumpable = parent->dumpable;
     c->keepcaps = parent->keepcaps;
     c->no_new_privs = parent->no_new_privs;

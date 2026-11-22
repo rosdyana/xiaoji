@@ -12,6 +12,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "mntns.h"
 #include "pipe.h"
 #include "proc.h"
 #include "sched.h"
@@ -521,6 +522,8 @@ static int64_t sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t mode)
     rc = vfs_resolve(dirfd_of(a0), path, 0, &r);
     if (rc)
         return rc;
+    if (r.ro)
+        return -LE_ROFS;
     if (r.exists || r.is_link)
         return -LE_EXIST;
     if (r.syn != SYN_NONE)
@@ -542,6 +545,8 @@ static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
         return rc;
     if (!r.exists && !r.is_link)
         return -LE_NOENT;
+    if (r.ro)
+        return -LE_ROFS;
     if (r.syn != SYN_NONE)
         return -LE_PERM;
     if (flags & LAT_REMOVEDIR)
@@ -568,28 +573,46 @@ static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t flags)
     return r.exists || r.is_link ? 0 : -LE_NOENT;
 }
 
-/* unshare(flags). Namespaces are not modelled: the guest has one mount table, one network and
- * one set of ids. CLONE_NEWNS succeeds and changes nothing (zygote asks for a private mount
- * namespace before it specializes an app; the synthetic root is shared by every process). Other
- * namespace flags are EINVAL, and so is CLONE_FILES, which would need a copy of the descriptors. */
-/* mount(source, target, type, flags, data). The guest has one mount table that the engine
- * serves (the synthetic /dev, /proc and /sys, and the root). Only a change of propagation (MS_SHARED,
- * MS_SLAVE, MS_PRIVATE, MS_UNBINDABLE) is accepted, on an existing target: propagation between
- * mount namespaces is not modelled, so it changes nothing. Any other mount is EPERM. */
-static int64_t sys_mount(uint64_t target_va, uint64_t flags)
+/* mount(source, target, type, flags, data) and umount2(target, flags), in the process's mount
+ * namespace (mntns.c). Mounting needs an effective uid of 0, as Linux's CAP_SYS_ADMIN check does
+ * for a root process. The data argument is not used. A string argument that is NULL is absent. */
+static int mount_str(uint64_t va, char *buf, size_t cap, int *present)
 {
-    const uint64_t MS_PROPAGATION = (1ull << 17) | (1ull << 18) | (1ull << 19) | (1ull << 20);
-    if (!(flags & MS_PROPAGATION))
+    *present = va != 0;
+    if (!va)
+        return 0;
+    return get_path(va, buf, cap);
+}
+
+static int64_t sys_mount(uint64_t src_va, uint64_t tgt_va, uint64_t type_va, uint64_t flags)
+{
+    static char src[VFS_PATH_MAX], tgt[VFS_PATH_MAX], type[64];
+    if (proc_cur()->cred.euid != 0)
         return -LE_PERM;
-    static char path[VFS_PATH_MAX];
-    static vfs_res r;
-    int rc = get_path(target_va, path, sizeof path);
+    int hsrc, htype, rc;
+    rc = mount_str(src_va, src, sizeof src, &hsrc);
     if (rc)
         return rc;
-    rc = vfs_resolve(LAT_FDCWD, path, 1, &r);
+    rc = mount_str(type_va, type, sizeof type, &htype);
     if (rc)
         return rc;
-    return r.exists ? 0 : -LE_NOENT;
+    if (!tgt_va)
+        return -LE_FAULT;
+    rc = get_path(tgt_va, tgt, sizeof tgt);
+    if (rc)
+        return rc;
+    return mntns_mount(vfs_ns(), hsrc ? src : NULL, tgt, htype ? type : NULL, flags);
+}
+
+static int64_t sys_umount2(uint64_t tgt_va, uint64_t flags)
+{
+    static char tgt[VFS_PATH_MAX];
+    if (proc_cur()->cred.euid != 0)
+        return -LE_PERM;
+    int rc = get_path(tgt_va, tgt, sizeof tgt);
+    if (rc)
+        return rc;
+    return mntns_umount(vfs_ns(), tgt, flags);
 }
 
 /* membarrier(cmd, flags): guest threads run one at a time on the host thread, so every memory
@@ -670,11 +693,19 @@ static int64_t sys_process_vm_readv(uint64_t pid, uint64_t liov, uint64_t liovcn
     return total;
 }
 
+/* unshare(flags): CLONE_NEWNS gives the process a copy of its mount namespace (the mounts made
+ * after this are its own). Other namespace flags, and CLONE_FILES (which would need a copy of the
+ * descriptors), are EINVAL. Needs an effective uid of 0. */
 static int64_t sys_unshare(uint64_t flags)
 {
     const uint64_t CLONE_NEWNS_FLAG = 0x00020000ull;
     if (flags & ~CLONE_NEWNS_FLAG)
         return -LE_INVAL;
+    if (!(flags & CLONE_NEWNS_FLAG))
+        return 0;
+    if (proc_cur()->cred.euid != 0)
+        return -LE_PERM;
+    vfs_fdtab_copy_ns(proc_cur()->fds);
     return 0;
 }
 
@@ -713,6 +744,8 @@ static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
         return -LE_NOENT;
     if (r.syn != SYN_NONE)
         return -LE_PERM;
+    if (r.ro)
+        return -LE_ROFS;
     return host_chmod(r.host, (uint32_t)mode);
 }
 
@@ -1023,7 +1056,8 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_FCHMOD: *ret = vfs_fchmod((int)(int32_t)a[0], (uint32_t)a[1]); return 1;
     case 54: /* fchownat */ *ret = sys_fchownat(a[0], a[1], a[4]); return 1;
     case 55: /* fchown */ *ret = vfs_get((int)(int32_t)a[0]) ? 0 : -LE_BADF; return 1;
-    case 40: /* mount */ *ret = sys_mount(a[1], a[3]); return 1;
+    case 40: /* mount */ *ret = sys_mount(a[0], a[1], a[2], a[3]); return 1;
+    case 39: /* umount2 */ *ret = sys_umount2(a[0], a[1]); return 1;
     case 283: /* membarrier */ *ret = sys_membarrier(a[0], a[1]); return 1;
     case 97: /* unshare */ *ret = sys_unshare(a[0]); return 1;
     case 270: /* process_vm_readv */ *ret = sys_process_vm_readv(a[0], a[1], a[2], a[3], a[4], a[5]); return 1;

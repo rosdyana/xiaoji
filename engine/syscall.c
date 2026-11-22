@@ -82,11 +82,9 @@
 #define SYS_SOCKET 198
 #define SYS_FLOCK 32
 #define SYS_GETRLIMIT 163
+#define SYS_SETRLIMIT 164
 
 #define PAGE_MASK 4095ull
-#define RLIM_INFINITY (~0ull)
-#define RLIMIT_STACK 3
-#define STACK_RLIMIT (8ull << 20)
 #define SIGSET_SIZE 8
 #define IO_CHUNK 65536
 
@@ -593,13 +591,39 @@ static int64_t sys_getrandom(uint64_t buf, uint64_t len)
     return (int64_t)len;
 }
 
-static int64_t sys_prlimit64(uint64_t resource, uint64_t old)
+/* prlimit64 and its getrlimit and setrlimit forms, on the calling process's limits (proc.c has the
+ * defaults). The old limit is read before the new one is applied and written after, as Linux does.
+ * Raising the hard limit needs an effective uid of 0. pid other than the caller's is ESRCH, or EPERM
+ * for a process that exists (the engine does not change another process's limits). */
+static int64_t sys_prlimit64(uint64_t resource, uint64_t newv, uint64_t old)
 {
+    proc_t *p = proc_cur();
+    if (resource >= PROC_RLIM_N)
+        return -LE_INVAL;
+    uint64_t prev[2] = {p->rlim[resource][0], p->rlim[resource][1]};
+    if (newv) {
+        uint8_t e[16];
+        if (mem_copy_out(e, newv, sizeof e) < 0)
+            return -LE_FAULT;
+        uint64_t nl[2] = {0, 0};
+        for (int k = 0; k < 8; k++) {
+            nl[0] |= (uint64_t)e[k] << (8 * k);
+            nl[1] |= (uint64_t)e[8 + k] << (8 * k);
+        }
+        if (nl[0] > nl[1])
+            return -LE_INVAL;
+        if (nl[1] > p->rlim[resource][1] && p->cred.euid != 0)
+            return -LE_PERM;
+        p->rlim[resource][0] = nl[0];
+        p->rlim[resource][1] = nl[1];
+    }
     if (old) {
-        uint64_t lim[2];
-        lim[0] = resource == RLIMIT_STACK ? STACK_RLIMIT : RLIM_INFINITY;
-        lim[1] = RLIM_INFINITY;
-        if (mem_copy_in(old, lim, sizeof lim) < 0)
+        uint8_t e[16];
+        for (int k = 0; k < 8; k++) {
+            e[k] = (uint8_t)(prev[0] >> (8 * k));
+            e[8 + k] = (uint8_t)(prev[1] >> (8 * k));
+        }
+        if (mem_copy_in(old, e, sizeof e) < 0)
             return -LE_FAULT;
     }
     return 0;
@@ -1320,7 +1344,10 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_clock_gettime(a[0], a[1]);
         return;
     case SYS_PRLIMIT64:
-        *ret = sys_prlimit64(a[1], a[3]);
+        if (a[0] != 0 && (int64_t)a[0] != proc_cur()->pid)
+            *ret = proc_find((int)a[0]) ? -LE_PERM : -LE_SRCH;
+        else
+            *ret = sys_prlimit64(a[1], a[2], a[3]);
         return;
     case SYS_RSEQ:
         *ret = -LE_NOSYS;
@@ -1333,7 +1360,10 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = 0; /* single process: file locks always succeed */
         return;
     case SYS_GETRLIMIT:
-        *ret = sys_prlimit64(a[0], a[1]);
+        *ret = sys_prlimit64(a[0], 0, a[1]);
+        return;
+    case SYS_SETRLIMIT:
+        *ret = sys_prlimit64(a[0], a[1], 0);
         return;
     default:
         if (nr < 1024) {

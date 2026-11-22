@@ -15,6 +15,7 @@
 
 #include "host.h"
 #include "linux.h"
+#include "mntns.h"
 #include "binder.h"
 #include "fdobj.h"
 #include "pipe.h"
@@ -41,6 +42,7 @@ struct fdtab {
     char prog[VFS_PATH_MAX];
     uint8_t *cmdline;
     size_t cmdline_len;
+    mntns_t *ns; /* the mount namespace (mntns.h); NULL is the root only */
 };
 
 static fdtab_t *cur_fdt;
@@ -144,6 +146,7 @@ static vfs_syn syn_of(const char *p)
     case SELFS_DIR: return SYN_DIR;
     case SELFS_STATUS: return SYN_SELFS_STATUS;
     case SELFS_ACCESS: return SYN_SELFS_ACCESS;
+    case SELFS_CONTEXT: return SYN_SELFS_CONTEXT;
     default: break;
     }
     return SYN_NONE;
@@ -168,6 +171,7 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
     out->exists = 1;
     out->is_link = 0;
     out->syn = SYN_NONE;
+    out->ro = 0;
 
     if (path[0] == '/') {
         strcpy(cur, "/");
@@ -235,7 +239,12 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
         else
             snprintf(cand, sizeof cand, "%s/%s", cur, name);
 
-        if (in_virtual(cand)) {
+        /* A mount in the process's namespace covers cand: hp then holds its host path (the
+         * synthetic names below are not looked at under a mount). */
+        int mcov = mntns_map(cur_fdt->ns, cand, hp, sizeof hp, NULL);
+        if (mcov < 0)
+            return mcov;
+        if (!mcov && in_virtual(cand)) {
             /* Synthetic namespace: /dev, /proc and /sys are never read from the host. */
             vfs_syn s = syn_of(cand);
             if (s == SYN_DIR) {
@@ -312,7 +321,7 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
             return -LE_NOENT;
         }
 
-        if (host_path_of(cand, hp, sizeof hp) < 0)
+        if (!mcov && host_path_of(cand, hp, sizeof hp) < 0)
             return -LE_NAMETOOLONG;
         host_stat st;
         int rc = host_stat_path(hp, 0, &st);
@@ -376,8 +385,13 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
     /* Resolved: cur holds the canonical guest path. */
     strcpy(out->guest, cur);
     if (out->syn == SYN_NONE) {
-        if (host_path_of(cur, out->host, sizeof out->host) < 0)
+        int ro = 0;
+        int mc = mntns_map(cur_fdt->ns, cur, out->host, sizeof out->host, &ro);
+        if (mc < 0)
+            return mc;
+        if (!mc && host_path_of(cur, out->host, sizeof out->host) < 0)
             return -LE_NAMETOOLONG;
+        out->ro = mc ? ro : 0;
     } else {
         out->host[0] = 0;
     }
@@ -638,7 +652,36 @@ fdtab_t *vfs_fdtab_new(void)
     }
     strcpy(t->cwd, "/");
     strcpy(t->prog, "/");
+    t->ns = mntns_new();
+    if (!t->ns) {
+        free(t->slots);
+        free(t);
+        return NULL;
+    }
     return t;
+}
+
+mntns_t *vfs_ns(void) { return cur_fdt->ns; }
+
+mntns_t *vfs_fdtab_ns(const fdtab_t *t) { return t->ns; }
+
+void vfs_fdtab_exit_ns(fdtab_t *t)
+{
+    /* The initial process ends without proc_release (it is not reaped): its mounts are released here,
+     * so its tmpfs directories are removed. The table gets an empty namespace, so it stays valid. */
+    mntns_unref(t->ns);
+    t->ns = mntns_new();
+    if (!t->ns)
+        die_oom();
+}
+
+void vfs_fdtab_copy_ns(fdtab_t *t)
+{
+    mntns_t *c = mntns_copy(t->ns);
+    if (!c)
+        die_oom();
+    mntns_unref(t->ns);
+    t->ns = c;
 }
 
 /* Makes t the running fd table. */
@@ -656,6 +699,9 @@ fdtab_t *vfs_fdtab_fork(fdtab_t *src)
     if (!t->cmdline)
         die_oom();
     memcpy(t->cmdline, src->cmdline, src->cmdline_len);
+    /* A fork shares the namespace; only unshare or clone with CLONE_NEWNS copies it. */
+    mntns_unref(t->ns);
+    t->ns = mntns_ref(src->ns);
     for (int i = 0; i < VFS_MAX_FD; i++) {
         if (!src->slots[i].desc)
             continue;
@@ -679,6 +725,7 @@ void vfs_fdtab_release(fdtab_t *t)
     }
     if (cur_fdt == t)
         cur_fdt = NULL;
+    mntns_unref(t->ns);
     free(t->slots);
     free(t->cmdline);
     free(t);
@@ -772,6 +819,9 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         return rc;
     if (r.is_link)
         return -LE_LOOP;
+    /* A write, a create or a truncate under a read-only mount. */
+    if (r.ro && ((lflags & LO_ACCMODE) != LO_RDONLY || (lflags & (LO_CREAT | LO_TRUNC))))
+        return -LE_ROFS;
     if ((lflags & LO_CREAT) && (lflags & LO_EXCL) && r.exists)
         return -LE_EXIST;
     if (!r.exists && !(lflags & LO_CREAT))
@@ -913,6 +963,7 @@ static int64_t syn_read(vfs_fd *f, void *buf, size_t n, uint64_t off, int use_of
 {
     switch (f->syn) {
     case SYN_NULL:
+    case SYN_SELFS_CONTEXT:
         return 0;
     case SYN_ZERO:
         memset(buf, 0, n);
@@ -1016,8 +1067,14 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
             f->dpos = 0;
             return (int64_t)n;
         }
-        if (f->syn == SYN_DATA)
+        if (f->syn == SYN_SELFS_CONTEXT)
+            return selinuxfs_check_context((const char *)buf, n) < 0 ? -LE_INVAL : (int64_t)n;
+        if (f->syn == SYN_DATA) {
+            /* attr/current takes a new context (setcon writes it); the other generated files are read-only. */
+            if (procfs_is_attr_current(f->guest))
+                return procfs_attr_write(f->guest, buf, n);
             return -LE_BADF;
+        }
         return (int64_t)n; /* /dev/null, /dev/zero and /dev/random discard writes */
     case VFS_SOCK: return sock_write(f->sock, buf, n);
     case VFS_BINDER: return -LE_INVAL;

@@ -1125,13 +1125,11 @@ Real implementations unless marked as a stub.
 - `XIAOJI_BOOT=1 tests/run.sh` runs the boot and passes when the log has `...preloaded N classes`. It takes
   about 60 s more than the default run, so it is opt-in. It stops with `--init-timeout 90`.
 
-## B4b: system_server (in progress)
+## B4b: system_server
 
-Status: **the descriptor allowlist blocker of B4a is fixed. Zygote forks system_server (milestone c),
-and the child passes ART's fd checks. system_server then stops at its storage bind mount. A correct fix
-gives each process a mount table and makes `vfs_resolve` honour it, which changes path resolution for
-every syscall. The boot is stopped here for that decision (see "The blocker"). Milestones (d1) to (d5)
-are not reached, and the daemon and HAL table below is empty for that reason.**
+Status: **the descriptor allowlist blocker of B4a is fixed, and zygote forks system_server (milestone c).
+The storage bind mount that stopped B4b is resolved by per-process mount namespaces (B4c). Read "The
+blocker (now)" below as the B4b state; the current state is in B4c.**
 
 ### Files
 
@@ -1303,3 +1301,223 @@ the wall time. The counts below are from that run.
 - `PR_SET_PDEATHSIG` is recorded only, and `PR_SET_SECCOMP` is not implemented (zygote's filter is not
   reached yet; see the component table).
 - Only pipes and sockets have object inodes. eventfd, timerfd, epoll and memfd keep their old inodes.
+
+## B4c: mount namespaces, system_server's entry (milestone d1)
+
+Status: **per-process mount namespaces work (bind with and without MS_REC, read-only remount, tmpfs, stacked
+mounts, umount2 with and without MNT_DETACH, unshare and clone with CLONE_NEWNS), with a guest test that matches
+native. Zygote's storage mount passes, and system_server enters "Entered the Android system server!" (d1). The
+HIDL service manager now runs. The boot stops in `startBootstrapServices` (d2 begun, not done): servicemanager
+and system_server wait for `apexservice`, init refuses the lazy AIDL start that would provide it, and the
+engine's deadlock check ends the run (see "The current blocker").** The timings below were taken on battery with
+Low Power Mode on (see "Conditions"); they are not the AC, Low Power Mode off figures the benchmark rule needs.
+
+### The namespace design
+
+Files: `engine/mntns.h`, `engine/mntns.c` (the table and its rules), `engine/vfs.c` and `engine/vfs.h` (the
+lookup; the fd table holds the namespace), `engine/sysfs.c` (`mount`, `umount2`, `unshare`), `engine/sched.c`
+(`clone` with CLONE_NEWNS; the initial process's exit), `engine/procfs.c` (`/proc/mounts`, `mountinfo`),
+`tests/guest/mountns.c`.
+
+- **Ownership.** Each fd table (`fdtab_t`, one per process) holds a refcounted `mntns_t`. A fork shares it
+  (`vfs_fdtab_fork`). `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` give the child a copy
+  (`vfs_fdtab_copy_ns`: the mounts are copied, the tmpfs contents are shared). A namespace is freed with its last
+  process: a non-initial process releases it when it ends (`proc_release`), and the initial process releases it
+  at its exit (`vfs_fdtab_exit_ns`, which leaves an empty namespace). Out of memory in a copy is fatal, as it is
+  for the other fd-table allocations.
+- **The table.** An ordered list of mounts. Each has an id, a parent id (the mount that covered its target when it
+  was made, 0 for the root), a kind (`bind` of a host directory, or `tmpfs` with its own host directory), the
+  read-only, nosuid, nodev and noexec flags, and the propagation (shared, or not). The root (the host root that
+  `/` maps to) is not in the list: an empty list is the root alone.
+- **Liveness.** A mount is live when no later mount has its target (a newer mount on the same path hides it) and
+  its parent is visible: the parent's target is not covered by another mount, and the parent is itself visible.
+  A mount stacked on its parent is live (its own stacking is ignored). Unmounting the top mount brings the one
+  under it back. `MNT_DETACH` removes the mount and every mount under it (Linux's `umount_tree`); without it, a
+  mount with children is EBUSY.
+- **Lookup.** `vfs_resolve` walks visible guest paths, as before, so `..`, symlinks and `getcwd` stay in guest
+  terms. Only the guest-to-host step changed: when a live mount covers the path (longest target prefix,
+  component-wise), the host path is the mount's backing directory plus the rest. A covered path skips the
+  synthetic `/proc`, `/sys` and `/dev` names. With no mounts the lookup is the old `host_path_of`, byte for byte
+  (`mntns_map` returns 0 with an empty table; `make test` is unchanged). `vfs_res.ro` carries the read-only flag.
+- **Read-only.** A write, create or truncate open (`vfs_open`), `mkdirat`, `unlinkat` and `fchmodat` under a
+  read-only mount give EROFS. Mutations through an fd opened before a remount are not checked (a gap, below).
+- **Flags, as Linux's `do_mount` orders them.** `MS_REMOUNT` (with MS_RDONLY and the other flags, on the live
+  mount at the target); then `MS_BIND` (with or without MS_REC; a bind onto `/` is EBUSY, and a mount on `/`
+  covers nothing in this model); then the propagation flags (recorded on the live mount; accepted with no effect
+  on `/`); then `MS_MOVE` (EINVAL, not modelled); then the tmpfs type. A bind copies the flags of the mount that
+  covers its source, and ignores the flags of the call (Linux ignores MS_RDONLY on the bind itself; a remount sets
+  it). The guest test checks these cases against the native kernel (the MS_PRIVATE bind and the MS_RDONLY bind
+  lines); the kernel source was not read.
+- **MS_REC.** The live submounts of the source are copied under the new target, with the same backing and
+  parent structure. The source's own mount point is the one being bound, so it is not copied again.
+- **Syscalls.** `mount`, `umount2` and `unshare(CLONE_NEWNS)` need an effective uid of 0. `clone(CLONE_NEWNS)` is
+  not checked for privilege (a gap: Linux needs CAP_SYS_ADMIN there too).
+- **Not modelled** (named, so they are not mistaken for support): MS_MOVE (EINVAL), `pivot_root` and `chroot`
+  (not hit), `setns` (not hit), propagation between namespaces (a copy is a snapshot), binds of synthetic paths
+  such as `/proc` or `/dev` (EINVAL), mounts over synthetic paths (EINVAL), and a bind or tmpfs onto `/` (EBUSY).
+- **Procfs.** `/proc/mounts`, `/proc/self/mounts`, `/proc/self/mountinfo`, and `/proc/<pid>/mounts` and
+  `mountinfo` of a live process show that process's namespace, in the kernel's layout: the root line, then the live
+  mounts in mount order, with octal escapes. Differences from Linux: the major:minor is `0:<id>`, the fs type and
+  source of a bind are `rootfs`, the root column of a bind is the source's guest path, and `/proc`, `/sys` and
+  `/dev` are not listed (the engine serves them synthetically). Zygote and vold parse these files; whether either
+  needs the missing entries was not checked.
+- **Tmpfs.** A host directory under `/tmp` named `xiaoji-tmpfs-<pid>-<n>`, removed (recursively, symlinks not
+  followed) when the last namespace that holds it goes away, including at the initial process's exit.
+
+### The guest test: `tests/guest/mountns.c`
+
+A freestanding program (built like the other guest tests). It runs in a private namespace (`unshare`, then
+`mount(MS_REC|MS_PRIVATE)` on `/`), in a base directory under the repository, given as an absolute path
+(`$ROOT/build/tests/mountns-work`, because a guest process starts in `/`). The steps and what each checks:
+
+- a bind and its read and write; the read-only remount (EROFS on create, mkdir and unlink; reads still work; a
+  create under the source is still allowed); `umount2` (EINVAL for a non-mount; ENOENT after the unmount);
+- a tmpfs stacked on a tmpfs (the top hides the file; `umount2` brings the lower one back);
+- `..` out of a tmpfs into the source directory (it leaves the mount);
+- rbind (MS_REC) shows the submount; a plain bind does not; `umount2` of a parent with a child is EBUSY; the child
+  first, then the parent; `MNT_DETACH` of a parent takes its child with it (the child's path is then ENOENT);
+- `MS_BIND|MS_PRIVATE` is a bind (the file is read through it);
+- `MS_BIND|MS_RDONLY` on the call is not applied (the create succeeds); a remount sets it (EROFS);
+- a child made with `clone(CLONE_NEWNS|SIGCHLD)` sees the parent's mount at clone time, its own unmount of that
+  mount does not affect the parent, and its own tmpfs is invisible to the parent;
+- a child made with `unshare(CLONE_NEWNS)` and its tmpfs, invisible to the parent;
+- the mountinfo lines under the base, normalised: the mount point, `ro` or `rw`, and `tmpfs` (only for a tmpfs with
+  its own root) or `bind`.
+
+- The native oracle runs under `sudo -n` (`tests/run.sh` does this for `mountns-*`): the builder VM runs as uid 501
+  with passwordless sudo, not as root in a chroot.
+- Native and engine output are byte-identical (`make test`: `mountns-O0` and `mountns-O2`, engine and Node).
+- The differences from Linux that the normalised output does not show: the fs type of a bind (Linux shows the
+  source's fs, here `rootfs`), the root column, and the `0:<id>` device numbers.
+
+### Milestones (B4c)
+
+One run of the native engine, `XIAOJI_STAMP=1 ./build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs
+--init-timeout 120` (the run with hwservicemanager started; `build/tests/boot/run3.err`):
+
+| Milestone | Logcat line | Elapsed | Instructions |
+|---|---|---|---|
+| (a) app_process starts ART | `I/AndroidRuntime: Using default boot image` | 2.21 s | 158.5 M |
+| (b) classes preloaded | `I/Zygote: ...preloaded 16252 classes in 29104ms.` | 38.4 s | 2.33 G |
+| (b) resources preloaded | `I/Zygote: ...preloaded 41 resources in 59ms.` | 38.8 s | 2.35 G |
+| (c) system_server forked | `I/Zygote: System server process 1009 has been created` | 50.6 s | 3.17 G |
+| (d1) system_server starts | `I/SystemServer: Entered the Android system server!` | 51.5 s | 3.22 G |
+| (d2) startBootstrapServices begins | `D/SystemServerTiming: startBootstrapServices` | 55.4 s | 3.46 G |
+| (d2) startBootstrapServices done | not reached (see the blocker) | | |
+| (d3) startCoreServices done | not reached | | |
+| (d4) startOtherServices | not reached | | |
+| (d5) System now ready / Boot completed | not reached | | |
+
+The storage mount that stopped B4b is past (system_server's `ensureInAppMountNamespace` and the bind of
+`/mnt/user/0` to `/storage` succeed, and so does the SELinux setcontext, below). The fork line is at about the same
+point as in B4b (49.9 s then, 50.6 s here), with the hwservicemanager process also running.
+
+### Conditions
+
+`pmset -g` on the Mac while these runs were made: `lowpowermode 1` and "Now drawing from 'Battery Power'". The
+task said the Mac is on AC, and the benchmark rule (memory: AC and Low Power Mode off) is not met, so the timings
+above are not benchmark figures. They are a single run each, and they should be remeasured on AC with Low Power
+Mode off before they are compared with B4b.
+
+### Engine changes made for system_server
+
+Real implementations unless marked.
+
+- **Mount namespaces**, as above.
+- **`setrlimit` (164) and `prlimit64` (261)**, per process: the table of soft and hard limits is copied by a fork
+  (defaults as before: infinity, and 8 MiB soft for the stack). The new limit is checked (soft at most hard;
+  raising the hard limit needs euid 0). `getrlimit` (163) reads the same table. A pid other than the caller's is
+  ESRCH, or EPERM for a process that exists (the engine does not change another process's limits). This was the
+  RLIMIT_CORE failure of zygote's specialize.
+- **SELinux context, form only.** `/sys/fs/selinux/context` accepts a write when the context has 4 or 5
+  colon-separated non-empty fields (user, role, type, sensitivity, optional categories), and reads are empty. No
+  policy is compiled, so the check does not test the context against the policy (the kernel does that). This is a
+  named stub; it is what libselinux's `security_check_context` needs, and the failure it fixes was that missing
+  file (ENOENT, logged as "Error setting context for system server").
+- **`/proc/<pid>/attr/current`** (the caller's, and a live process's) is per process: a write (setcon's) stores the
+  context (the NUL dropped; at most 127 bytes) and a read returns it. The copy of the parent's context is made at
+  fork. The binder driver still reports `u:r:kernel:s0` as every sender's context (a gap, below).
+  `/proc/thread-self/attr/exec` and the other attr files are ENOENT.
+- **`hwservicemanager` is started** by `image/xiaoji.rc` (the Android 13 block, verbatim, without `disabled`). This
+  is the real daemon. It is what sets `hwservicemanager.ready`, which system_server's HIDL lookups wait for (in
+  `system/libhidl/transport/ServiceManagement.cpp`, gated on `/dev/hwbinder` being accessible, which the engine
+  serves). With it running, the "Waited for hwservicemanager.ready" loop is gone.
+
+### Component choices
+
+| Component | Choice | Why |
+|---|---|---|
+| Services' stdin, stdout, stderr | `/dev/null` per service (B4b) | ART's fd allowlist; matches a device |
+| Zygote's storage and per-app bind mounts | real, through the engine's mount namespaces (this section) | `BindMountStorageToLowerFs`, `/storage`; apps need per-process views |
+| SELinux | permissive; the context is checked for form only; attr/current is per process | The engine's SELinux is permissive (B3); no compiled policy |
+| rlimits | real, per process | zygote and system_server set them; no daemon involved |
+| `/proc/mounts` and mountinfo | real, from the namespace | `/proc`, `/sys` and `/dev` are not listed (gap) |
+| `hwservicemanager` | **real, started** from `image/xiaoji.rc` | system_server's HIDL lookups wait for the property it sets; `/dev/hwbinder` is served by the engine's binder driver. Its HIDL transactions fail (below) |
+| `apexservice` (apexd) | **not started; the lazy start is refused** | servicemanager and system_server wait for it. Decide: the real apexd (it mounts APEX images, which the engine's rootfs does not have as images: `/apex` is extracted), or an engine stub. docs/features.md must decide first |
+| init's `ctl.interface_start` (lazy AIDL start) | **refused: "is not a ctl action"** | servicemanager asks for it once a second for `apexservice`. Decide with apexd: either init supports it for services declared in the rc files, or the lazy start stays off and the waiters must not block |
+| Seccomp filter (zygote's `SetUpSeccompFilter`) | not reached: it is skipped when SELinux is not enforcing | Confirm when the boot reaches it |
+| `userfaultfd` (syscall 282) | ENOSYS (the engine's "unimplemented syscall" line) | ART probes it and falls back; not a blocker |
+| `/proc/sys/kernel/random/boot_id` | missing (non-fatal: ashmem logs it) | Record, not a blocker |
+| cgroups (`/dev/cgroup_info/cgroup.rc`) | missing (non-fatal: libprocessgroup logs it) | No cgroups; task profiles do nothing |
+| Other HALs (power, health, light, sensors, ...), lmkd, installd, netd, vold, statsd, storaged | not decided yet | system_server has not reached the code that starts them |
+| Telephony, NFC, Bluetooth | not decided yet | Decide from docs/features.md when system_server reaches them |
+
+### The current blocker (d2): apexservice, the lazy start, and the deadlock check
+
+```
+[50634 ms 3170995621 insn] I/Zygote(1009): System server process 1009 has been created
+xiaoji: unimplemented syscall 282
+[51534 ms 3221649710 insn] I/SystemServer(1009): Entered the Android system server!
+[55449 ms 3458848694 insn] D/SystemServerTiming(1009): startBootstrapServices
+...
+[58771 ms 3506550409 insn] W/ServiceManager(1009): Waited one second for apexservice (is service started? ...)
+[58771 ms 3506550409 insn] I/servicemanager(1001): Since 'apexservice' could not be found, trying to start it as a lazy AIDL service
+xiaoji: init: ctl.interface_start is not a ctl action
+...
+xiaoji: init: nothing has been runnable for 5 s
+xiaoji: deadlock: every thread is blocked and none can wake
+[85501 ms 3597846663 insn] E/hw-Parcel(1002): Buffer in parent 0x6ffd6fece2d0 differs from embedded buffer 0x6ffd64c1c100
+[85502 ms 3598048833 insn] E/HidlServiceManagement(1009): getService: defaultServiceManager()->getTransport returns Status(EX_TRANSACTION_FAILED): 'BAD_VALUE: '
+[85505 ms 3598048833 insn] E/AndroidRuntime(1009): *** FATAL EXCEPTION IN SYSTEM PROCESS: watchdog
+java.util.NoSuchElementException
+	at android.os.HwBinder.getService(Native Method)
+	at com.android.server.Watchdog.addInterestingHidlPids(Watchdog.java:671)
+	...
+```
+
+- system_server waits in `startBootstrapServices` for `apexservice`; servicemanager asks init to start it lazily,
+  and init refuses. The engine then has no runnable thread, and its deadlock check ends the processes (`killed by
+  signal 9`). The Watchdog's own HIDL lookup, at 85 s, is the second failure: hwservicemanager's reply carries a
+  buffer whose embedded pointer does not match the parent (`hw-Parcel`), so `HwBinder.getService` gets a bad value.
+  The binder driver's scatter-gather fix-up for hwbinder (`BINDER_TYPE_PTR` with parent offsets) is the likely
+  cause. It is binder work (B3), not a boot-config change, and it was not investigated here.
+- Nothing here is a missing file. The two decisions are apexd and `ctl.interface_start` (the table), and the
+  hwbinder buffer fix-up is an engine fix in the binder driver.
+
+### Tests
+
+- `make test`: 154 passed, 0 failed, 0 xfail (was 150). The new cases are `mountns-O0` and `mountns-O2`, each under
+  the engine and Node. The `mountns` oracle runs under `sudo -n`.
+- `XIAOJI_JIT=0 make test`: 154 passed, 0 failed, 0 xfail.
+- `XIAOJI_BOOT=1 make test`: 155 passed, 0 failed. The boot check requires the class preload, the system_server fork
+  and the d1 line, `Entered the Android system server!`.
+- `make test-web`: all web checks passed, exit 0.
+- Each run was read unfiltered (`rtk proxy make test`), and `-Wall -Wextra` is clean for the native build and for each
+  changed file under emcc.
+
+### Gaps (B4c)
+
+- Mutations through an fd opened before a remount, and `fchmod` and `ftruncate` on an fd, are not checked against the
+  read-only flag.
+- Dirfd and the cwd are guest strings re-resolved through the current namespace, not pinned to a mount.
+- Propagation is recorded, not applied. A copy is a snapshot: a later mount in the init namespace does not reach an
+  unshared process. `MS_MOVE`, `pivot_root`, `chroot` and `setns` are not modelled.
+- AF_UNIX socket lookup is by guest path, so a bind alias to a socket's directory is not checked against the socket's
+  inode (`sock.c`, not audited in this section).
+- `/proc/mounts` has no `/proc`, `/sys` or `/dev` entries; the fs type and source of a bind are `rootfs`.
+- The binder driver reports `u:r:kernel:s0` as every sender's context, though attr/current is now per process.
+- `/proc/thread-self/attr/exec`, `sockcreate`, `fscreate` and `keycreate` are ENOENT.
+- A non-initial process's namespace is released by `proc_release` when it ends. The deadlock check's kill path was
+  not tested for this.
+- hwbinder: the scatter-gather buffer fix-up (the `hw-Parcel` error above), which blocks HIDL lookups.
+- init: `ctl.interface_start` is not supported, so lazy AIDL services do not start.

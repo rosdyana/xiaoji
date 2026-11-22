@@ -11,6 +11,7 @@
 
 #include "loader.h"
 #include "mem.h"
+#include "mntns.h"
 #include "proc.h"
 #include "sched.h"
 #include "vfs.h"
@@ -107,13 +108,41 @@ int procfs_known(const char *guest)
 {
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
-        is_self_attr(guest))
+        is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
+        !strcmp(guest, "/proc/self/mountinfo"))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
         return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline") ||
-               !strcmp(rest, "/attr/current");
+               !strcmp(rest, "/attr/current") || !strcmp(rest, "/mounts") || !strcmp(rest, "/mountinfo");
     return 0;
+}
+
+/* /proc/mounts and /proc/<pid>/mounts (and the mountinfo forms): the mount namespace of the
+ * process (mntns.c). Returns 1 when guest is one of them, with *rc set. */
+static int mounts_read(const char *guest, uint8_t **data, size_t *len, int *rc)
+{
+    const char *rest = NULL;
+    proc_t *target = NULL;
+    int info;
+    if (!strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts"))
+        info = 0;
+    else if (!strcmp(guest, "/proc/self/mountinfo"))
+        info = 1;
+    else {
+        target = live_proc(guest, &rest);
+        if (!target || !rest)
+            return 0;
+        if (!strcmp(rest, "/mounts"))
+            info = 0;
+        else if (!strcmp(rest, "/mountinfo"))
+            info = 1;
+        else
+            return 0;
+    }
+    mntns_t *ns = target ? vfs_fdtab_ns(target->fds) : vfs_ns();
+    *rc = mntns_text(ns, info, data, len) ? -1 : 0;
+    return 1;
 }
 
 int procfs_dir(const char *guest)
@@ -241,6 +270,9 @@ static void build_maps(sbuf *b)
 
 int procfs_read(const char *guest, uint8_t **data, size_t *len)
 {
+    int mrc;
+    if (mounts_read(guest, data, len, &mrc))
+        return mrc;
     sbuf b = {0};
     const char *rest;
     proc_t *target = live_proc(guest, &rest);
@@ -254,7 +286,7 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
             const uint8_t *bytes = vfs_cmdline_bytes(target->fds, &n);
             sb_add(&b, (const char *)bytes, n);
         } else if (!strcmp(rest, "/attr/current")) {
-            sb_fmt(&b, "%s", SELINUX_CTX);
+            sb_fmt(&b, "%s", target->attr_current);
         } else {
             return -1;
         }
@@ -267,7 +299,7 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
     } else if (is_self_attr(guest)) {
-        sb_fmt(&b, "%s", SELINUX_CTX);
+        sb_fmt(&b, "%s", proc_cur()->attr_current);
     } else {
         return -1;
     }
@@ -284,4 +316,30 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
     *data = (uint8_t *)b.p;
     *len = b.n;
     return 0;
+}
+
+/* The process whose attr/current a guest path names, or NULL. */
+static proc_t *attr_owner(const char *guest)
+{
+    if (!strcmp(guest, "/proc/self/attr/current") || !strcmp(guest, "/proc/thread-self/attr/current"))
+        return proc_cur();
+    const char *rest;
+    proc_t *p = live_proc(guest, &rest);
+    return p && rest && !strcmp(rest, "/attr/current") ? p : NULL;
+}
+
+int procfs_is_attr_current(const char *guest) { return attr_owner(guest) != NULL; }
+
+int64_t procfs_attr_write(const char *guest, const uint8_t *buf, size_t n)
+{
+    proc_t *p = attr_owner(guest);
+    if (!p)
+        return -LE_BADF;
+    while (n > 0 && buf[n - 1] == 0)
+        n--; /* the NUL that libselinux writes with the context */
+    if (n == 0 || n >= PROC_ATTR_MAX)
+        return -LE_INVAL;
+    memcpy(p->attr_current, buf, n);
+    p->attr_current[n] = 0;
+    return (int64_t)n;
 }

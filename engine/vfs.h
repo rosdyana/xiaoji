@@ -9,6 +9,7 @@
 
 #include "host.h"
 #include "memfd.h"
+#include "mntns.h"
 #include "sock.h"
 
 #define VFS_PATH_MAX 4096
@@ -16,7 +17,8 @@
 
 typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE, VFS_SOCK, VFS_BINDER, VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL } vfs_kind;
 typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA, SYN_BINDER,
-               SYN_DIR, SYN_SELFS_STATUS, SYN_SELFS_ACCESS } vfs_syn;
+               SYN_DIR, SYN_SELFS_STATUS, SYN_SELFS_ACCESS,
+               SYN_SELFS_CONTEXT } vfs_syn;
 
 /* An open file description: the offset, the status flags and the object. Every fd
  * that refers to it (dup, fork) shares it; it is freed when refs drops to 0. */
@@ -57,6 +59,7 @@ typedef struct {
     char guest[VFS_PATH_MAX]; /* canonical guest path (or the link itself) */
     char host[VFS_PATH_MAX];  /* host path for guest[] */
     char target[VFS_PATH_MAX]; /* link target when is_link */
+    int ro;              /* the path is under a read-only mount (mutating calls give EROFS) */
 } vfs_res;
 
 /* host_root NULL means the host root "/". prog is the guest path of the
@@ -67,6 +70,13 @@ fdtab_t *vfs_fdtab_new(void);
 void vfs_fdtab_switch(fdtab_t *t);
 /* A copy for fork: every descriptor shares its description with the source. */
 fdtab_t *vfs_fdtab_fork(fdtab_t *src);
+/* The running process's mount namespace (NULL when it has no mounts), and the namespace of t. */
+mntns_t *vfs_ns(void);
+mntns_t *vfs_fdtab_ns(const fdtab_t *t);
+/* The initial process ends: its namespace is released (and its tmpfs directories removed). */
+void vfs_fdtab_exit_ns(fdtab_t *t);
+/* unshare(CLONE_NEWNS) and clone(CLONE_NEWNS): t gets a copy of its namespace (out of memory is fatal). */
+void vfs_fdtab_copy_ns(fdtab_t *t);
 /* Closes every descriptor of t (the last reference to a description frees it) and frees
  * t. If t is the running table, the running table is cleared. */
 void vfs_fdtab_release(fdtab_t *t);

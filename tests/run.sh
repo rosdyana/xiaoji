@@ -24,6 +24,7 @@ mkdir -p "$ORACLE" "$OUT"
 args_for() {
     case "$1" in
     args) echo "alpha beta" ;;
+    mountns) echo "$ROOT/build/tests/mountns-work" ;; # absolute: a guest process starts in "/"
     *) echo "" ;;
     esac
 }
@@ -78,7 +79,10 @@ make_oracle() {
     if [ -f "$rc" ] && [ "$rc" -nt "$bin" ]; then
         return 0
     fi
-    "$ORB" -m builder sh -c "cd '$ROOT' && '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
+    # mountns makes mounts: its oracle runs as root (passwordless sudo in the builder VM).
+    local runas=""
+    case "$name" in mountns-*) runas="sudo -n" ;; esac
+    "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
 }
@@ -448,16 +452,18 @@ for case_name in init-sockets init-ctl; do
     done
 done
 
-# Zygote (B4a, B4b), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc. The log must show
-# the class preload ("...preloaded N classes") and the fork of system_server (zygote's own
-# "System server process N has been created", B4b milestone c). About 50 s natively. Not in the
+# Zygote (B4a, B4b, B4c), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc. The log must show
+# the class preload ("...preloaded N classes"), the fork of system_server (zygote's own
+# "System server process N has been created", B4b milestone c) and system_server's entry ("Entered
+# the Android system server!", B4c milestone d1). About 52 s natively. Not in the
 # default run, which is kept short; the boot is stopped by --init-timeout.
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
-        grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err"; then
-        echo "PASS  zygote preload and system_server fork (XIAOJI_BOOT)"
+        grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
+        grep -q 'Entered the Android system server!' "$OUT/boot.err"; then
+        echo "PASS  zygote preload, system_server fork and its entry (XIAOJI_BOOT, B4c milestone d1)"
         pass=$((pass + 1))
     else
         echo "FAIL  zygote boot (XIAOJI_BOOT): no preload or no system_server fork line in $OUT/boot.err"

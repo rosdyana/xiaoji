@@ -36,6 +36,7 @@
 #define CLD_KILLED 2
 
 #define CLONE_VM 0x00000100ull
+#define CLONE_NEWNS 0x00020000ull
 #define CLONE_THREAD 0x00010000ull
 #define CLONE_SETTLS 0x00080000ull
 #define CLONE_PARENT_SETTID 0x00100000ull
@@ -416,6 +417,8 @@ static void finish_process(proc_t *p)
     for (int i = 0; i < MAX_THREADS; i++)
         if (threads[i] && threads[i]->proc == p)
             reap(i);
+    if (p == init_proc && p->fds)
+        vfs_fdtab_exit_ns(p->fds);
     if (p == init_proc || p->zombie)
         return;
     p->zombie = 1;
@@ -675,6 +678,8 @@ static int64_t clone_process(cpu_t *parent, uint64_t flags, uint64_t newsp, uint
     proc_t *child = proc_fork(me->proc, (int)pid, vfork);
     if (!child)
         return -LE_NOMEM;
+    if (flags & CLONE_NEWNS) /* the child gets a copy of the mount namespace */
+        vfs_fdtab_copy_ns(child->fds);
     thread_t *t = add_thread(parent, pid, child);
     if (!t) /* not reached: live_count left a free slot */
         return -LE_NOMEM;

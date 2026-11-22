@@ -25,6 +25,7 @@ static const struct {
     {"/sys/fs/selinux/checkreqprot", SELFS_FILE, "0\n"},
     {"/sys/fs/selinux/mls", SELFS_FILE, "0\n"},
     {"/sys/fs/selinux/access", SELFS_ACCESS, NULL},
+    {"/sys/fs/selinux/context", SELFS_CONTEXT, NULL},
     {"/sys/fs/selinux/class", SELFS_DIR, NULL},
     {"/sys/fs/selinux/class/service_manager", SELFS_DIR, NULL},
     {"/sys/fs/selinux/class/service_manager/index", SELFS_FILE, "60\n"},
@@ -118,6 +119,26 @@ memfd_t *selinuxfs_status_memfd(void)
     }
     status = m;
     return status;
+}
+
+int selinuxfs_check_context(const char *ctx, size_t n)
+{
+    if (n < 2 || n > 4096 || ctx[n - 1] != 0)
+        return -1;
+    size_t len = n - 1, fields = 1, field_len = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (ctx[i] == ':') {
+            if (field_len == 0)
+                return -1;
+            fields++;
+            field_len = 0;
+        } else {
+            field_len++;
+        }
+    }
+    if (field_len == 0)
+        return -1;
+    return fields >= 4 && fields <= 5 ? 0 : -1;
 }
 
 int selinuxfs_access(const char *req, size_t n, uint8_t **reply, size_t *len)
