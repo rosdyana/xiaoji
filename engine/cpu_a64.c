@@ -78,7 +78,7 @@ static uint32_t nz_flags(uint64_t r, unsigned sf)
     return (N << 31) | (Z << 30);
 }
 
-static int cond_true(uint32_t f, unsigned cond)
+int cond_true(uint32_t f, unsigned cond)
 {
     unsigned N = (f >> 31) & 1, Z = (f >> 30) & 1, C = (f >> 29) & 1, V = (f >> 28) & 1;
     int r;
@@ -981,6 +981,9 @@ static int exec(cpu_t *c, uint32_t insn, uint64_t pc)
 static void unimplemented(cpu_t *c, uint32_t insn, uint64_t pc)
 {
     c->pc = pc;
+    if (sig_debug_faults() && sig_catchable(c, SIGILL_N))
+        fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,
+                (unsigned long long)pc);
     if (sig_fault(c, SIGILL_N, ILL_ILLOPC, pc))
         return;
     fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,

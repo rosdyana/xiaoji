@@ -107,37 +107,112 @@ static uint64_t d_bits(double d) { uint64_t b; memcpy(&b, &d, 8); return b; }
 static void put_fs(cpu_t *c, unsigned r, uint32_t bits) { c->v[r][0] = bits; c->v[r][1] = 0; }
 static void put_fd(cpu_t *c, unsigned r, uint64_t bits) { c->v[r][0] = bits; c->v[r][1] = 0; }
 
-/* Two-source arithmetic: FMUL (0), FDIV (1), FADD (2), FSUB (3). A NaN operand
- * propagates (the first NaN, quieted); a NaN from non-NaN operands is the
- * default NaN. */
+/* Operand classes for the NaN rules (FPProcessNaNs): raw bits of the given precision. */
+static int isnan_b(uint64_t v, int dbl) { return dbl ? nan_d(v) : nan_s((uint32_t)v); }
+static int isqnan_b(uint64_t v, int dbl)
+{
+    return isnan_b(v, dbl) && (v & (dbl ? FP_QUIET_D : FP_QUIET_S));
+}
+static uint64_t quiet_b(uint64_t v, int dbl) { return v | (dbl ? FP_QUIET_D : FP_QUIET_S); }
+
+/* Two NaN operands (at least one is NaN): the first signalling NaN, quieted, else
+ * the first quiet NaN. */
+static uint64_t nan_pick(uint64_t a, uint64_t b, int dbl)
+{
+    if (isnan_b(a, dbl) && !isqnan_b(a, dbl))
+        return quiet_b(a, dbl);
+    if (isnan_b(b, dbl) && !isqnan_b(b, dbl))
+        return quiet_b(b, dbl);
+    return isqnan_b(a, dbl) ? a : b;
+}
+
+/* FMAX/FMIN choice between two non-NaN values, returns 1 for b, 0 for a. Zeros
+ * of either sign compare equal, so FMAX prefers +0 and FMIN prefers -0. */
+static int pick_minmax(double x, double y, int is_min)
+{
+    if (x > y)
+        return is_min;
+    if (y > x)
+        return !is_min;
+    if (x == 0.0) {
+        int xn = signbit(x), yn = signbit(y);
+        if (is_min)
+            return xn ? 0 : (yn ? 1 : 0);
+        return xn ? 1 : 0;
+    }
+    return 0; /* equal and nonzero: the same value */
+}
+
+/* Two-source: FMUL (0), FDIV (1), FADD (2), FSUB (3), FMAX (4), FMIN (5), FMAXNM (6),
+ * FMINNM (7), FNMUL (8). A NaN operand propagates (see nan_pick); the NM variants
+ * return the other operand when only one is a quiet NaN; a NaN from non-NaN
+ * operands is the default NaN. */
 static int fp_arith2(cpu_t *c, uint32_t insn)
 {
     unsigned type = (insn >> 22) & 3, rm = (insn >> 16) & 31, opc = (insn >> 12) & 0xF;
     unsigned rn = (insn >> 5) & 31, rd = insn & 31;
-    if (opc > 3 || type > 1 || !fp_default(c))
+    if (opc > 8 || type > 1 || !fp_default(c))
         return -1;
-    if (type == 0) {
-        uint32_t a = (uint32_t)c->v[rn][0], b = (uint32_t)c->v[rm][0], r;
-        if (nan_s(a) || nan_s(b)) {
-            r = nan_s(a) ? (a | FP_QUIET_S) : (b | FP_QUIET_S);
-        } else {
-            float fa = as_f(a), fb = as_f(b), fr;
-            fr = opc == 0 ? fa * fb : opc == 1 ? fa / fb : opc == 2 ? fa + fb : fa - fb;
-            r = nan_s(f_bits(fr)) ? FP_DEFAULT_NAN_S : f_bits(fr);
-        }
-        put_fs(c, rd, r);
-        return 0;
-    }
+    int dbl = type == 1;
     uint64_t a = c->v[rn][0], b = c->v[rm][0], r;
-    if (nan_d(a) || nan_d(b)) {
-        r = nan_d(a) ? (a | FP_QUIET_D) : (b | FP_QUIET_D);
-    } else {
-        double da = as_d(a), db = as_d(b), dr;
-        dr = opc == 0 ? da * db : opc == 1 ? da / db : opc == 2 ? da + db : da - db;
-        r = nan_d(d_bits(dr)) ? FP_DEFAULT_NAN_D : d_bits(dr);
+    if (!dbl) {
+        a &= 0xFFFFFFFFu;
+        b &= 0xFFFFFFFFu;
     }
-    put_fd(c, rd, r);
+    int an = isnan_b(a, dbl), bn = isnan_b(b, dbl);
+    if (an || bn) {
+        if ((opc == 6 || opc == 7) && isqnan_b(a, dbl) && !bn)
+            r = b;
+        else if ((opc == 6 || opc == 7) && isqnan_b(b, dbl) && !an)
+            r = a;
+        else
+            r = nan_pick(a, b, dbl);
+        if (opc == 8) /* FNMUL negates the result, including a NaN (as the hardware does) */
+            r ^= dbl ? (1ull << 63) : (1ull << 31);
+    } else if (opc >= 4 && opc <= 7) {
+        double x = dbl ? as_d(a) : as_f((uint32_t)a);
+        double y = dbl ? as_d(b) : as_f((uint32_t)b);
+        r = pick_minmax(x, y, opc & 1) ? b : a;
+    } else if (dbl) {
+        double da = as_d(a), db = as_d(b), dr;
+        if (opc == 8)
+            dr = -(da * db);
+        else
+            dr = opc == 0 ? da * db : opc == 1 ? da / db : opc == 2 ? da + db : da - db;
+        r = nan_d(d_bits(dr)) ? FP_DEFAULT_NAN_D : d_bits(dr);
+    } else {
+        float fa = as_f((uint32_t)a), fb = as_f((uint32_t)b), fr;
+        if (opc == 8)
+            fr = -(fa * fb);
+        else
+            fr = opc == 0 ? fa * fb : opc == 1 ? fa / fb : opc == 2 ? fa + fb : fa - fb;
+        r = nan_s(f_bits(fr)) ? FP_DEFAULT_NAN_S : f_bits(fr);
+    }
+    if (dbl)
+        put_fd(c, rd, r);
+    else
+        put_fs(c, rd, (uint32_t)r);
     return 0;
+}
+
+/* NZCV for a floating-point compare of two raw values of the given precision. */
+static uint32_t fcmp_nzcv(unsigned type, uint64_t a, uint64_t b)
+{
+    double x, y;
+    if (type == 0) {
+        x = as_f((uint32_t)a);
+        y = as_f((uint32_t)b);
+    } else {
+        x = as_d(a);
+        y = as_d(b);
+    }
+    if (x != x || y != y)
+        return 0x30000000u; /* unordered: C and V */
+    if (x == y)
+        return 0x60000000u; /* equal: Z and C */
+    if (x < y)
+        return 0x80000000u; /* less: N */
+    return 0x20000000u;     /* greater: C */
 }
 
 /* FCMP and FCMPE (register, or against zero when the opc bit 3 is set). The
@@ -150,24 +225,169 @@ static int fp_cmp(cpu_t *c, uint32_t insn)
     int zero = (opc >> 3) & 1;
     if (zero && rm != 0)
         return -1;
-    double a, b;
-    if (type == 0) {
-        a = as_f((uint32_t)c->v[rn][0]);
-        b = zero ? 0.0 : as_f((uint32_t)c->v[rm][0]);
-    } else {
-        a = as_d(c->v[rn][0]);
-        b = zero ? 0.0 : as_d(c->v[rm][0]);
-    }
-    uint32_t nzcv;
-    if (a != a || b != b)
-        nzcv = 0x30000000u; /* unordered: C and V */
-    else if (a == b)
-        nzcv = 0x60000000u; /* equal: Z and C */
-    else if (a < b)
-        nzcv = 0x80000000u; /* less: N */
+    c->nzcv = fcmp_nzcv(type, c->v[rn][0], zero ? 0 : c->v[rm][0]);
+    return 0;
+}
+
+/* FCCMP and FCCMPE: compare when cond holds, else set NZCV from the immediate. */
+static int fp_ccmp(cpu_t *c, uint32_t insn)
+{
+    unsigned type = (insn >> 22) & 3, rm = (insn >> 16) & 31, cond = (insn >> 12) & 0xF;
+    unsigned rn = (insn >> 5) & 31, nzcv = insn & 0xF;
+    if (type > 1 || !fp_default(c))
+        return -1;
+    if (cond_true(c->nzcv, cond))
+        c->nzcv = fcmp_nzcv(type, c->v[rn][0], c->v[rm][0]);
     else
-        nzcv = 0x20000000u; /* greater: C */
-    c->nzcv = nzcv;
+        c->nzcv = nzcv << 28;
+    return 0;
+}
+
+/* FP 1-source (opcode in bits 20:15): FMOV, FABS, FNEG, FSQRT, FCVT to single or
+ * double (half precision is not implemented), and FRINTN/P/M/Z/A/X/I. */
+static int fp_1src(cpu_t *c, uint32_t insn)
+{
+    unsigned type = (insn >> 22) & 3, opcode = (insn >> 15) & 0x3F;
+    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+    if (type > 1 || !fp_default(c))
+        return -1;
+    int dbl = type == 1;
+    uint64_t a = c->v[rn][0];
+    if (!dbl)
+        a &= 0xFFFFFFFFu;
+    if (opcode <= 2) { /* FMOV, FABS, FNEG: bit operations, NaNs are not changed */
+        uint64_t sign = dbl ? (1ull << 63) : (1ull << 31), r = a;
+        if (opcode == 1)
+            r = a & ~sign;
+        else if (opcode == 2)
+            r = a ^ sign;
+        if (dbl)
+            put_fd(c, rd, r);
+        else
+            put_fs(c, rd, (uint32_t)r);
+        return 0;
+    }
+    if (opcode == 3) { /* FSQRT: a negative operand gives the default NaN */
+        uint64_t r;
+        if (isnan_b(a, dbl)) {
+            r = quiet_b(a, dbl);
+        } else if (dbl) {
+            double x = as_d(a);
+            r = x < 0 ? FP_DEFAULT_NAN_D : d_bits(sqrt(x));
+        } else {
+            float x = as_f((uint32_t)a);
+            r = x < 0 ? FP_DEFAULT_NAN_S : f_bits(sqrtf(x));
+        }
+        if (dbl)
+            put_fd(c, rd, r);
+        else
+            put_fs(c, rd, (uint32_t)r);
+        return 0;
+    }
+    if (opcode >= 4 && opcode <= 7) { /* FCVT: the destination type is opcode bits 1:0 */
+        unsigned dst = opcode & 3;
+        if (dst == 3 || dst == (unsigned)type)
+            return -1; /* half precision, or no conversion */
+        if (dst == 1) { /* single to double: exact, NaN payload kept at the top of the fraction */
+            uint64_t r;
+            if (isnan_b(a, 0))
+                r = ((a >> 31) << 63) | (0x7FFull << 52) | ((a & 0x7FFFFFu) << 29) | FP_QUIET_D;
+            else
+                r = d_bits((double)as_f((uint32_t)a));
+            put_fd(c, rd, r);
+        } else { /* double to single: rounds to nearest, NaN keeps the top fraction bits */
+            uint32_t r;
+            if (isnan_b(a, 1))
+                r = (uint32_t)(((a >> 63) << 31) | (0xFFu << 23) | ((a >> 29) & 0x7FFFFFu) | FP_QUIET_S);
+            else
+                r = f_bits((float)as_d(a));
+            put_fs(c, rd, r);
+        }
+        return 0;
+    }
+    if (opcode >= 8 && opcode <= 15 && opcode != 13) { /* FRINT*: round to integral, NaNs quieted */
+        uint64_t r;
+        if (isnan_b(a, dbl))
+            r = quiet_b(a, dbl);
+        else if (dbl) {
+            double x = as_d(a);
+            double y = opcode == 8 || opcode == 14 || opcode == 15 ? rint(x) : opcode == 9 ? ceil(x)
+                     : opcode == 10 ? floor(x) : opcode == 11 ? trunc(x) : round(x);
+            r = d_bits(y);
+        } else {
+            float x = as_f((uint32_t)a);
+            float y = opcode == 8 || opcode == 14 || opcode == 15 ? rintf(x) : opcode == 9 ? ceilf(x)
+                     : opcode == 10 ? floorf(x) : opcode == 11 ? truncf(x) : roundf(x);
+            r = f_bits(y);
+        }
+        if (dbl)
+            put_fd(c, rd, r);
+        else
+            put_fs(c, rd, (uint32_t)r);
+        return 0;
+    }
+    return -1;
+}
+
+/* FMADD, FMSUB, FNMADD, FNMSUB: Rd = +-Ra +- Rn*Rm with one rounding (fma). The
+ * operands are negated by flipping the sign, which is exact. NaN operands are
+ * chosen in the order Rn, Rm, Ra. */
+static int fp_3src(cpu_t *c, uint32_t insn)
+{
+    unsigned type = (insn >> 22) & 3, o1 = (insn >> 21) & 1, rm = (insn >> 16) & 31, o0 = (insn >> 15) & 1;
+    unsigned ra = (insn >> 10) & 31, rn = (insn >> 5) & 31, rd = insn & 31;
+    if (type > 1 || !fp_default(c))
+        return -1;
+    int dbl = type == 1;
+    uint64_t n = c->v[rn][0], m = c->v[rm][0], a = c->v[ra][0];
+    if (!dbl) {
+        n &= 0xFFFFFFFFu;
+        m &= 0xFFFFFFFFu;
+        a &= 0xFFFFFFFFu;
+    }
+    int prod_neg = (int)(o1 ^ o0), add_neg = (int)o1;
+    if (isnan_b(n, dbl) || isnan_b(m, dbl) || isnan_b(a, dbl)) {
+        /* The negations apply to the operands before a NaN is chosen, as on hardware. */
+        uint64_t sign = dbl ? (1ull << 63) : (1ull << 31);
+        uint64_t x[3] = {prod_neg ? n ^ sign : n, m, add_neg ? a ^ sign : a}, r = 0;
+        int i;
+        for (i = 0; i < 3; i++) {
+            if (isnan_b(x[i], dbl) && !isqnan_b(x[i], dbl)) {
+                r = quiet_b(x[i], dbl);
+                break;
+            }
+        }
+        if (i == 3) {
+            for (i = 0; i < 3; i++) {
+                if (isqnan_b(x[i], dbl)) {
+                    r = x[i];
+                    break;
+                }
+            }
+        }
+        if (dbl)
+            put_fd(c, rd, r);
+        else
+            put_fs(c, rd, (uint32_t)r);
+        return 0;
+    }
+    if (dbl) {
+        double dn = as_d(n), dm = as_d(m), da = as_d(a);
+        if (prod_neg)
+            dn = -dn;
+        if (add_neg)
+            da = -da;
+        double r = fma(dn, dm, da);
+        put_fd(c, rd, nan_d(d_bits(r)) ? FP_DEFAULT_NAN_D : d_bits(r));
+    } else {
+        float fn = as_f((uint32_t)n), fm = as_f((uint32_t)m), fa = as_f((uint32_t)a);
+        if (prod_neg)
+            fn = -fn;
+        if (add_neg)
+            fa = -fa;
+        float r = fmaf(fn, fm, fa);
+        put_fs(c, rd, nan_s(f_bits(r)) ? FP_DEFAULT_NAN_S : f_bits(r));
+    }
     return 0;
 }
 
@@ -259,6 +479,44 @@ static int fmov_gen(cpu_t *c, uint32_t insn)
     }
     if (sf && ftype == 2 && rmode == 1 && opc == 6) { /* FMOV Xd, Vn.D[1] */
         gpr_w(c, rd, c->v[rn][1]);
+        return 0;
+    }
+    return -1;
+}
+
+/* FCSEL: Vd = cond ? Vn : Vm, scalar, single or double. */
+static int fp_csel(cpu_t *c, uint32_t insn)
+{
+    unsigned type = (insn >> 22) & 3, rm = (insn >> 16) & 31, cond = (insn >> 12) & 0xF;
+    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+    if (type > 1)
+        return -1;
+    unsigned src = cond_true(c->nzcv, cond) ? rn : rm;
+    if (type == 0)
+        put_fs(c, rd, (uint32_t)c->v[src][0]);
+    else
+        put_fd(c, rd, c->v[src][0]);
+    return 0;
+}
+
+/* ---------- FMOV (scalar, immediate) ----------
+ * VFPExpandImm from the Arm ARM. Single: sign imm8<7>, exponent NOT(b):Replicate(b,5):
+ * imm8<5:4> (b = imm8<6>), fraction imm8<3:0>:Zeros(19). Double: exponent
+ * NOT(b):Replicate(b,8):imm8<5:4>, fraction imm8<3:0>:Zeros(48). Type 2 is
+ * unallocated; type 3 is half precision (FEAT_FP16), not implemented. */
+static int fmov_imm(cpu_t *c, uint32_t insn)
+{
+    unsigned type = (insn >> 22) & 3, rd = insn & 31;
+    uint32_t imm8 = (insn >> 13) & 0xFF;
+    uint32_t sign = (imm8 >> 7) & 1, b = (imm8 >> 6) & 1, lo = (imm8 >> 4) & 3, frac = imm8 & 0xF;
+    if (type == 0) {
+        uint32_t e = ((b ^ 1) << 7) | (b ? 0x1Fu << 2 : 0) | lo;
+        put_fs(c, rd, (sign << 31) | (e << 23) | (frac << 19));
+        return 0;
+    }
+    if (type == 1) {
+        uint64_t e = ((uint64_t)(b ^ 1) << 10) | (b ? 0xFFull << 2 : 0) | lo;
+        put_fd(c, rd, ((uint64_t)sign << 63) | (e << 52) | ((uint64_t)frac << 48));
         return 0;
     }
     return -1;
@@ -479,6 +737,64 @@ static int three_same(cpu_t *c, uint32_t insn)
         for (unsigned i = 0; i < lanes; i++)
             putel(r, esz, i, (getel(n, esz, i) * getel(m, esz, i)) & emask(esz));
         break;
+    case 0x00: /* SHADD (u=0), UHADD (u=1): halving add, rounding down */
+    case 0x02: /* SRHADD (u=0), URHADD (u=1): halving add, rounding up */
+    case 0x04: /* SHSUB (u=0), UHSUB (u=1): halving subtract, rounding down */
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t a = getel(n, esz, i), b = getel(m, esz, i), q;
+            if (!u) {
+                int64_t x = sext_el(a, esz), y = sext_el(b, esz);
+                q = (uint64_t)(opc == 0x00 ? (x >> 1) + (y >> 1) + ((x & y) & 1)
+                  : opc == 0x02 ? (x >> 1) + (y >> 1) + ((x | y) & 1)
+                  : (x >> 1) - (y >> 1) - ((~x & y) & 1));
+            } else {
+                q = opc == 0x00 ? (a >> 1) + (b >> 1) + ((a & b) & 1)
+                  : opc == 0x02 ? (a >> 1) + (b >> 1) + ((a | b) & 1)
+                  : (a >> 1) - (b >> 1) - ((~a & b) & 1);
+            }
+            putel(r, esz, i, q);
+        }
+        break;
+    case 0x08: /* SSHL (u=0), USHL (u=1): shift by the signed low byte of the shift element */
+    case 0x0A: /* SRSHL (u=0), URSHL (u=1): the same, rounding right shifts */
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t a = getel(n, esz, i), res = 0;
+            int s = (int8_t)(getel(m, esz, i) & 0xFF);
+            unsigned bits = 8 * esz;
+            if (s >= 0) {
+                res = (unsigned)s >= bits ? 0 : a << s;
+            } else {
+                unsigned k = (unsigned)-s;
+                int64_t sa = sext_el(a, esz);
+                if (opc == 0x08) {
+                    if (!u)
+                        res = (uint64_t)(k >= 64 ? (sa < 0 ? -1 : 0) : (sa >> k));
+                    else
+                        res = k >= 64 ? 0 : a >> k;
+                } else if (k >= 64) {
+                    res = 0;
+                } else if (!u) {
+                    res = (uint64_t)((sa >> k) + ((sa >> (k - 1)) & 1));
+                } else {
+                    res = (a >> k) + ((a >> (k - 1)) & 1);
+                }
+            }
+            putel(r, esz, i, res);
+        }
+        break;
+    case 0x0E: /* SABD (u=0), UABD (u=1): absolute difference */
+    case 0x0F: /* SABA (u=0), UABA (u=1): absolute difference added to Vd */
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t a = getel(n, esz, i), b = getel(m, esz, i), diff;
+            if (!u) {
+                int64_t x = sext_el(a, esz), y = sext_el(b, esz);
+                diff = x > y ? (uint64_t)x - (uint64_t)y : (uint64_t)y - (uint64_t)x;
+            } else {
+                diff = a > b ? a - b : b - a;
+            }
+            putel(r, esz, i, opc == 0x0E ? diff : getel(d, esz, i) + diff);
+        }
+        break;
     case 0x0C: /* SMAX (u=0), UMAX (u=1) */
     case 0x0D: /* SMIN (u=0), UMIN (u=1) */
         for (unsigned i = 0; i < lanes; i++) {
@@ -544,17 +860,66 @@ static int three_diff(cpu_t *c, uint32_t insn)
         wr_v(c, rd, r, 16);
         return 0;
     }
-    if (size == 3 || !(u && opc == 0x8)) /* only UMLAL, UMLAL2 and 8-bit PMULL are in M1 */
+    /* Saturating doubling forms (opc 9, 11, 13) need the QC flag, which is not kept;
+     * opc 15 and U=1 with PMULL are unallocated. */
+    if (opc == 9 || opc == 11 || opc == 13 || opc == 15 || (u && opc == 14))
         return -1;
-    unsigned esz = 1u << size, dst_esz = 2 * esz, lanes = 8 / esz;
-    unsigned half = q ? 8 : 0;
     uint8_t n[16], m[16], d[16], r[16];
     rd_v(c, rn, n);
     rd_v(c, rm, m);
     rd_v(c, rd, d);
+    memset(r, 0, sizeof r);
+    int sgn = !u;
+
+    if (opc == 4 || opc == 6) { /* ADDHN, RADDHN (u=1), SUBHN, RSUBHN (u=1): narrowing, the high half */
+        /* size is the narrow result's element size (as for XTN): the sources are twice as wide */
+        if (size == 3)
+            return -1;
+        unsigned esz_s = 2u << size, h = 4 * esz_s, lanes = 16 / esz_s;
+        unsigned dst_esz = esz_s / 2;
+        uint64_t mb = h * 2 == 64 ? ~0ull : ((1ull << (2 * h)) - 1);
+        uint64_t mh = (1ull << h) - 1;
+        uint64_t rc = u ? (1ull << (h - 1)) : 0; /* rounding constant of the R forms */
+        unsigned off = q ? 8 : 0;
+        if (q)
+            memcpy(r, d, 8); /* the "2" forms keep the low half of Rd */
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t a = getel(n, esz_s, i), b = getel(m, esz_s, i), v;
+            v = opc == 4 ? (a + b + rc) & mb : (a - b + rc) & mb;
+            putel(r + off, dst_esz, i, (v >> h) & mh);
+        }
+        wr_v(c, rd, r, 16);
+        return 0;
+    }
+
+    if (size == 3)
+        return -1; /* 2D sources would need a 128-bit result element */
+    unsigned esz = 1u << size, dst_esz = 2 * esz, lanes = 8 / esz;
+    unsigned half = q ? 8 : 0;
+    int wide = opc == 1 || opc == 3; /* SADDW, SSUBW: the first operand is already wide */
     for (unsigned i = 0; i < lanes; i++) {
-        uint64_t prod = getel(n + half, esz, i) * getel(m + half, esz, i);
-        putel(r, dst_esz, i, (getel(d, dst_esz, i) + prod) & emask(dst_esz));
+        uint64_t a, b;
+        if (wide)
+            a = sgn ? (uint64_t)sext_el(getel(n, dst_esz, i), dst_esz) : getel(n, dst_esz, i);
+        else
+            a = sgn ? (uint64_t)sext_el(getel(n + half, esz, i), esz) : getel(n + half, esz, i);
+        b = sgn ? (uint64_t)sext_el(getel(m + half, esz, i), esz) : getel(m + half, esz, i);
+        uint64_t acc = getel(d, dst_esz, i), res = 0;
+        uint64_t diff = sgn ? (uint64_t)((int64_t)a >= (int64_t)b ? (int64_t)a - (int64_t)b : (int64_t)b - (int64_t)a)
+                            : (a >= b ? a - b : b - a);
+        switch (opc) {
+        case 0: res = a + b; break;                 /* SADDL, UADDL */
+        case 1: res = a + b; break;                 /* SADDW, UADDW */
+        case 2: res = a - b; break;                 /* SSUBL, USUBL */
+        case 3: res = a - b; break;                 /* SSUBW, USUBW */
+        case 5: res = acc + diff; break;            /* SABAL, UABAL */
+        case 7: res = diff; break;                  /* SABDL, UABDL */
+        case 8: res = acc + a * b; break;           /* SMLAL, UMLAL */
+        case 10: res = acc - a * b; break;          /* SMLSL, UMLSL */
+        case 12: res = a * b; break;                /* SMULL, UMULL */
+        default: return -1;
+        }
+        putel(r, dst_esz, i, res);
     }
     wr_v(c, rd, r, 16);
     return 0;
@@ -572,16 +937,69 @@ static int two_misc(cpu_t *c, uint32_t insn)
     memset(r, 0, sizeof r);
 
     switch (opc) {
-    case 0x00: { /* REV64 (u=0): reverse the elements inside each 64-bit doubleword */
-        if (u || size == 3)
+    case 0x00: { /* REV64 (u=0), REV32 (u=1): reverse the elements inside each 64- or 32-bit container */
+        if (size == 3 || (u && size == 2))
             return -1;
-        unsigned per = 8 / esz;
+        unsigned per = (u ? 4 : 8) / esz;
         for (unsigned i = 0; i < lanes; i++) {
             unsigned base = (i / per) * per;
             unsigned j = base + (per - 1 - (i - base));
             putel(r, esz, i, getel(n, esz, j));
         }
         break;
+    }
+    case 0x01: /* REV16 (u=0, size 0): swap the two bytes of each halfword */
+        if (u || size != 0)
+            return -1;
+        for (unsigned i = 0; i < dsz; i += 2) {
+            r[i] = n[i + 1];
+            r[i + 1] = n[i];
+        }
+        break;
+    case 0x04: { /* CLS (u=0): leading sign bits, not counting the sign bit; CLZ (u=1) */
+        if (size == 3)
+            return -1;
+        unsigned bits = 8 * esz;
+        uint64_t mask = emask(esz);
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t v = getel(n, esz, i) & mask;
+            int neg = !u && ((v >> (bits - 1)) & 1);
+            uint64_t x = neg ? (~v & mask) : v; /* leading zeros of x, then one less for CLS */
+            unsigned lz = 0;
+            while (lz < bits && !((x >> (bits - 1 - lz)) & 1))
+                lz++;
+            putel(r, esz, i, u ? lz : lz - 1);
+        }
+        break;
+    }
+    case 0x06: { /* SADALP (u=0), UADALP (u=1): pairwise sums added to the wide elements of Rd */
+        if (size == 3)
+            return -1;
+        unsigned dst_esz = 2 * esz;
+        rd_v(c, rd, d);
+        for (unsigned i = 0; i < lanes / 2; i++) {
+            uint64_t a = getel(n, esz, 2 * i), b = getel(n, esz, 2 * i + 1);
+            uint64_t sum = u ? a + b : (uint64_t)(sext_el(a, esz) + sext_el(b, esz));
+            putel(r, dst_esz, i, getel(d, dst_esz, i) + sum);
+        }
+        break;
+    }
+    case 0x0B: /* ABS (u=0), NEG (u=1) */
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t v = getel(n, esz, i);
+            int neg = u || sext_el(v, esz) < 0;
+            putel(r, esz, i, neg ? 0 - v : v);
+        }
+        break;
+    case 0x13: { /* SHLL (u=1), SHLL2 when q: widen each element and shift left by its width */
+        if (!u || size == 3)
+            return -1;
+        unsigned src_esz = esz, dst_esz = 2 * esz, src_lanes = 8 / esz;
+        unsigned half = q ? 8 : 0;
+        for (unsigned i = 0; i < src_lanes; i++)
+            putel(r, dst_esz, i, getel(n + half, src_esz, i) << (8 * src_esz));
+        wr_v(c, rd, r, 16);
+        return 0;
     }
     case 0x02: { /* SADDLP (u=0), UADDLP (u=1): pairwise sums into elements twice as wide */
         if (size == 3)
@@ -595,11 +1013,23 @@ static int two_misc(cpu_t *c, uint32_t insn)
         wr_v(c, rd, r, dsz);
         return 0;
     }
-    case 0x05: /* CNT (u=0, size 0) and NOT (u=1, size 0) */
-        if (size != 0)
+    case 0x05: /* CNT (u=0, size 0), NOT (u=1, size 0), RBIT (u=1, size 1): bits within each byte */
+        if (!u && size == 0) {
+            for (unsigned i = 0; i < dsz; i++)
+                r[i] = (uint8_t)__builtin_popcount(n[i]);
+        } else if (u && size == 0) {
+            for (unsigned i = 0; i < dsz; i++)
+                r[i] = (uint8_t)~n[i];
+        } else if (u && size == 1) {
+            for (unsigned i = 0; i < dsz; i++) {
+                uint8_t x = n[i], y = 0;
+                for (unsigned k = 0; k < 8; k++)
+                    y |= (uint8_t)(((x >> k) & 1) << (7 - k));
+                r[i] = y;
+            }
+        } else {
             return -1;
-        for (unsigned i = 0; i < dsz; i++)
-            r[i] = u ? (uint8_t)~n[i] : (uint8_t)__builtin_popcount(n[i]);
+        }
         break;
     case 0x08: /* CMGT zero (u=0), CMGE zero (u=1) */
     case 0x09: /* CMEQ zero (u=0), CMLE zero (u=1) */
@@ -871,36 +1301,85 @@ static int umov_smov(cpu_t *c, uint32_t insn, int is_signed)
 
 /* ---------- LD1/ST1 (multiple structures) ---------- */
 
+/* Element of esz bytes from or to guest memory, zero-extended. */
+static uint64_t mem_rd_el(uint64_t va, unsigned esz)
+{
+    switch (esz) {
+    case 1: return mem_read8(va);
+    case 2: return mem_read16(va);
+    case 4: return mem_read32(va);
+    default: return mem_read64(va);
+    }
+}
+
+static void mem_wr_el(uint64_t va, unsigned esz, uint64_t v)
+{
+    switch (esz) {
+    case 1: mem_write8(va, (uint8_t)v); break;
+    case 2: mem_write16(va, (uint16_t)v); break;
+    case 4: mem_write32(va, (uint32_t)v); break;
+    default: mem_write64(va, v); break;
+    }
+}
+
 int simd_ldst_multi(cpu_t *c, uint32_t insn)
 {
     unsigned q = (insn >> 30) & 1, post = (insn >> 23) & 1, L = (insn >> 22) & 1;
     unsigned rm = (insn >> 16) & 31, opc = (insn >> 12) & 0xF;
     unsigned rn = (insn >> 5) & 31, rt = insn & 31;
     unsigned nregs;
+    int inter = 0; /* LD2/3/4 and ST2/3/4: elements of the registers interleaved in memory */
     switch (opc) {
     case 0x7: nregs = 1; break; /* LD1/ST1 {Vt} */
     case 0xA: nregs = 2; break; /* {Vt, Vt2} */
     case 0x6: nregs = 3; break; /* {Vt, Vt2, Vt3} */
     case 0x2: nregs = 4; break; /* {Vt, Vt2, Vt3, Vt4} */
-    default: return -1;         /* LD2, LD3 and LD4 are not in M1 */
+    case 0x8: nregs = 2; inter = 1; break; /* LD2/ST2 */
+    case 0x4: nregs = 3; inter = 1; break; /* LD3/ST3 */
+    case 0x0: nregs = 4; inter = 1; break; /* LD4/ST4 */
+    default: return -1;
     }
     unsigned dsz = q ? 16 : 8;
     uint64_t addr = rn == 31 ? c->sp : c->x[rn];
-    for (unsigned t = 0; t < nregs; t++) {
-        unsigned reg = (rt + t) & 31;
-        uint64_t va = addr + (uint64_t)t * dsz;
+    if (inter) {
+        unsigned esz = 1u << ((insn >> 10) & 3);
+        if (esz == 8 && !q)
+            return -1; /* 1D with LD2/3/4 is reserved */
+        unsigned elems = dsz / esz;
         if (L) {
-            if (dsz == 16) {
-                mem_read128(va, c->v[reg]);
-            } else {
-                c->v[reg][0] = mem_read64(va);
+            for (unsigned t = 0; t < nregs; t++) {
+                unsigned reg = (rt + t) & 31;
+                c->v[reg][0] = 0;
                 c->v[reg][1] = 0;
             }
-        } else {
-            if (dsz == 16)
-                mem_write128(va, c->v[reg]);
-            else
-                mem_write64(va, c->v[reg][0]);
+        }
+        for (unsigned e = 0; e < elems; e++) {
+            for (unsigned t = 0; t < nregs; t++) {
+                unsigned reg = (rt + t) & 31;
+                uint64_t va = addr + (uint64_t)(e * nregs + t) * esz;
+                if (L)
+                    putel((uint8_t *)c->v[reg], esz, e, mem_rd_el(va, esz));
+                else
+                    mem_wr_el(va, esz, getel((const uint8_t *)c->v[reg], esz, e));
+            }
+        }
+    } else {
+        for (unsigned t = 0; t < nregs; t++) {
+            unsigned reg = (rt + t) & 31;
+            uint64_t va = addr + (uint64_t)t * dsz;
+            if (L) {
+                if (dsz == 16) {
+                    mem_read128(va, c->v[reg]);
+                } else {
+                    c->v[reg][0] = mem_read64(va);
+                    c->v[reg][1] = 0;
+                }
+            } else {
+                if (dsz == 16)
+                    mem_write128(va, c->v[reg]);
+                else
+                    mem_write64(va, c->v[reg][0]);
+            }
         }
     }
     if (post) {
@@ -990,12 +1469,83 @@ int simd_ldst_single(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* ---------- scalar AdvSIMD two-register miscellaneous (0x5E and 0x7E) ----------
+ * ABS and NEG (64-bit), SCVTF and UCVTF (from a 32- or 64-bit integer in the
+ * register), and FCVTNS..FCVTZU to a 32- or 64-bit integer, saturating. */
+
+/* Float to integer with rounding mode (0 nearest, 1 down, 2 up, 3 toward zero,
+ * 4 ties away), saturating to 32 or 64 bits. NaN gives 0. */
+static uint64_t to_int_sat(double x, unsigned mode, unsigned bits, int uns)
+{
+    if (x != x)
+        return 0;
+    double r = mode == 0 ? rint(x) : mode == 1 ? floor(x) : mode == 2 ? ceil(x) : mode == 3 ? trunc(x) : round(x);
+    if (uns) {
+        if (r <= 0)
+            return 0;
+        if (r >= (bits == 64 ? 18446744073709551616.0 : 4294967296.0))
+            return bits == 64 ? ~0ull : 0xFFFFFFFFull;
+        return (uint64_t)r;
+    }
+    double hi = bits == 64 ? 9223372036854775808.0 : 2147483648.0;
+    if (r >= hi)
+        return bits == 64 ? (uint64_t)INT64_MAX : 0x7FFFFFFFull;
+    if (r < -hi)
+        return bits == 64 ? (uint64_t)INT64_MIN : 0x80000000ull;
+    return bits == 64 ? (uint64_t)(int64_t)r : (uint64_t)(uint32_t)(int32_t)r;
+}
+
+static int scalar_simd(cpu_t *c, uint32_t insn)
+{
+    /* Only the two-register miscellaneous form (bits 21:17 = 10000, bits 11:10 = 10). */
+    if (!((insn >> 21) & 1) || ((insn >> 17) & 0x1F) != 0x10 || ((insn >> 10) & 3) != 2)
+        return -1;
+    unsigned u = (insn >> 29) & 1, a = (insn >> 23) & 1, sz = (insn >> 22) & 1;
+    unsigned opc = (insn >> 12) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
+    uint64_t x = c->v[rn][0];
+    switch (opc) {
+    case 0x0B: /* ABS (u=0), NEG (u=1), 64-bit only */
+        if (!a || !sz)
+            return -1;
+        put_fd(c, rd, u || (int64_t)x < 0 ? 0 - x : x);
+        return 0;
+    case 0x1D: /* SCVTF (u=0), UCVTF (u=1) from a 32-bit (S) or 64-bit (D) integer */
+        if (a)
+            return -1;
+        if (sz)
+            put_fd(c, rd, d_bits(u ? (double)x : (double)(int64_t)x));
+        else
+            put_fs(c, rd, f_bits(u ? (float)(uint32_t)x : (float)(int32_t)(uint32_t)x));
+        return 0;
+    case 0x1A: /* FCVTNS/FCVTNU (a=0), FCVTPS/FCVTPU (a=1) */
+    case 0x1B: /* FCVTMS/FCVTMU (a=0), FCVTZS/FCVTZU (a=1) */
+    case 0x1C: /* FCVTAS/FCVTAU (a=0) */
+    {
+        if (opc == 0x1C && a)
+            return -1;
+        unsigned mode = opc == 0x1A ? (a ? 2 : 0) : opc == 0x1B ? (a ? 3 : 1) : 4;
+        double v = sz ? as_d(x) : (double)as_f((uint32_t)x);
+        unsigned bits = sz ? 64 : 32;
+        uint64_t out = to_int_sat(v, mode, bits, (int)u);
+        if (sz)
+            put_fd(c, rd, out);
+        else
+            put_fs(c, rd, (uint32_t)out);
+        return 0;
+    }
+    default:
+        return -1;
+    }
+}
+
 /* ---------- dispatch ---------- */
 
 int simd_exec(cpu_t *c, uint32_t insn)
 {
     unsigned top = (insn >> 24) & 0x1F; /* bits 28..24 */
     if (top == 0x1E) { /* scalar floating point: bits 30 and 29 are zero (0x5E and 0x7E are AdvSIMD) */
+        if ((insn >> 30) & 1) /* scalar AdvSIMD: bit 31 is zero */
+            return (insn >> 31) ? -1 : scalar_simd(c, insn);
         if (((insn >> 29) & 3) || !((insn >> 21) & 1))
             return -1;
         unsigned low6 = (insn >> 10) & 0x3F;
@@ -1012,11 +1562,24 @@ int simd_exec(cpu_t *c, uint32_t insn)
         }
         if (insn >> 31)
             return -1;
-        if ((low6 & 3) == 2 && ((insn >> 12) & 0xF) <= 3)
+        if (((insn >> 10) & 0x1F) == 0x10) /* bits 14:10 = 10000: 1-source */
+            return fp_1src(c, insn);
+        if (((insn >> 10) & 7) == 4 && ((insn >> 5) & 0x1F) == 0) /* bits 12:10 = 100, Rn = 0: FMOV imm */
+            return fmov_imm(c, insn);
+        if ((low6 & 3) == 3)
+            return fp_csel(c, insn);
+        if ((low6 & 3) == 1)
+            return fp_ccmp(c, insn);
+        if ((low6 & 3) == 2 && ((insn >> 12) & 0xF) <= 8)
             return fp_arith2(c, insn);
         if (low6 == 0x08)
             return fp_cmp(c, insn);
         return -1;
+    }
+    if (top == 0x1F) { /* FP 3-source: FMADD and relatives, bit 31 and bits 30:29 zero */
+        if ((insn >> 31) || ((insn >> 29) & 3))
+            return -1;
+        return fp_3src(c, insn);
     }
     if (insn >> 31)
         return -1;

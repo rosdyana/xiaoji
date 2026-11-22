@@ -30,6 +30,14 @@ void sig_deliver_pending(cpu_t *c);
  * handler), and the caller reports and exits. */
 int sig_fault(cpu_t *c, int sig, int code, uint64_t addr);
 
+/* 1 if a fault with this signal would enter a guest handler now (installed and not
+ * blocked). */
+int sig_catchable(const cpu_t *c, int sig);
+/* XIAOJI_DEBUG_FAULTS=1: sig_set_debug_faults(1) turns on a stderr line per fault
+ * delivered to a guest handler. */
+void sig_set_debug_faults(int on);
+int sig_debug_faults(void);
+
 /* The default SIGSEGV action: message and exit 139. */
 void sig_segv_fatal(uint64_t addr, uint64_t pc);
 

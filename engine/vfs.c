@@ -15,6 +15,7 @@
 
 #include "host.h"
 #include "linux.h"
+#include "procfs.h"
 
 #define MAX_SYMLINKS 40
 #define NAME_MAX_LEN 255
@@ -119,6 +120,7 @@ static vfs_syn syn_of(const char *p)
     if (!strcmp(p, "/dev/zero")) return SYN_ZERO;
     if (!strcmp(p, "/dev/urandom") || !strcmp(p, "/dev/random")) return SYN_RANDOM;
     if (!strcmp(p, "/proc/self/cmdline")) return SYN_DATA;
+    if (procfs_known(p)) return SYN_DATA; /* generated at open, see vfs_open */
     return SYN_NONE;
 }
 
@@ -218,6 +220,12 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 out->syn = s;
                 strcpy(cur, cand);
                 break;
+            }
+            if (procfs_dir(cand)) {
+                if (last)
+                    return -LE_NOENT;
+                strcpy(cur, cand);
+                continue;
             }
             if (!strcmp(cand, "/proc/self") || !strcmp(cand, "/proc/self/fd")) {
                 if (last)
@@ -423,6 +431,12 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     if (r.syn != SYN_NONE) {
         if (lflags & LO_DIRECTORY)
             return -LE_NOTDIR;
+        /* Generated contents (/proc/self/stat and the like) are made before the slot is
+         * taken, so a failure leaves the fd table alone. */
+        uint8_t *gen = NULL;
+        size_t glen = 0;
+        if (r.syn == SYN_DATA && procfs_known(r.guest) && procfs_read(r.guest, &gen, &glen) < 0)
+            return -LE_NOMEM;
         memset(f, 0, sizeof *f);
         f->used = 1;
         f->kind = VFS_SYN;
@@ -431,7 +445,10 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
         f->cloexec = (lflags & LO_CLOEXEC) != 0;
         f->guest = xstrdup(r.guest);
-        if (r.syn == SYN_DATA) {
+        if (gen) {
+            f->data = gen;
+            f->dlen = glen;
+        } else if (r.syn == SYN_DATA) {
             f->data = malloc(cmdline_len ? cmdline_len : 1);
             if (!f->data)
                 die_oom();

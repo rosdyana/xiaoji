@@ -44,4 +44,7 @@ typedef struct cpu {
  * instruction, after a message). */
 void cpu_run(cpu_t *c);
 
+/* Evaluates a 4-bit A64 condition code against NZCV (N=bit31, Z=30, C=29, V=28). */
+int cond_true(uint32_t nzcv, unsigned cond);
+
 #endif

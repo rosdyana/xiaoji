@@ -60,6 +60,9 @@
 #define SYS_PRLIMIT64 261
 #define SYS_GETRANDOM 278
 #define SYS_RSEQ 293
+#define SYS_SOCKET 198
+#define SYS_FLOCK 32
+#define SYS_GETRLIMIT 163
 
 #define GUEST_TID 1000
 #define GUEST_ROOT_ID 0 /* uid and gid: the oracle runs as root */
@@ -641,8 +644,17 @@ static int64_t sys_rt_sigtimedwait(cpu_t *c, uint64_t set, uint64_t info, uint64
 
 static int64_t sys_prctl(uint64_t option, uint64_t arg2)
 {
+    static int dumpable = 1; /* SUID_DUMP_USER: the default, and the only value kept */
     if (option == LPR_SET_VMA)
         return 0;
+    if (option == LPR_GET_DUMPABLE)
+        return dumpable;
+    if (option == LPR_SET_DUMPABLE) {
+        if (arg2 > 1)
+            return -LE_INVAL;
+        dumpable = (int)arg2;
+        return 0;
+    }
     if (option == LPR_SET_NAME) {
         char name[16];
         int64_t n = mem_strlen(arg2);
@@ -799,6 +811,16 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_RSEQ:
         *ret = -LE_NOSYS;
+        return;
+    case SYS_SOCKET:
+        /* No network and no logd: the socket cannot be created (ART copes without logd). */
+        *ret = -LE_ACCES;
+        return;
+    case SYS_FLOCK:
+        *ret = 0; /* single process: file locks always succeed */
+        return;
+    case SYS_GETRLIMIT:
+        *ret = sys_prlimit64(a[0], a[1]);
         return;
     default:
         if (nr < 1024) {

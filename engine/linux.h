@@ -133,6 +133,8 @@
 #define LTIMER_ABSTIME 1
 
 /* prctl(2) options. */
+#define LPR_GET_DUMPABLE 3
+#define LPR_SET_DUMPABLE 4
 #define LPR_SET_NAME 15
 #define LPR_GET_NAME 16
 #define LPR_SET_VMA 0x53564d41

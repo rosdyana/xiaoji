@@ -120,3 +120,9 @@ int loader_setup_stack(cpu_t *c, const elf_info *ei, uint64_t at_base, int argc,
     c->sp = frame;
     return 0;
 }
+
+void loader_stack_range(uint64_t *lo, uint64_t *hi)
+{
+    *lo = STACK_TOP - STACK_SIZE;
+    *hi = STACK_TOP;
+}

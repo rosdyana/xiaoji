@@ -10,6 +10,7 @@
 #include "loader.h"
 #include "mem.h"
 #include "sched.h"
+#include "signals.h"
 #include "syscall.h"
 #include "vfs.h"
 
@@ -132,6 +133,8 @@ int main(int argc, char **argv)
 
     const char *stats_env = getenv("XIAOJI_STATS");
     int stats = stats_env && stats_env[0] == '1';
+    const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
+    sig_set_debug_faults(faults_env && faults_env[0] == '1');
     uint64_t t0 = host_monotonic_ns();
     int status = sched_run(c);
     uint64_t dt = host_monotonic_ns() - t0;

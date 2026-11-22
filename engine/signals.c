@@ -234,10 +234,32 @@ void sig_deliver_pending(cpu_t *c)
         sig_segv_fatal(c->sp, c->pc);
 }
 
+int sig_catchable(const cpu_t *c, int sig)
+{
+    return catchable_now(c, sig);
+}
+
+/* XIAOJI_DEBUG_FAULTS=1 (read by main.c): a line on stderr for each fault delivered
+ * to a guest handler. Other behaviour is unchanged. */
+static int debug_faults;
+
+void sig_set_debug_faults(int on)
+{
+    debug_faults = on;
+}
+
+int sig_debug_faults(void)
+{
+    return debug_faults;
+}
+
 int sig_fault(cpu_t *c, int sig, int code, uint64_t addr)
 {
     if (!catchable_now(c, sig))
         return 0;
+    if (sig_debug_faults())
+        fprintf(stderr, "xiaoji: deliver signal %d (si_code %d) to guest handler: addr 0x%llx pc 0x%llx\n",
+                sig, code, (unsigned long long)addr, (unsigned long long)c->pc);
     if (setup_frame(c, sig, code, 1, addr, 0) < 0)
         sig_segv_fatal(c->sp, c->pc);
     return 1;

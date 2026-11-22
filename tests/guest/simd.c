@@ -465,6 +465,140 @@ int main(int argc, char **argv)
     MEMCASE("ld1r-16b-post", "ld1r {v0.16b}, [x5], #1");
     MEMCASE("ld1r-8h-post", "ld1r {v0.8h}, [x5], #2");
 
+    /* LD2, LD3, LD4 and ST2, ST3, ST4 (interleaved multiple structures). */
+    MEMCASE("ld2-8b", "ld2 {v0.8b, v1.8b}, [x5]");
+    MEMCASE("ld2-4s-post", "ld2 {v0.4s, v1.4s}, [x5], #32");
+    MEMCASE("ld3-8h", "ld3 {v0.8h, v1.8h, v2.8h}, [x5]");
+    MEMCASE("ld4-16b", "ld4 {v0.16b, v1.16b, v2.16b, v3.16b}, [x5]");
+    MEMCASE("ld4-2d-post", "ld4 {v0.2d, v1.2d, v2.2d, v3.2d}, [x5], #64");
+    MEMCASE("st2-4h", "st2 {v0.4h, v1.4h}, [x5]");
+    MEMCASE("st3-2s-post", "st3 {v0.2s, v1.2s, v2.2s}, [x5], #24");
+    MEMCASE("st4-16b", "st4 {v0.16b, v1.16b, v2.16b, v3.16b}, [x5]");
+
+    /* FMOV (scalar, immediate). Writes the low word; the high word is zero. */
+    FPD("fmov-d-half", "fmov d0, #0.5");
+    FPD("fmov-d-neg2", "fmov d0, #-2.0");
+    FPD("fmov-d-31", "fmov d0, #31.0");
+    FPS("fmov-s-1p5", "fmov s0, #1.5");
+    FPS("fmov-s-neg", "fmov s0, #-0.125");
+
+    /* FCSEL and FCCMP (flags from FCMP). */
+    FPD("fcsel-d-eq", "fcmp d1, d2\n fcsel d0, d1, d2, eq");
+    FPD("fcsel-d-lt", "fcmp d1, d2\n fcsel d0, d1, d2, lt");
+    FPS("fcsel-s-ge", "fcmp s1, s2\n fcsel s0, s1, s2, ge");
+    FPD("fccmp-d", "fcmp d1, d2\n fccmp d2, d1, #5, gt\n fcsel d0, d1, d2, eq");
+    FPS("fccmpe-s", "fcmp s1, s2\n fccmpe s2, s1, #3, le\n fcsel s0, s1, s2, vs");
+
+    /* FP 1-source: moves, sign operations, square root, precision conversion,
+     * round to integral in each mode. */
+    FPD("fmov-d-reg", "fmov d0, d1");
+    FPS("fmov-s-reg", "fmov s0, s1");
+    FPD("fabs-d", "fabs d0, d1");
+    FPS("fneg-s", "fneg s0, s1");
+    FPD("fsqrt-d", "fsqrt d0, d1");
+    FPS("fsqrt-s", "fsqrt s0, s1");
+    FPS("fcvt-s-to-d", "fcvt d0, s1");
+    FPD("fcvt-d-to-s", "fcvt s0, d1");
+    FPD("frintn-d", "frintn d0, d1");
+    FPS("frintp-s", "frintp s0, s1");
+    FPD("frintm-d", "frintm d0, d1");
+    FPS("frintz-s", "frintz s0, s1");
+    FPD("frinta-d", "frinta d0, d1");
+    FPS("frintx-s", "frintx s0, s1");
+    FPD("frinti-d", "frinti d0, d1");
+
+    /* FP 2-source: max and min (with and without the NaN-number forms), negated product. */
+    FPD("fmax-d", "fmax d0, d1, d2");
+    FPS("fmin-s", "fmin s0, s1, s2");
+    FPD("fmaxnm-d", "fmaxnm d0, d1, d2");
+    FPS("fminnm-s", "fminnm s0, s1, s2");
+    FPD("fnmul-d", "fnmul d0, d1, d2");
+    FPS("fnmul-s", "fnmul s0, s1, s2");
+
+    /* FP 3-source: fused multiply-add forms, one rounding. */
+    FPD("fmadd-d", "fmadd d0, d1, d2, d3");
+    FPS("fmsub-s", "fmsub s0, s1, s2, s3");
+    FPD("fnmadd-d", "fnmadd d0, d1, d2, d3");
+    FPS("fnmsub-s", "fnmsub s0, s1, s2, s3");
+
+    /* Scalar integer/FP conversions and scalar ABS/NEG. */
+    CASE("scvtf-d-from-x", "scvtf d0, d1");
+    CASE("ucvtf-d-from-x", "ucvtf d0, d1");
+    CASE("scvtf-s-from-w", "scvtf s0, s1");
+    CASE("ucvtf-s-from-w", "ucvtf s0, s1");
+    CASE("abs-d", "abs d0, d1");
+    CASE("neg-d", "neg d0, d1");
+    FPD("fcvtzs-d", "fcvtzs d0, d1");
+    FPD("fcvtzu-d", "fcvtzu d0, d1");
+    FPS("fcvtzs-s", "fcvtzs s0, s1");
+    FPS("fcvtzu-s", "fcvtzu s0, s1");
+    FPD("fcvtns-d", "fcvtns d0, d1");
+    FPS("fcvtms-s", "fcvtms s0, s1");
+    FPD("fcvtas-d", "fcvtas d0, d1");
+    FPS("fcvtps-s", "fcvtps s0, s1");
+    FPD("fcvtau-d", "fcvtau d0, d1");
+
+    /* Three same: halving add and subtract, shifts by register (signed and unsigned,
+     * rounding), absolute difference and accumulate. */
+    CASE("shadd-8b", "shadd v0.8b, v1.8b, v2.8b");
+    CASE("uhadd-16b", "uhadd v0.16b, v1.16b, v2.16b");
+    CASE("srhadd-4h", "srhadd v0.4h, v1.4h, v2.4h");
+    CASE("urhadd-8h", "urhadd v0.8h, v1.8h, v2.8h");
+    CASE("shsub-4s", "shsub v0.4s, v1.4s, v2.4s");
+    CASE("uhsub-8b", "uhsub v0.8b, v1.8b, v2.8b");
+    CASE("sshl-8h", "sshl v0.8h, v1.8h, v2.8h");
+    CASE("ushl-4s", "ushl v0.4s, v1.4s, v2.4s");
+    CASE("sshl-2d", "sshl v0.2d, v1.2d, v2.2d");
+    CASE("ushl-16b", "ushl v0.16b, v1.16b, v2.16b");
+    CASE("srshl-16b", "srshl v0.16b, v1.16b, v2.16b");
+    CASE("urshl-2d", "urshl v0.2d, v1.2d, v2.2d");
+    CASE("sabd-8b", "sabd v0.8b, v1.8b, v2.8b");
+    CASE("uabd-4s", "uabd v0.4s, v1.4s, v2.4s");
+    CASE("saba-16b", "saba v0.16b, v1.16b, v2.16b");
+    CASE("uaba-8h", "uaba v0.8h, v1.8h, v2.8h");
+
+    /* Two-register miscellaneous: byte and halfword reversal, leading bits,
+     * bit reversal, pairwise accumulate, ABS and NEG, SHLL. */
+    CASE("rev32-16b", "rev32 v0.16b, v1.16b");
+    CASE("rev32-8h", "rev32 v0.8h, v1.8h");
+    CASE("rev16-8b", "rev16 v0.8b, v1.8b");
+    CASE("cls-8b", "cls v0.8b, v1.8b");
+    CASE("cls-4s", "cls v0.4s, v1.4s");
+    CASE("clz-16b", "clz v0.16b, v1.16b");
+    CASE("clz-8h", "clz v0.8h, v1.8h");
+    CASE("rbit-16b", "rbit v0.16b, v1.16b");
+    CASE("sadalp-8h", "sadalp v0.8h, v1.16b");
+    CASE("uadalp-4s", "uadalp v0.4s, v1.8h");
+    CASE("abs-8h", "abs v0.8h, v1.8h");
+    CASE("neg-4s", "neg v0.4s, v1.4s");
+    CASE("neg-2d", "neg v0.2d, v1.2d");
+    CASE("shll-8h", "shll v0.8h, v1.8b, #8");
+    CASE("shll2-4s", "shll2 v0.4s, v1.8h, #16");
+    CASE("shll-2d", "shll v0.2d, v1.2s, #32");
+
+    /* Three different: long, wide, narrowing high-half (and rounding), absolute
+     * difference, multiply-accumulate and multiply, with the "2" forms. */
+    CASE("saddl-8h", "saddl v0.8h, v1.8b, v2.8b");
+    CASE("uaddl2-4s", "uaddl2 v0.4s, v1.8h, v2.8h");
+    CASE("saddw-8h", "saddw v0.8h, v1.8h, v2.8b");
+    CASE("uaddw2-4s", "uaddw2 v0.4s, v1.4s, v2.8h");
+    CASE("ssubl-4s", "ssubl v0.4s, v1.4h, v2.4h");
+    CASE("usubw-2d", "usubw v0.2d, v1.2d, v2.2s");
+    CASE("addhn-8b", "addhn v0.8b, v1.8h, v2.8h");
+    CASE("raddhn2-8h", "raddhn2 v0.8h, v1.4s, v2.4s");
+    CASE("subhn-4h", "subhn v0.4h, v1.4s, v2.4s");
+    CASE("rsubhn-2s", "rsubhn v0.2s, v1.2d, v2.2d");
+    CASE("sabal-8h", "sabal v0.8h, v1.8b, v2.8b");
+    CASE("uabal2-4s", "uabal2 v0.4s, v1.8h, v2.8h");
+    CASE("sabdl-8h", "sabdl v0.8h, v1.8b, v2.8b");
+    CASE("uabdl-4s", "uabdl v0.4s, v1.4h, v2.4h");
+    CASE("smlal-8h", "smlal v0.8h, v1.8b, v2.8b");
+    CASE("umlal2-4s", "umlal2 v0.4s, v1.8h, v2.8h");
+    CASE("smlsl-2d", "smlsl v0.2d, v1.2s, v2.2s");
+    CASE("umlsl-8h", "umlsl v0.8h, v1.8b, v2.8b");
+    CASE("smull-4s", "smull v0.4s, v1.4h, v2.4h");
+    CASE("umull2-2d", "umull2 v0.2d, v1.4s, v2.4s");
+
     put("simd done\n");
     return 0;
 }
