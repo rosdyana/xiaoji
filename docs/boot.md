@@ -320,3 +320,199 @@ Status: **steps 0 to 4 done (uncommitted); `sh-pipe`, `sh-pipeline`, `sh-subshel
   `comm` for a `#!` script (the test's interpreter is `args`, which prints nothing about
   itself).
 - `/proc/<pid>/maps` is still missing, and so are `clone3` and stop states (as before).
+
+## B2: system properties (property area and property service)
+
+Status: **done (uncommitted).** `getprop` and `setprop` work in the engine, with the
+property area and the service, and `prop-get`, `prop-set`, `prop-ro`, `prop-list` and
+`prop-wait` pass in the engine and in Node, also with `XIAOJI_JIT=0`.
+
+### Backend chosen and why
+
+Single file, bionic's "pre-split" backend. The area is one file at
+`/dev/__properties__`, with no `property_info` and no SELinux contexts.
+
+Evidence, from AOSP `android13-release` (`bionic/libc/system_properties/`, read over ssh
+on the build machine, not modified):
+- `system_properties.cpp`, `SystemProperties::Init`: `is_dir(filename)` decides. A
+  directory with `property_info` picks `ContextsSerialized`, a directory without it
+  `ContextsSplit`. Anything else (the case here: `stat` fails or the path is a regular
+  file) takes `ContextsPreSplit`.
+- `include/system_properties/contexts_pre_split.h`: `ContextsPreSplit::Initialize` calls
+  `prop_area::map_prop_area(filename)`, and the one area serves every name.
+- `prop_area.cpp`, `map_fd_ro`: the file must be owned by uid 0 and gid 0, have no
+  group or other write bit, and be at least `sizeof(prop_area)` (128) bytes. The size
+  is `st_size` (so the engine's area size is what readers use). The map is
+  `PROT_READ, MAP_SHARED`.
+- The guest libc (`build/rootfs/apex/com.android.runtime/lib64/bionic/libc.so`) contains
+  both `/dev/__properties__` and `/dev/__properties__/property_info` strings, so both
+  paths exist in the build. The Android 13 build has `ro.build.version.release=13`.
+- Verified in the engine (`--trace` of `getprop ro.hardware`): `newfstatat` on
+  `/dev/__properties__` returns 0 (a regular file), `openat` returns an fd, `fstat` 0,
+  `mmap(0x40000, PROT_READ, MAP_SHARED)`. No `property_info` lookup follows.
+
+Not disassembled: the check is from source plus the engine trace (which is the
+behaviour the guest actually follows). The guest's libc is the Android 13 build, so
+the source matches it.
+
+### Format facts (verified against AOSP android13-release)
+
+- Header (`prop_area`, 128 bytes): `bytes_used` (0), `serial` (4), `magic` 0x504f5250
+  (8), `version` 0xfc6ed0ab (12), `reserved[28]`. Data starts at 128.
+- `prop_bt` is 20 bytes (`namelen`, `prop`, `left`, `right`, `children`), then the
+  segment name and a NUL. The root is at data offset 0. The dirty backup area is at data
+  offset 20 (92 bytes). The first allocation is at data offset 112.
+- `prop_info` is 96 bytes: `serial` (4), `value[92]` (or, for a long value,
+  `error_message[56]` and an `offset`, at 60), then the full name and a NUL. The
+  serial's top byte is the value length; bit 0 is the dirty bit; bit 16 (`kLongFlag`)
+  marks a long record. A long value sits after the record, at `offset` from the record.
+- Offsets in the trie are relative to data offset 0. Sibling order is by (length, then
+  bytes), not plain lexicographic. Bionic's `foreach` walks left, self, children, right.
+- Update (`SystemProperties::Update`): copy the old value to the backup, set the dirty
+  bit, write the value, store the new serial (`len << 24 | (serial+1) & 0xffffff`), wake
+  the record's serial, bump the area serial, wake the area serial. Add
+  (`SystemProperties::Add`): insert, bump the area serial, wake it.
+- `Wait` (bionic) futex-waits on the area serial (for any property) or on a record's
+  serial. Both are words of the shared area.
+
+### The service protocol (verified against bionic and init)
+
+- Client (`bionic/libc/bionic/system_property_set.cpp`): it first reads
+  `ro.property_service.version` and uses protocol 2 only at 2 or more. Otherwise it uses
+  the legacy 128-byte `prop_msg` with a 250 ms poll. **Difference from the plan**: the
+  engine sets `ro.property_service.version=2`, because the plan did not list it.
+- SETPROP2 (`0x00020001`): `socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC)`, `connect` to
+  `/dev/socket/property_service` (a sockaddr_un with NUL-terminated path), one `writev`
+  of `cmd, u32 len, name, u32 len, value`, then `recv(MSG_WAITALL)` of a u32 result.
+- Init's rules (`property_service.cpp`, `util.cpp`): `IsLegalPropertyName` (alphanumerics
+  and `._-@:`, no leading or trailing dot, no empty segment). `IsLegalPropertyValue`:
+  a non-`ro.` value of 92 bytes or more is `PROP_ERROR_INVALID_VALUE` (0x14). `PropertySet`:
+  an existing `ro.` is `PROP_ERROR_READ_ONLY_PROPERTY` (0x0b). A failed add is
+  `PROP_ERROR_SET_FAILED` (0x24). **Difference from the plan**: init has no
+  `PROP_NAME_MAX` (32) limit for SETPROP2; the 32-byte limit belongs to the legacy
+  message only, and the engine follows init.
+- Init's `ctl.*` names are handled before `PropertySet`. The engine accepts them and
+  logs them to stderr; it does not act on them (B4).
+
+### What is in the engine
+
+- `engine/props.c`, `engine/props.h`: the area builder (a port of bionic's trie code and
+  update protocol, with a 256 KiB shadow written to one memfd after each change), the
+  build.prop loader, the engine values, `--prop`, the service's `props_set`, and the
+  endpoint for `/dev/socket/property_service` (SETPROP2 and the legacy message).
+- The area is a memfd (`engine/memfd.c`). Every process that opens `/dev/__properties__`
+  gets a read-only fd on it (`ro_area`): `O_RDWR` and `O_WRONLY` opens are EACCES, a write
+  is EBADF, `ftruncate` on it is EINVAL (the fd is read-only), `mprotect` to a writable
+  protection on the area is EACCES, and `mmap` with `PROT_WRITE` and `MAP_SHARED` is
+  EACCES (a private writable map is allowed, as on Linux). `pwrite` and `fallocate` are
+  not implemented at all (ENOSYS), so there is no other path to the memfd. `stat` reports a
+  regular file, mode 0444, uid and gid 0, and the area's size.
+- Wakes: `sched_futex_wake(offset, memfd, ...)` on the area serial (offset 4) and on each
+  changed record (offset 128 + data offset). The key and object are the ones
+  `mem_futex_key` computes for a word in a shared mapping of the memfd, so a guest
+  futex wait on the mapped word is woken by the engine.
+- Startup (`engine/main.c`): `props_init` runs after `vfs_init`. It loads, in order, the
+  build.prop files that exist (`/system/etc/prop.default`, `/system/build.prop`,
+  `/system_ext/etc/build.prop`, `/vendor/default.prop`, `/vendor/build.prop`,
+  `/odm/etc/build.prop`, `/product/etc/build.prop`). Later files override, except
+  `ro.*`, where the first value wins. Then the engine's values, then the `--prop K=V`
+  overrides (repeatable, `--prop` in the usage text).
+- **Difference from the plan**: the engine's values are overrides, applied after the
+  files, so `ro.secure=0`, `ro.zygote=zygote64` and `ro.adb.secure=0` replace the
+  guest's `ro.secure=1` and `ro.zygote=zygote64_32`. The plan's "first wins" applies to
+  the files only. Engine values: `ro.hardware`, `ro.boot.hardware`, `ro.kernel.qemu=0`,
+  `ro.debuggable=1`, `ro.secure=0`, `ro.adb.secure=0`, `ro.zygote=zygote64`,
+  `ro.xiaoji.engine=b2`, `ro.property_service.version=2`.
+- Sockets (`engine/sock.c`, `engine/sock.h`): a socket is a VFS fd kind (`VFS_SOCK`)
+  holding a `sock_t`, which connects through an ops table (connect, write, read, close).
+  The property service is one ops table. B4 adds a listener table and a second ops
+  implementation; the fd and VFS hooks stay.
+- Syscalls (`engine/sysfs.c`): `socket` (198) for AF_UNIX SOCK_STREAM (SOCK_CLOEXEC
+  honoured, SOCK_NONBLOCK ignored because the endpoint never blocks), `connect` (203, the
+  path must be `/dev/socket/property_service`, else ENOENT), `sendto` (206, with a
+  destination address EISCONN) and `recvfrom` (207) as `write` and `read`. `writev`
+  and `read`/`write` go through the VFS as for pipes.
+- `engine/linux.h` gained the errno values `ENOTSOCK`, `EPROTONOSUPPORT`,
+  `EAFNOSUPPORT`, `EISCONN`, `ENOTCONN`, `ECONNREFUSED`.
+
+### Tools
+
+- `getprop` and `setprop` in the guest are **toolbox** (symlinks to
+  `/system/bin/toolbox`), not toybox. The plan assumed toybox. Call them as
+  `/system/bin/getprop` and `/system/bin/setprop`, since the guest has no PATH.
+- `getprop` with no arguments lists every property, sorted by name (byte order). The
+  check is on the names only: `prop-list` extracts them with `toybox sed`, sorts them
+  with `toybox sort`, and compares. (An earlier check of whole `[name]: [value]` lines
+  flagged a disorder only because `]` sorts after `-`; that was a bad test, not a bad
+  order.)
+- `getprop -T` and `-Z` both exit 255 with `Unable to load property info file`. They
+  need `property_info` (and SELinux contexts), which the single-file backend does not
+  have. **Gap.**
+
+### Tests
+
+- `tests/run.sh`, section "Property cases": `prop-get`, `prop-set`, `prop-ro`,
+  `prop-list` (each a single `sh -c`, because the store lives in the engine process,
+  so setprop and getprop must share one run) and `prop-wait`. Stdout must equal
+  `tests/expect/<name>.out`, and the exit code must be 0. Each runs in the engine and
+  in Node, so 10 checks.
+- `prop-wait` is `tests/guest/prop-wait.c`, built by `make guest-tests` and copied to
+  `build/rootfs/data/local/tmp/prop-wait` by `tests/run.sh`. It implements the protocol
+  itself: it sets `debug.xiaoji.wait=start` through the socket, maps the area read-only,
+  forks, and the child waits with `FUTEX_WAIT` on the record's serial until the value
+  is `done`. The parent sleeps 50 ms, sets `done`, and reaps the child. Then it checks
+  the read-only guarantee: a writable shared `mmap`, an `mprotect` to writable and an
+  `ftruncate` of the area fd are refused (-13, -13, -22), and a child that writes into the
+  mapping dies of SIGSEGV (signal 11). The `prop-list` case also checks that the names
+  are sorted. The `prop-*`
+  guest binaries are not oracle cases (the loop in `tests/run.sh` skips them), because
+  native runs have no property service.
+- Strace-style check: `futex(0x...3f8, FUTEX_WAIT, 0x5000000)` returns 0 in the
+  `--trace` run, so the child was woken (not EAGAIN), by the engine's wake.
+
+### Results (B2)
+
+- `make test`: **114 passed, 0 failed, 0 xfail.** The 104 from before, plus 10 property
+  checks (5 cases, engine and Node).
+- `XIAOJI_JIT=0 tests/run.sh`: **114 passed, 0 failed, 0 xfail.**
+- `make test-web`: all checks passed (`hello-int` and `hello-jit`, after the change).
+- Warnings: `clang -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -c` on every
+  `engine/*.c` except `jit.c` (wasm-only): 0 warnings. `emcc` with the same flags on every
+  `engine/*.c`, `jit.c` included: 0 warnings. `gcc -Wall -Wextra` on
+  `tests/guest/prop-wait.c` in the builder VM: 0 warnings.
+- `prop-wait` also checks the read-only guarantee (see Tests above).
+- Guest instruction counts, re-measured with `XIAOJI_STATS=1` on the freestanding
+  deterministic cases, equal the B1 counts exactly: `arith-O0` 39365, `control-O0`
+  10061838, `control-O2` 4577199, `jitstress-O0` 115922202, `jitstress-O2` 30967369,
+  `jitthreads-O0` 25625244, `memory-O0` 38017899, `signals-O0` 13055, `simd-O0` 6384406.
+  Those programs do not use bionic, so they are the unchanged control. Bionic guests
+  now do read properties, which their counts reflect; those were not compared with B1
+  (B1 did not record them).
+
+### Gaps (B2)
+
+- `ctl.*` properties are accepted and logged, not acted on (B4).
+- Each engine run rebuilds the store from the build.prop files and the engine's values.
+  Properties set in one run are gone in the next (init's `persist.*` is not modelled).
+- The legacy `PROP_MSG_SETPROP` message is implemented but not tested. A legacy client
+  waits for the service to hang up with `ppoll` (73), which the engine does not implement,
+  so that path fails. Bionic uses protocol 2 when `ro.property_service.version` is 2, and
+  the engine sets it.
+- Only the record-serial futex wake is tested (`prop-wait`). The area serial (offset 4)
+  is woken by the same code, but no test waits on it.
+- `ro.xiaoji.engine=b2` is a placeholder: the engine has no version constant.
+- `getprop` and `setprop` were not exercised in the web build; `make test-web` runs only
+  its hello cases.
+- `mprotect` checks the region of the first page only. A range that spans the area and
+  other mappings is not split.
+- `recv` on the socket returns what is queued and never blocks (no `MSG_WAITALL`
+  semantics beyond the reply size, which is always complete in one write).
+- `stat` of `/dev/socket/property_service` is ENOENT (the socket is not a path entry).
+- No UTF-8 check on values (init checks with `mbstowcs`).
+- Values with long lengths are written as long records only for `ro.` names. An
+  existing long record cannot be updated, so a `--prop` override of one is refused.
+- The area is fixed at 256 KiB. Filling it makes a set fail with
+  `PROP_ERROR_SET_FAILED`. At boot it holds 41792 of its 262016 data bytes (the header's
+  `bytes_used`, read in a guest with `toybox od`; the serial then was 243), so there is
+  room for runtime properties.
+- `getprop -T`/`-Z` (needs `property_info`) and SELinux are not modelled.

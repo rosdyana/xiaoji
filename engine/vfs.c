@@ -17,6 +17,7 @@
 #include "linux.h"
 #include "pipe.h"
 #include "procfs.h"
+#include "props.h"
 #include "proc.h"
 #include "sched.h"
 
@@ -380,6 +381,8 @@ static void desc_unref(vfs_fd *f)
         host_close(f->hfd);
     if (f->kind == VFS_PIPE)
         pipe_close(f->pipe, (f->lflags & LO_ACCMODE) == LO_WRONLY);
+    if (f->kind == VFS_SOCK)
+        sock_unref(f->sock);
     free(f->guest);
     free(f->host);
     free(f->data);
@@ -614,6 +617,20 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     int slot = free_fd_from(0);
     if (slot < 0)
         return -LE_MFILE;
+    /* The property area: the engine's shared memfd, read-only, whatever the dirfd. */
+    if (!strcmp(path, PROPS_AREA_PATH)) {
+        if ((lflags & LO_ACCMODE) != LO_RDONLY)
+            return -LE_ACCES;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_MEMFD;
+        f->mfd = props_memfd();
+        memfd_ref(f->mfd);
+        f->ro_area = 1;
+        f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
+        f->guest = xstrdup(PROPS_AREA_PATH);
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     int rc = vfs_resolve(dirfd, path, !(lflags & LO_NOFOLLOW), &r);
     if (rc)
         return rc;
@@ -766,6 +783,7 @@ int64_t vfs_read(int fd, void *buf, size_t n)
         if ((f->lflags & LO_ACCMODE) != LO_RDONLY)
             return -LE_BADF;
         return pipe_read(f->pipe, buf, n);
+    case VFS_SOCK: return sock_read(f->sock, buf, n);
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -783,7 +801,8 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_DIR: return -LE_ISDIR;
     case VFS_SYN: return syn_read(f, buf, n, off, 1);
     case VFS_MEMFD: return memfd_pread(f->mfd, buf, n, off);
-    case VFS_PIPE: return -LE_SPIPE;
+    case VFS_PIPE:
+    case VFS_SOCK: return -LE_SPIPE;
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -803,7 +822,10 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
         if (f->syn == SYN_DATA)
             return -LE_BADF;
         return (int64_t)n; /* /dev/null, /dev/zero and /dev/random discard writes */
+    case VFS_SOCK: return sock_write(f->sock, buf, n);
     case VFS_MEMFD: {
+        if (f->ro_area)
+            return -LE_BADF;
         int64_t r = memfd_pwrite(f->mfd, buf, n, f->dpos);
         if (r < 0)
             return -LE_NOMEM;
@@ -830,6 +852,7 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
     case VFS_PATH:
         return -LE_BADF;
     case VFS_PIPE:
+    case VFS_SOCK:
         return -LE_SPIPE;
     case VFS_DIR:
         if (whence == 0 && off == 0) { /* SEEK_SET 0 rewinds */
@@ -1031,11 +1054,20 @@ int vfs_stat_fd(int fd, host_stat *out)
         out->uid = out->gid = 0;
         return 0;
     }
+    if (f->kind == VFS_SOCK) {
+        memset(out, 0, sizeof *out);
+        out->dev = 0x10;
+        out->ino = 0x4000u + (uint64_t)fd;
+        out->mode = 0140777; /* S_IFSOCK */
+        out->nlink = 1;
+        out->blksize = 4096;
+        return 0;
+    }
     if (f->kind == VFS_MEMFD) {
         memset(out, 0, sizeof *out);
         out->dev = 0x10;
         out->ino = 0x3000u + (uint64_t)fd;
-        out->mode = LS_IFREG | 0600;
+        out->mode = LS_IFREG | (f->ro_area ? 0444u : 0600u);
         out->nlink = 1;
         out->size = memfd_size(f->mfd);
         out->blksize = 4096;
@@ -1070,6 +1102,35 @@ int vfs_statfs_fd(int fd, host_statfs *out)
     if (f->host)
         return host_statfs_path(f->host, out);
     return host_statfs_path(root[0] ? root : "/", out);
+}
+
+int vfs_stat_props(host_stat *out)
+{
+    memset(out, 0, sizeof *out);
+    out->dev = 0x10;
+    out->ino = 0x3001u;
+    out->mode = LS_IFREG | 0444u;
+    out->nlink = 1;
+    out->size = memfd_size(props_memfd());
+    out->blksize = 4096;
+    out->blocks = (out->size + 511) / 512;
+    return 0;
+}
+
+int vfs_socket(int cloexec)
+{
+    int slot = free_fd_from(0);
+    if (slot < 0)
+        return -LE_MFILE;
+    sock_t *s = sock_new();
+    if (!s)
+        die_oom();
+    vfs_fd *f = desc_new();
+    f->kind = VFS_SOCK;
+    f->sock = s;
+    f->lflags = LO_RDWR;
+    slot_install(slot, f, cloexec != 0);
+    return slot;
 }
 
 int vfs_load_file(const char *path, uint8_t **data, size_t *len, char *canon, size_t cap)

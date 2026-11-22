@@ -9,11 +9,12 @@
 
 #include "host.h"
 #include "memfd.h"
+#include "sock.h"
 
 #define VFS_PATH_MAX 4096
 #define VFS_MAX_FD 1024
 
-typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE } vfs_kind;
+typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE, VFS_SOCK } vfs_kind;
 typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA } vfs_syn;
 
 /* An open file description: the offset, the status flags and the object. Every fd
@@ -34,6 +35,8 @@ typedef struct {
     uint64_t nent;   /* directory entries returned so far */
     memfd_t *mfd;    /* VFS_MEMFD: the file */
     pipe_t *pipe;    /* VFS_PIPE: the pipe; lflags (LO_RDONLY or LO_WRONLY) says which end */
+    sock_t *sock;    /* VFS_SOCK: the socket (sock.h) */
+    int ro_area;     /* VFS_MEMFD: the property area, read-only (PROT_WRITE is refused) */
 } vfs_fd;
 
 /* A descriptor: a slot in a process's fd table. The close-on-exec flag is per slot;
@@ -88,6 +91,8 @@ int vfs_memfd_create(const char *name, uint32_t mflags);
 int vfs_close(int fd);
 /* pipe2: two descriptors, read end in out[0] and write end in out[1]. Returns 0 or -LE_*. */
 int vfs_pipe2(int out[2], uint32_t flags);
+/* A new unconnected AF_UNIX stream socket in a free slot. Returns the fd, or -LE_*. */
+int vfs_socket(int cloexec);
 /* Blocks the running thread if the read or write on fd would block on a pipe (and
  * the descriptor is not O_NONBLOCK). The call is then restarted. Returns 1 if it blocked. */
 int vfs_pipe_block(int fd);
@@ -111,6 +116,8 @@ int vfs_fchdir(int fd);
 
 int vfs_stat_res(const vfs_res *r, host_stat *out);
 int vfs_stat_fd(int fd, host_stat *out);
+/* stat of PROPS_AREA_PATH: a regular file, mode 0444, owned by root, the area's size. */
+int vfs_stat_props(host_stat *out);
 /* chmod of an open file (pipes and memfds accept and ignore it). */
 int vfs_fchmod(int fd, uint32_t mode);
 int vfs_statfs_fd(int fd, host_statfs *out);

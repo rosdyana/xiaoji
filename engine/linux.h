@@ -42,6 +42,12 @@
 #define LE_OVERFLOW 75
 #define LE_NOTSUP 95
 #define LE_TIMEDOUT 110
+#define LE_NOTSOCK 88
+#define LE_PROTONOSUPPORT 93
+#define LE_AFNOSUPPORT 97
+#define LE_ISCONN 106
+#define LE_NOTCONN 107
+#define LE_CONNREFUSED 111
 
 /* open(2) flags as the guest passes them. */
 #define LO_RDONLY 00

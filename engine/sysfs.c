@@ -12,6 +12,7 @@
 #include "sched.h"
 #include "signals.h"
 #include "syscall.h"
+#include "props.h"
 #include "vfs.h"
 
 #define SYS_GETCWD 17
@@ -35,6 +36,10 @@
 #define SYS_WRITE 64
 #define SYS_READV 65
 #define SYS_WRITEV 66
+#define SYS_SOCKET 198
+#define SYS_CONNECT 203
+#define SYS_SENDTO 206
+#define SYS_RECVFROM 207
 #define SYS_PREAD64 67
 #define SYS_READLINKAT 78
 #define SYS_NEWFSTATAT 79
@@ -282,6 +287,54 @@ static int64_t pipe_writev(int fd, uint64_t iov, uint64_t cnt)
     return pipe_write_segs(fd, cnt);
 }
 
+/* Sockets (sock.h): AF_UNIX stream sockets that the engine serves. socket makes an
+ * unconnected one. connect takes a sockaddr_un path, which only an engine endpoint
+ * answers. sendto and recvfrom take no address on a connected stream, so they are
+ * read and write. */
+#define SOCK_AF_UNIX 1
+#define SOCK_STREAM_TYPE 1
+#define SOCK_TYPE_MASK 0xF
+#define SOCK_CLOEXEC_FLAG 0x80000
+#define SOCK_NONBLOCK_FLAG 0x800
+
+static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
+{
+    if (domain != SOCK_AF_UNIX)
+        return -LE_AFNOSUPPORT;
+    if ((type & SOCK_TYPE_MASK) != SOCK_STREAM_TYPE || proto != 0)
+        return -LE_PROTONOSUPPORT;
+    /* SOCK_NONBLOCK is accepted and ignored: the endpoints never block. */
+    return vfs_socket((type & SOCK_CLOEXEC_FLAG) != 0);
+}
+
+static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t alen)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_SOCK)
+        return -LE_NOTSOCK;
+    if (alen < 3 || alen > 110) /* sizeof(sockaddr_un) is 110 */
+        return -LE_INVAL;
+    uint8_t sa[110];
+    if (mem_copy_out(sa, addr, (size_t)alen) < 0)
+        return -LE_FAULT;
+    if (sa[0] != SOCK_AF_UNIX || sa[1] != 0)
+        return -LE_AFNOSUPPORT;
+    size_t plen = (size_t)alen - 2;
+    if (sa[2] == 0) /* abstract and unnamed addresses are not served */
+        return -LE_NOENT;
+    size_t n = 0;
+    while (n < plen && sa[2 + n])
+        n++;
+    if (n == plen) /* not NUL-terminated */
+        return -LE_INVAL;
+    char path[sizeof sa];
+    memcpy(path, sa + 2, n);
+    path[n] = 0;
+    return sock_connect(f->sock, path);
+}
+
 /* pipe2(int fds[2], flags): the read end in fds[0], the write end in fds[1]. */
 static int64_t sys_pipe2(uint64_t fds_va, uint64_t flags)
 {
@@ -397,6 +450,10 @@ static int64_t sys_newfstatat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
         return rc;
     if ((flags & LAT_EMPTY_PATH) && path[0] == 0)
         return sys_fstat((uint64_t)(int64_t)dirfd, a2);
+    if (!strcmp(path, PROPS_AREA_PATH)) { /* the property area is a regular file */
+        vfs_stat_props(&st);
+        return copy_stat(a2, &st);
+    }
     static vfs_res r;
     rc = vfs_resolve(dirfd, path, !(flags & LAT_SYMLINK_NOFOLLOW), &r);
     if (rc)
@@ -702,6 +759,16 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_DUP: *ret = vfs_dup((int)(int32_t)a[0], 0, 0, 0); return 1;
     case SYS_DUP3: *ret = sys_dup3(a[0], a[1], a[2]); return 1;
     case SYS_PIPE2: *ret = sys_pipe2(a[0], a[1]); return 1;
+    case SYS_SOCKET: *ret = sys_socket(a[0], a[1], a[2]); return 1;
+    case SYS_CONNECT: *ret = sys_connect(a[0], a[1], a[2]); return 1;
+    case SYS_SENDTO:
+        if (a[4]) { /* a destination on a connected stream */
+            *ret = -LE_ISCONN;
+            return 1;
+        }
+        *ret = fs_write((int)(int32_t)a[0], a[1], a[2]);
+        return 1;
+    case SYS_RECVFROM: *ret = fs_read((int)(int32_t)a[0], a[1], a[2]); return 1;
     case SYS_GETCWD: *ret = sys_getcwd(a[0], a[1]); return 1;
     case SYS_CHDIR: *ret = sys_chdir(a[0]); return 1;
     case SYS_FCHDIR: *ret = vfs_fchdir((int)(int32_t)a[0]); return 1;

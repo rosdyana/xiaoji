@@ -12,6 +12,7 @@
 #include "mem.h"
 #include "proc.h"
 #include "prof.h"
+#include "props.h"
 #include "sched.h"
 #include "signals.h"
 #include "sysfs.h"
@@ -111,6 +112,10 @@ const char *syscall_name(uint64_t nr)
     case 64: return "write";
     case 65: return "readv";
     case 66: return "writev";
+    case 198: return "socket";
+    case 203: return "connect";
+    case 206: return "sendto";
+    case 207: return "recvfrom";
     case 67: return "pread64";
     case 78: return "readlinkat";
     case 79: return "newfstatat";
@@ -312,6 +317,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
             return -LE_BADF;
         if (f->kind == VFS_PATH)
             return -LE_BADF;
+        /* The property area is read-only to guests: no shared writable view. */
+        if (f->ro_area && type == LMAP_SHARED && (p & 2))
+            return -LE_ACCES;
         if (f->kind == VFS_MEMFD)
             return mmap_memfd(addr, len, p, type, flags, f, off);
         if (f->kind == VFS_DIR || f->kind == VFS_SYN || !f->host)
@@ -378,6 +386,12 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
         return 0;
     if (addr >= MEM_VA_LIMIT || page_up(len) > MEM_VA_LIMIT - addr)
         return -LE_NOMEM;
+    /* The property area is read-only to guests: no view of it becomes writable. Checked
+     * on the first page only; a range that spans other mappings is not split here. */
+    uint64_t mstart = 0, moff = 0;
+    memfd_t *region = mem_region_memfd(addr, &mstart, &moff);
+    if ((prot & 2) && region && region == props_memfd())
+        return -LE_ACCES;
     if (mem_protect(addr, page_up(len), (unsigned)(prot & 7)) < 0)
         return -LE_NOMEM;
     return 0;

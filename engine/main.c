@@ -22,12 +22,14 @@ EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); 
 #include "mem.h"
 #include "proc.h"
 #include "prof.h"
+#include "props.h"
 #include "sched.h"
 #include "signals.h"
 #include "syscall.h"
 #include "vfs.h"
 
 #define MAX_ENV 256
+#define MAX_PROP 64
 
 static const char *g_root = NULL; /* NULL: the host root "/" */
 
@@ -57,6 +59,7 @@ static int usage(FILE *out)
     fputs("usage: xiaoji [--root DIR] [--env K=V]... [--trace] [--stats] [--] /path/in/guest [args...]\n"
           "  --root DIR   guest root directory (default: the host root /)\n"
           "  --env K=V    add a guest environment variable\n"
+          "  --prop K=V   set a system property (after the guest's build.prop files)\n"
           "  --trace      print each syscall and its result to stderr\n"
           "  --stats      print the instruction count and rate on exit (as XIAOJI_STATS=1)\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
@@ -67,7 +70,8 @@ static int usage(FILE *out)
 int main(int argc, char **argv)
 {
     char *envs[MAX_ENV];
-    int nenv = 0, trace = 0, stats = 0, root_given = 0;
+    const char *props[MAX_PROP];
+    int nenv = 0, nprop = 0, trace = 0, stats = 0, root_given = 0;
     int i = 1;
 
     for (; i < argc; i++) {
@@ -89,6 +93,12 @@ int main(int argc, char **argv)
             if (i + 1 >= argc || !strchr(argv[i + 1], '=') || nenv == MAX_ENV)
                 return usage(stderr);
             envs[nenv++] = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--prop")) {
+            if (i + 1 >= argc || !strchr(argv[i + 1], '=') || nprop == MAX_PROP)
+                return usage(stderr);
+            props[nprop++] = argv[++i];
             continue;
         }
         if (!strcmp(a, "--trace")) {
@@ -113,6 +123,11 @@ int main(int argc, char **argv)
     proc_init(); // the initial process: its address space, fd table and signal handlers
     if (vfs_init(g_root, path, gargc, gargv) < 0) {
         fprintf(stderr, "xiaoji: root path too long\n");
+        return 2;
+    }
+    /* The system properties: the guest's build.prop files, the engine's values, then --prop. */
+    if (props_init((const char *const *)props, nprop) < 0) {
+        fprintf(stderr, "xiaoji: cannot create the property area\n");
         return 2;
     }
 

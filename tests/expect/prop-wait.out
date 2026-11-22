@@ -1,0 +1,5 @@
+prop-wait: start set rc=0
+prop-wait: writable mmap=-13 mprotect=-13 ftruncate=-22
+prop-wait: done set rc=0
+prop-wait: child exit=0
+prop-wait: child write signal=11

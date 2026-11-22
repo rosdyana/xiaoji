@@ -179,6 +179,9 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     name=$(basename "$bin")
     stretch=0
     case "$name" in glibc_hello*) stretch=1 ;; esac
+    # prop-* programs need the engine's property service, which the native run lacks:
+    # they are expectation cases (PROP_CASES below), not oracle cases.
+    case "$name" in prop-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -243,6 +246,64 @@ if [ -d build/rootfs/system/bin ]; then
     done
 else
     echo "note: build/rootfs missing, skipping rootfs cases (tools/extract-rootfs.sh)"
+fi
+
+# Property cases (B2): expectation tests. The builder VM has no property service,
+# so there is no oracle; stdout must equal tests/expect/<name>.out and the exit code
+# must be 0. Properties live in the engine process, so each case is one sh -c, where
+# setprop and getprop share the store.
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait"
+prop_argv() {
+    case "$1" in
+    prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
+    prop-set) ARGV=(/system/bin/sh -c '/system/bin/setprop debug.xiaoji.test hello; /system/bin/getprop debug.xiaoji.test') ;;
+    prop-ro) ARGV=(/system/bin/sh -c '/system/bin/setprop ro.xiaoji.once a; echo rc=$?; /system/bin/setprop ro.xiaoji.once b 2>/dev/null; echo rc=$?; /system/bin/getprop ro.xiaoji.once; /system/bin/setprop ro.hardware x 2>/dev/null; echo rc=$?') ;;
+    prop-list) ARGV=(/system/bin/sh -c 'n=$(/system/bin/getprop | /system/bin/toybox grep -c "^\["); names=$(/system/bin/getprop | /system/bin/toybox sed "s/^\[\([^]]*\)\].*/\1/"); sorted=$(printf "%s\n" "$names" | /system/bin/toybox sort); if [ "$n" -gt 100 ] && [ "$names" = "$sorted" ]; then echo above 100 and sorted; fi') ;;
+    prop-wait) ARGV=(/data/local/tmp/prop-wait) ;;
+    esac
+}
+
+# Runs one property case through one runner and compares stdout with the expectation.
+check_expect() {
+    local label=$1 runner=$2 name=$3
+    local tag="$name $label"
+    local out="$OUT/$name.$label.out" err="$OUT/$name.$label.err"
+    local expect="tests/expect/$name.out"
+    if [ ! -f "$expect" ]; then
+        echo "FAIL  $tag (no $expect)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    if [ "$runner" = engine ]; then
+        "$ENGINE" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+    else
+        node "$NODE_JS" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+    fi
+    local rc=$?
+    if cmp -s "$out" "$expect" && [ "$rc" = 0 ]; then
+        echo "PASS  $tag"
+        pass=$((pass + 1))
+        return 0
+    fi
+    echo "FAIL  $tag (exit $rc)"
+    diff "$expect" "$out" | head -n 6 | sed 's/^/        /'
+    fail=$((fail + 1))
+    return 1
+}
+
+if [ -d build/rootfs/system/bin ]; then
+    # The futex program (tests/guest/prop-wait.c) runs from the guest: copy it in.
+    if [ -f build/tests/guest/prop-wait-O0 ]; then
+        mkdir -p build/rootfs/data/local/tmp
+        cp build/tests/guest/prop-wait-O0 build/rootfs/data/local/tmp/prop-wait
+    fi
+    for name in $PROP_CASES; do
+        prop_argv "$name"
+        check_expect engine engine "$name"
+        if [ -f "$NODE_JS" ]; then
+            check_expect node node "$name"
+        fi
+    done
 fi
 
 echo
