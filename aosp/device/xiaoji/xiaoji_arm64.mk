@@ -13,7 +13,7 @@ PRODUCT_BROKEN_VERIFY_USES_LIBRARIES := true
 
 # system: the GSI system image, 64-bit only.
 $(call inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit_only.mk)
-$(call inherit-product, $(SRC_TARGET_DIR)/product/generic_system.mk)
+$(call inherit-product, device/xiaoji/xiaoji_system.mk)
 
 # system_ext: SystemUI, Launcher3QuickStep, Settings (no telephony_system_ext).
 $(call inherit-product, $(SRC_TARGET_DIR)/product/handheld_system_ext.mk)
