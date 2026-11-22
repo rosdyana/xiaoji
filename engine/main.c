@@ -7,7 +7,12 @@
 #include "cpu_a64.h"
 #include "elf.h"
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 #include "jit.h"
+/* Called once, just before the first guest instruction runs. The web worker sets
+ * Module.onRunStart to time the start of the guest; Node and native builds have no
+ * such hook, so this does nothing there. */
+EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); });
 #endif
 #include "host.h"
 #include "loader.h"
@@ -47,10 +52,11 @@ static void print_stats(void)
 
 static int usage(FILE *out)
 {
-    fputs("usage: xiaoji [--root DIR] [--env K=V]... [--trace] [--] /path/in/guest [args...]\n"
+    fputs("usage: xiaoji [--root DIR] [--env K=V]... [--trace] [--stats] [--] /path/in/guest [args...]\n"
           "  --root DIR   guest root directory (default: the host root /)\n"
           "  --env K=V    add a guest environment variable\n"
           "  --trace      print each syscall and its result to stderr\n"
+          "  --stats      print the instruction count and rate on exit (as XIAOJI_STATS=1)\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
           out);
     return out == stdout ? 0 : 2;
@@ -59,7 +65,7 @@ static int usage(FILE *out)
 int main(int argc, char **argv)
 {
     char *envs[MAX_ENV];
-    int nenv = 0, trace = 0, root_given = 0;
+    int nenv = 0, trace = 0, stats = 0, root_given = 0;
     int i = 1;
 
     for (; i < argc; i++) {
@@ -85,6 +91,10 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--trace")) {
             trace = 1;
+            continue;
+        }
+        if (!strcmp(a, "--stats")) {
+            stats = 1;
             continue;
         }
         if (a[0] == '-')
@@ -157,12 +167,15 @@ int main(int argc, char **argv)
     c->pc = entry;
 
     const char *stats_env = getenv("XIAOJI_STATS");
-    stats_on = stats_env && stats_env[0] == '1';
+    stats_on = stats || (stats_env && stats_env[0] == '1');
     const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
     sig_set_debug_faults(faults_env && faults_env[0] == '1');
     stats_t0 = host_monotonic_ns();
     if (stats_on)
         atexit(print_stats);
     prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit
+#ifdef __EMSCRIPTEN__
+    xn_run_start();
+#endif
     return sched_run(c);
 }

@@ -14,7 +14,7 @@ ENGINE_HDR := $(wildcard engine/*.h)
 NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
 JIT_LIB := engine/jit_lib.js
 
-.PHONY: all engine wasm wasm-node guest-tests test image oracle clean help
+.PHONY: all engine wasm wasm-node guest-tests test test-web serve image oracle clean help
 
 all: engine     ## default: native engine
 
@@ -29,9 +29,12 @@ build/xiaoji: $(NATIVE_SRC) $(ENGINE_HDR)
 
 wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 
+# The web build: a module for a Web Worker (web/worker.js), with the guest
+# filesystem built by the worker in MEMFS (createLazyFile over HTTP).
 build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=node,web \
+	$(EMENV) emcc -O3 -std=c11 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
 	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC)
 
@@ -57,6 +60,16 @@ guest-tests:    ## freestanding test programs, built in the builder VM -> build/
 test: engine wasm-node guest-tests build/rootfs/data/hello.dex   ## run the guest tests natively and in Node (tests/run.sh)
 	tests/run.sh
 
+build/web/manifest.json: tools/mkmanifest.py build/rootfs/data/hello.dex
+	@mkdir -p build/web
+	tools/mkmanifest.py build/rootfs $@
+
+test-web: wasm build/web/manifest.json   ## run the web build in headless Chromium (tests/web.mjs)
+	node tests/web.mjs hello-jit hello-int
+
+serve: wasm build/web/manifest.json   ## dev server for the web page (web/serve.mjs), port 8080
+	node web/serve.mjs --port 8080
+
 image:          ## download + extract the Android 13 arm64 guest -> build/rootfs
 	tools/fetch-image.sh
 	tools/extract-rootfs.sh
@@ -78,4 +91,4 @@ build/rootfs/data/hello.dex: build/hello/classes.dex   ## the test dex, where th
 	cp $< $@
 
 clean:          ## remove engine builds (keeps build/rootfs and build/image)
-	rm -rf build/xiaoji build/wasm build/wasm-node build/tests build/hello
+	rm -rf build/xiaoji build/wasm build/wasm-node build/web build/tests build/hello

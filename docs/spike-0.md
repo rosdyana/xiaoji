@@ -515,3 +515,73 @@ What remains:
 - The `threads` count variation is not investigated.
 - The JIT-off cost of +2 to +5% is not isolated.
 - The web build has not been run in a browser.
+
+## M4 results: Hello in Chrome (web build)
+
+**The exit criterion is met.** `dalvikvm64 -Ximage:… -cp /data/hello.dex Hello` (hello-jit, and hello-int with `-Xint`) prints `Hello from xiaoji ART (sum=2999997)` with exit 0 in all three places:
+1. natively on macOS: `make test`, the `engine` rows for hello-jit and hello-int (PASS);
+2. as wasm in Node: `make test`, the `node` rows (PASS);
+3. as wasm in a headless Chromium page, run in a Web Worker: `make test-web` (PASS).
+
+The web test compares stdout with `build/oracle/<case>.out` and the exit code with `.rc`, in a fresh browser process per case.
+
+### How it is built
+
+- **Web build** (`make wasm`, `build/wasm/xiaoji.mjs` and `.wasm`): `-sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_ES6 -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1`, plus the same memory, table and `jit_lib.js` flags as before. `-sEXIT_RUNTIME=1` lets the `XIAOJI_STATS` atexit handler run when `callMain` returns. `make wasm-node` is unchanged.
+- **Manifest** (`tools/mkmanifest.py build/rootfs build/web/manifest.json`, a Make target): 4,671 entries, 3,520 regular files, 1.54 GB. Each entry has its type (dir, file, symlink), mode, size or symlink target, sorted by path. `/proc`, `/sys` and `/dev` keep their contents out, but the three directories stay as empty entries (see the first problem below). `/data/hello.dex`, `/linkerconfig` and `/apex/apex-info-list.xml` are required and checked. Files are not copied: the server serves them from `build/rootfs`.
+- **Worker filesystem** (`web/worker.js`): fetches the manifest, imports `xiaoji.mjs`, and creates `/rootfs` in MEMFS. Directories use `FS.mkdir` and `FS.chmod`, symlinks use `FS.symlink` with the guest-absolute target, and regular files use `FS.createLazyFile(parent, name, url, true, false)` followed by `FS.chmod` with the manifest mode. Lazy files load with emscripten's synchronous XHR (1 MB Range chunks) from `/rootfs/<path>`. Then `callMain(['--root', '/rootfs', '--stats', --env …, '--', <dalvikvm64 argv>])`. Each run uses a fresh module instance. stdout and stderr go to the page through `Module.print` and `Module.printErr`.
+- **Argv and environment** (`web/cases.js`): the same argv and the same six `--env` variables as `tests/run.sh` and `tools/guest-env.sh`. `tests/web.mjs` checks the env values against the script on every run.
+- **Server** (`web/serve.mjs`, `make serve`): Node, no dependencies. Serves `web/`, `build/wasm/`, `build/web/manifest.json` and `/rootfs/` from `build/rootfs`. Handles HEAD and single `Range` requests (206 with `Content-Range`, 416 when unsatisfiable), refuses paths that leave their root, sends `Content-Type` for `.mjs`, `.wasm` and `.json`, and sends `Cache-Control: no-store`. `--coop` adds COOP and COEP headers and is off by default; the engine does not use SharedArrayBuffer yet, so it is not needed.
+- **Page** (`web/index.html`, `web/main.js`): a case selector, Run, stdout and stderr panes, and a timing table. Each Run starts a new worker, which is terminated when the run ends. No framework, no build step.
+- **Test** (`tests/web.mjs`, `make test-web`): starts the server on a free port, runs the cases given on the command line (`make test-web` runs hello-jit and hello-int), and reads `window.xn`. Playwright is imported from the xiaonux bench install (`XN_PLAYWRIGHT` overrides the path), with the cached Chromium. Not part of `make test`.
+
+### Engine changes
+
+- **No adapter in `host.c` or `vfs.c`.** The engine's own FS calls (`newfstatat`, `readlinkat`, `openat`, `pread64`, `fstatfs`, as seen in the trace) worked on MEMFS, lazy files and symlinks as they are. `getdents` is not exercised by Hello.
+- `engine/main.c`, `EM_JS xn_run_start`: before `sched_run`, calls `Module.onRunStart` if the page set it. Node and native builds have no such hook, so nothing changes there. It is how the worker measures time to first instruction.
+- `engine/main.c`, `--stats`: the same as `XIAOJI_STATS=1`. Added because emscripten reads the `ENV` for `getenv` from a module-local variable, so `ENV` in the module config has no effect. Native and Node behaviour is unchanged; the option is only new.
+
+### Problems found on the way
+
+1. `/proc/self/exe` failed with ENOENT. The engine resolves guest paths one component at a time in the host tree, so `/rootfs/proc` has to exist. The first manifest left out `proc`, `sys` and `dev` entirely. The fix keeps those three directories as empty entries; their contents are still synthesized by the engine. After that, hello-jit exits 0.
+2. The `ENV` key in the module config is ignored (see above). Fixed with `--stats`.
+3. `XIAOJI_STATS` is printed from `atexit`, which does not run when `callMain` returns without `exit`. Fixed with `-sEXIT_RUNTIME=1` in the web build only.
+
+### Timings
+
+`make test-web`, final run, headless Chromium (the Playwright build, `headless: true`), a fresh browser per case, on AC power with `lowpowermode 0`. Time to first instruction is measured from `callMain`, when the engine starts the ELF loads, to the call just before `sched_run`. "From Run" adds the manifest fetch, module instantiation and tree build.
+
+| | hello-jit | hello-int |
+|---|---|---|
+| total, Run to exit | 13.30 s | 13.40 s |
+| engine run (`callMain`) | 13.25 s | 13.34 s |
+| time to first instruction, from `callMain` | 35.7 ms | 36.4 ms |
+| time to first instruction, from Run | 89 ms | 87 ms |
+| manifest fetch (420,992 bytes) | 3.5 ms | 2.8 ms |
+| MEMFS tree build (3,520 lazy files) | 40.5 ms | 39.7 ms |
+| fetches (chunk requests) | 419 | 413 |
+| distinct files fetched | 293 | 292 |
+| bytes fetched | 185,192,698 | 179,786,114 |
+| `XIAOJI_STATS` | 297,524,445 instructions in 13.209 s (22.52 M/s), 87.3% in translated code | 652,386,505 instructions in 13.307 s (49.02 M/s), 93.1% in translated code |
+
+Earlier runs during the work gave hello-jit totals of 12.0 to 13.3 s and hello-int totals of 12.7 to 13.4 s, with the same instruction counts to within 0.01%. The instruction count varies a little between runs (Hello's threads); the 87% and 93% translated shares did not change. The `-Xint` case still shows 93% in translated code because the translator is the engine's, and `-Xint` only selects ART's interpreter.
+
+Largest fetches in the hello-jit run: `framework.jar` 37.2 MB, `icudt70l.dat` 26.5 MB, `libart.so` 9.8 MB, `boot-framework.oat` 9.6 MB, `libhwui.so` 9.1 MB, `libart-compiler.so` 5.4 MB, `core-oj.jar` 5.3 MB, `boot.oat` 4.0 MB. Each file is fetched whole in 1 MB chunks as the engine reads it, so 185 MB is far more than Hello's own reads. The boot images are small (about 5.9 MB in total).
+
+**Power state** (`pmset -g ps`, `pmset -g`): "Now drawing from 'AC Power'", battery 100%, charged, `lowpowermode 0`. `displaysleep 120` with "display sleep prevented by Godot", which is a running app, not part of this test. Other load on the machine was not checked during the final run.
+
+### Checks
+
+- `make && make wasm && make wasm-node && make test`: 80 passed, 0 failed, 0 xfail.
+- `make test-web`: hello-jit and hello-int PASS. Stdout matches the oracle, exit 0, no page errors, and the guest env matches `tools/guest-env.sh`.
+- `engine/main.c` compiles with no warnings under `clang -Wall -Wextra` and `emcc -Wall -Wextra` (both without the Makefile's `-Wno-unused-parameter`).
+- `make serve`: starts. The server was also checked directly: HEAD, Range 206 and 416, 404, 405, and refusal of a path that leaves the root.
+
+### What remains
+
+- **Delivery is the simplest form.** Whole-file lazy fetch with 1 MB chunks. A Hello run fetches 185 MB, including all of `framework.jar` (37 MB) and `icudt70l.dat` (26 MB). There is no compression, no chunk cache, and no snapshot. The server sends `no-store`, so the browser cache is not used. Snapshots and chunking are the next delivery step.
+- **Time to first instruction** is the engine's setup (ELF loads of dalvikvm64 and linker64, which fetch their files), not the first guest instruction after a snapshot.
+- **Browsers.** Only Playwright's headless Chromium was run, not headed Chrome or other browsers. Memory use under the 4 GB limit was not measured.
+- **COOP/COEP** is off. Turn it on when the engine uses SharedArrayBuffer (threads in the worker).
+- **Env in the page** is a copy of `tools/guest-env.sh` in `web/cases.js`. `tests/web.mjs` checks it, but it is still a second copy.
+- Nothing is committed. `make test-web` needs the Playwright path (`XN_PLAYWRIGHT`); there is no network install.
