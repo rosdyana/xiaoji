@@ -75,6 +75,10 @@
 #define OFF_SP ((uint32_t)offsetof(cpu_t, sp))
 #define OFF_PC ((uint32_t)offsetof(cpu_t, pc))
 #define OFF_NZCV ((uint32_t)offsetof(cpu_t, nzcv))
+#define OFF_ICOUNT ((uint32_t)offsetof(cpu_t, icount))
+#define OFF_STOP ((uint32_t)offsetof(cpu_t, stop))
+#define OFF_SIG_PENDING ((uint32_t)offsetof(cpu_t, sig_pending))
+#define OFF_SIG_MASK ((uint32_t)offsetof(cpu_t, sig_mask))
 
 /* Operations of jit_pure. */
 enum {
@@ -98,6 +102,8 @@ enum {
     W_END = 0x0B,
     W_RETURN = 0x0F,
     W_CALL = 0x10,
+    W_RETURN_CALL = 0x12,
+    W_RETURN_CALL_INDIRECT = 0x13,
     W_DROP = 0x1A,
     W_SELECT = 0x1B,
     W_LGET = 0x20,
@@ -125,7 +131,9 @@ enum {
     W_I32_SHR_U = 0x76,
     W_I64_EQZ = 0x50,
     W_I64_EQ = 0x51,
+    W_I64_NE = 0x52,
     W_I64_LT_U = 0x54,
+    W_I64_LE_S = 0x57,
     W_I64_LE_U = 0x58,
     W_I64_CLZ = 0x79,
     W_I64_ADD = 0x7C,
@@ -263,9 +271,36 @@ static uint32_t tlb_rd_base, tlb_wr_base, tlb_stride, tlb_page_off;
 static uint64_t st_dispatch, st_block_runs, st_insns, st_blocks, st_untranslatable,
     st_refused, st_modules, st_compile_fail, st_inv_pages, st_inv_blocks, st_faults, st_smc_exits;
 
+/* Block chaining. A block whose exit is known to the generated code tail-calls chain_fn
+ * (a function of its module), which looks the next pc up in fast[] and tail-calls that
+ * block, without returning to C. Entries hold pc + 1, so zeroed memory is empty; only
+ * untagged, aligned pcs are cached. The slice budget and the hit count are plain statics
+ * at fixed addresses, which the generated code reads and writes. */
+#define JIT_FAST 4096
+typedef struct {
+    uint64_t key; /* pc + 1 of a block's first instruction; 0 = empty */
+    int32_t fn;   /* its table index */
+    int32_t pad;
+} FastEnt;
+static FastEnt fast[JIT_FAST];
+static int64_t jit_budget; /* instructions left in the slice, while translated code runs */
+static uint64_t st_chain_hits;
+static int chain_on = -1; /* -1 until decided; wasm builds with tail calls only */
+
 /* Compiles the module at buf (len bytes) and installs its nfuncs functions in the
  * table. Returns the first table index, or -1 if the module did not compile. */
 int js_jit_compile(const uint8_t *buf, int len, int nfuncs);
+
+/* 1 if this browser validates a module with return_call (the tail-call proposal).
+ * Chaining needs it; without it, blocks return to C as before. */
+EM_JS(int, js_tail_ok, (void), {
+    try {
+        return WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127,
+                                                    3, 2, 1, 0, 10, 6, 1, 4, 0, 18, 0, 11])) ? 1 : 0;
+    } catch (e) {
+        return 0;
+    }
+});
 
 static int jit_enabled(void)
 {
@@ -278,8 +313,32 @@ static int jit_enabled(void)
         mem_jit_tlb(&rd, &wr, &tlb_stride, &tlb_page_off);
         tlb_rd_base = (uint32_t)rd;
         tlb_wr_base = (uint32_t)wr;
+        e = getenv("XIAOJI_CHAIN");
+        chain_on = !(e && e[0] == '0') && js_tail_ok();
     }
     return jit_on;
+}
+
+/* Empties the chain cache. Called by the memory layer on every change of the mapping
+ * (tlb_flush), so no cached pc outlives the host page it was mapped to. */
+void jit_chain_flush(void) { memset(fast, 0, sizeof fast); }
+
+static uint32_t fast_idx(uint64_t pc) { return (uint32_t)(pc >> 2) & (JIT_FAST - 1); }
+
+static void fast_fill(uint64_t pc, int32_t fn)
+{
+    if (pc & ~(uint64_t)MEM_UNTAG_MASK)
+        return; /* tagged: the chain code compares untagged pcs only */
+    FastEnt *e = &fast[fast_idx(pc)];
+    e->key = pc + 1;
+    e->fn = fn;
+}
+
+static void fast_drop(uint64_t pc, int32_t fn)
+{
+    FastEnt *e = &fast[fast_idx(pc)];
+    if (e->key == pc + 1 && e->fn == fn)
+        e->key = 0;
 }
 
 static uint32_t blk_hash(uintptr_t host, uint64_t vpage)
@@ -348,6 +407,8 @@ void jit_page_changed(const uint8_t *host_page)
     if (!pe || !pe->code)
         return;
     for (int32_t i = pe->head; i >= 0; i = blks[i].next_page) {
+        if (blks[i].fn >= 0)
+            fast_drop(((uint64_t)blks[i].vpage << 12) | (blks[i].host & 0xFFF), blks[i].fn);
         if (blks[i].valid) {
             blks[i].valid = 0;
             st_inv_blocks++;
@@ -375,6 +436,7 @@ typedef struct {
     unsigned cur_n; /* instructions up to and including it */
     uint32_t touched, written; /* bit r: x_r (r < 31); bit 31: sp */
     int nzcv_touched, nzcv_written;
+    int chain; /* the module has chain_fn, and exits tail-call it */
 } Gen;
 
 static void o8(Gen *g, uint8_t op) { buf_put(g->o, op); }
@@ -436,7 +498,44 @@ static void flush(Gen *g, uint32_t regs, int nzcv)
  * is in bits 0..7). NEXT: the pc is the next instruction to run (an untranslated one,
  * or the length limit). JUMP: a branch, taken or not, or an indirect branch. SMC: a
  * store changed translated code; the pc is the instruction after the store. */
-enum { EXIT_NEXT = 0, EXIT_JUMP = 1, EXIT_SMC = 2 };
+enum { EXIT_NEXT = 0, EXIT_JUMP = 1, EXIT_SMC = 2, EXIT_BAIL = 3 /* chain_fn: n = 0 */ };
+
+/* The module's chain function is its first function, after the imports. */
+#define CHAIN_FN N_IMPORTS
+/* Addresses of the statics that generated code reads and writes. */
+#define ADDR_BUDGET ((int32_t)(uintptr_t)&jit_budget)
+#define ADDR_RUN_START ((int32_t)(uintptr_t)&run_start)
+#define ADDR_HITS ((int32_t)(uintptr_t)&st_chain_hits)
+#define ADDR_FAST ((int32_t)(uintptr_t)fast)
+
+/* The block's n instructions are done: charge them to the cpu and the slice budget,
+ * then leave. A chained exit tail-calls chain_fn, which hops to the next block or
+ * returns with n = 0 (the charge above already counted this block). Otherwise the
+ * block returns n | kind. SMC always returns to C, so the interpreter takes the next
+ * instruction. */
+static void exit_finish(Gen *g, unsigned n, unsigned kind)
+{
+    lget(g, 0);
+    lget(g, 0);
+    memop(g, W_I64_LOAD, 3, OFF_ICOUNT);
+    i64c(g, n);
+    o8(g, W_I64_ADD);
+    memop(g, W_I64_STORE, 3, OFF_ICOUNT);
+    i32c(g, ADDR_BUDGET);
+    i32c(g, ADDR_BUDGET);
+    memop(g, W_I64_LOAD, 3, 0);
+    i64c(g, n);
+    o8(g, W_I64_SUB);
+    memop(g, W_I64_STORE, 3, 0);
+    if (g->chain && kind != EXIT_SMC) {
+        lget(g, 0);
+        o8(g, W_RETURN_CALL);
+        buf_uleb(g->o, CHAIN_FN);
+        return;
+    }
+    i32c(g, (int32_t)(n | kind << 8));
+    o8(g, W_RETURN);
+}
 
 /* Exits with pc = the constant pc, having run n instructions. */
 static void exit_kind(Gen *g, uint64_t pc, unsigned n, unsigned kind)
@@ -445,8 +544,7 @@ static void exit_kind(Gen *g, uint64_t pc, unsigned n, unsigned kind)
     lget(g, 0);
     i64c(g, (int64_t)pc);
     memop(g, W_I64_STORE, 3, OFF_PC);
-    i32c(g, (int32_t)(n | kind << 8));
-    o8(g, W_RETURN);
+    exit_finish(g, n, kind);
 }
 
 static void exit_to(Gen *g, uint64_t pc, unsigned n) { exit_kind(g, pc, n, EXIT_NEXT); }
@@ -458,8 +556,7 @@ static void exit_dyn(Gen *g, unsigned n)
     lget(g, 0);
     lget(g, L_T0);
     memop(g, W_I64_STORE, 3, OFF_PC);
-    i32c(g, (int32_t)(n | EXIT_JUMP << 8));
-    o8(g, W_RETURN);
+    exit_finish(g, n, EXIT_JUMP);
 }
 
 /* Exits to taken or fall, depending on the i32 condition on the stack. */
@@ -1867,13 +1964,112 @@ static void type_entry(Buf *b, int np, const uint8_t *params, int nr, uint8_t re
 
 static Buf mod_buf, sec_buf, fn_bodies[JIT_BATCH];
 
-/* Builds the module of nf functions in fn_bodies. */
-static void build_module(int nf)
+/* Ends the current if-arm with an early return of EXIT_BAIL (n = 0), which the caller
+ * takes as "already charged, return to the dispatcher". */
+static void bail_if(Gen *g)
+{
+    o8(g, W_IF);
+    buf_put(g->o, 0x40);
+    i32c(g, EXIT_BAIL << 8);
+    o8(g, W_RETURN);
+    o8(g, W_END);
+}
+
+/* The chain function, the module's first function: (cpu) -> i32. Its locals are 1 (i64)
+ * pc and 2 (i32) the cache entry. It bails unless the budget is positive, no stop and no
+ * signal is pending, and the pc is cached; then it counts the hit, sets the block's
+ * start pc for jit_fault, and tail-calls the cached block. The cache check is the whole
+ * validity check: jit_page_changed and tlb_flush drop every entry they make stale. */
+static void chain_body(Buf *out)
+{
+    Gen g;
+    Buf code = {0};
+    memset(&g, 0, sizeof g);
+    g.o = &code;
+    i32c(&g, ADDR_BUDGET);
+    memop(&g, W_I64_LOAD, 3, 0);
+    i64c(&g, 0);
+    o8(&g, W_I64_LE_S);
+    bail_if(&g);
+    lget(&g, 0);
+    memop(&g, W_I32_LOAD, 2, OFF_STOP);
+    bail_if(&g);
+    lget(&g, 0);
+    memop(&g, W_I64_LOAD, 3, OFF_SIG_PENDING);
+    lget(&g, 0);
+    memop(&g, W_I64_LOAD, 3, OFF_SIG_MASK);
+    i64c(&g, -1);
+    o8(&g, W_I64_XOR);
+    o8(&g, W_I64_AND);
+    i64c(&g, 0);
+    o8(&g, W_I64_NE);
+    bail_if(&g);
+    lget(&g, 0);
+    memop(&g, W_I64_LOAD, 3, OFF_PC);
+    lset(&g, 1);
+    /* entry = fast + ((pc >> 2) & (JIT_FAST - 1)) * sizeof(FastEnt) */
+    lget(&g, 1);
+    i64c(&g, 2);
+    o8(&g, W_I64_SHR_U);
+    o8(&g, W_I32_WRAP_I64);
+    i32c(&g, JIT_FAST - 1);
+    o8(&g, W_I32_AND);
+    i32c(&g, (int32_t)sizeof(FastEnt));
+    o8(&g, W_I32_MUL);
+    i32c(&g, ADDR_FAST);
+    o8(&g, W_I32_ADD);
+    lset(&g, 2);
+    lget(&g, 2);
+    memop(&g, W_I64_LOAD, 3, offsetof(FastEnt, key));
+    lget(&g, 1);
+    i64c(&g, 1);
+    o8(&g, W_I64_ADD);
+    o8(&g, W_I64_NE);
+    bail_if(&g);
+    /* the hop */
+    i32c(&g, ADDR_HITS);
+    i32c(&g, ADDR_HITS);
+    memop(&g, W_I64_LOAD, 3, 0);
+    i64c(&g, 1);
+    o8(&g, W_I64_ADD);
+    memop(&g, W_I64_STORE, 3, 0);
+    i32c(&g, ADDR_RUN_START);
+    lget(&g, 1);
+    memop(&g, W_I64_STORE, 3, 0);
+    lget(&g, 0);
+    lget(&g, 2);
+    memop(&g, W_I32_LOAD, 2, offsetof(FastEnt, fn));
+    o8(&g, W_RETURN_CALL_INDIRECT);
+    buf_uleb(&code, TY_BLOCK);
+    buf_uleb(&code, 0); /* table 0: the imported table */
+    i32c(&g, EXIT_BAIL << 8);
+    o8(&g, W_RETURN);
+
+    out->n = 0;
+    buf_uleb(out, 2);
+    buf_uleb(out, 1);
+    buf_put(out, 0x7E);
+    buf_uleb(out, 1);
+    buf_put(out, 0x7F);
+    buf_bytes(out, code.p, code.n);
+    buf_put(out, W_END);
+    free(code.p);
+}
+
+static Buf chain_buf;
+
+/* Builds the module of nf functions in fn_bodies. With chain, it also has the table
+ * import and the chain function (CHAIN_FN), and the blocks follow it. */
+static void build_module(int nf, int chain)
 {
     static const uint8_t i32t = 0x7F, i64t = 0x7E;
     Buf *s = &sec_buf;
     mod_buf.n = 0;
     buf_bytes(&mod_buf, "\0asm\x01\0\0\0", 8);
+    if (chain) {
+        chain_buf.n = 0;
+        chain_body(&chain_buf);
+    }
 
     s->n = 0;
     buf_uleb(s, 4);
@@ -1893,7 +2089,7 @@ static void build_module(int nf)
     section(&mod_buf, 1, s);
 
     s->n = 0;
-    buf_uleb(s, N_IMPORTS + 1);
+    buf_uleb(s, N_IMPORTS + 1 + (chain ? 1 : 0));
     buf_name(s, "e");
     buf_name(s, "m");
     buf_put(s, 0x02); /* memory */
@@ -1911,11 +2107,20 @@ static void build_module(int nf)
     buf_name(s, "pure");
     buf_put(s, 0x00);
     buf_uleb(s, TY_PURE);
+    if (chain) { /* the table the chain tail-calls through */
+        buf_name(s, "e");
+        buf_name(s, "t");
+        buf_put(s, 0x01); /* table */
+        buf_put(s, 0x70); /* funcref */
+        buf_put(s, 0x00); /* no maximum */
+        buf_uleb(s, 0);   /* minimum: the engine's table is larger */
+    }
     section(&mod_buf, 2, s);
 
+    int nfn = nf + (chain ? 1 : 0); /* chain_fn, then the blocks */
     s->n = 0;
-    buf_uleb(s, nf);
-    for (int i = 0; i < nf; i++)
+    buf_uleb(s, nfn);
+    for (int i = 0; i < nfn; i++)
         buf_uleb(s, TY_BLOCK);
     section(&mod_buf, 3, s);
 
@@ -1926,12 +2131,16 @@ static void build_module(int nf)
         snprintf(name, sizeof name, "f%d", i);
         buf_name(s, name);
         buf_put(s, 0x00);
-        buf_uleb(s, N_IMPORTS + i);
+        buf_uleb(s, N_IMPORTS + (chain ? 1 : 0) + i);
     }
     section(&mod_buf, 7, s);
 
     s->n = 0;
-    buf_uleb(s, nf);
+    buf_uleb(s, nfn);
+    if (chain) {
+        buf_uleb(s, chain_buf.n);
+        buf_bytes(s, chain_buf.p, chain_buf.n);
+    }
     for (int i = 0; i < nf; i++) {
         buf_uleb(s, fn_bodies[i].n);
         buf_bytes(s, fn_bodies[i].p, fn_bodies[i].n);
@@ -1977,6 +2186,7 @@ static void translate_batch(void)
         g->o = &g->ops;
         g->touched = g->written = 0;
         g->nzcv_touched = g->nzcv_written = 0;
+        g->chain = chain_on;
         unsigned n = gen_block(g, p->pc, (const uint8_t *)page, (uint32_t)(p->host - page));
         if (n == 0) {
             st_untranslatable++;
@@ -1989,7 +2199,7 @@ static void translate_batch(void)
     if (new_code)
         mem_flush_write_tlb();
     if (nf) {
-        build_module(nf);
+        build_module(nf, chain_on);
         st_modules++;
         int base = js_jit_compile(mod_buf.p, (int)mod_buf.n, nf);
         if (base < 0) {
@@ -2006,19 +2216,22 @@ static void translate_batch(void)
 
 /* ---------- dispatch ---------- */
 
+/* Runs the block at table index fn, and any blocks it chains to. The blocks charge
+ * their instructions to c->icount and jit_budget as they exit, so this only sets the
+ * budget in and copies it out. */
 static void run_block(cpu_t *c, int32_t fn, uint64_t *budget)
 {
     run_start = c->pc;
     running = 1;
+    jit_budget = (int64_t)*budget;
+    uint64_t ic0 = c->icount;
     int32_t r = ((int32_t (*)(cpu_t *))(uintptr_t)(uint32_t)fn)(c);
     running = 0;
-    uint64_t n = (uint64_t)(r & 0xFF);
     if ((r >> 8) == EXIT_SMC)
         st_smc_exits++;
-    c->icount += n;
-    st_insns += n;
+    st_insns += c->icount - ic0;
     st_block_runs++;
-    *budget = n >= *budget ? 0 : *budget - n;
+    *budget = jit_budget > 0 ? (uint64_t)jit_budget : 0;
 }
 
 int jit_dispatch(cpu_t *c, uint64_t *budget)
@@ -2036,6 +2249,7 @@ int jit_dispatch(cpu_t *c, uint64_t *budget)
     if (b) {
         if (b->fn < 0)
             return 2; /* not translatable: the interpreter runs it, then may re-enter */
+        fast_fill(pc, b->fn);
         run_block(c, b->fn, budget);
         return 1;
     }
@@ -2057,6 +2271,7 @@ int jit_dispatch(cpu_t *c, uint64_t *budget)
      * interpreting the instruction and leaving the block for the next entry. */
     b = blk_find(host, vpage);
     if (b && b->fn >= 0) {
+        fast_fill(pc, b->fn);
         run_block(c, b->fn, budget);
         return 1;
     }
@@ -2080,14 +2295,14 @@ void jit_print_stats(uint64_t total_insns)
     fprintf(stderr,
             "xiaoji: jit %s: %llu of %llu instructions in translated code (%.1f%%); "
             "%llu blocks in %llu modules (%llu refused, %llu not translatable, %llu compile failures); "
-            "%llu block runs of %llu dispatches; %llu faults in translated code; "
+            "%llu block runs of %llu dispatches, %llu chain hits; %llu faults in translated code; "
             "%llu self-modifying exits; %llu pages and %llu blocks invalidated\n",
             jit_on ? "on" : "off", (unsigned long long)st_insns, (unsigned long long)total_insns,
             total_insns ? 100.0 * (double)st_insns / (double)total_insns : 0.0,
             (unsigned long long)st_blocks, (unsigned long long)st_modules,
             (unsigned long long)st_refused, (unsigned long long)st_untranslatable,
             (unsigned long long)st_compile_fail, (unsigned long long)st_block_runs,
-            (unsigned long long)st_dispatch, (unsigned long long)st_faults,
+            (unsigned long long)st_dispatch, (unsigned long long)st_chain_hits, (unsigned long long)st_faults,
             (unsigned long long)st_smc_exits, (unsigned long long)st_inv_pages,
             (unsigned long long)st_inv_blocks);
 }

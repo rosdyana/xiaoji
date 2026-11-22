@@ -14,6 +14,7 @@ addToLibrary({
           ld: wasmExports['jit_ld'],
           st: wasmExports['jit_st'],
           pure: wasmExports['jit_pure'],
+          t: wasmTable,
         },
       });
     } catch (e) {

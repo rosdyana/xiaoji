@@ -94,6 +94,11 @@ static void tlb_flush(void)
     memset(tlb_wr, 0, sizeof tlb_wr);
     fetch_tag = 0;
     fetch_page = NULL;
+#ifdef __EMSCRIPTEN__
+    /* Every change of the mapping calls this (shared pages do not call
+     * jit_page_changed when unmapped), so the translator's chain cache goes too. */
+    jit_chain_flush();
+#endif
 }
 
 static uint64_t *pte_slot(uint64_t vpn, int create)

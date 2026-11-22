@@ -179,6 +179,19 @@ __asm__(".text\n"
 extern u64 jitstress_load(const u64 *p);
 extern void jitstress_restore(void);
 
+/* A leaf entered through the chain: three ALU ops, then the load at offset 12. The
+ * fault is the fourth instruction of its block, so its instruction count depends on
+ * where the block starts. The handler sets x0 = 77 and returns to the caller. */
+extern u64 jitstress_chain_load(const u64 *p, u64 k);
+__asm__(".text\n"
+        ".global jitstress_chain_load\n"
+        "jitstress_chain_load:\n"
+        "  add x2, x1, #3\n"
+        "  eor x2, x2, x1, lsl #2\n"
+        "  add x2, x2, #1\n"
+        "  ldr x0, [x0]\n"
+        "  ret\n");
+
 /* Leaves with a fault in the middle, after registers were written: the handler must
  * see those values (x1..x3) and the faulting pc, and the post-index load must not have
  * written back. */
@@ -239,6 +252,139 @@ static void hot_fault(u64 *sum)
     *sum = s;
 }
 
+#define RET_INSN 0xD65F03C0u
+static u32 movz_w0(u32 imm) { return 0x52800000u | (imm << 5); }
+
+/* HINT-space NOPs and barriers inside a hot loop. The translator treats them as no-ops
+ * and keeps the block going, so the loop runs as translated code. */
+static u64 hint_loop(u64 n)
+{
+    u64 acc = 0;
+    for (u64 i = 0; i < n; i++) {
+        __asm__ volatile("nop\n\t"
+                         "dmb ish\n\t"
+                         "dsb sy\n\t"
+                         "hint #34\n\t"
+                         "isb\n\t"
+                         : : : "memory");
+        acc += i ^ (acc >> 2);
+    }
+    return acc;
+}
+
+/* ---------- hot loops that chain through blocks ---------- */
+
+/* chain_loop: every iteration leaves its block by a conditional branch, a direct branch,
+ * an indirect call through a table (BLR) and a return (RET). Each exit is a hop to
+ * the next block, so one iteration chains through several blocks. */
+typedef u64 (*chain_fn_t)(u64);
+static u64 chain_a(u64 x) { return x * 3 + 1; }
+static u64 chain_b(u64 x) { return (x >> 1) ^ 0x55; }
+static u64 chain_c(u64 x) { return x + ((x & 4) ? 7 : 9); }
+static chain_fn_t volatile chain_tab[3] = {chain_a, chain_b, chain_c};
+
+static u64 chain_loop(u64 seed, u64 n)
+{
+    u64 x = seed, acc = 0;
+    for (u64 i = 0; i < n; i++) {
+        u64 k = i % 3;
+        if (x & 1)
+            x = chain_tab[k](x);
+        else
+            x = chain_tab[(k + 1) % 3](x);
+        switch (i & 3) {
+        case 0: acc += x; break;
+        case 1: acc ^= x; break;
+        case 2: acc += x >> 3; break;
+        default: acc -= x; break;
+        }
+        if (acc & (1ull << 40))
+            acc = acc * 5 + 1;
+        x ^= acc & 0xFFFF;
+    }
+    return acc ^ x;
+}
+
+/* Makes the instruction at p, just written, visible to fetch: the same maintenance as
+ * the self-modify test. A real core keeps stale instruction lines otherwise. */
+static void sync_code(void *p)
+{
+    __asm__ volatile("dc cvau, %0\n\t"
+                     "dsb ish\n\t"
+                     "ic ivau, %0\n\t"
+                     "dsb ish\n\t"
+                     "isb"
+                     : : "r"(p) : "memory");
+}
+
+/* A translated loop that rewrites a function it calls, in the middle of the loop. The
+ * store is a block exit, and the calls after it must run the new instruction. */
+static void smc_chain(u64 *sum)
+{
+    typedef u64 (*pure_fn)(void);
+    u32 *fn = (u32 *)sys_mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    fn[0] = movz_w0(2);
+    fn[1] = RET_INSN;
+    sync_code(fn);
+    u64 s = *sum;
+    for (u64 i = 0; i < CALLS; i++) {
+        if (i == CALLS / 2) {
+            fn[0] = movz_w0(5);
+            sync_code(fn);
+        }
+        s += ((pure_fn)(uintptr_t)fn)();
+    }
+    *sum = s;
+}
+
+/* A fault reached by a chain: the hot loop calls the load on every pass, and the last
+ * pass passes a bad pointer, so the fault is in a block entered by a hop from the loop.
+ * The handler makes that load return 77. */
+static void chain_fault(u64 *sum)
+{
+    static const u64 good = 5;
+    u64 s = 0;
+    /* Twice as long as the warm-up, so the blocks are translated and chained when the
+     * last pass faults. */
+    for (u64 i = 0; i < 2 * CALLS; i++)
+        s += jitstress_chain_load(i == 2 * CALLS - 1 ? (const u64 *)0x40 : &good, i);
+    *sum = s;
+}
+
+/* Two threads, each running a long chained loop, so the slice budget runs out inside
+ * chained blocks while the other thread is runnable. */
+extern i64 jitstress_spawn(u64 flags, void *stack_top, u32 *ptid, u32 *ctid, void (*fn)(void *), void *arg);
+__asm__(".text\n"
+        ".global jitstress_spawn\n"
+        "jitstress_spawn:\n"
+        "  stp x4, x5, [x1, #-16]!\n"
+        "  mov x4, x3\n"
+        "  mov x3, xzr\n"
+        "  mov x8, #220\n"
+        "  svc #0\n"
+        "  cbnz x0, 1f\n"
+        "  ldp x9, x0, [sp]\n"
+        "  blr x9\n"
+        "  mov x0, #0\n"
+        "  mov x8, #93\n"
+        "  svc #0\n"
+        "1:\n"
+        "  ret\n");
+
+#define THREAD_FLAGS 0x350F00ull /* VM, FS, FILES, SIGHAND, THREAD, SYSVSEM, PARENT/CHILD_SETTID */
+static unsigned char tstack[65536] __attribute__((aligned(16)));
+static u32 tid_parent, tid_child;
+static volatile u32 child_done;
+static u64 child_val;
+
+static void thread_main(void *arg)
+{
+    (void)arg;
+    child_val = chain_loop(777, CALLS * 16);
+    child_done = 1;
+}
+
 static void check(const char *label, int ok)
 {
     put(label);
@@ -286,8 +432,6 @@ static void hot_branches(u64 *sum)
 }
 
 /* Self-modifying code. A function is "movz w0, #imm; ret". */
-#define RET_INSN 0xD65F03C0u
-static u32 movz_w0(u32 imm) { return 0x52800000u | (imm << 5); }
 
 typedef int (*gen_fn)(void);
 
@@ -486,6 +630,46 @@ int main(int argc, char **argv)
     check("self_modify", smc_bad == 0);
     put("self_modify_bad=");
     putd((i64)smc_bad);
+    put("\n");
+
+    // 5b. Barriers and HINT-space NOPs in a hot loop. Output must match native.
+    put("hint_loop=");
+    putx(hint_loop(CALLS * 4));
+    put("\n");
+
+    // 6. Hot loops that chain through blocks by direct, conditional, indirect and return
+    // exits. Output must match native.
+    put("chain_loop=");
+    putx(chain_loop(12345, CALLS * 8));
+    put("\n");
+
+    // 7. A rewrite in the middle of a chained loop: the calls after it must run the new
+    // instruction. The sum is exact.
+    u64 smc_sum = 0;
+    smc_chain(&smc_sum);
+    check("smc_chain", smc_sum == (u64)(CALLS / 2) * 2 + (u64)(CALLS - CALLS / 2) * 5);
+
+    // 8. A fault reached through a chain of blocks, handled by the signal handler.
+    faults = 0;
+    u64 cf_sum = 0;
+    chain_fault(&cf_sum);
+    check("fault_chained", faults == 1 && snap_addr == 0x40 && snap_pc == (u64)jitstress_chain_load + 12 &&
+                               cf_sum == (u64)(2 * CALLS - 1) * 5 + 77);
+    put("fault_chained_sum=");
+    putd((i64)cf_sum);
+    put("\n");
+
+    // 9. Thread switches while both threads run chained loops. The child's result must
+    // equal the same loop run on this thread, which it does only if neither thread's
+    // blocks or budget were disturbed by the other.
+    child_done = 0;
+    jitstress_spawn(THREAD_FLAGS, tstack + sizeof tstack, &tid_parent, &tid_child, thread_main, 0);
+    u64 main_val = chain_loop(777, CALLS * 16);
+    while (!child_done)
+        sc6(124 /* sched_yield */, 0, 0, 0, 0, 0, 0);
+    check("thread_chained", child_val == main_val);
+    put("thread_chained_val=");
+    putx(main_val);
     put("\n");
 
     put(checks ? "jitstress=FAIL\n" : "jitstress=ok\n");

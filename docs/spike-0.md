@@ -386,3 +386,39 @@ Notes: at about 5.5 blocks per module, JS compilation is a visible cost (about 3
 Not exercised by any test: `mremap` (it takes the same invalidation path through `mem_move`, but no test runs it on its own), the `XIAOJI_PROFILE` path (dispatch is skipped when the profiler is on), and the web build (`make wasm` compiles, but it has not been run in a browser).
 
 Left for T2: block chaining, translating the HINT-space NOPs and barriers instead of ending blocks there, a larger batch policy, lazy flags, SIMD&FP translation, register caching across blocks, and reclamation of invalidated blocks and table slots.
+
+### T2 (part 1): block chaining
+
+Done: plan item 1, block chaining with wasm tail calls. Not done: items 2 (tried and reverted, below), 3 (FP and SIMD), 4 (lazy flags), 5 (reclamation of invalidated blocks and table slots, and the cap stop).
+
+What it does. Each block charges its `icount` and a slice-budget word (`jit_budget`, a static at a fixed address) as it exits. An exit with a known or runtime target (direct, conditional, fall-through, BR/BLR/RET) tail-calls the module's `chain_fn` (a first function of every module, with a table import `e.t`). `chain_fn` returns to C with no work unless the budget is positive, `stop` is clear, no signal is pending, and `fast[]` has the next pc. On a hit it tail-calls the block's table index with `return_call_indirect`. Otherwise it returns `EXIT_BAIL`, and the dispatcher runs as before. SMC exits never chain. Module layout and the chain code are emitted only when the browser validates a `return_call` module (the same probe as xiaonux's `js_tail_ok`), so older browsers get the T1 code. `XIAOJI_CHAIN=0` turns chaining off, for A/B runs.
+
+Cache design. `fast[]` has 4096 entries keyed by the guest pc (entries hold pc + 1, so zeroed memory is empty), and only untagged pcs are cached. The dispatcher keys blocks by host address and VA page; the cache keys by guest pc, so its validity rests on two rules: `tlb_flush` (called on every change of the mapping, including unmap of shared memfd pages, which do not reach `jit_page_changed`) clears the whole cache, and `jit_page_changed` clears the entries of the blocks it drops. Blocks that are invalid are never entered, because their entries are gone.
+
+Jitstress additions (`tests/guest/jitstress.c`), all checked against native output:
+- `hint_loop`: NOP, DMB, DSB, BTI and ISB in a hot loop (passes on the interpreter path; the translator still ends blocks there, see below).
+- `chain_loop`: a hot loop that leaves each block by a conditional branch, a direct branch, an indirect call through a table, and a return.
+- `smc_chain`: a loop that rewrites a function it calls, in the middle of the loop; the sum is exact.
+- `fault_chained`: a leaf (`jitstress_chain_load`: three ALU ops, then the faulting load) that the loop calls twice as often as the warm-up needs; the fault is on the last pass. The handler's pc and address and the exact sum are checked, and the icount matches the JIT-off run.
+- `thread_chained`: two threads, each running a long chained loop; the child's result must equal the parent's.
+
+Open items in this part, found while checking the tests (not fixed):
+- The per-hop `run_start` store in `chain_fn` is not yet shown to matter. With the store removed, the icount of `fault_chained` did not change. The trace shows why for the current loop: the faulting block is entered from the C dispatcher (which sets `run_start`) rather than from a hop, because early in the loop, blocks L and R of the call site are not yet translated or chained. A bite test that proves the store needs a call site that is chained from its first pass.
+- Early in the `fault_chained` loop, the call site dispatches back to C about once per iteration until its blocks are translated and cached. Block translation is batched (64 queued blocks, or 8192 misses), so a hot block can wait for a long time. This is existing T1 batching, but it dominates the chain misses in this test (about 3700 C dispatches to the leaf per run). Chain hits are still 3.5M in this test.
+- Native self-modifying code in `smc_chain` was flaky (SIGILL on a fresh RWX page, 50% of runs) until the initial writes were followed by the same I-cache sync as the rewrite. The engine was not the cause.
+
+Measurements (Node, 5 runs each, medians; AC power; Low Power Mode off; `pmset -g` shows `lowpowermode 0`, `displaysleep 120`). Engine time is the `instructions in X s` line of `XIAOJI_STATS=1`.
+
+| Build | hello-jit | hello-int |
+|---|---|---|
+| T1 start (before T2) | JIT on 2.582 s, off 3.087 s | JIT on 3.741 s, off 6.031 s |
+| After item 1, chaining on | JIT on **1.944 s** | JIT on **2.889 s** |
+| After item 1, `XIAOJI_CHAIN=0` (same session) | JIT on 2.258 s, off 2.978 s | JIT on 3.848 s, off 5.993 s |
+
+Item 1 against its own A/B control: hello-jit 2.258 to 1.944 s (about 14% faster), hello-int 3.848 to 2.889 s (about 25% faster). Chain hits: 106.4 M in hello-int (10.6 M block runs of 28.7 M dispatches) and 43.5 M in hello-jit. Translated share: 91.5% (hello-int) and 84% (hello-jit), 1949 blocks in 354 modules (hello-int) and about 1650 blocks in about 325 modules (hello-jit). Run-to-run spread on this machine is about 10%.
+
+Item 2 (HINT-space NOPs, barriers other than CLREX, PRFM): tried, no measurable gain (hello-jit 1.944 to 1.957 s, hello-int 2.889 to 2.889 s, translated share 83.9% to 84.1%), so it was reverted. PRFM was already translated in T1. The hot paths of Hello rarely reach these encodings; the untranslatable starts are cold.
+
+Instruction counts are identical with the JIT on and off for jitstress, control, memory, simd and glibc_hello.
+
+Gates at this state: `make test`: 62 passed, 0 failed, 0 xfail; `XIAOJI_JIT=0 tests/run.sh`: 62 passed; threshold-1 build (`-DJIT_HOT=1`): 62 passed. emcc `-c -Wall -Wextra` for `jit.c` and `mem.c`: no warnings; clang native `mem.c`: no warnings.
