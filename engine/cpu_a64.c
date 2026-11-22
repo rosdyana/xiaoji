@@ -7,6 +7,7 @@
 #include "host.h"
 #include "mem.h"
 #include "sched.h"
+#include "signals.h"
 #include "simd.h"
 #include "syscall.h"
 
@@ -975,23 +976,61 @@ static int exec(cpu_t *c, uint32_t insn, uint64_t pc)
     return -1; /* reserved and SVE */
 }
 
-void cpu_run(cpu_t *c)
+/* An instruction the engine does not implement: SIGILL if a handler is installed,
+ * otherwise the process ends with status 132. */
+static void unimplemented(cpu_t *c, uint32_t insn, uint64_t pc)
+{
+    c->pc = pc;
+    if (sig_fault(c, SIGILL_N, ILL_ILLOPC, pc))
+        return;
+    fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,
+            (unsigned long long)pc);
+    c->exited = 1;
+    c->stop = 1;
+    sched_exit_process(132);
+}
+
+/* A memory fault longjmped here; the faulting instruction's pc is the one to report. */
+static void mem_fault(cpu_t *c)
+{
+    uint64_t addr;
+    int code;
+    mem_fault_info(&addr, &code);
+    c->pc = mem_cur_pc();
+    if (sig_fault(c, SIGSEGV_N, code, addr & MEM_UNTAG_MASK))
+        return;
+    sig_segv_fatal(addr, c->pc);
+}
+
+/* The instruction loop. Pending signals are delivered at each instruction boundary.
+ * A fault longjmps out of the instruction, so budget spent on that instruction is
+ * not subtracted: the slice can run slightly long, which only affects fairness. */
+static void run_loop(cpu_t *c)
 {
     uint64_t budget = c->budget;
     while (!c->stop && budget) {
         budget--;
+        if (c->sig_pending & ~c->sig_mask) {
+            sig_deliver_pending(c);
+            continue;
+        }
         uint64_t pc = c->pc;
         mem_set_pc(pc);
         uint32_t insn = mem_fetch32(pc);
         c->pc = pc + 4;
         c->icount++;
-        if (exec(c, insn, pc) < 0) {
-            fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,
-                    (unsigned long long)pc);
-            c->exited = 1;
-            c->stop = 1;
-            sched_exit_process(132);
-        }
+        if (exec(c, insn, pc) < 0)
+            unimplemented(c, insn, pc);
     }
     c->budget = budget;
+}
+
+void cpu_run(cpu_t *c)
+{
+    jmp_buf jb;
+    jmp_buf *outer = mem_set_fault_jmp(&jb);
+    if (setjmp(jb))
+        mem_fault(c);
+    run_loop(c);
+    mem_set_fault_jmp(outer);
 }

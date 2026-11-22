@@ -10,6 +10,7 @@
 #include "linux.h"
 #include "mem.h"
 #include "sched.h"
+#include "signals.h"
 #include "sysfs.h"
 #include "vfs.h"
 
@@ -29,6 +30,8 @@
 #define SYS_SIGALTSTACK 132
 #define SYS_RT_SIGACTION 134
 #define SYS_RT_SIGPROCMASK 135
+#define SYS_RT_SIGTIMEDWAIT 137
+#define SYS_RT_SIGRETURN 139
 #define SYS_SETPRIORITY 140
 #define SYS_GETPRIORITY 141
 #define SYS_GETPGID 155
@@ -67,20 +70,11 @@
 #define RLIMIT_STACK 3
 #define STACK_RLIMIT (8ull << 20)
 #define SIGSET_SIZE 8
-#define SIG_MAX 64
-#define SA_SIZE 32
-#define STACK_T_SIZE 24
 #define IO_CHUNK 65536
-
-typedef struct {
-    uint64_t handler, flags, restorer, mask;
-} guest_sigaction;
 
 static uint64_t brk_base;
 static uint64_t brk_cur;
 static uint64_t unimpl_seen[1024 / 64];
-static guest_sigaction sigactions[SIG_MAX + 1];
-static uint64_t altstack[3]; /* ss_sp, ss_flags, ss_size */
 static uint8_t fill_buf[IO_CHUNK];
 
 static uint64_t page_up(uint64_t x) { return (x + PAGE_MASK) & ~PAGE_MASK; }
@@ -127,6 +121,8 @@ static const char *syscall_name(uint64_t nr)
     case 132: return "sigaltstack";
     case 134: return "rt_sigaction";
     case 135: return "rt_sigprocmask";
+    case 137: return "rt_sigtimedwait";
+    case 139: return "rt_sigreturn";
     case 140: return "setpriority";
     case 141: return "getpriority";
     case 155: return "getpgid";
@@ -619,43 +615,28 @@ static int64_t sys_sched_getaffinity(uint64_t len, uint64_t mask)
     return SIGSET_SIZE;
 }
 
-static int64_t sys_sigaltstack(uint64_t ss, uint64_t oss)
+/* rt_sigtimedwait: the timeout is relative. A zero timeout only polls. */
+static int64_t sys_rt_sigtimedwait(cpu_t *c, uint64_t set, uint64_t info, uint64_t timeout, uint64_t sigsetsize)
 {
-    if (oss && mem_copy_in(oss, altstack, STACK_T_SIZE) < 0)
-        return -LE_FAULT;
-    if (ss) {
-        uint64_t n[3];
-        if (mem_copy_out(n, ss, STACK_T_SIZE) < 0)
-            return -LE_FAULT;
-        altstack[0] = n[0];
-        altstack[1] = n[1] & 0xFFFFFFFFu;
-        altstack[2] = n[2];
-    }
-    return 0;
-}
-
-static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oact, uint64_t sigsetsize)
-{
-    if (sigsetsize != SIGSET_SIZE || sig < 1 || sig > SIG_MAX)
+    if (sigsetsize != SIGSET_SIZE)
         return -LE_INVAL;
-    if (act && (sig == 9 || sig == 19)) /* SIGKILL and SIGSTOP */
-        return -LE_INVAL;
-    if (oact && mem_copy_in(oact, &sigactions[sig], SA_SIZE) < 0)
+    uint64_t wanted;
+    if (mem_copy_out(&wanted, set, sizeof wanted) < 0)
         return -LE_FAULT;
-    if (act) {
-        guest_sigaction n;
-        if (mem_copy_out(&n, act, SA_SIZE) < 0)
+    int poll = 0, has = 0;
+    uint64_t deadline = 0;
+    if (timeout) {
+        uint64_t ns;
+        if (read_timespec(timeout, &ns) < 0)
             return -LE_FAULT;
-        sigactions[sig] = n; /* stored only: no signal is delivered yet */
+        if (ns == 0)
+            poll = 1;
+        else {
+            has = 1;
+            deadline = deadline_of(ns, 0, 0);
+        }
     }
-    return 0;
-}
-
-static void die_by_signal(uint64_t sig)
-{
-    fflush(stdout);
-    fprintf(stderr, "xiaoji: killed by signal %llu\n", (unsigned long long)sig);
-    sched_exit_process(128 + sig);
+    return sig_timedwait(c, wanted, info, poll, has, deadline);
 }
 
 static int64_t sys_prctl(uint64_t option, uint64_t arg2)
@@ -777,31 +758,29 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
         return;
     case SYS_SIGALTSTACK:
-        *ret = sys_sigaltstack(a[0], a[1]);
+        *ret = sig_sigaltstack(c, a[0], a[1]);
         return;
     case SYS_RT_SIGACTION:
-        *ret = sys_rt_sigaction(a[0], a[1], a[2], a[3]);
+        *ret = sig_rt_sigaction(a[0], a[1], a[2], a[3]);
         return;
     case SYS_RT_SIGPROCMASK:
-        /* Zero the old mask (8 bytes); no signal masking yet. */
-        *ret = (a[2] && mem_set(a[2], 0, 8) < 0) ? -LE_FAULT : 0;
+        *ret = sig_rt_sigprocmask(c, a[0], a[1], a[2], a[3]);
+        return;
+    case SYS_RT_SIGTIMEDWAIT:
+        *ret = sys_rt_sigtimedwait(c, a[0], a[1], a[2], a[3]);
+        return;
+    case SYS_RT_SIGRETURN:
+        sig_rt_sigreturn(c); /* sets c->sig_restore: x0 comes from the frame */
+        *ret = 0;
         return;
     case SYS_KILL:
+        *ret = sig_kill(a[0], a[1]);
+        return;
     case SYS_TKILL:
-        if (a[1] == 0) {
-            *ret = 0;
-            return;
-        }
-        die_by_signal(a[1]);
-        *ret = 0;
+        *ret = sig_tkill(a[0], a[1]);
         return;
     case SYS_TGKILL:
-        if (a[2] == 0) {
-            *ret = 0;
-            return;
-        }
-        die_by_signal(a[2]);
-        *ret = 0;
+        *ret = sig_tgkill(a[0], a[1], a[2]);
         return;
     case SYS_PRCTL:
         *ret = sys_prctl(a[0], a[1]);
@@ -842,8 +821,9 @@ void syscall_dispatch(cpu_t *c)
     uint64_t a[6] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5]};
     int64_t ret = 0;
     dispatch(c, nr, a, &ret);
-    if (!c->blocked) /* a blocked call gets its x0 when it wakes */
+    if (!c->blocked && !c->sig_restore) /* a blocked call gets its x0 when it wakes */
         c->x[0] = (uint64_t)ret;
+    c->sig_restore = 0;
     if (c->trace) {
         fprintf(stderr, "xiaoji: %s(%llu) (0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) = %lld\n",
                 syscall_name(nr), (unsigned long long)nr, (unsigned long long)a[0],

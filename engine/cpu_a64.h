@@ -23,11 +23,25 @@ typedef struct cpu {
     uint64_t budget;    /* instructions left in this scheduling slice */
     int stop;           /* leave cpu_run after the current instruction */
     int blocked;        /* a syscall blocked: x0 is written at wake-up, not now */
+
+    /* Signal state, per thread. Bit n-1 of a mask or pending set is signal n. */
+    uint64_t sig_mask;        /* blocked signals */
+    uint64_t sig_pending;     /* raised for this thread, not yet delivered */
+    int32_t sig_code[65];     /* si_code of each pending signal, by signal number */
+    uint32_t sig_pid[65];     /* si_pid of each pending signal, by signal number */
+    uint64_t sig_wait_set;    /* rt_sigtimedwait: the set being waited for */
+    uint64_t sig_wait_info;   /* rt_sigtimedwait: guest siginfo pointer, or 0 */
+    uint64_t alt_sp;          /* sigaltstack: ss_sp and ss_size (size 0 means none) */
+    uint64_t alt_size;
+    uint32_t alt_flags;       /* SS_DISABLE or 0 */
+    int sig_restore;          /* the syscall just run was rt_sigreturn: keep x0 */
 } cpu_t;
 
 /* Runs the thread until it stops (exit, block, yield) or its slice budget is
- * spent. Unimplemented instructions print a message and end the process with
- * status 132 (sched_exit_process). */
+ * spent. Pending signals are delivered at instruction boundaries. A fault or an
+ * unimplemented instruction raises SIGSEGV or SIGILL; without a handler, the
+ * process ends with the default action (139 for a fault, 132 for an unimplemented
+ * instruction, after a message). */
 void cpu_run(cpu_t *c);
 
 #endif

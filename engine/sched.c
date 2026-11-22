@@ -6,6 +6,7 @@
  * none has one, the scheduler reports a deadlock. */
 #include "sched.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +15,7 @@
 #include "linux.h"
 #include "mem.h"
 
-#define MAX_THREADS 256
+#define MAX_THREADS SCHED_MAX_THREADS
 #define TID_MAIN 1000u
 #define TID_FIRST_NEW 1001u
 #define DEADLOCK_STATUS 134
@@ -27,7 +28,7 @@
 #define CLONE_CHILD_CLEARTID 0x00200000ull
 #define CLONE_CHILD_SETTID 0x01000000ull
 
-typedef enum { TS_RUNNABLE, TS_FUTEX, TS_SLEEP } thr_state;
+typedef enum { TS_RUNNABLE, TS_FUTEX, TS_SLEEP, TS_SIGWAIT } thr_state;
 
 typedef struct thread {
     cpu_t cpu;
@@ -39,6 +40,9 @@ typedef struct thread {
     uint64_t clear_child_tid;
     char comm[16];
 } thread_t;
+
+/* sched_wait_kind and sched_wake take a cpu_t pointer and cast it to thread_t. */
+_Static_assert(offsetof(thread_t, cpu) == 0, "thread_t must start with its cpu_t");
 
 static thread_t *threads[MAX_THREADS];
 static int cur_slot;          /* slot of the running thread */
@@ -118,6 +122,47 @@ void sched_sleep_until(uint64_t deadline)
     block_current(TS_SLEEP, 0, 0, 1, deadline);
 }
 
+void sched_block_sigwait(int has_deadline, uint64_t deadline)
+{
+    block_current(TS_SIGWAIT, 0, 0, has_deadline, deadline);
+}
+
+sched_wait_t sched_wait_kind(const cpu_t *c)
+{
+    /* cpu_t is the first member of thread_t, so the pointer is the thread's. */
+    const thread_t *t = (const thread_t *)c;
+    switch (t->state) {
+    case TS_FUTEX: return SW_FUTEX;
+    case TS_SLEEP: return SW_SLEEP;
+    case TS_SIGWAIT: return SW_SIGWAIT;
+    default: return SW_NONE;
+    }
+}
+
+void sched_wake(cpu_t *c, int64_t ret)
+{
+    thread_t *t = (thread_t *)c;
+    if (t->state != TS_RUNNABLE)
+        wake(t, ret);
+}
+
+int sched_threads(cpu_t **out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_THREADS && n < max; i++)
+        if (threads[i])
+            out[n++] = &threads[i]->cpu;
+    return n;
+}
+
+cpu_t *sched_find_thread(uint64_t tid)
+{
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (threads[i] && threads[i]->cpu.tid == tid)
+            return &threads[i]->cpu;
+    return NULL;
+}
+
 int64_t sched_futex_wake(uint64_t key, uint64_t count, uint32_t bitset)
 {
     int64_t n = 0;
@@ -160,7 +205,11 @@ static void expire_timers(uint64_t now)
         if (!t || t->state == TS_RUNNABLE || !t->has_deadline || t->deadline > now)
             continue;
         /* A timed-out futex wait returns ETIMEDOUT; a sleep returns 0. */
-        int64_t ret = t->state == TS_FUTEX ? -(int64_t)LE_TIMEDOUT : 0;
+        int64_t ret = 0;
+        if (t->state == TS_FUTEX)
+            ret = -(int64_t)LE_TIMEDOUT;
+        else if (t->state == TS_SIGWAIT)
+            ret = -(int64_t)LE_AGAIN;
         wake(t, ret);
     }
 }
@@ -209,7 +258,10 @@ static void report_deadlock(void)
         if (!t)
             continue;
         fprintf(stderr, "xiaoji:   tid %llu %s pc 0x%llx\n", (unsigned long long)t->cpu.tid,
-                t->state == TS_FUTEX ? "blocked on futex" : t->state == TS_SLEEP ? "sleeping" : "runnable",
+                t->state == TS_FUTEX      ? "blocked on futex"
+                : t->state == TS_SLEEP    ? "sleeping"
+                : t->state == TS_SIGWAIT  ? "waiting in sigtimedwait"
+                                          : "runnable",
                 (unsigned long long)t->cpu.pc);
     }
 }
@@ -310,6 +362,14 @@ int64_t sched_clone(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid
         return -LE_NOMEM;
     next_tid++;
     t->cpu.x[0] = 0;
+    /* The child keeps the mask but starts with no pending signals, no alternate
+     * stack and no signal wait, as Linux does. */
+    t->cpu.sig_pending = 0;
+    t->cpu.sig_wait_set = 0;
+    t->cpu.sig_wait_info = 0;
+    t->cpu.alt_sp = 0;
+    t->cpu.alt_size = 0;
+    t->cpu.alt_flags = 0;
     if (newsp)
         t->cpu.sp = newsp;
     if (flags & CLONE_SETTLS)

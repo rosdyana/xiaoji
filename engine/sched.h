@@ -42,4 +42,15 @@ const char *sched_name(void);
 /* Instructions executed by all threads. */
 uint64_t sched_icount(void);
 
+/* Signal waits. A thread in rt_sigtimedwait blocks as SW_SIGWAIT. sched_wake ends
+ * any wait with the given x0 (a no-op for a runnable thread). sched_threads lists
+ * the live threads in slot order. */
+#define SCHED_MAX_THREADS 256
+typedef enum { SW_NONE, SW_FUTEX, SW_SLEEP, SW_SIGWAIT } sched_wait_t;
+void sched_block_sigwait(int has_deadline, uint64_t deadline);
+sched_wait_t sched_wait_kind(const cpu_t *c);
+void sched_wake(cpu_t *c, int64_t ret);
+int sched_threads(cpu_t **out, int max);
+cpu_t *sched_find_thread(uint64_t tid);
+
 #endif

@@ -96,13 +96,39 @@ static uint64_t *pte_slot(uint64_t vpn, int create)
     return &(*l2)[vpn & (L2_COUNT - 1)];
 }
 
+static jmp_buf *fault_jb;
+static uint64_t fault_va;
+static int fault_code;
+
+jmp_buf *mem_set_fault_jmp(jmp_buf *jb)
+{
+    jmp_buf *old = fault_jb;
+    fault_jb = jb;
+    return old;
+}
+
+void mem_fault_info(uint64_t *addr, int *code)
+{
+    *addr = fault_va;
+    *code = fault_code;
+}
+
+uint64_t mem_cur_pc(void) { return cur_pc; }
+
+/* A guest access failed. The CPU loop gets the fault (and the faulting pc) by
+ * longjmp, so it can deliver SIGSEGV; without a loop, the process exits. */
 static void mem_segv(uint64_t va) __attribute__((noreturn));
 static void mem_segv(uint64_t va)
 {
-    fflush(stdout);
-    fprintf(stderr, "xiaoji: segfault at 0x%llx (pc 0x%llx)\n", (unsigned long long)va,
-            (unsigned long long)cur_pc);
-    exit(139);
+    if (!fault_jb) {
+        fflush(stdout);
+        fprintf(stderr, "xiaoji: segfault at 0x%llx (pc 0x%llx)\n", (unsigned long long)va,
+                (unsigned long long)cur_pc);
+        exit(139);
+    }
+    fault_va = va;
+    fault_code = mem_is_mapped(va & VA_MASK, 1) ? MEM_FAULT_ACCERR : MEM_FAULT_MAPERR;
+    longjmp(*fault_jb, 1);
 }
 
 /* ---------- region list ---------- */

@@ -3,6 +3,7 @@
 #ifndef XIAOJI_MEM_H
 #define XIAOJI_MEM_H
 
+#include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -11,6 +12,18 @@
 #define MEM_PROT_W 2u
 #define MEM_PROT_X 4u
 #define MEM_VA_LIMIT (1ull << 48)
+
+/* Fault codes, the Linux si_code values for SIGSEGV. */
+#define MEM_FAULT_MAPERR 1 /* SEGV_MAPERR: no mapping at the address */
+#define MEM_FAULT_ACCERR 2 /* SEGV_ACCERR: mapped, but the access is not allowed */
+/* The top byte of a guest address is an ignored tag; Linux reports addresses without it. */
+#define MEM_UNTAG_MASK 0x00FFFFFFFFFFFFFFull
+
+/* A fault in a guest access longjmps to the buffer set here (NULL: no buffer, so
+ * the process exits). Returns the previous buffer. */
+jmp_buf *mem_set_fault_jmp(jmp_buf *jb);
+void mem_fault_info(uint64_t *addr, int *code);
+uint64_t mem_cur_pc(void);
 
 /* Mapping. Addresses and lengths must be page aligned. Pages that are already
  * mapped keep their contents and get the new protection. Return 0 or -1. */
