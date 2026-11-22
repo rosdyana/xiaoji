@@ -47,6 +47,8 @@ static inline void host_page_changed(uint8_t *p)
 #define PTE_X 4u
 #define PTE_MAPPED 8u
 #define PTE_SHARED 0x10u /* the host page belongs to a memfd; this entry does not own it */
+#define PTE_COW 0x20u    /* a private host page shared with another address space (fork): the
+                          * first write copies it. The entry keeps PTE_W, the logical permission. */
 #define PTE_FLAGS 0xFFu  /* host pages are 4 KiB aligned, so the low 12 bits hold flags */
 
 #define VA_MASK 0x00FFFFFFFFFFFFFFull /* top byte is a tag */
@@ -79,6 +81,7 @@ struct mm {
     uint64_t **l1;
     region_t *regs;
     size_t nregs, cregs;
+    int refs; /* processes using this address space (vfork shares one) */
 };
 
 static mm_t *cur_mm;
@@ -90,7 +93,13 @@ static uint64_t cur_pc;
 
 static void tlb_flush(void);
 
-mm_t *mem_mm_new(void) { return calloc(1, sizeof(mm_t)); }
+mm_t *mem_mm_new(void)
+{
+    mm_t *m = calloc(1, sizeof(mm_t));
+    if (m)
+        m->refs = 1;
+    return m;
+}
 
 /* Makes m the running address space. The first call installs it without a flush. */
 void mem_mm_switch(mm_t *m)
@@ -162,6 +171,18 @@ void mem_fault_info(uint64_t *addr, int *code)
 }
 
 uint64_t mem_cur_pc(void) { return cur_pc; }
+
+uint64_t mem_futex_key(uint64_t va, uint64_t *obj)
+{
+    uint64_t a = va & VA_MASK, start, off;
+    memfd_t *m = mem_region_memfd(a, &start, &off);
+    if (m) {
+        *obj = (uint64_t)(uintptr_t)m;
+        return off + (a - start);
+    }
+    *obj = (uint64_t)(uintptr_t)cur_mm;
+    return a;
+}
 
 /* A guest access failed. The CPU loop gets the fault (and the faulting pc) by
  * longjmp, so it can deliver SIGSEGV; without a loop, the process exits. */
@@ -321,6 +342,147 @@ int mem_region_next(uint64_t va, uint64_t *start, uint64_t *end, const char **pa
     return 1;
 }
 
+/* ---------- copy-on-write ---------- */
+
+/* Host pages with more than one owner. A page owned once is not in the table; an entry
+ * holds the number of owners beyond the first. Open addressing with tombstones. */
+typedef struct {
+    uint8_t *page; /* NULL: empty; SHARE_TOMB: deleted */
+    uint32_t extra;
+} share_ent;
+#define SHARE_TOMB ((uint8_t *)1)
+static share_ent *share_tab;
+static size_t share_cap, share_used; /* share_used counts live entries and tombstones */
+
+static size_t share_slot(const uint8_t *p, int *found)
+{
+    uint64_t h = (uint64_t)(uintptr_t)p >> 12;
+    h *= 0x9E3779B97F4A7C15ull;
+    size_t i = (size_t)(h >> 20) & (share_cap - 1), tomb = (size_t)-1;
+    *found = 0;
+    for (;;) {
+        share_ent *e = &share_tab[i];
+        if (e->page == p) {
+            *found = 1;
+            return i;
+        }
+        if (e->page == SHARE_TOMB && tomb == (size_t)-1)
+            tomb = i;
+        if (!e->page)
+            return tomb != (size_t)-1 ? tomb : i;
+        i = (i + 1) & (share_cap - 1);
+    }
+}
+
+static void share_grow(void)
+{
+    size_t oldcap = share_cap;
+    share_ent *old = share_tab;
+    share_cap = share_cap ? share_cap * 2 : 256;
+    share_tab = calloc(share_cap, sizeof *share_tab);
+    if (!share_tab)
+        die_oom();
+    share_used = 0;
+    for (size_t i = 0; i < oldcap; i++) {
+        if (old[i].page && old[i].page != SHARE_TOMB) {
+            int found;
+            size_t j = share_slot(old[i].page, &found);
+            share_tab[j] = old[i];
+            share_used++;
+        }
+    }
+    free(old);
+}
+
+static uint32_t share_extra(const uint8_t *p)
+{
+    if (!share_cap || !p)
+        return 0;
+    int found;
+    size_t i = share_slot(p, &found);
+    return found ? share_tab[i].extra : 0;
+}
+
+/* One more owner of p. */
+static void share_add(uint8_t *p)
+{
+    if ((share_used + 1) * 4 >= share_cap * 3)
+        share_grow();
+    int found;
+    size_t i = share_slot(p, &found);
+    if (found) {
+        share_tab[i].extra++;
+        return;
+    }
+    if (share_tab[i].page == NULL)
+        share_used++;
+    share_tab[i].page = p;
+    share_tab[i].extra = 1;
+}
+
+/* One owner of p goes away. */
+static void share_drop(uint8_t *p)
+{
+    int found;
+    size_t i = share_slot(p, &found);
+    if (!found)
+        return;
+    if (--share_tab[i].extra == 0)
+        share_tab[i].page = SHARE_TOMB;
+}
+
+/* This address space gives up its owner of a private host page: the last owner frees it. */
+static void page_release(uint8_t *p)
+{
+    if (!p)
+        return;
+    if (share_extra(p)) {
+        share_drop(p);
+        return;
+    }
+    host_page_changed(p);
+    free(p);
+}
+
+/* Drops the cached translations of vpn in the TLBs and the fetch cache. */
+static void tlb_forget(uint64_t vpn)
+{
+    tlb_ent *r = &tlb_rd[vpn % TLB_SIZE];
+    if (r->tag == vpn + 1) {
+        r->tag = 0;
+        r->page = NULL;
+    }
+    tlb_ent *w = &tlb_wr[vpn % TLB_SIZE];
+    if (w->tag == vpn + 1) {
+        w->tag = 0;
+        w->page = NULL;
+    }
+    if (fetch_tag == vpn + 1) {
+        fetch_tag = 0;
+        fetch_page = NULL;
+    }
+}
+
+/* A write to a copy-on-write page. If other address spaces still share the host page,
+ * this one takes a copy; the last owner keeps the page. The translations of the old page
+ * are dropped first (the other owners see only a retranslation). */
+static void cow_break(uint64_t vpn, uint64_t *slot)
+{
+    uint64_t e = *slot;
+    uint8_t *old = (uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS);
+    uint8_t *p = old;
+    host_page_changed(old);
+    if (share_extra(old)) {
+        p = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
+        if (!p)
+            die_oom();
+        memcpy(p, old, MEM_PAGE_SIZE);
+        share_drop(old);
+    }
+    *slot = (uint64_t)(uintptr_t)p | (e & (uint64_t)PTE_FLAGS & ~(uint64_t)PTE_COW);
+    tlb_forget(vpn);
+}
+
 /* ---------- page access ---------- */
 
 /* Host page for vpn with the given permission, allocating backing if needed.
@@ -335,6 +497,10 @@ static uint8_t *page_lookup(uint64_t vpn, unsigned need)
     uint64_t e = *slot;
     if (!(e & PTE_MAPPED) || !(e & need))
         return NULL;
+    if ((need & PTE_W) && (e & PTE_COW)) {
+        cow_break(vpn, slot);
+        e = *slot;
+    }
     uint8_t *p = (uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS);
     if (!p && (e & PTE_SHARED)) {
         /* First touch of a shared view: take the page from the memfd at this offset. */
@@ -510,7 +676,7 @@ int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint6
         uint64_t e = *slot;
         if (e & PTE_SHARED)
             e = 0; /* a private mapping replaces a shared view; it does not keep its pages */
-        *slot = (e & ~(uint64_t)PTE_FLAGS) | PTE_MAPPED | (prot & PTE_FLAGS & 7u);
+        *slot = (e & ~(uint64_t)PTE_FLAGS) | PTE_MAPPED | (prot & PTE_FLAGS & 7u) | (e & PTE_COW);
     }
     tlb_flush();
     return 0;
@@ -549,10 +715,8 @@ void mem_unmap(uint64_t va, uint64_t len)
         if (!slot)
             continue;
         uint64_t e = *slot;
-        if (!(e & PTE_SHARED)) { /* shared pages stay with the memfd */
-            host_page_changed((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
-            free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
-        }
+        if (!(e & PTE_SHARED)) /* shared pages stay with the memfd */
+            page_release((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
         *slot = 0;
     }
     tlb_flush();
@@ -585,7 +749,7 @@ int mem_protect(uint64_t va, uint64_t len, unsigned prot)
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 0);
         host_page_changed((uint8_t *)(uintptr_t)(*slot & ~(uint64_t)PTE_FLAGS));
-        *slot = (*slot & ~(uint64_t)PTE_FLAGS) | (*slot & PTE_SHARED) | PTE_MAPPED | (prot & 7u);
+        *slot = (*slot & ~(uint64_t)PTE_FLAGS) | (*slot & (PTE_SHARED | PTE_COW)) | PTE_MAPPED | (prot & 7u);
     }
     tlb_flush();
     return 0;
@@ -669,9 +833,8 @@ void mem_drop(uint64_t va, uint64_t len)
         if (!slot || !(*slot & PTE_MAPPED) || (*slot & PTE_SHARED))
             continue;
         uint64_t e = *slot;
-        host_page_changed((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
-        free((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
-        *slot = e & PTE_FLAGS;
+        page_release((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
+        *slot = e & PTE_FLAGS & ~(uint64_t)PTE_COW;
     }
     tlb_flush();
 }
@@ -684,6 +847,8 @@ static uint8_t *page_any(uint64_t vpn)
     uint64_t *slot = pte_slot(vpn, 0);
     if (!slot || !(*slot & PTE_MAPPED))
         return NULL;
+    if (*slot & PTE_COW)
+        cow_break(vpn, slot); /* a poke writes, whatever the protection */
     return page_lookup(vpn, PTE_MAPPED);
 }
 
@@ -779,4 +944,93 @@ int64_t mem_strlen(uint64_t va)
             if (p[off] == 0)
                 return n;
     }
+}
+
+/* ---------- address spaces: fork, sharing and release ---------- */
+
+void mem_mm_ref(mm_t *m) { m->refs++; }
+
+/* Clones src (the running address space) for fork. Every private page with a host page
+ * becomes copy-on-write in both spaces, and its share count goes up; a write copies it.
+ * Shared (memfd) views stay shared. Pages never touched stay lazily zero in both. The
+ * regions are copied with their backing; the TLBs are flushed, since the write
+ * entries of src are no longer valid. Returns NULL if out of memory. */
+mm_t *mem_mm_fork(mm_t *src)
+{
+    mm_t *dst = mem_mm_new();
+    if (!dst)
+        return NULL;
+    if (src->nregs) {
+        dst->regs = malloc(src->nregs * sizeof *dst->regs);
+        if (!dst->regs) {
+            free(dst);
+            return NULL;
+        }
+        for (size_t i = 0; i < src->nregs; i++) {
+            dst->regs[i] = src->regs[i];
+            dst->regs[i].path = dup_path(src->regs[i].path);
+            memfd_ref(dst->regs[i].shm);
+        }
+        dst->nregs = dst->cregs = src->nregs;
+    }
+    if (src->l1) {
+        dst->l1 = calloc(L1_COUNT, sizeof *dst->l1);
+        if (!dst->l1)
+            die_oom();
+        for (uint32_t i = 0; i < L1_COUNT; i++) {
+            uint64_t *s2 = src->l1[i];
+            if (!s2)
+                continue;
+            uint64_t *d2 = calloc(L2_COUNT, sizeof(uint64_t));
+            if (!d2)
+                die_oom();
+            dst->l1[i] = d2;
+            for (uint32_t j = 0; j < L2_COUNT; j++) {
+                uint64_t e = s2[j];
+                if (!(e & PTE_MAPPED))
+                    continue;
+                if (!(e & PTE_SHARED) && (e & ~(uint64_t)PTE_FLAGS)) {
+                    share_add((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
+                    e |= PTE_COW;
+                    s2[j] = e;
+                }
+                d2[j] = e;
+            }
+        }
+    }
+    tlb_flush();
+    return dst;
+}
+
+/* Frees an address space when its last process lets go of it. If it is the running
+ * one, the running pointer is cleared and the TLBs flushed (the next switch does not
+ * flush). */
+void mem_mm_unref(mm_t *m)
+{
+    if (!m || --m->refs > 0)
+        return;
+    if (m->l1) {
+        for (uint32_t i = 0; i < L1_COUNT; i++) {
+            uint64_t *l2 = m->l1[i];
+            if (!l2)
+                continue;
+            for (uint32_t j = 0; j < L2_COUNT; j++) {
+                uint64_t e = l2[j];
+                if ((e & PTE_MAPPED) && !(e & PTE_SHARED))
+                    page_release((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
+            }
+            free(l2);
+        }
+        free(m->l1);
+    }
+    for (size_t i = 0; i < m->nregs; i++) {
+        free(m->regs[i].path);
+        memfd_unref(m->regs[i].shm);
+    }
+    free(m->regs);
+    if (cur_mm == m) {
+        cur_mm = NULL;
+        tlb_flush();
+    }
+    free(m);
 }

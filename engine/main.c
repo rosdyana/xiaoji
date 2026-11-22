@@ -1,5 +1,8 @@
 /* xiaoji engine entry point: parse arguments, load an AArch64 program (static,
  * or dynamic with its interpreter), run it. */
+/* realpath (POSIX) under -std=c11. */
+#define _XOPEN_SOURCE 700
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,8 +128,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "xiaoji: cannot read %s\n", path);
             return 127;
         }
-        strncpy(canon, path, sizeof canon - 1);
-        canon[sizeof canon - 1] = 0;
+        /* The guest path is the host path, so /proc/self/exe must be absolute (as on Linux). */
+        if (!realpath(path, canon)) {
+            strncpy(canon, path, sizeof canon - 1);
+            canon[sizeof canon - 1] = 0;
+        }
     } else if (vfs_load_file(path, &img, &len, canon, sizeof canon) < 0) {
         fprintf(stderr, "xiaoji: cannot read %s\n", path);
         return 127;

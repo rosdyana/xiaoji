@@ -9,6 +9,8 @@
 #include "linux.h"
 #include "mem.h"
 #include "proc.h"
+#include "sched.h"
+#include "signals.h"
 #include "syscall.h"
 #include "vfs.h"
 
@@ -16,6 +18,7 @@
 #define SYS_FTRUNCATE 46
 #define SYS_DUP 23
 #define SYS_DUP3 24
+#define SYS_PIPE2 59
 #define SYS_FCNTL 25
 #define SYS_FACCESSAT 48
 #define SYS_CHDIR 49
@@ -137,10 +140,15 @@ static int64_t copy_statfs(uint64_t va, const host_statfs *s)
 
 /* ---------- guest I/O helpers ---------- */
 
+/* A pipe read or write that would block ends the thread's wait (the call restarts
+ * when the pipe changes); vfs_pipe_block does the waiting. The returned value is then
+ * not used. */
 static int64_t fs_read(int fd, uint64_t buf, uint64_t n)
 {
     size_t want = n < IO_CHUNK ? (size_t)n : IO_CHUNK;
     int64_t r = vfs_read(fd, iobuf, want);
+    if (r == -LE_AGAIN && vfs_pipe_block(fd))
+        return 0;
     if (r > 0 && mem_copy_in(buf, iobuf, (size_t)r) < 0)
         return -LE_FAULT;
     return r;
@@ -155,8 +163,62 @@ static int64_t fs_pread(int fd, uint64_t buf, uint64_t n, uint64_t off)
     return r;
 }
 
+#define SIGPIPE_N 13
+
+/* Pipe writes. A blocked call records how many bytes of its segments are done (in
+ * the thread's io_done) and restarts there. The segments are read from guest memory
+ * again on each attempt, so the restart sends the same bytes. A blocking write waits
+ * until all of its bytes are in the pipe. */
+static uint64_t seg_va[IOV_MAX], seg_len[IOV_MAX];
+
+static int64_t pipe_write_segs(int fd, uint64_t cnt)
+{
+    cpu_t *c = sched_cur_cpu();
+    uint64_t base = 0, cur = c->io_done; /* base: offset of segment i; cur: bytes done */
+    int64_t res = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        uint64_t len = seg_len[i];
+        if (cur >= base + len) {
+            base += len;
+            continue;
+        }
+        uint64_t off = cur - base;
+        while (off < len) {
+            size_t chunk = len - off < IO_CHUNK ? (size_t)(len - off) : IO_CHUNK;
+            if (mem_copy_out(iobuf, seg_va[i] + off, chunk) < 0) {
+                res = cur ? (int64_t)cur : -LE_FAULT;
+                goto out;
+            }
+            int64_t w = vfs_write(fd, iobuf, chunk);
+            if (w == -LE_AGAIN && vfs_pipe_block(fd)) {
+                c->io_done = base + off;
+                return 0;
+            }
+            if (w == -LE_PIPE)
+                sig_raise_current(SIGPIPE_N);
+            if (w < 0) {
+                res = base + off ? (int64_t)(base + off) : w;
+                goto out;
+            }
+            off += (uint64_t)w;
+            cur = base + off;
+        }
+        base += len;
+    }
+    res = (int64_t)base;
+out:
+    c->io_done = 0;
+    return res;
+}
+
 static int64_t fs_write(int fd, uint64_t buf, uint64_t n)
 {
+    vfs_fd *f = vfs_get(fd);
+    if (f && f->kind == VFS_PIPE) {
+        seg_va[0] = buf;
+        seg_len[0] = n;
+        return pipe_write_segs(fd, 1);
+    }
     uint64_t done = 0;
     do {
         size_t chunk = n - done < IO_CHUNK ? (size_t)(n - done) : IO_CHUNK;
@@ -172,10 +234,78 @@ static int64_t fs_write(int fd, uint64_t buf, uint64_t n)
     return (int64_t)done;
 }
 
+/* readv on a pipe: once some bytes are read, an empty pipe ends the call with the count
+ * (no blocking, so the call never restarts after data was taken). */
+static int64_t pipe_readv(int fd, uint64_t iov, uint64_t cnt)
+{
+    int64_t total = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        uint64_t ent[2];
+        if (mem_copy_out(ent, iov + i * 16, 16) < 0)
+            return total ? total : -LE_FAULT;
+        if (ent[1] == 0)
+            continue;
+        size_t want = ent[1] < IO_CHUNK ? (size_t)ent[1] : IO_CHUNK;
+        int64_t r = vfs_read(fd, iobuf, want);
+        if (r == -LE_AGAIN) {
+            if (total)
+                return total;
+            if (vfs_pipe_block(fd))
+                return 0;
+            return r;
+        }
+        if (r < 0)
+            return total ? total : r;
+        if (r == 0)
+            break;
+        if (mem_copy_in(ent[0], iobuf, (size_t)r) < 0)
+            return total ? total : -LE_FAULT;
+        total += r;
+    }
+    return total;
+}
+
+/* writev. On a pipe the segment list is saved in the static arrays for this call. */
+static int64_t pipe_writev(int fd, uint64_t iov, uint64_t cnt)
+{
+    for (uint64_t i = 0; i < cnt; i++) {
+        uint64_t ent[2];
+        if (mem_copy_out(ent, iov + i * 16, 16) < 0)
+            return -LE_FAULT;
+        seg_va[i] = ent[0];
+        seg_len[i] = ent[1];
+    }
+    return pipe_write_segs(fd, cnt);
+}
+
+/* pipe2(int fds[2], flags): the read end in fds[0], the write end in fds[1]. */
+static int64_t sys_pipe2(uint64_t fds_va, uint64_t flags)
+{
+    if (flags & ~(uint64_t)(LO_CLOEXEC | LO_NONBLOCK))
+        return -LE_INVAL;
+    int fds[2];
+    int rc = vfs_pipe2(fds, (uint32_t)flags);
+    if (rc)
+        return rc;
+    uint8_t b[8];
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 4; k++)
+            b[4 * i + k] = (uint8_t)((uint32_t)fds[i] >> (8 * k));
+    if (mem_copy_in(fds_va, b, sizeof b) < 0) {
+        vfs_close(fds[0]);
+        vfs_close(fds[1]);
+        return -LE_FAULT;
+    }
+    return 0;
+}
+
 static int64_t fs_readv(int fd, uint64_t iov, uint64_t cnt)
 {
     if (cnt > IOV_MAX)
         return -LE_INVAL;
+    vfs_fd *pf = vfs_get(fd);
+    if (pf && pf->kind == VFS_PIPE)
+        return pipe_readv(fd, iov, cnt);
     int64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
         uint64_t ent[2];
@@ -197,6 +327,9 @@ static int64_t fs_writev(int fd, uint64_t iov, uint64_t cnt)
 {
     if (cnt > IOV_MAX)
         return -LE_INVAL;
+    vfs_fd *pf = vfs_get(fd);
+    if (pf && pf->kind == VFS_PIPE)
+        return pipe_writev(fd, iov, cnt);
     int64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
         uint64_t ent[2];
@@ -395,10 +528,9 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case LF_DUPFD_CLOEXEC:
         return vfs_dup(ifd, (int)arg, 0, 1);
     case LF_GETFD:
-        return f->cloexec ? LFD_CLOEXEC : 0;
+        return vfs_cloexec_get(ifd) ? LFD_CLOEXEC : 0;
     case LF_SETFD:
-        f->cloexec = (arg & LFD_CLOEXEC) != 0;
-        return 0;
+        return vfs_cloexec_set(ifd, (arg & LFD_CLOEXEC) != 0);
     case LF_GETFL:
         return (int64_t)f->lflags;
     case LF_SETFL:
@@ -506,6 +638,7 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_FCNTL: *ret = sys_fcntl(a[0], a[1], a[2]); return 1;
     case SYS_DUP: *ret = vfs_dup((int)(int32_t)a[0], 0, 0, 0); return 1;
     case SYS_DUP3: *ret = sys_dup3(a[0], a[1], a[2]); return 1;
+    case SYS_PIPE2: *ret = sys_pipe2(a[0], a[1]); return 1;
     case SYS_GETCWD: *ret = sys_getcwd(a[0], a[1]); return 1;
     case SYS_CHDIR: *ret = sys_chdir(a[0]); return 1;
     case SYS_FCHDIR: *ret = vfs_fchdir((int)(int32_t)a[0]); return 1;

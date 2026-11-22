@@ -15,7 +15,10 @@
 
 #include "host.h"
 #include "linux.h"
+#include "pipe.h"
 #include "procfs.h"
+#include "proc.h"
+#include "sched.h"
 
 #define MAX_SYMLINKS 40
 #define NAME_MAX_LEN 255
@@ -25,7 +28,7 @@ static char root[VFS_PATH_MAX];  /* host directory for guest "/", no trailing '/
 /* One process's file state: its fd table, cwd, program name and argv. The host root
  * is shared by all processes and stays global. */
 struct fdtab {
-    vfs_fd *fds; /* VFS_MAX_FD slots */
+    vfs_slot *slots; /* VFS_MAX_FD descriptors */
     char cwd[VFS_PATH_MAX];
     char prog[VFS_PATH_MAX];
     uint8_t *cmdline;
@@ -239,17 +242,26 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 strcpy(cur, cand);
                 continue;
             }
-            int is_exe = !strcmp(cand, "/proc/self/exe");
+            /* /proc/<pid>/exe: the program of that (live) process. */
+            int epid;
+            const char *erest;
+            int is_pid_exe = procfs_pid_path(cand, &epid, &erest) && !strcmp(erest, "/exe");
+            int is_exe = !strcmp(cand, "/proc/self/exe") || is_pid_exe;
             int is_fd = strncmp(cand, "/proc/self/fd/", 14) == 0 && is_digits(cand + 14, strlen(cand + 14));
             if (is_exe || is_fd) {
                 const char *target;
-                if (is_exe) {
+                if (is_pid_exe) {
+                    proc_t *ep = proc_find(epid);
+                    if (!ep || ep->zombie || ep->exited)
+                        return -LE_NOENT;
+                    target = vfs_prog_of(ep->fds);
+                } else if (is_exe) {
                     target = cur_fdt->prog;
                 } else {
                     long n = strtol(cand + 14, NULL, 10);
-                    if (n < 0 || n >= VFS_MAX_FD || !cur_fdt->fds[n].used)
+                    if (n < 0 || n >= VFS_MAX_FD || !cur_fdt->slots[n].desc)
                         return -LE_NOENT;
-                    target = cur_fdt->fds[n].guest;
+                    target = cur_fdt->slots[n].desc->guest;
                 }
                 if (last && !follow) {
                     out->is_link = 1;
@@ -272,6 +284,11 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
             return -LE_NAMETOOLONG;
         host_stat st;
         int rc = host_stat_path(hp, 0, &st);
+        if (rc == -LE_NOENT && !last && !strcmp(cand, "/proc")) {
+            /* A host without /proc (macOS): the guest's /proc is synthetic. */
+            strcpy(cur, cand);
+            continue;
+        }
         if (rc == -LE_NOENT) {
             if (!last)
                 return -LE_NOENT;
@@ -329,29 +346,54 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
 
 vfs_fd *vfs_get(int fd)
 {
-    if (fd < 0 || fd >= VFS_MAX_FD || !cur_fdt->fds[fd].used)
+    if (fd < 0 || fd >= VFS_MAX_FD)
         return NULL;
-    return &cur_fdt->fds[fd];
+    return cur_fdt->slots[fd].desc;
 }
 
 static int free_fd_from(int from)
 {
     for (int i = from; i < VFS_MAX_FD; i++)
-        if (!cur_fdt->fds[i].used)
+        if (!cur_fdt->slots[i].desc)
             return i;
     return -1;
 }
 
-static void fd_reset(vfs_fd *f)
+/* A new description, with one reference. */
+static vfs_fd *desc_new(void)
 {
+    vfs_fd *d = calloc(1, sizeof *d);
+    if (!d)
+        die_oom();
+    d->refs = 1;
+    d->hfd = -1;
+    return d;
+}
+
+/* Drops one reference to a description; the last one releases its host fd and
+ * objects. */
+static void desc_unref(vfs_fd *f)
+{
+    if (!f || --f->refs > 0)
+        return;
+    if (f->hfd >= 0)
+        host_close(f->hfd);
+    if (f->kind == VFS_PIPE)
+        pipe_close(f->pipe, (f->lflags & LO_ACCMODE) == LO_WRONLY);
     free(f->guest);
     free(f->host);
     free(f->data);
     if (f->dir)
         closedir((DIR *)f->dir);
     memfd_unref(f->mfd);
-    memset(f, 0, sizeof *f);
-    f->hfd = -1;
+    free(f);
+}
+
+/* Puts d in slot (which must be free) with the given cloexec flag. */
+static void slot_install(int slot, vfs_fd *d, int cloexec)
+{
+    cur_fdt->slots[slot].desc = d;
+    cur_fdt->slots[slot].cloexec = cloexec;
 }
 
 int vfs_memfd_create(const char *name, uint32_t mflags)
@@ -364,15 +406,12 @@ int vfs_memfd_create(const char *name, uint32_t mflags)
         return -LE_NOMEM;
     char guest[128];
     snprintf(guest, sizeof guest, "/memfd:%s (deleted)", name ? name : "");
-    vfs_fd *d = &cur_fdt->fds[slot];
-    memset(d, 0, sizeof *d);
-    d->used = 1;
-    d->cloexec = (mflags & 1u) != 0;
+    vfs_fd *d = desc_new();
     d->kind = VFS_MEMFD;
-    d->hfd = -1;
     d->lflags = LO_RDWR;
     d->mfd = m;
     d->guest = xstrdup(guest);
+    slot_install(slot, d, (mflags & 1u) != 0);
     return slot;
 }
 
@@ -381,10 +420,71 @@ int vfs_close(int fd)
     vfs_fd *f = vfs_get(fd);
     if (!f)
         return -LE_BADF;
-    if (f->hfd >= 0)
-        host_close(f->hfd);
-    fd_reset(f);
+    cur_fdt->slots[fd].desc = NULL;
+    cur_fdt->slots[fd].cloexec = 0;
+    desc_unref(f);
     return 0;
+}
+
+int vfs_pipe2(int out[2], uint32_t flags)
+{
+    int r = free_fd_from(0);
+    if (r < 0)
+        return -LE_MFILE;
+    int w = -1;
+    for (int i = r + 1; i < VFS_MAX_FD; i++)
+        if (!cur_fdt->slots[i].desc) {
+            w = i;
+            break;
+        }
+    if (w < 0)
+        return -LE_MFILE;
+    pipe_t *p = pipe_new();
+    if (!p)
+        return -LE_NOMEM;
+    static int serial;
+    char guest[48];
+    snprintf(guest, sizeof guest, "pipe:[%d]", ++serial);
+    int cloexec = (flags & LO_CLOEXEC) != 0;
+    uint32_t nb = flags & LO_NONBLOCK;
+    vfs_fd *rd = desc_new(), *wr = desc_new();
+    rd->kind = wr->kind = VFS_PIPE;
+    rd->pipe = wr->pipe = p;
+    rd->lflags = LO_RDONLY | nb;
+    wr->lflags = LO_WRONLY | nb;
+    rd->guest = xstrdup(guest);
+    wr->guest = xstrdup(guest);
+    pipe_open(p, 0);
+    pipe_open(p, 1);
+    slot_install(r, rd, cloexec);
+    slot_install(w, wr, cloexec);
+    out[0] = r;
+    out[1] = w;
+    return 0;
+}
+
+int vfs_cloexec_get(int fd)
+{
+    if (!vfs_get(fd))
+        return -LE_BADF;
+    return cur_fdt->slots[fd].cloexec;
+}
+
+int vfs_cloexec_set(int fd, int on)
+{
+    if (!vfs_get(fd))
+        return -LE_BADF;
+    cur_fdt->slots[fd].cloexec = on != 0;
+    return 0;
+}
+
+int vfs_pipe_block(int fd)
+{
+    vfs_fd *f = vfs_get(fd);
+    if (!f || f->kind != VFS_PIPE || (f->lflags & LO_NONBLOCK))
+        return 0;
+    sched_block_restart((uint64_t)(uintptr_t)f->pipe);
+    return 1;
 }
 
 fdtab_t *vfs_fdtab_new(void)
@@ -392,8 +492,8 @@ fdtab_t *vfs_fdtab_new(void)
     fdtab_t *t = calloc(1, sizeof *t);
     if (!t)
         return NULL;
-    t->fds = calloc(VFS_MAX_FD, sizeof *t->fds);
-    if (!t->fds) {
+    t->slots = calloc(VFS_MAX_FD, sizeof *t->slots);
+    if (!t->slots) {
         free(t);
         return NULL;
     }
@@ -404,6 +504,46 @@ fdtab_t *vfs_fdtab_new(void)
 
 /* Makes t the running fd table. */
 void vfs_fdtab_switch(fdtab_t *t) { cur_fdt = t; }
+
+fdtab_t *vfs_fdtab_fork(fdtab_t *src)
+{
+    fdtab_t *t = vfs_fdtab_new();
+    if (!t)
+        return NULL;
+    memcpy(t->cwd, src->cwd, sizeof t->cwd);
+    memcpy(t->prog, src->prog, sizeof t->prog);
+    t->cmdline_len = src->cmdline_len;
+    t->cmdline = malloc(src->cmdline_len ? src->cmdline_len : 1);
+    if (!t->cmdline)
+        die_oom();
+    memcpy(t->cmdline, src->cmdline, src->cmdline_len);
+    for (int i = 0; i < VFS_MAX_FD; i++) {
+        if (!src->slots[i].desc)
+            continue;
+        src->slots[i].desc->refs++;
+        t->slots[i].desc = src->slots[i].desc;
+        t->slots[i].cloexec = src->slots[i].cloexec;
+    }
+    return t;
+}
+
+void vfs_fdtab_release(fdtab_t *t)
+{
+    if (!t)
+        return;
+    for (int i = 0; i < VFS_MAX_FD; i++) {
+        vfs_fd *d = t->slots[i].desc;
+        if (!d)
+            continue;
+        t->slots[i].desc = NULL;
+        desc_unref(d);
+    }
+    if (cur_fdt == t)
+        cur_fdt = NULL;
+    free(t->slots);
+    free(t->cmdline);
+    free(t);
+}
 
 int vfs_init(const char *host_root, const char *prog_guest, int argc, char **argv)
 {
@@ -438,13 +578,12 @@ int vfs_init(const char *host_root, const char *prog_guest, int argc, char **arg
 
     static const char *std_names[3] = {"/dev/stdin", "/dev/stdout", "/dev/stderr"};
     for (int i = 0; i < 3; i++) {
-        vfs_fd *f = &cur_fdt->fds[i];
-        memset(f, 0, sizeof *f);
-        f->used = 1;
+        vfs_fd *f = desc_new();
         f->kind = VFS_FILE;
         f->hfd = i;
         f->lflags = i == 0 ? LO_RDONLY : LO_WRONLY;
         f->guest = xstrdup(std_names[i]);
+        slot_install(i, f, 0);
     }
     return 0;
 }
@@ -474,7 +613,6 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     if (!r.exists && !(lflags & LO_CREAT))
         return -LE_NOENT;
 
-    vfs_fd *f = &cur_fdt->fds[slot];
     if (r.syn != SYN_NONE) {
         if (lflags & LO_DIRECTORY)
             return -LE_NOTDIR;
@@ -484,13 +622,10 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         size_t glen = 0;
         if (r.syn == SYN_DATA && procfs_known(r.guest) && procfs_read(r.guest, &gen, &glen) < 0)
             return -LE_NOMEM;
-        memset(f, 0, sizeof *f);
-        f->used = 1;
+        vfs_fd *f = desc_new();
         f->kind = VFS_SYN;
         f->syn = r.syn;
-        f->hfd = -1;
         f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
-        f->cloexec = (lflags & LO_CLOEXEC) != 0;
         f->guest = xstrdup(r.guest);
         if (gen) {
             f->data = gen;
@@ -502,6 +637,7 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
             memcpy(f->data, cur_fdt->cmdline, cur_fdt->cmdline_len);
             f->dlen = cur_fdt->cmdline_len;
         }
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
 
@@ -537,17 +673,18 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     if (hfd < 0 && kind != VFS_PATH)
         return hfd;
 
-    memset(f, 0, sizeof *f);
-    f->used = 1;
+    vfs_fd *f = desc_new();
     f->kind = kind;
     f->hfd = hfd;
     f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
-    f->cloexec = (lflags & LO_CLOEXEC) != 0;
     f->guest = xstrdup(r.guest);
     f->host = xstrdup(r.host);
+    slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
     return slot;
 }
 
+/* dup and dup3 (exact: the target slot is closed first). The new fd shares the
+ * description of oldfd: offset and status flags are shared, as in Linux. */
 int vfs_dup(int oldfd, int minfd, int exact, int cloexec)
 {
     vfs_fd *src = vfs_get(oldfd);
@@ -558,42 +695,15 @@ int vfs_dup(int oldfd, int minfd, int exact, int cloexec)
         if (minfd < 0 || minfd >= VFS_MAX_FD)
             return -LE_BADF;
         slot = minfd;
-        if (cur_fdt->fds[slot].used)
+        if (cur_fdt->slots[slot].desc)
             vfs_close(slot);
     } else {
         slot = free_fd_from(minfd < 0 ? 0 : minfd);
         if (slot < 0)
             return -LE_MFILE;
     }
-    int hfd = -1;
-    if (src->hfd >= 0) {
-        hfd = host_dup(src->hfd);
-        if (hfd < 0)
-            return hfd;
-    }
-    vfs_fd *d = &cur_fdt->fds[slot];
-    memset(d, 0, sizeof *d);
-    d->used = 1;
-    d->cloexec = cloexec;
-    d->kind = src->kind;
-    d->syn = src->syn;
-    d->hfd = hfd;
-    d->lflags = src->lflags;
-    d->guest = xstrdup(src->guest);
-    d->host = src->host ? xstrdup(src->host) : NULL;
-    if (src->kind == VFS_MEMFD) {
-        d->mfd = src->mfd;
-        memfd_ref(d->mfd);
-        d->dpos = src->dpos;
-    }
-    if (src->data) {
-        d->data = malloc(src->dlen ? src->dlen : 1);
-        if (!d->data)
-            die_oom();
-        memcpy(d->data, src->data, src->dlen);
-        d->dlen = src->dlen;
-        d->dpos = src->dpos;
-    }
+    src->refs++;
+    slot_install(slot, src, cloexec);
     return slot;
 }
 
@@ -641,6 +751,10 @@ int64_t vfs_read(int fd, void *buf, size_t n)
             f->dpos += (uint64_t)r;
         return r;
     }
+    case VFS_PIPE:
+        if ((f->lflags & LO_ACCMODE) != LO_RDONLY)
+            return -LE_BADF;
+        return pipe_read(f->pipe, buf, n);
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -658,6 +772,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_DIR: return -LE_ISDIR;
     case VFS_SYN: return syn_read(f, buf, n, off, 1);
     case VFS_MEMFD: return memfd_pread(f->mfd, buf, n, off);
+    case VFS_PIPE: return -LE_SPIPE;
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -684,6 +799,10 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
         f->dpos += (uint64_t)r;
         return r;
     }
+    case VFS_PIPE:
+        if ((f->lflags & LO_ACCMODE) != LO_WRONLY)
+            return -LE_BADF;
+        return pipe_write(f->pipe, buf, n);
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
@@ -699,6 +818,8 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
     switch (f->kind) {
     case VFS_PATH:
         return -LE_BADF;
+    case VFS_PIPE:
+        return -LE_SPIPE;
     case VFS_DIR:
         if (whence == 0 && off == 0) { /* SEEK_SET 0 rewinds */
             if (f->dir)
@@ -889,6 +1010,16 @@ int vfs_stat_fd(int fd, host_stat *out)
     if (!f)
         return -LE_BADF;
     int rc;
+    if (f->kind == VFS_PIPE) {
+        memset(out, 0, sizeof *out);
+        out->dev = 0x11;
+        out->ino = 0x4000u + (uint64_t)fd;
+        out->mode = LS_IFIFO | 0600;
+        out->nlink = 1;
+        out->blksize = 4096;
+        out->uid = out->gid = 0;
+        return 0;
+    }
     if (f->kind == VFS_MEMFD) {
         memset(out, 0, sizeof *out);
         out->dev = 0x10;
@@ -944,4 +1075,13 @@ int vfs_load_file(const char *path, uint8_t **data, size_t *len, char *canon, si
         return -LE_IO;
     strcpy(canon, r.guest);
     return 0;
+}
+
+const char *vfs_prog_of(const fdtab_t *t) { return t ? t->prog : "/"; }
+
+const uint8_t *vfs_cmdline_bytes(const fdtab_t *t, size_t *len)
+{
+    static const uint8_t none[1] = {0};
+    *len = t ? t->cmdline_len : 0;
+    return t && t->cmdline ? t->cmdline : none;
 }

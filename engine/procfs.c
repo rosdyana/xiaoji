@@ -12,6 +12,7 @@
 #include "mem.h"
 #include "proc.h"
 #include "sched.h"
+#include "vfs.h"
 
 /* The guest pid. The main thread's tid is the process pid (see syscall.c). */
 
@@ -62,34 +63,93 @@ static void sb_fmt(sbuf *b, const char *fmt, ...)
     free(tmp);
 }
 
+/* "/proc/<digits>" optionally followed by "/rest" (rest is "" or starts with '/').
+ * Returns 1 and sets *pid and *rest, or 0 (not a numbered entry). */
+int procfs_pid_path(const char *guest, int *pid, const char **rest)
+{
+    if (strncmp(guest, "/proc/", 6))
+        return 0;
+    const char *q = guest + 6;
+    if (*q < '0' || *q > '9')
+        return 0;
+    long v = 0;
+    while (*q >= '0' && *q <= '9') {
+        v = v * 10 + (*q - '0');
+        if (v > (1L << 30))
+            return 0;
+        q++;
+    }
+    if (*q && *q != '/')
+        return 0;
+    *pid = (int)v;
+    *rest = q;
+    return 1;
+}
+
+/* A live (not yet reaped, not ended) process with this pid. */
+static proc_t *live_proc(const char *guest, const char **rest)
+{
+    int pid;
+    if (!procfs_pid_path(guest, &pid, rest))
+        return NULL;
+    proc_t *p = proc_find(pid);
+    return p && !p->zombie && !p->exited ? p : NULL;
+}
+
 int procfs_known(const char *guest)
 {
-    return !strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/maps") ||
-           !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online");
+    if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/maps") ||
+        !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online"))
+        return 1;
+    const char *rest;
+    if (live_proc(guest, &rest))
+        return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline");
+    return 0;
 }
 
 int procfs_dir(const char *guest)
 {
+    const char *rest;
+    if (live_proc(guest, &rest))
+        return rest[0] == 0;
     return !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
            !strcmp(guest, "/sys/devices/system/cpu");
 }
 
+/* The last component of a process's program path (its name, when it is not the caller). */
+static const char *prog_base(const proc_t *p)
+{
+    const char *prog = vfs_prog_of(p->fds);
+    const char *slash = strrchr(prog, '/');
+    return slash ? slash + 1 : prog;
+}
+
+/* /proc/<pid>/status: the few fields a caller reads. */
+static void build_status(sbuf *b, const proc_t *p)
+{
+    sb_fmt(b, "Name:\t%s\nState:\tS (sleeping)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n"
+              "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
+           prog_base(p), p->pid, p->pid, p->ppid);
+}
+
 /* /proc/self/stat: the 52 fields of proc(5). f[k] is field k+4 (fields 1 to 3 are
  * printed before). Fields the engine keeps no state for are zero. */
-static void build_stat(sbuf *b)
+static void build_stat(sbuf *b, const proc_t *p)
 {
     long long f[49] = {0};
     cpu_t *list[SCHED_MAX_THREADS];
-    int live = sched_threads(list, SCHED_MAX_THREADS);
+    int live = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    /* The address space is the running one's: for another process the sizes are zero. */
+    int self = p == proc_cur();
     uint64_t vsize = 0, va = 0, s, e, off;
     const char *path;
-    while (mem_region_next(va, &s, &e, &path, &off)) {
+    while (self && mem_region_next(va, &s, &e, &path, &off)) {
         vsize += e - s;
         va = e;
     }
-    f[0] = proc_cur()->ppid;                       /* 4 ppid */
-    f[1] = proc_cur()->pgid;                       /* 5 pgrp */
-    f[2] = proc_cur()->sid;                       /* 6 session */
+    f[0] = p->ppid;                       /* 4 ppid */
+    f[1] = p->pgid;                       /* 5 pgrp */
+    f[2] = p->sid;                       /* 6 session */
     f[4] = -1;                              /* 8 tpgid */
     f[5] = 4194304;                         /* 9 flags */
     f[14] = 20;                             /* 18 priority */
@@ -101,8 +161,11 @@ static void build_stat(sbuf *b)
      * that contains this address (in /proc/self/maps), so it must lie in the stack. */
     uint64_t slo, shi;
     loader_stack_range(&slo, &shi);
-    f[24] = (long long)(shi - 16);
-    sb_fmt(b, "%d (%s) S", proc_cur()->pid, sched_name());
+    f[24] = self ? (long long)(shi - 16) : 0;
+    if (p == proc_cur())
+        sb_fmt(b, "%d (%s) S", p->pid, sched_name());
+    else
+        sb_fmt(b, "%d (%s) S", p->pid, prog_base(p));
     for (int i = 0; i < 49; i++) {
         if (i == 21) /* 25 rsslim: unlimited */
             sb_fmt(b, " 18446744073709551615");
@@ -138,8 +201,22 @@ static void build_maps(sbuf *b)
 int procfs_read(const char *guest, uint8_t **data, size_t *len)
 {
     sbuf b = {0};
-    if (!strcmp(guest, "/proc/self/stat")) {
-        build_stat(&b);
+    const char *rest;
+    proc_t *target = live_proc(guest, &rest);
+    if (target) {
+        if (!strcmp(rest, "/stat"))
+            build_stat(&b, target);
+        else if (!strcmp(rest, "/status"))
+            build_status(&b, target);
+        else if (!strcmp(rest, "/cmdline")) {
+            size_t n = 0;
+            const uint8_t *bytes = vfs_cmdline_bytes(target->fds, &n);
+            sb_add(&b, (const char *)bytes, n);
+        } else {
+            return -1;
+        }
+    } else if (!strcmp(guest, "/proc/self/stat")) {
+        build_stat(&b, proc_cur());
     } else if (!strcmp(guest, "/proc/self/maps")) {
         build_maps(&b);
     } else if (!strcmp(guest, "/proc/filesystems")) {

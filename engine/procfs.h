@@ -9,6 +9,8 @@
 
 /* 1 if guest path names a synthetic file. */
 int procfs_known(const char *guest);
+/* "/proc/<pid>[/rest]": 1 and the pid and rest ("" or "/stat" ...) if the path has that form. */
+int procfs_pid_path(const char *guest, int *pid, const char **rest);
 /* 1 if guest path is a directory on the way to a synthetic file (not listable). */
 int procfs_dir(const char *guest);
 

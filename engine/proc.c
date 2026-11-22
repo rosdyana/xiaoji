@@ -1,10 +1,8 @@
-/* Guest processes: creation of the initial process and switching between processes.
- * The subsystems (mem.c, vfs.c, signals.c) keep one current record each; this file
- * installs a process's records into them. */
 #include "proc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "mem.h"
 #include "signals.h"
@@ -16,6 +14,7 @@
 #define INIT_UMASK 022
 
 static proc_t *cur;
+static proc_t *all_procs; /* every process made, newest first */
 
 static void die_oom(void)
 {
@@ -33,7 +32,6 @@ proc_t *proc_init(void)
     p->pgid = INIT_PGID;
     p->sid = INIT_PID;
     p->umask = INIT_UMASK;
-    p->dumpable = 1; /* SUID_DUMP_USER */
     p->mm = mem_mm_new();
     p->fds = vfs_fdtab_new();
     p->sig = calloc(1, sig_tab_size());
@@ -43,6 +41,8 @@ proc_t *proc_init(void)
     vfs_fdtab_switch(p->fds);
     sig_tab_switch(p->sig);
     cur = p;
+    p->all_next = all_procs;
+    all_procs = p;
     return p;
 }
 
@@ -56,4 +56,112 @@ void proc_switch(proc_t *p)
     vfs_fdtab_switch(p->fds);
     sig_tab_switch(p->sig);
     cur = p;
+}
+
+static void link_child(proc_t *parent, proc_t *c)
+{
+    c->parent = parent;
+    c->next_sibling = parent->first_child;
+    parent->first_child = c;
+}
+
+static void unlink_child(proc_t *c)
+{
+    proc_t *par = c->parent;
+    if (!par)
+        return;
+    proc_t **pp = &par->first_child;
+    while (*pp && *pp != c)
+        pp = &(*pp)->next_sibling;
+    if (*pp)
+        *pp = c->next_sibling;
+    c->parent = NULL;
+    c->next_sibling = NULL;
+}
+
+proc_t *proc_fork(proc_t *parent, int pid, int vfork)
+{
+    proc_t *c = calloc(1, sizeof *c);
+    if (!c)
+        return NULL;
+    c->pid = pid;
+    c->ppid = parent->pid;
+    c->pgid = parent->pgid;
+    c->sid = parent->sid;
+    c->umask = parent->umask;
+    c->dumpable = parent->dumpable;
+    c->brk_base = parent->brk_base;
+    c->brk_cur = parent->brk_cur;
+    c->vfork = vfork != 0;
+    if (vfork) {
+        c->mm = parent->mm;
+        mem_mm_ref(c->mm);
+    } else {
+        c->mm = mem_mm_fork(parent->mm);
+    }
+    c->fds = vfs_fdtab_fork(parent->fds);
+    c->sig = calloc(1, sig_tab_size());
+    if (!c->mm || !c->fds || !c->sig) {
+        if (c->mm)
+            mem_mm_unref(c->mm);
+        if (c->fds)
+            vfs_fdtab_release(c->fds);
+        free(c->sig);
+        free(c);
+        return NULL;
+    }
+    sig_tab_copy(c->sig, parent->sig);
+    link_child(parent, c);
+    c->all_next = all_procs;
+    all_procs = c;
+    return c;
+}
+
+proc_t *proc_first(void) { return all_procs; }
+
+proc_t *proc_next(proc_t *p) { return p->all_next; }
+
+int proc_is_initial(const proc_t *p) { return p->pid == INIT_PID; }
+
+proc_t *proc_find(int pid)
+{
+    for (proc_t *p = all_procs; p; p = p->all_next)
+        if (p->pid == pid)
+            return p;
+    return NULL;
+}
+
+void proc_release(proc_t *p)
+{
+    if (p->fds) {
+        vfs_fdtab_release(p->fds);
+        p->fds = NULL;
+    }
+    if (p->mm) {
+        mem_mm_unref(p->mm);
+        p->mm = NULL;
+    }
+    free(p->sig);
+    p->sig = NULL;
+}
+
+void proc_reparent_children(proc_t *p, proc_t *init)
+{
+    while (p->first_child) {
+        proc_t *c = p->first_child;
+        unlink_child(c);
+        c->ppid = init->pid;
+        link_child(init, c);
+    }
+}
+
+void proc_free(proc_t *p)
+{
+    unlink_child(p);
+    proc_t **pp = &all_procs;
+    while (*pp && *pp != p)
+        pp = &(*pp)->all_next;
+    if (*pp)
+        *pp = p->all_next;
+    free(p);
 }

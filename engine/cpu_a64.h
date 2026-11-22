@@ -23,18 +23,22 @@ typedef struct cpu {
     uint64_t budget;    /* instructions left in this scheduling slice */
     int stop;           /* leave cpu_run after the current instruction */
     int blocked;        /* a syscall blocked: x0 is written at wake-up, not now */
+    uint64_t io_done;   /* bytes of a blocked pipe write already done (the call restarts) */
 
     /* Signal state, per thread. Bit n-1 of a mask or pending set is signal n. */
     uint64_t sig_mask;        /* blocked signals */
     uint64_t sig_pending;     /* raised for this thread, not yet delivered */
     int32_t sig_code[65];     /* si_code of each pending signal, by signal number */
     uint32_t sig_pid[65];     /* si_pid of each pending signal, by signal number */
+    int32_t sig_status[65];   /* si_status of each pending signal (SIGCHLD: the child's status) */
     uint64_t sig_wait_set;    /* rt_sigtimedwait: the set being waited for */
     uint64_t sig_wait_info;   /* rt_sigtimedwait: guest siginfo pointer, or 0 */
     uint64_t alt_sp;          /* sigaltstack: ss_sp and ss_size (size 0 means none) */
     uint64_t alt_size;
     uint32_t alt_flags;       /* SS_DISABLE or 0 */
     int sig_restore;          /* the syscall just run was rt_sigreturn: keep x0 */
+    int sig_suspended;        /* rt_sigsuspend: the mask to restore is sig_saved (the frame gets it) */
+    uint64_t sig_saved;
 } cpu_t;
 
 /* Runs the thread until it stops (exit, block, yield) or its slice budget is

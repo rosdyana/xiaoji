@@ -30,10 +30,12 @@ void sched_set_clear_child_tid(uint64_t va);
 
 /* Blocks the calling thread on a futex key. The wake-up value is set in x0 when
  * it wakes: 0 for a wake, -ETIMEDOUT for a timeout. */
-void sched_block_futex(uint64_t key, uint32_t bitset, int has_deadline, uint64_t deadline);
+void sched_block_futex(uint64_t key, uint64_t obj, uint32_t bitset, int has_deadline, uint64_t deadline);
 void sched_sleep_until(uint64_t deadline);
-int64_t sched_futex_wake(uint64_t key, uint64_t count, uint32_t bitset);
-int64_t sched_futex_requeue(uint64_t from, uint64_t to, uint64_t wake_n, uint64_t requeue_n);
+/* Futex keys are (key, obj) pairs from mem_futex_key: the word's position and its object. */
+int64_t sched_futex_wake(uint64_t key, uint64_t obj, uint64_t count, uint32_t bitset);
+int64_t sched_futex_requeue(uint64_t from, uint64_t from_obj, uint64_t to, uint64_t to_obj, uint64_t wake_n,
+                            uint64_t requeue_n);
 
 /* Thread name (16 bytes, NUL-terminated), per thread. */
 void sched_set_name(const char *name);
@@ -46,11 +48,33 @@ uint64_t sched_icount(void);
  * any wait with the given x0 (a no-op for a runnable thread). sched_threads lists
  * the live threads in slot order. */
 #define SCHED_MAX_THREADS 256
-typedef enum { SW_NONE, SW_FUTEX, SW_SLEEP, SW_SIGWAIT } sched_wait_t;
+typedef enum { SW_NONE, SW_FUTEX, SW_SLEEP, SW_SIGWAIT, SW_RESTART, SW_SUSPEND } sched_wait_t;
+/* rt_sigsuspend: the thread waits until a signal is raised for it (sched_wake gives -EINTR). */
+void sched_block_suspend(void);
 void sched_block_sigwait(int has_deadline, uint64_t deadline);
 sched_wait_t sched_wait_kind(const cpu_t *c);
 void sched_wake(cpu_t *c, int64_t ret);
 int sched_threads(cpu_t **out, int max);
 cpu_t *sched_find_thread(uint64_t tid);
+struct proc;
+/* The threads of one process, in slot order. */
+int sched_threads_of(const struct proc *p, cpu_t **out, int max);
+/* The process a thread (its cpu) belongs to. */
+struct proc *sched_proc_of(const cpu_t *c);
+/* vfork: the calling thread waits for key (its child's process); the wake gives it ret. */
+void sched_block_vfork(uint64_t key, int64_t ret);
+/* A fatal signal ends the calling process: the status is 128+sig, and the process
+ * reports the signal to its parent (wait status). */
+void sched_exit_signal(int sig);
+
+/* Restart waits. The calling thread's syscall is rewound (pc goes back to its svc)
+ * and the thread sleeps on key until sched_wake_key(key). The syscall then runs again
+ * with the same registers; x0 is not written on that wake-up. A signal wakes it too
+ * (sched_wake): the call restarts after the handler, except a part-done pipe write,
+ * which returns the bytes it wrote. No EINTR is returned. */
+void sched_block_restart(uint64_t key);
+void sched_wake_key(uint64_t key);
+/* The cpu of the running thread (the one whose syscall is being run). */
+cpu_t *sched_cur_cpu(void);
 
 #endif

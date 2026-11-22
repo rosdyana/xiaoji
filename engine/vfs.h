@@ -13,12 +13,14 @@
 #define VFS_PATH_MAX 4096
 #define VFS_MAX_FD 1024
 
-typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD } vfs_kind;
+typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE } vfs_kind;
 typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA } vfs_syn;
 
+/* An open file description: the offset, the status flags and the object. Every fd
+ * that refers to it (dup, fork) shares it; it is freed when refs drops to 0. */
+typedef struct pipe pipe_t;
 typedef struct {
-    int used;
-    int cloexec;
+    int refs;
     vfs_kind kind;
     vfs_syn syn;
     int hfd;         /* host fd, or -1 (O_PATH without access, and synthetic files) */
@@ -30,8 +32,16 @@ typedef struct {
     uint64_t dpos;
     void *dir;       /* DIR * for directories, opened by the first getdents64 */
     uint64_t nent;   /* directory entries returned so far */
-    memfd_t *mfd;    /* VFS_MEMFD: the file; dup shares it (dpos is per fd) */
+    memfd_t *mfd;    /* VFS_MEMFD: the file */
+    pipe_t *pipe;    /* VFS_PIPE: the pipe; lflags (LO_RDONLY or LO_WRONLY) says which end */
 } vfs_fd;
+
+/* A descriptor: a slot in a process's fd table. The close-on-exec flag is per slot;
+ * the description is shared. desc is NULL for a free slot. */
+typedef struct {
+    vfs_fd *desc;
+    int cloexec;
+} vfs_slot;
 
 typedef struct {
     int exists;          /* the final component exists on the host or is synthetic */
@@ -48,12 +58,22 @@ typedef struct {
 typedef struct fdtab fdtab_t;
 fdtab_t *vfs_fdtab_new(void);
 void vfs_fdtab_switch(fdtab_t *t);
+/* A copy for fork: every descriptor shares its description with the source. */
+fdtab_t *vfs_fdtab_fork(fdtab_t *src);
+/* Closes every descriptor of t (the last reference to a description frees it) and frees
+ * t. If t is the running table, the running table is cleared. */
+void vfs_fdtab_release(fdtab_t *t);
 
 int vfs_init(const char *host_root, const char *prog, int argc, char **argv);
 
 /* Resolves path (relative to dirfd, or the guest cwd for LAT_FDCWD) component by
  * component inside the root. follow=0 leaves a final symlink unresolved. */
 int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out);
+
+/* The program path and the argv bytes (NUL-separated) of a process's fd table, for
+ * /proc/<pid> (the table is the one of that process). */
+const char *vfs_prog_of(const fdtab_t *t);
+const uint8_t *vfs_cmdline_bytes(const fdtab_t *t, size_t *len);
 
 /* Sets the guest path of the program (what /proc/self/exe reads as). */
 void vfs_set_prog(const char *guest);
@@ -62,6 +82,14 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode);
 /* memfd_create: a new read-write memfd. mflags bit 0 is MFD_CLOEXEC. Returns the fd or -LE_*. */
 int vfs_memfd_create(const char *name, uint32_t mflags);
 int vfs_close(int fd);
+/* pipe2: two descriptors, read end in out[0] and write end in out[1]. Returns 0 or -LE_*. */
+int vfs_pipe2(int out[2], uint32_t flags);
+/* Blocks the running thread if the read or write on fd would block on a pipe (and
+ * the descriptor is not O_NONBLOCK). The call is then restarted. Returns 1 if it blocked. */
+int vfs_pipe_block(int fd);
+/* FD_CLOEXEC of one slot: -LE_BADF for a free slot. */
+int vfs_cloexec_get(int fd);
+int vfs_cloexec_set(int fd, int on);
 int64_t vfs_read(int fd, void *buf, size_t n);
 int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off);
 int64_t vfs_write(int fd, const void *buf, size_t n);

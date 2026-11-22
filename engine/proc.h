@@ -1,16 +1,16 @@
-/* Guest processes. A process owns its address space, fd table and cwd, signal
- * handlers, ids, brk, umask, exit status, and its place in the parent and child
- * lists. One current process is kept; the scheduler switches it with proc_switch
- * when it runs a thread of another process. Only .c files include this header. */
 #ifndef XIAOJI_PROC_H
 #define XIAOJI_PROC_H
 
 #include <stdint.h>
 
-typedef struct mm mm_t;         /* mem.c: page table and region list */
-typedef struct fdtab fdtab_t;   /* vfs.c: fd table, cwd, program name and argv */
-typedef struct sigtab sigtab_t; /* signals.c: handler table and the return trampoline */
+#include "mem.h"
+#include "signals.h"
+#include "vfs.h"
 
+/* A guest process: its address space, fd table, signal handlers, ids and family.
+ * Its threads are in the scheduler. A process ends when its last thread goes (or
+ * on exit_group, or a fatal signal). It is then a zombie until its parent reaps it;
+ * its address space and fd table are released at once (pipes see end of file). */
 typedef struct proc {
     int pid, ppid, pgid, sid;
     mm_t *mm;
@@ -19,20 +19,44 @@ typedef struct proc {
     uint64_t brk_base, brk_cur;
     uint32_t umask;
     int dumpable;
-    int exited;
-    int exit_code;
+    int exited;      /* ended: its threads are going away */
+    int exit_code;   /* the exit status (exit_group's code, or 128+sig for a fatal signal) */
+    int term_sig;    /* the signal that ended it, or 0 */
+    int zombie;      /* ended and not reaped: wait4 and waitid report it */
+    int vfork;       /* made by vfork: shares its parent's address space */
     int nthreads;
     struct proc *parent, *first_child, *next_sibling;
+    struct proc *all_next; /* every process made since start, for lookup by pid */
 } proc_t;
 
-/* Creates the initial process (pid 1000), installs its state and makes it current.
- * Call once, before anything else in the engine uses memory, files or signals. */
 proc_t *proc_init(void);
 
 proc_t *proc_cur(void);
 
-/* Installs p's address space, fd table and signal table, and makes p current.
- * The TLBs and translation caches are flushed by the address-space switch. */
 void proc_switch(proc_t *p);
+
+/* A child of cur (the running process) with a new pid. vfork shares cur's address
+ * space; otherwise the address space is copied copy-on-write. Its fd table shares the
+ * parent's descriptions, and its signal handlers are copied. NULL if out of memory. */
+proc_t *proc_fork(proc_t *parent, int pid, int vfork);
+
+/* The process with pid, zombies included; NULL if there is none. */
+proc_t *proc_find(int pid);
+
+/* Releases what an ended process holds: its fd table (pipes see end of file), its
+ * address space (shared by a vfork parent until that ends), and its signal table. */
+void proc_release(proc_t *p);
+
+/* The processes made so far, in no particular order (zombies included). */
+proc_t *proc_first(void);
+proc_t *proc_next(proc_t *p);
+/* 1 for the initial process (its exit ends the engine). */
+int proc_is_initial(const proc_t *p);
+
+/* Moves the children of p to init (orphans). */
+void proc_reparent_children(proc_t *p, proc_t *init);
+
+/* Frees a reaped zombie. */
+void proc_free(proc_t *p);
 
 #endif

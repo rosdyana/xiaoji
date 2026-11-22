@@ -1,9 +1,17 @@
-/* Green threads. Each guest thread has its own cpu_t. The scheduler runs the
- * current thread for SCHED_SLICE instructions, then the next runnable thread.
- * A thread also gives up the host when it blocks on a futex or sleeps, or when
- * it exits. Futex waits and sleeps have deadlines (host monotonic time). When
- * every live thread is blocked, the host sleeps until the earliest deadline. If
- * none has one, the scheduler reports a deadlock. */
+/* Green threads, grouped into processes. Each guest thread has its own cpu_t. The
+ * scheduler runs the current thread for SCHED_SLICE instructions, then the next
+ * runnable thread of any process; a switch to another process installs its address
+ * space, fd table and signal table (proc_switch). A thread also gives up the host
+ * when it blocks (a futex, a sleep, a pipe, a wait for a child) or exits. Futex waits
+ * and sleeps have deadlines (host monotonic time). When every live thread is blocked,
+ * the host sleeps until the earliest deadline. If none has one, the scheduler reports
+ * a deadlock.
+ *
+ * A process ends when its last thread exits, on exit_group, or on a fatal signal. Then
+ * its other threads are reaped, its fds and address space are released (pipes see end
+ * of file), its children go to the initial process, and the parent is told (SIGCHLD,
+ * and a wake for its waits). The process stays a zombie until it is reaped. The
+ * initial process's exit ends the engine. */
 #include "sched.h"
 
 #include <stddef.h>
@@ -16,30 +24,39 @@
 #include "mem.h"
 #include "prof.h"
 #include "proc.h"
+#include "signals.h"
 
 #define MAX_THREADS SCHED_MAX_THREADS
 #define TID_MAIN 1000u
 #define TID_FIRST_NEW 1001u
 #define DEADLOCK_STATUS 134
 #define KEY_MASK 0x00FFFFFFFFFFFFFFull /* futex keys ignore the address tag */
+#define SIGCHLD_N 17
+#define CLD_EXITED 1
+#define CLD_KILLED 2
 
 #define CLONE_VM 0x00000100ull
 #define CLONE_THREAD 0x00010000ull
 #define CLONE_SETTLS 0x00080000ull
 #define CLONE_PARENT_SETTID 0x00100000ull
 #define CLONE_CHILD_CLEARTID 0x00200000ull
+#define CLONE_VFORK 0x00004000ull
 #define CLONE_CHILD_SETTID 0x01000000ull
 
-typedef enum { TS_RUNNABLE, TS_FUTEX, TS_SLEEP, TS_SIGWAIT } thr_state;
+typedef enum { TS_RUNNABLE, TS_FUTEX, TS_SLEEP, TS_SIGWAIT, TS_RESTART, TS_VFORK, TS_SUSPEND } thr_state;
 
 typedef struct thread {
     cpu_t cpu;
     thr_state state;
-    uint64_t key;        /* futex key while blocked on a futex */
+    uint64_t key;        /* futex key, or the wait key (a pipe, a process) while blocked */
+    uint64_t key_obj;    /* futex: the object the key is in (mem_futex_key) */
     uint32_t bitset;     /* wake mask of a FUTEX_WAIT_BITSET */
     int has_deadline;
     uint64_t deadline;   /* host monotonic ns */
     uint64_t clear_child_tid;
+    int settid_pending;  /* CLONE_CHILD_SETTID: write the tid into the child's memory on its first slice */
+    uint64_t settid_va;
+    int64_t vfork_ret;   /* TS_VFORK: the x0 the parent gets when its child execs or exits */
     char comm[16];
     proc_t *proc; /* the process this thread belongs to */
 } thread_t;
@@ -49,8 +66,8 @@ _Static_assert(offsetof(thread_t, cpu) == 0, "thread_t must start with its cpu_t
 
 static thread_t *threads[MAX_THREADS];
 static int cur_slot;          /* slot of the running thread */
-static proc_t *init_proc; /* the initial process: its exit ends the engine */
-static uint64_t next_tid = TID_FIRST_NEW;
+static proc_t *init_proc;     /* the initial process: its exit ends the engine */
+static uint64_t next_tid = TID_FIRST_NEW; /* tids and pids share one number space */
 static uint64_t dead_icount;  /* instructions of threads already reaped */
 static char init_name[16] = "xiaoji";
 
@@ -80,6 +97,7 @@ static thread_t *add_thread(const cpu_t *from, uint64_t tid, proc_t *p)
         t->cpu.exited = 0;
         t->cpu.icount = 0; /* the copy is the parent: a new thread counts its own instructions */
         t->cpu.excl_valid = 0; /* a new thread never inherits the exclusive monitor */
+        t->cpu.io_done = 0;
         t->state = TS_RUNNABLE;
         t->proc = p;
         p->nthreads++;
@@ -108,6 +126,15 @@ static void wake(thread_t *t, int64_t ret)
     t->cpu.blocked = 0;
 }
 
+/* Makes a restart-blocked thread runnable. Its registers are left as they are, so
+ * its svc runs again. */
+static void wake_restart(thread_t *t)
+{
+    t->state = TS_RUNNABLE;
+    t->has_deadline = 0;
+    t->cpu.blocked = 0;
+}
+
 static void block_current(thr_state st, uint64_t key, uint32_t bitset, int has_deadline, uint64_t deadline)
 {
     thread_t *t = cur();
@@ -120,9 +147,10 @@ static void block_current(thr_state st, uint64_t key, uint32_t bitset, int has_d
     t->cpu.stop = 1;
 }
 
-void sched_block_futex(uint64_t key, uint32_t bitset, int has_deadline, uint64_t deadline)
+void sched_block_futex(uint64_t key, uint64_t obj, uint32_t bitset, int has_deadline, uint64_t deadline)
 {
     block_current(TS_FUTEX, key, bitset, has_deadline, deadline);
+    cur()->key_obj = obj;
 }
 
 void sched_sleep_until(uint64_t deadline)
@@ -135,14 +163,59 @@ void sched_block_sigwait(int has_deadline, uint64_t deadline)
     block_current(TS_SIGWAIT, 0, 0, has_deadline, deadline);
 }
 
-sched_wait_t sched_wait_kind(const cpu_t *c)
+void sched_block_suspend(void)
+{
+    block_current(TS_SUSPEND, 0, 0, 0, 0);
+}
+
+void sched_block_restart(uint64_t key)
+{
+    thread_t *t = cur();
+    t->cpu.pc -= 4; /* the svc runs again when the thread wakes */
+    block_current(TS_RESTART, key, 0, 0, 0);
+}
+
+void sched_block_vfork(uint64_t key, int64_t ret)
+{
+    thread_t *t = cur();
+    t->vfork_ret = ret;
+    block_current(TS_VFORK, key, 0, 0, 0);
+}
+
+void sched_wake_key(uint64_t key)
+{
+    key &= KEY_MASK;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->key != key)
+            continue;
+        if (t->state == TS_RESTART)
+            wake_restart(t);
+        else if (t->state == TS_VFORK)
+            wake(t, t->vfork_ret);
+    }
+}
+
+cpu_t *sched_cur_cpu(void)
+{
+    return cur() ? &cur()->cpu : NULL;
+}
+
+proc_t *sched_proc_of(const cpu_t *c)
 {
     /* cpu_t is the first member of thread_t, so the pointer is the thread's. */
+    return ((const thread_t *)c)->proc;
+}
+
+sched_wait_t sched_wait_kind(const cpu_t *c)
+{
     const thread_t *t = (const thread_t *)c;
     switch (t->state) {
     case TS_FUTEX: return SW_FUTEX;
     case TS_SLEEP: return SW_SLEEP;
     case TS_SIGWAIT: return SW_SIGWAIT;
+    case TS_RESTART: return SW_RESTART;
+    case TS_SUSPEND: return SW_SUSPEND;
     default: return SW_NONE;
     }
 }
@@ -150,7 +223,9 @@ sched_wait_t sched_wait_kind(const cpu_t *c)
 void sched_wake(cpu_t *c, int64_t ret)
 {
     thread_t *t = (thread_t *)c;
-    if (t->state != TS_RUNNABLE)
+    if (t->state == TS_RESTART)
+        wake_restart(t);
+    else if (t->state != TS_RUNNABLE)
         wake(t, ret);
 }
 
@@ -163,6 +238,15 @@ int sched_threads(cpu_t **out, int max)
     return n;
 }
 
+int sched_threads_of(const proc_t *p, cpu_t **out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_THREADS && n < max; i++)
+        if (threads[i] && threads[i]->proc == p)
+            out[n++] = &threads[i]->cpu;
+    return n;
+}
+
 cpu_t *sched_find_thread(uint64_t tid)
 {
     for (int i = 0; i < MAX_THREADS; i++)
@@ -171,13 +255,13 @@ cpu_t *sched_find_thread(uint64_t tid)
     return NULL;
 }
 
-int64_t sched_futex_wake(uint64_t key, uint64_t count, uint32_t bitset)
+int64_t sched_futex_wake(uint64_t key, uint64_t obj, uint64_t count, uint32_t bitset)
 {
     int64_t n = 0;
     key &= KEY_MASK;
     for (int i = 0; i < MAX_THREADS && (uint64_t)n < count; i++) {
         thread_t *t = threads[i];
-        if (t && t->state == TS_FUTEX && t->key == key && (t->bitset & bitset)) {
+        if (t && t->state == TS_FUTEX && t->key == key && t->key_obj == obj && (t->bitset & bitset)) {
             wake(t, 0);
             n++;
         }
@@ -185,7 +269,8 @@ int64_t sched_futex_wake(uint64_t key, uint64_t count, uint32_t bitset)
     return n;
 }
 
-int64_t sched_futex_requeue(uint64_t from, uint64_t to, uint64_t wake_n, uint64_t requeue_n)
+int64_t sched_futex_requeue(uint64_t from, uint64_t from_obj, uint64_t to, uint64_t to_obj, uint64_t wake_n,
+                            uint64_t requeue_n)
 {
     int64_t woke = 0;
     uint64_t moved = 0;
@@ -193,13 +278,14 @@ int64_t sched_futex_requeue(uint64_t from, uint64_t to, uint64_t wake_n, uint64_
     to &= KEY_MASK;
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_t *t = threads[i];
-        if (!t || t->state != TS_FUTEX || t->key != from)
+        if (!t || t->state != TS_FUTEX || t->key != from || t->key_obj != from_obj)
             continue;
         if ((uint64_t)woke < wake_n) {
             wake(t, 0);
             woke++;
         } else if (moved < requeue_n) {
             t->key = to;
+            t->key_obj = to_obj;
             moved++;
         }
     }
@@ -272,9 +358,34 @@ static void report_deadlock(void)
                 t->state == TS_FUTEX      ? "blocked on futex"
                 : t->state == TS_SLEEP    ? "sleeping"
                 : t->state == TS_SIGWAIT  ? "waiting in sigtimedwait"
+                : t->state == TS_RESTART  ? "waiting on a pipe or a child"
+                : t->state == TS_VFORK    ? "waiting for a vfork child"
+                : t->state == TS_SUSPEND  ? "in sigsuspend"
                                           : "runnable",
                 (unsigned long long)t->cpu.pc);
     }
+}
+
+/* A process has ended (its last thread is gone, or exit_group or a fatal signal): its
+ * remaining threads are reaped, and unless it is the initial process it becomes a
+ * zombie. Its children go to the initial process, and its parent learns of it. */
+static void finish_process(proc_t *p)
+{
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (threads[i] && threads[i]->proc == p)
+            reap(i);
+    if (p == init_proc || p->zombie)
+        return;
+    p->zombie = 1;
+    proc_reparent_children(p, init_proc);
+    proc_release(p);
+    if (p->parent) {
+        int code = p->term_sig ? CLD_KILLED : CLD_EXITED;
+        int status = p->term_sig ? p->term_sig : p->exit_code;
+        sig_child_event(p->parent, SIGCHLD_N, code, (uint32_t)p->pid, status);
+        sched_wake_key((uint64_t)(uintptr_t)p->parent); /* wait4 and waitid waiters */
+    }
+    sched_wake_key((uint64_t)(uintptr_t)p); /* a vfork parent waiting for this process */
 }
 
 int sched_run(cpu_t *main_cpu)
@@ -304,6 +415,12 @@ int sched_run(cpu_t *main_cpu)
         }
         if (t->proc != proc_cur())
             proc_switch(t->proc); /* another process: its address space and files */
+        if (t->settid_pending) {
+            /* CLONE_CHILD_SETTID: the child's own tid word, written in its address space. */
+            uint32_t tid32 = (uint32_t)t->cpu.tid;
+            (void)mem_copy_in(t->settid_va, &tid32, sizeof tid32);
+            t->settid_pending = 0;
+        }
         t->cpu.stop = 0;
         t->cpu.budget = SCHED_SLICE;
         /* A context switch clears the exclusive monitor, as on hardware, so
@@ -315,14 +432,17 @@ int sched_run(cpu_t *main_cpu)
             prof_slice(t->cpu.tid, t->cpu.budget == 0);
         if (init_proc->exited)
             break;
+        proc_t *p = t->proc;
         if (t->cpu.exited) {
-            if (live_count() == 1) {
+            if (p->nthreads == 1 && !p->exited) {
                 /* The last thread: its status is the process status. */
-                t->proc->exit_code = t->cpu.exit_code;
-                t->proc->exited = 1;
+                p->exit_code = t->cpu.exit_code;
+                p->exited = 1;
             }
             reap(cur_slot);
         }
+        if (p->exited)
+            finish_process(p);
     }
     /* Unreaped threads (the process ended while they lived) add their counts. */
     return init_proc->exit_code;
@@ -341,6 +461,20 @@ void sched_exit_process(uint64_t code)
     }
 }
 
+void sched_exit_signal(int sig)
+{
+    proc_t *p = cur() ? cur()->proc : proc_cur();
+    if (!p->exited) {
+        p->exited = 1;
+        p->exit_code = (128 + sig) & 0xFF; /* the engine's status for a fatal signal */
+        p->term_sig = sig;
+    }
+    if (cur()) {
+        cur()->cpu.exited = 1;
+        cur()->cpu.stop = 1;
+    }
+}
+
 void sched_thread_exit(cpu_t *c, uint64_t code)
 {
     thread_t *t = cur();
@@ -350,23 +484,19 @@ void sched_thread_exit(cpu_t *c, uint64_t code)
     if (t && t->clear_child_tid) {
         /* A thread-exit clear must not kill the process: ignore a bad address. */
         uint8_t zero[4] = {0, 0, 0, 0};
-        if (mem_copy_in(t->clear_child_tid, zero, sizeof zero) == 0)
-            sched_futex_wake(t->clear_child_tid, 1, 0xFFFFFFFFu);
+        if (mem_copy_in(t->clear_child_tid, zero, sizeof zero) == 0) {
+            uint64_t obj;
+            uint64_t key = mem_futex_key(t->clear_child_tid, &obj);
+            sched_futex_wake(key, obj, 1, 0xFFFFFFFFu);
+        }
         t->clear_child_tid = 0;
     }
 }
 
-int64_t sched_clone(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid)
+/* clone for a new thread of the calling process. */
+static int64_t clone_thread(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid)
 {
     thread_t *me = cur();
-    if (!(flags & CLONE_VM) || !(flags & CLONE_THREAD)) {
-        static int notice;
-        if (!notice) {
-            notice = 1;
-            fprintf(stderr, "xiaoji: process creation (clone without CLONE_THREAD) is not supported yet\n");
-        }
-        return -LE_NOSYS;
-    }
     if (live_count() >= MAX_THREADS)
         return -LE_AGAIN;
     uint64_t tid = next_tid;
@@ -403,6 +533,65 @@ int64_t sched_clone(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid
     if (prof_on)
         prof_thread_new(tid, t->comm);
     return (int64_t)tid;
+}
+
+/* fork (no CLONE_THREAD): a new process with a copy of the address space (copy-on-write,
+ * or shared with the parent for vfork), its own main thread, and the pid as its tid.
+ * The child starts with x0 = 0. A vfork parent is suspended until the child exits. */
+static int64_t clone_process(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls,
+                             uint64_t ctid)
+{
+    thread_t *me = cur();
+    if (live_count() >= MAX_THREADS)
+        return -LE_AGAIN;
+    int vfork = (flags & CLONE_VM) != 0;
+    uint64_t pid = next_tid;
+    uint32_t pid32 = (uint32_t)pid;
+    if (flags & CLONE_PARENT_SETTID) {
+        if (mem_copy_in(ptid, &pid32, sizeof pid32) < 0)
+            return -LE_FAULT;
+    }
+    proc_t *child = proc_fork(me->proc, (int)pid, vfork);
+    if (!child)
+        return -LE_NOMEM;
+    thread_t *t = add_thread(parent, pid, child);
+    if (!t) /* not reached: live_count left a free slot */
+        return -LE_NOMEM;
+    next_tid++;
+    t->cpu.x[0] = 0;
+    t->cpu.sig_pending = 0;
+    t->cpu.sig_wait_set = 0;
+    t->cpu.sig_wait_info = 0;
+    t->cpu.alt_sp = 0;
+    t->cpu.alt_size = 0;
+    t->cpu.alt_flags = 0;
+    if (newsp)
+        t->cpu.sp = newsp;
+    if (flags & CLONE_SETTLS)
+        t->cpu.tpidr_el0 = tls;
+    if (flags & CLONE_CHILD_CLEARTID)
+        t->clear_child_tid = ctid;
+    if (flags & CLONE_CHILD_SETTID) {
+        /* The child's tid word is written in the child's memory, on its first slice. */
+        t->settid_pending = 1;
+        t->settid_va = ctid;
+    }
+    memcpy(t->comm, me->comm, sizeof t->comm);
+    if (prof_on)
+        prof_thread_new(pid, t->comm);
+    if (flags & CLONE_VFORK)
+        sched_block_vfork((uint64_t)(uintptr_t)child, (int64_t)pid);
+    return (int64_t)pid;
+}
+
+int64_t sched_clone(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid)
+{
+    if (flags & CLONE_THREAD) {
+        if (!(flags & CLONE_VM))
+            return -LE_NOSYS;
+        return clone_thread(parent, flags, newsp, ptid, tls, ctid);
+    }
+    return clone_process(parent, flags, newsp, ptid, tls, ctid);
 }
 
 uint64_t sched_tid(void)

@@ -14,6 +14,7 @@
 typedef struct sigtab sigtab_t;
 size_t sig_tab_size(void); /* bytes for one zeroed table */
 void sig_tab_switch(sigtab_t *t);
+void sig_tab_copy(sigtab_t *dst, const sigtab_t *src); /* fork: the handlers are copied */
 
 /* Syscalls. Each returns the Linux result (negative errno) unless noted. */
 int64_t sig_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oact, uint64_t sigsetsize);
@@ -22,7 +23,14 @@ int64_t sig_sigaltstack(cpu_t *c, uint64_t ss, uint64_t oss);
 int64_t sig_kill(uint64_t pid, uint64_t sig);
 int64_t sig_tkill(uint64_t tid, uint64_t sig);
 int64_t sig_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig);
+/* Raises sig for the running thread, as a kernel-generated signal (SIGPIPE). */
+void sig_raise_current(int sig);
+/* SIGCHLD (or another child-state signal) for a parent process: code is the si_code
+ * (CLD_EXITED or CLD_KILLED), pid the child, status its exit status or signal. */
+struct proc;
+void sig_child_event(struct proc *parent, int sig, int code, uint32_t pid, int status);
 int64_t sig_timedwait(cpu_t *c, uint64_t wanted, uint64_t info, int poll, int has_deadline, uint64_t deadline);
+int64_t sig_sigsuspend(cpu_t *c, uint64_t set, uint64_t sigsetsize);
 /* rt_sigreturn: restores the thread from the frame at sp. Sets c->sig_restore so
  * the syscall result does not overwrite the restored x0. */
 void sig_rt_sigreturn(cpu_t *c);

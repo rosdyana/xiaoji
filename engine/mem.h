@@ -27,6 +27,11 @@
 typedef struct mm mm_t;
 mm_t *mem_mm_new(void);
 void mem_mm_switch(mm_t *m);
+/* A new address space for fork: the private pages of m become copy-on-write in both. */
+mm_t *mem_mm_fork(mm_t *m);
+/* A process starts (or stops) using m. unref frees m with its last user. */
+void mem_mm_ref(mm_t *m);
+void mem_mm_unref(mm_t *m);
 
 jmp_buf *mem_set_fault_jmp(jmp_buf *jb);
 void mem_fault_info(uint64_t *addr, int *code);
@@ -67,6 +72,12 @@ unsigned mem_prot_at(uint64_t va);
  * anonymous; valid until the next mapping change) and its file offset at start.
  * Returns 0 if there is none. */
 int mem_region_next(uint64_t va, uint64_t *start, uint64_t *end, const char **path, uint64_t *off);
+
+/* The identity of the futex word at va: *obj is the object the word belongs to (the
+ * address space for a private word, the memfd for a word in a shared mapping), and the
+ * return value is the word's position in that object (its address, or the offset in
+ * the memfd). Two words are the same futex when both match. */
+uint64_t mem_futex_key(uint64_t va, uint64_t *obj);
 
 /* Guest-side accesses. These never return on a fault: they print the segfault
  * message and exit with status 139. Little-endian, unaligned and page-crossing

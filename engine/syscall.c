@@ -37,6 +37,12 @@
 #define SYS_SETPRIORITY 140
 #define SYS_GETPRIORITY 141
 #define SYS_GETPGID 155
+#define SYS_SETPGID 154
+#define SYS_GETSID 156
+#define SYS_SETSID 157
+#define SYS_WAITID 95
+#define SYS_WAIT4 260
+#define SYS_RT_SIGSUSPEND 133
 #define SYS_UNAME 160
 #define SYS_PRCTL 167
 #define SYS_GETPPID 173
@@ -329,6 +335,18 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
             mem_unmap(base, len);
             return -LE_NOMEM;
         }
+    } else if (type == LMAP_SHARED) {
+        /* A MAP_SHARED anonymous mapping is a view of a hidden memfd, so a forked child
+         * shares it with its parent. */
+        memfd_t *m = memfd_new("zero");
+        if (!m)
+            return -LE_NOMEM;
+        int rc = memfd_truncate(m, len);
+        if (rc == 0)
+            rc = mem_map_shared(base, len, p, m, 0);
+        memfd_unref(m);
+        if (rc < 0)
+            return -LE_NOMEM;
     } else if (mem_map(base, len, p) < 0) {
         return -LE_NOMEM;
     }
@@ -575,6 +593,9 @@ static uint64_t deadline_of(uint64_t ns, int absolute, int realtime)
 static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t timeout, uint64_t uaddr2, uint64_t val3)
 {
     unsigned cmd = (unsigned)(op & LFUTEX_OP_MASK);
+    uint64_t obj1 = 0, obj2 = 0;
+    uint64_t key1 = mem_futex_key(uaddr, &obj1);
+    uint64_t key2 = mem_futex_key(uaddr2, &obj2);
     int realtime = (op & LFUTEX_CLOCK_REALTIME) != 0;
     switch (cmd) {
     case LFUTEX_WAIT:
@@ -599,7 +620,7 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t tim
             deadline = deadline_of(ns, cmd == LFUTEX_WAIT_BITSET, realtime);
             has = 1;
         }
-        sched_block_futex(uaddr, bits, has, deadline); /* x0 is set on wake-up */
+        sched_block_futex(key1, obj1, bits, has, deadline); /* x0 is set on wake-up */
         return 0;
     }
     case LFUTEX_WAKE:
@@ -610,17 +631,17 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t tim
             if (bits == 0)
                 return -LE_INVAL;
         }
-        return sched_futex_wake(uaddr, val, bits);
+        return sched_futex_wake(key1, obj1, val, bits);
     }
     case LFUTEX_REQUEUE: /* the timeout argument carries the requeue count */
-        return sched_futex_requeue(uaddr, uaddr2, val, timeout);
+        return sched_futex_requeue(key1, obj1, key2, obj2, val, timeout);
     case LFUTEX_CMP_REQUEUE: {
         uint32_t cur;
         if (read_u32(uaddr, &cur) < 0)
             return -LE_FAULT;
         if (cur != (uint32_t)val3)
             return -LE_AGAIN;
-        return sched_futex_requeue(uaddr, uaddr2, val, timeout);
+        return sched_futex_requeue(key1, obj1, key2, obj2, val, timeout);
     }
     default: {
         static int notice;
@@ -720,6 +741,182 @@ static int64_t sys_prctl(uint64_t option, uint64_t arg2)
     return -LE_INVAL;
 }
 
+/* ---------- processes: wait, process groups and sessions ---------- */
+
+#define LWNOHANG 1
+#define LWEXITED 4
+#define LWNOWAIT 0x01000000u
+#define LWAIT_KNOWN (LWNOHANG | LWEXITED | LWNOWAIT | 2u | 8u | 0x40000000u | 0x80000000u)
+#define LP_ALL 0
+#define LP_PID 1
+#define LP_PGID 2
+#define LSIGCHLD 17
+#define LCLD_EXITED 1
+#define LCLD_KILLED 2
+
+/* Whether child c is chosen by a wait4 selector: >0 that pid, 0 the caller's group,
+ * -1 any child, below -1 the group -sel. */
+static int child_selected(const proc_t *c, const proc_t *me, int32_t sel)
+{
+    if (sel > 0)
+        return c->pid == sel;
+    if (sel == 0)
+        return c->pgid == me->pgid;
+    if (sel == -1)
+        return 1;
+    return c->pgid == -(int64_t)sel;
+}
+
+/* The wait status of an ended process: the exit status in bits 8..15, or the signal. */
+static uint32_t wait_status(const proc_t *c)
+{
+    return c->term_sig ? (uint32_t)(c->term_sig & 0x7F) : ((uint32_t)(c->exit_code & 0xFF) << 8);
+}
+
+/* wait4: reaps a zombie child, or blocks until one ends (the call is restarted then). */
+static int64_t sys_wait4(uint64_t pid64, uint64_t wstatus, uint64_t options, uint64_t rusage)
+{
+    (void)rusage;
+    int32_t sel = (int32_t)pid64;
+    proc_t *me = proc_cur();
+    if (options & ~(uint64_t)(LWNOHANG | 2u | 8u | 0x40000000u | 0x80000000u))
+        return -LE_INVAL;
+    int any = 0;
+    for (proc_t *c = proc_first(); c; c = proc_next(c)) {
+        if (c->parent != me || !child_selected(c, me, sel))
+            continue;
+        any = 1;
+        if (!c->zombie)
+            continue;
+        uint32_t st = wait_status(c);
+        if (wstatus && mem_copy_in(wstatus, &st, sizeof st) < 0)
+            return -LE_FAULT;
+        int64_t pid = c->pid;
+        proc_free(c);
+        return pid;
+    }
+    if (!any)
+        return -LE_CHILD;
+    if (options & LWNOHANG)
+        return 0;
+    sched_block_restart((uint64_t)(uintptr_t)me); /* woken when a child ends */
+    return 0;
+}
+
+/* siginfo of a waited-for child (si_signo, si_code, si_pid, si_uid, si_status). */
+static int write_child_info(uint64_t va, const proc_t *c)
+{
+    /* siginfo: si_signo 0, si_errno 4, si_code 8; the SIGCHLD union at 16: si_pid, si_uid
+     * (20), si_status (24). */
+    uint8_t b[128];
+    memset(b, 0, sizeof b);
+    uint32_t fields[6];
+    fields[0] = LSIGCHLD;
+    fields[1] = 0;
+    fields[2] = c->term_sig ? LCLD_KILLED : LCLD_EXITED;
+    fields[3] = (uint32_t)c->pid;
+    fields[4] = 0;
+    fields[5] = c->term_sig ? (uint32_t)c->term_sig : (uint32_t)(c->exit_code & 0xFF);
+    const int off[6] = {0, 4, 8, 16, 20, 24};
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 4; k++)
+            b[off[i] + k] = (uint8_t)(fields[i] >> (8 * k));
+    return mem_copy_in(va, b, sizeof b) < 0 ? -LE_FAULT : 0;
+}
+
+/* waitid: like wait4, for children chosen by idtype (P_ALL, P_PID, P_PGID). */
+static int64_t sys_waitid(uint64_t idtype, uint64_t id, uint64_t info, uint64_t options, uint64_t rusage)
+{
+    (void)rusage;
+    proc_t *me = proc_cur();
+    if (!(options & LWEXITED) || (options & ~(uint64_t)LWAIT_KNOWN))
+        return -LE_INVAL;
+    if (idtype != LP_ALL && idtype != LP_PID && idtype != LP_PGID)
+        return -LE_INVAL;
+    int32_t want = (int32_t)id;
+    if (idtype == LP_PGID && want == 0)
+        want = me->pgid;
+    int any = 0;
+    for (proc_t *c = proc_first(); c; c = proc_next(c)) {
+        if (c->parent != me)
+            continue;
+        if ((idtype == LP_PID && c->pid != want) || (idtype == LP_PGID && c->pgid != want))
+            continue;
+        any = 1;
+        if (!c->zombie)
+            continue;
+        if (info) {
+            int r = write_child_info(info, c);
+            if (r < 0)
+                return r;
+        }
+        if (!(options & LWNOWAIT))
+            proc_free(c);
+        return 0;
+    }
+    if (!any)
+        return -LE_CHILD;
+    if (options & LWNOHANG) {
+        if (info) {
+            uint8_t zero[128];
+            memset(zero, 0, sizeof zero);
+            if (mem_copy_in(info, zero, sizeof zero) < 0)
+                return -LE_FAULT;
+        }
+        return 0;
+    }
+    sched_block_restart((uint64_t)(uintptr_t)me);
+    return 0;
+}
+
+static proc_t *proc_or_self(int32_t pid)
+{
+    if (pid == 0)
+        return proc_cur();
+    proc_t *p = proc_find(pid);
+    return p && !p->zombie ? p : NULL;
+}
+
+static int64_t sys_getpgid(uint64_t pid64)
+{
+    proc_t *p = proc_or_self((int32_t)pid64);
+    return p ? p->pgid : -LE_SRCH;
+}
+
+static int64_t sys_getsid(uint64_t pid64)
+{
+    proc_t *p = proc_or_self((int32_t)pid64);
+    return p ? p->sid : -LE_SRCH;
+}
+
+/* setpgid: the caller or one of its children, not a session leader. */
+static int64_t sys_setpgid(uint64_t pid64, uint64_t pgid64)
+{
+    int32_t pid = (int32_t)pid64, pgid = (int32_t)pgid64;
+    proc_t *me = proc_cur();
+    proc_t *p = pid == 0 ? me : proc_find(pid);
+    if (!p || p->zombie)
+        return -LE_SRCH;
+    if (p != me && p->parent != me)
+        return -LE_SRCH;
+    if (p->sid == p->pid && p->pid != me->pid)
+        return -LE_PERM;
+    if (pgid < 0)
+        return -LE_INVAL;
+    p->pgid = pgid == 0 ? p->pid : pgid;
+    return 0;
+}
+
+/* setsid: a new session led by the caller, unless it already leads a group. */
+static int64_t sys_setsid(void)
+{
+    proc_t *me = proc_cur();
+    if (me->pgid == me->pid)
+        return -LE_PERM;
+    me->sid = me->pgid = me->pid;
+    return me->pid;
+}
+
 /* ---------- dispatch ---------- */
 
 static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
@@ -796,7 +993,22 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = proc_cur()->ppid;
         return;
     case SYS_GETPGID:
-        *ret = proc_cur()->pgid;
+        *ret = sys_getpgid(a[0]);
+        return;
+    case SYS_SETPGID:
+        *ret = sys_setpgid(a[0], a[1]);
+        return;
+    case SYS_GETSID:
+        *ret = sys_getsid(a[0]);
+        return;
+    case SYS_SETSID:
+        *ret = sys_setsid();
+        return;
+    case SYS_WAIT4:
+        *ret = sys_wait4(a[0], a[1], a[2], a[3]);
+        return;
+    case SYS_WAITID:
+        *ret = sys_waitid(a[0], a[1], a[2], a[3], a[4]);
         return;
     case SYS_SCHED_YIELD:
         c->stop = 1; /* the rest of the slice goes to the next thread */
@@ -824,6 +1036,9 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_RT_SIGTIMEDWAIT:
         *ret = sys_rt_sigtimedwait(c, a[0], a[1], a[2], a[3]);
+        return;
+    case SYS_RT_SIGSUSPEND:
+        *ret = sig_sigsuspend(c, a[0], a[1]);
         return;
     case SYS_RT_SIGRETURN:
         sig_rt_sigreturn(c); /* sets c->sig_restore: x0 comes from the frame */
@@ -891,6 +1106,8 @@ void syscall_dispatch(cpu_t *c)
         prof_syscall(c->tid, nr, a, ret, c->blocked);
     if (!c->blocked && !c->sig_restore) /* a blocked call gets its x0 when it wakes */
         c->x[0] = (uint64_t)ret;
+    if (!c->blocked)
+        c->io_done = 0; /* a finished or failed call has no partial pipe write left */
     c->sig_restore = 0;
     if (c->trace) {
         fprintf(stderr, "xiaoji: %s(%llu) (0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) = %lld\n",
