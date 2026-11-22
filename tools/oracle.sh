@@ -54,5 +54,11 @@ run toybox-sha  "exec /system/bin/toybox sha256sum /apex/com.android.runtime/bin
 run toybox-lsdir "exec /system/bin/toybox ls /apex/com.android.art/bin"
 run toybox-cat  "exec /system/bin/toybox cat /system/etc/hosts"
 run sh-arith    'echo $((6*7))'
+run sh-pipe     'echo hello | /system/bin/toybox tr a-z A-Z'
+run sh-pipeline '/system/bin/toybox ls /system/bin | /system/bin/toybox wc -l'
+run sh-subshell 'x=$(/system/bin/toybox uname -m); echo "arch=$x"; (exit 3); echo "rc=$?"'
+run sh-bg       '/system/bin/toybox sleep 0.1 & wait; echo done'
+run sh-loop     'for i in 1 2 3; do /system/bin/toybox echo $i; done | /system/bin/toybox tac'
+run sh-script   'echo "#!/system/bin/sh" > /data/local/tmp/s.sh; echo "echo script ran \$1" >> /data/local/tmp/s.sh; chmod 755 /data/local/tmp/s.sh; /data/local/tmp/s.sh arg1'
 run hello-int   "exec /apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello"
 run hello-jit   "exec /apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello"

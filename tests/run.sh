@@ -41,11 +41,20 @@ rootfs_argv() {
     toybox-lsdir) ARGV=(/system/bin/toybox ls /apex/com.android.art/bin) ;;
     toybox-cat) ARGV=(/system/bin/toybox cat /system/etc/hosts) ;;
     sh-arith) ARGV=(/system/bin/sh -c 'echo $((6*7))') ;;
+    sh-pipe) ARGV=(/system/bin/sh -c 'echo hello | /system/bin/toybox tr a-z A-Z') ;;
+    sh-pipeline) ARGV=(/system/bin/sh -c '/system/bin/toybox ls /system/bin | /system/bin/toybox wc -l') ;;
+    sh-subshell) ARGV=(/system/bin/sh -c 'x=$(/system/bin/toybox uname -m); echo "arch=$x"; (exit 3); echo "rc=$?"') ;;
+    sh-bg) ARGV=(/system/bin/sh -c '/system/bin/toybox sleep 0.1 & wait; echo done') ;;
+    sh-loop) ARGV=(/system/bin/sh -c 'for i in 1 2 3; do /system/bin/toybox echo $i; done | /system/bin/toybox tac') ;;
+    sh-script) ARGV=(/system/bin/sh -c 'echo "#!/system/bin/sh" > /data/local/tmp/s.sh; echo "echo script ran \$1" >> /data/local/tmp/s.sh; chmod 755 /data/local/tmp/s.sh; /data/local/tmp/s.sh arg1') ;;
     hello-int) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello) ;;
     hello-jit) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello) ;;
     esac
 }
-ROOTFS_CASES="toybox-echo toybox-ls toybox-uname toybox-wc toybox-sha toybox-lsdir toybox-cat sh-arith hello-int hello-jit"
+ROOTFS_CASES="toybox-echo toybox-ls toybox-uname toybox-wc toybox-sha toybox-lsdir toybox-cat sh-arith hello-int hello-jit sh-pipe sh-pipeline sh-subshell sh-bg sh-loop sh-script"
+# Rootfs cases the engine does not pass yet (multiple processes, B1): a failure is
+# XFAIL, not FAIL. Remove a name here once it passes.
+ROOTFS_PENDING="sh-pipe sh-pipeline sh-subshell sh-bg sh-loop sh-script"
 
 # The guest environment of the ART cases, from tools/guest-env.sh, as --env
 # arguments (the same variables the oracle exports with . /data/env.sh).
@@ -208,6 +217,13 @@ check_rootfs() {
     if [ -s "$err" ]; then
         why="$why; stderr: $(tail -n 1 "$err")"
     fi
+    case " $ROOTFS_PENDING " in
+    *" $name "*)
+        echo "XFAIL $tag ($why)"
+        xfail=$((xfail + 1))
+        return 1
+        ;;
+    esac
     echo "FAIL  $tag ($why)"
     diff "$expect_out" "$out" | head -n 6 | sed 's/^/        /'
     fail=$((fail + 1))
