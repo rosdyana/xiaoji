@@ -9,6 +9,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "proc.h"
 #include "prof.h"
 #include "sched.h"
 #include "signals.h"
@@ -65,10 +66,7 @@
 #define SYS_FLOCK 32
 #define SYS_GETRLIMIT 163
 
-#define GUEST_TID 1000
 #define GUEST_ROOT_ID 0 /* uid and gid: the oracle runs as root */
-#define GUEST_PPID 1
-#define GUEST_PGID 1000
 #define PAGE_MASK 4095ull
 #define RLIM_INFINITY (~0ull)
 #define RLIMIT_STACK 3
@@ -76,8 +74,6 @@
 #define SIGSET_SIZE 8
 #define IO_CHUNK 65536
 
-static uint64_t brk_base;
-static uint64_t brk_cur;
 static uint64_t unimpl_seen[1024 / 64];
 static uint8_t fill_buf[IO_CHUNK];
 
@@ -162,8 +158,8 @@ const char *syscall_name(uint64_t nr)
 
 void syscall_init(uint64_t base)
 {
-    brk_base = base;
-    brk_cur = base;
+    proc_cur()->brk_base = base;
+    proc_cur()->brk_cur = base;
 }
 
 void syscall_set_comm(const char *argv0)
@@ -176,18 +172,18 @@ void syscall_set_comm(const char *argv0)
 
 static int64_t sys_brk(uint64_t want)
 {
-    if (want == 0 || want < brk_base || want >= MEM_VA_LIMIT)
-        return (int64_t)brk_cur;
-    uint64_t cur_top = page_up(brk_cur), new_top = page_up(want);
+    if (want == 0 || want < proc_cur()->brk_base || want >= MEM_VA_LIMIT)
+        return (int64_t)proc_cur()->brk_cur;
+    uint64_t cur_top = page_up(proc_cur()->brk_cur), new_top = page_up(want);
     if (new_top > cur_top) {
         if (!mem_range_free(cur_top, new_top - cur_top))
-            return (int64_t)brk_cur;
+            return (int64_t)proc_cur()->brk_cur;
         if (mem_map(cur_top, new_top - cur_top, MEM_PROT_R | MEM_PROT_W) < 0)
-            return (int64_t)brk_cur;
+            return (int64_t)proc_cur()->brk_cur;
     } else if (new_top < cur_top) {
         mem_unmap(new_top, cur_top - new_top);
     }
-    brk_cur = want;
+    proc_cur()->brk_cur = want;
     return (int64_t)want;
 }
 
@@ -693,15 +689,14 @@ static int64_t sys_rt_sigtimedwait(cpu_t *c, uint64_t set, uint64_t info, uint64
 
 static int64_t sys_prctl(uint64_t option, uint64_t arg2)
 {
-    static int dumpable = 1; /* SUID_DUMP_USER: the default, and the only value kept */
     if (option == LPR_SET_VMA) /* anonymous VMA names are not kept; the oracle kernel returns EINVAL too */
         return -LE_INVAL;
     if (option == LPR_GET_DUMPABLE)
-        return dumpable;
+        return proc_cur()->dumpable;
     if (option == LPR_SET_DUMPABLE) {
         if (arg2 > 1)
             return -LE_INVAL;
-        dumpable = (int)arg2;
+        proc_cur()->dumpable = (int)arg2;
         return 0;
     }
     if (option == LPR_SET_NAME) {
@@ -774,7 +769,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_uname(a[0]);
         return;
     case SYS_GETPID:
-        *ret = GUEST_TID;
+        *ret = proc_cur()->pid;
         return;
     case SYS_GETTID:
         *ret = (int64_t)sched_tid();
@@ -798,10 +793,10 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_gettimeofday(a[0], a[1]);
         return;
     case SYS_GETPPID:
-        *ret = GUEST_PPID;
+        *ret = proc_cur()->ppid;
         return;
     case SYS_GETPGID:
-        *ret = GUEST_PGID;
+        *ret = proc_cur()->pgid;
         return;
     case SYS_SCHED_YIELD:
         c->stop = 1; /* the rest of the slice goes to the next thread */

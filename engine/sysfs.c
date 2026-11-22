@@ -8,6 +8,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "proc.h"
 #include "syscall.h"
 #include "vfs.h"
 
@@ -44,7 +45,6 @@
 #define STATFS_EXT4_MAGIC 0xEF53
 
 static uint8_t iobuf[IO_CHUNK];
-static uint32_t umask_bits = 022;
 
 /* ---------- guest structure writers ---------- */
 
@@ -510,8 +510,8 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_CHDIR: *ret = sys_chdir(a[0]); return 1;
     case SYS_FCHDIR: *ret = vfs_fchdir((int)(int32_t)a[0]); return 1;
     case SYS_UMASK: {
-        uint32_t old = umask_bits;
-        umask_bits = (uint32_t)a[0] & 0777u;
+        uint32_t old = proc_cur()->umask;
+        proc_cur()->umask = (uint32_t)a[0] & 0777u;
         *ret = old;
         return 1;
     }

@@ -15,6 +15,7 @@
 #include "linux.h"
 #include "mem.h"
 #include "prof.h"
+#include "proc.h"
 
 #define MAX_THREADS SCHED_MAX_THREADS
 #define TID_MAIN 1000u
@@ -40,6 +41,7 @@ typedef struct thread {
     uint64_t deadline;   /* host monotonic ns */
     uint64_t clear_child_tid;
     char comm[16];
+    proc_t *proc; /* the process this thread belongs to */
 } thread_t;
 
 /* sched_wait_kind and sched_wake take a cpu_t pointer and cast it to thread_t. */
@@ -47,8 +49,7 @@ _Static_assert(offsetof(thread_t, cpu) == 0, "thread_t must start with its cpu_t
 
 static thread_t *threads[MAX_THREADS];
 static int cur_slot;          /* slot of the running thread */
-static int proc_done;
-static int proc_code;
+static proc_t *init_proc; /* the initial process: its exit ends the engine */
 static uint64_t next_tid = TID_FIRST_NEW;
 static uint64_t dead_icount;  /* instructions of threads already reaped */
 static char init_name[16] = "xiaoji";
@@ -64,7 +65,7 @@ static int live_count(void)
     return n;
 }
 
-static thread_t *add_thread(const cpu_t *from, uint64_t tid)
+static thread_t *add_thread(const cpu_t *from, uint64_t tid, proc_t *p)
 {
     for (int i = 0; i < MAX_THREADS; i++) {
         if (threads[i])
@@ -80,6 +81,8 @@ static thread_t *add_thread(const cpu_t *from, uint64_t tid)
         t->cpu.icount = 0; /* the copy is the parent: a new thread counts its own instructions */
         t->cpu.excl_valid = 0; /* a new thread never inherits the exclusive monitor */
         t->state = TS_RUNNABLE;
+        t->proc = p;
+        p->nthreads++;
         threads[i] = t;
         return t;
     }
@@ -91,6 +94,7 @@ static void reap(int slot)
     if (prof_on)
         prof_thread_end(threads[slot]->cpu.tid, threads[slot]->cpu.icount);
     dead_icount += threads[slot]->cpu.icount;
+    threads[slot]->proc->nthreads--;
     free(threads[slot]);
     threads[slot] = NULL;
 }
@@ -275,7 +279,7 @@ static void report_deadlock(void)
 
 int sched_run(cpu_t *main_cpu)
 {
-    thread_t *m = add_thread(main_cpu, TID_MAIN);
+    thread_t *m = add_thread(main_cpu, TID_MAIN, proc_cur());
     if (!m) {
         fprintf(stderr, "xiaoji: out of host memory\n");
         return 1;
@@ -284,19 +288,22 @@ int sched_run(cpu_t *main_cpu)
     if (prof_on)
         prof_thread_new(TID_MAIN, m->comm);
     cur_slot = 0;
-    proc_done = 0;
+    init_proc = proc_cur();
+    init_proc->exited = 0;
 
-    while (!proc_done) {
+    while (!init_proc->exited) {
         expire_timers(host_monotonic_ns());
         thread_t *t = pick();
         if (!t) {
             if (!wait_for_timers()) {
                 report_deadlock();
-                proc_code = DEADLOCK_STATUS;
+                init_proc->exit_code = DEADLOCK_STATUS;
                 break;
             }
             continue;
         }
+        if (t->proc != proc_cur())
+            proc_switch(t->proc); /* another process: its address space and files */
         t->cpu.stop = 0;
         t->cpu.budget = SCHED_SLICE;
         /* A context switch clears the exclusive monitor, as on hardware, so
@@ -306,26 +313,27 @@ int sched_run(cpu_t *main_cpu)
         cpu_run(&t->cpu);
         if (prof_on)
             prof_slice(t->cpu.tid, t->cpu.budget == 0);
-        if (proc_done)
+        if (init_proc->exited)
             break;
         if (t->cpu.exited) {
             if (live_count() == 1) {
                 /* The last thread: its status is the process status. */
-                proc_code = t->cpu.exit_code;
-                proc_done = 1;
+                t->proc->exit_code = t->cpu.exit_code;
+                t->proc->exited = 1;
             }
             reap(cur_slot);
         }
     }
     /* Unreaped threads (the process ended while they lived) add their counts. */
-    return proc_code;
+    return init_proc->exit_code;
 }
 
 void sched_exit_process(uint64_t code)
 {
-    if (!proc_done) {
-        proc_done = 1;
-        proc_code = (int)(code & 0xFF);
+    proc_t *p = cur() ? cur()->proc : proc_cur();
+    if (!p->exited) {
+        p->exited = 1;
+        p->exit_code = (int)(code & 0xFF);
     }
     if (cur()) {
         cur()->cpu.exited = 1;
@@ -372,7 +380,7 @@ int64_t sched_clone(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid
         if (mem_copy_in(ctid, &tid32, sizeof tid32) < 0)
             return -LE_FAULT;
     }
-    thread_t *t = add_thread(parent, tid);
+    thread_t *t = add_thread(parent, tid, me->proc);
     if (!t)
         return -LE_NOMEM;
     next_tid++;

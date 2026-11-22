@@ -72,15 +72,36 @@ typedef struct {
 /* A region with no file or memfd behind it. Only these merge with neighbours. */
 static int reg_anon(const region_t *r) { return !r->path && !r->shm; }
 
-static uint64_t **l1;
+/* One address space: its page table and its region list. The TLBs and the fetch
+ * cache are not part of it: they stay at fixed addresses (the translator bakes them
+ * in) and are flushed on every switch. */
+struct mm {
+    uint64_t **l1;
+    region_t *regs;
+    size_t nregs, cregs;
+};
+
+static mm_t *cur_mm;
 static tlb_ent tlb_rd[TLB_SIZE];
 static tlb_ent tlb_wr[TLB_SIZE];
 static uint64_t fetch_tag;
 static uint8_t *fetch_page;
 static uint64_t cur_pc;
 
-static region_t *regs;
-static size_t nregs, cregs;
+static void tlb_flush(void);
+
+mm_t *mem_mm_new(void) { return calloc(1, sizeof(mm_t)); }
+
+/* Makes m the running address space. The first call installs it without a flush. */
+void mem_mm_switch(mm_t *m)
+{
+    if (cur_mm == m)
+        return;
+    int first = cur_mm == NULL;
+    cur_mm = m;
+    if (!first)
+        tlb_flush();
+}
 
 static void die_oom(void)
 {
@@ -105,14 +126,14 @@ static uint64_t *pte_slot(uint64_t vpn, int create)
 {
     if (vpn >= VPN_LIMIT)
         return NULL;
-    if (!l1) {
+    if (!cur_mm->l1) {
         if (!create)
             return NULL;
-        l1 = calloc(L1_COUNT, sizeof *l1);
-        if (!l1)
+        cur_mm->l1 = calloc(L1_COUNT, sizeof *cur_mm->l1);
+        if (!cur_mm->l1)
             die_oom();
     }
-    uint64_t **l2 = &l1[vpn >> 18];
+    uint64_t **l2 = &cur_mm->l1[vpn >> 18];
     if (!*l2) {
         if (!create)
             return NULL;
@@ -163,10 +184,10 @@ static void mem_segv(uint64_t va)
 /* Index of the first region with end > va. */
 static size_t reg_lower(uint64_t va)
 {
-    size_t lo = 0, hi = nregs;
+    size_t lo = 0, hi = cur_mm->nregs;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (regs[mid].end <= va)
+        if (cur_mm->regs[mid].end <= va)
             lo = mid + 1;
         else
             hi = mid;
@@ -190,34 +211,34 @@ static char *dup_path(const char *p)
 static void reg_splice(size_t i, size_t j, const region_t *src, size_t n)
 {
     size_t removed = j - i;
-    size_t want = nregs - removed + n;
-    if (want > cregs) {
-        size_t nc = cregs ? cregs : 64;
+    size_t want = cur_mm->nregs - removed + n;
+    if (want > cur_mm->cregs) {
+        size_t nc = cur_mm->cregs ? cur_mm->cregs : 64;
         while (nc < want)
             nc *= 2;
-        region_t *nr = realloc(regs, nc * sizeof *regs);
+        region_t *nr = realloc(cur_mm->regs, nc * sizeof *cur_mm->regs);
         if (!nr)
             die_oom();
-        regs = nr;
-        cregs = nc;
+        cur_mm->regs = nr;
+        cur_mm->cregs = nc;
     }
-    memmove(&regs[i + n], &regs[j], (nregs - j) * sizeof *regs);
+    memmove(&cur_mm->regs[i + n], &cur_mm->regs[j], (cur_mm->nregs - j) * sizeof *cur_mm->regs);
     for (size_t k = 0; k < n; k++)
-        regs[i + k] = src[k];
-    nregs = want;
+        cur_mm->regs[i + k] = src[k];
+    cur_mm->nregs = want;
 }
 
 /* Removes [a, b) from the region list, keeping the parts outside it. */
 static void reg_clear(uint64_t a, uint64_t b)
 {
     size_t i = reg_lower(a), j = i;
-    while (j < nregs && regs[j].start < b)
+    while (j < cur_mm->nregs && cur_mm->regs[j].start < b)
         j++;
     if (i == j)
         return;
     region_t keep[2];
     size_t nk = 0;
-    region_t first = regs[i], last = regs[j - 1];
+    region_t first = cur_mm->regs[i], last = cur_mm->regs[j - 1];
     if (first.start < a) {
         keep[nk].start = first.start;
         keep[nk].end = a;
@@ -237,8 +258,8 @@ static void reg_clear(uint64_t a, uint64_t b)
         nk++;
     }
     for (size_t k = i; k < j; k++) {
-        free(regs[k].path);
-        memfd_unref(regs[k].shm);
+        free(cur_mm->regs[k].path);
+        memfd_unref(cur_mm->regs[k].shm);
     }
     reg_splice(i, j, keep, nk);
 }
@@ -251,17 +272,17 @@ static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off, memf
     size_t i = reg_lower(a);
     if (!path && !shm) {
         /* Merge with anonymous neighbours so long-lived ranges stay one entry. */
-        if (i > 0 && regs[i - 1].end == a && reg_anon(&regs[i - 1])) {
-            regs[i - 1].end = b;
-            if (i < nregs && regs[i].start == b && reg_anon(&regs[i])) {
-                regs[i - 1].end = regs[i].end;
-                free(regs[i].path);
+        if (i > 0 && cur_mm->regs[i - 1].end == a && reg_anon(&cur_mm->regs[i - 1])) {
+            cur_mm->regs[i - 1].end = b;
+            if (i < cur_mm->nregs && cur_mm->regs[i].start == b && reg_anon(&cur_mm->regs[i])) {
+                cur_mm->regs[i - 1].end = cur_mm->regs[i].end;
+                free(cur_mm->regs[i].path);
                 reg_splice(i, i + 1, NULL, 0);
             }
             return;
         }
-        if (i < nregs && regs[i].start == b && reg_anon(&regs[i])) {
-            regs[i].start = a;
+        if (i < cur_mm->nregs && cur_mm->regs[i].start == b && reg_anon(&cur_mm->regs[i])) {
+            cur_mm->regs[i].start = a;
             return;
         }
     }
@@ -273,11 +294,11 @@ static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off, memf
 memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off)
 {
     size_t i = reg_lower(va);
-    if (i >= nregs || regs[i].start > va || !regs[i].shm)
+    if (i >= cur_mm->nregs || cur_mm->regs[i].start > va || !cur_mm->regs[i].shm)
         return NULL;
-    *start = regs[i].start;
-    *off = regs[i].off;
-    return regs[i].shm;
+    *start = cur_mm->regs[i].start;
+    *off = cur_mm->regs[i].off;
+    return cur_mm->regs[i].shm;
 }
 
 unsigned mem_prot_at(uint64_t va)
@@ -291,12 +312,12 @@ unsigned mem_prot_at(uint64_t va)
 int mem_region_next(uint64_t va, uint64_t *start, uint64_t *end, const char **path, uint64_t *off)
 {
     size_t i = reg_lower(va);
-    if (i >= nregs)
+    if (i >= cur_mm->nregs)
         return 0;
-    *start = regs[i].start;
-    *end = regs[i].end;
-    *path = regs[i].path;
-    *off = regs[i].off;
+    *start = cur_mm->regs[i].start;
+    *end = cur_mm->regs[i].end;
+    *path = cur_mm->regs[i].path;
+    *off = cur_mm->regs[i].off;
     return 1;
 }
 
@@ -542,9 +563,9 @@ int mem_is_mapped(uint64_t va, uint64_t len)
     uint64_t pos = va, end = va + len;
     while (pos < end) {
         size_t i = reg_lower(pos);
-        if (i >= nregs || regs[i].start > pos)
+        if (i >= cur_mm->nregs || cur_mm->regs[i].start > pos)
             return 0;
-        pos = regs[i].end;
+        pos = cur_mm->regs[i].end;
     }
     return 1;
 }
@@ -552,7 +573,7 @@ int mem_is_mapped(uint64_t va, uint64_t len)
 int mem_range_free(uint64_t va, uint64_t len)
 {
     size_t i = reg_lower(va);
-    return !(i < nregs && regs[i].start < va + len);
+    return !(i < cur_mm->nregs && cur_mm->regs[i].start < va + len);
 }
 
 int mem_protect(uint64_t va, uint64_t len, unsigned prot)
@@ -579,8 +600,8 @@ uint64_t mem_find_free(uint64_t len, uint64_t hint)
         return hint;
     /* Walk the gaps between regions, from the top down. */
     uint64_t top = MMAP_TOP;
-    for (size_t i = nregs; i > 0; i--) {
-        region_t *r = &regs[i - 1];
+    for (size_t i = cur_mm->nregs; i > 0; i--) {
+        region_t *r = &cur_mm->regs[i - 1];
         if (r->start >= top)
             continue;
         if (r->end < top && top - r->end >= len)
@@ -598,7 +619,7 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
         return -1;
     /* Region pieces inside the source range, clipped to it. */
     size_t i = reg_lower(from), j = i;
-    while (j < nregs && regs[j].start < from + len)
+    while (j < cur_mm->nregs && cur_mm->regs[j].start < from + len)
         j++;
     size_t np = j - i;
     region_t *pieces = NULL;
@@ -607,7 +628,7 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
         if (!pieces)
             die_oom();
         for (size_t k = 0; k < np; k++) {
-            region_t *r = &regs[i + k];
+            region_t *r = &cur_mm->regs[i + k];
             uint64_t s = r->start < from ? from : r->start;
             uint64_t e = r->end > from + len ? from + len : r->end;
             pieces[k].start = s - from + to;

@@ -8,9 +8,9 @@
 
 #include "linux.h"
 #include "mem.h"
+#include "proc.h"
 #include "sched.h"
 
-#define GUEST_PID 1000 /* the process id; the main thread's tid (see syscall.c) */
 #define SIG_MAX 64
 #define SIGSET_SIZE 8
 #define SIGKILL_N 9
@@ -67,8 +67,18 @@ typedef struct {
     uint64_t handler, flags, restorer, mask;
 } guest_sigaction;
 
-static guest_sigaction sigactions[SIG_MAX + 1]; /* per process */
-static uint64_t tramp_va;                       /* `mov x8,#139; svc #0`, when SA_RESTORER is absent */
+/* One process's handler table, and the return trampoline (`mov x8,#139; svc #0`,
+ * used when SA_RESTORER is absent). */
+struct sigtab {
+    guest_sigaction act[SIG_MAX + 1];
+    uint64_t tramp_va;
+};
+
+static sigtab_t *cur_sig;
+
+size_t sig_tab_size(void) { return sizeof(sigtab_t); }
+
+void sig_tab_switch(sigtab_t *t) { cur_sig = t; }
 
 static uint64_t bit(int sig) { return 1ull << (sig - 1); }
 
@@ -110,14 +120,14 @@ static int ignored_for(const cpu_t *c, int sig)
 {
     if (c->sig_mask & bit(sig))
         return 0;
-    uint64_t h = sigactions[sig].handler;
+    uint64_t h = cur_sig->act[sig].handler;
     return h == SIG_IGN_H || (h == SIG_DFL_H && default_ignored(sig));
 }
 
 /* A synchronous fault can be caught only by a real handler that is not blocked. */
 static int catchable_now(const cpu_t *c, int sig)
 {
-    return sigactions[sig].handler > SIG_IGN_H && !(c->sig_mask & bit(sig));
+    return cur_sig->act[sig].handler > SIG_IGN_H && !(c->sig_mask & bit(sig));
 }
 
 static void die_by_signal(int sig)
@@ -137,7 +147,7 @@ void sig_segv_fatal(uint64_t addr, uint64_t pc)
 
 static int ensure_trampoline(void)
 {
-    if (tramp_va)
+    if (cur_sig->tramp_va)
         return 0;
     uint64_t va = mem_find_free(MEM_PAGE_SIZE, 0);
     if (!va || mem_map(va, MEM_PAGE_SIZE, MEM_PROT_R | MEM_PROT_X) < 0)
@@ -147,7 +157,7 @@ static int ensure_trampoline(void)
     put32(code + 4, 0xD4000001u); /* svc #0 */
     if (mem_poke(va, code, sizeof code) < 0)
         return -1;
-    tramp_va = va;
+    cur_sig->tramp_va = va;
     return 0;
 }
 
@@ -155,7 +165,7 @@ static int ensure_trampoline(void)
  * synchronous fault, si_addr and fault_address are addr; otherwise si_pid is pid. */
 static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uint32_t pid)
 {
-    const guest_sigaction *sa = &sigactions[sig];
+    const guest_sigaction *sa = &cur_sig->act[sig];
     uint64_t sp = c->sp;
     if ((sa->flags & SA_ONSTACK) && alt_enabled(c) && !on_altstack(c, sp))
         sp = c->alt_sp + c->alt_size;
@@ -164,7 +174,7 @@ static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uin
     if (!(sa->flags & SA_RESTORER)) {
         if (ensure_trampoline() < 0)
             return -1;
-        tramp = tramp_va;
+        tramp = cur_sig->tramp_va;
     }
 
     uint8_t f[FRAME_SIZE];
@@ -212,7 +222,7 @@ static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uin
     c->sig_mask = m & ~UNBLOCKABLE;
     c->excl_valid = 0;
     if (sa->flags & SA_RESETHAND)
-        sigactions[sig].handler = SIG_DFL_H;
+        cur_sig->act[sig].handler = SIG_DFL_H;
     return 0;
 }
 
@@ -223,7 +233,7 @@ void sig_deliver_pending(cpu_t *c)
         return;
     int sig = __builtin_ctzll(ready) + 1;
     c->sig_pending &= ~bit(sig);
-    uint64_t h = sigactions[sig].handler;
+    uint64_t h = cur_sig->act[sig].handler;
     if (h == SIG_IGN_H || (h == SIG_DFL_H && default_ignored(sig)))
         return;
     if (h == SIG_DFL_H) {
@@ -307,13 +317,13 @@ int64_t sig_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oact, uint64_t sig
         return -LE_INVAL;
     if (act && (sig == SIGKILL_N || sig == SIGSTOP_N))
         return -LE_INVAL;
-    if (oact && mem_copy_in(oact, &sigactions[sig], SA_SIZE) < 0)
+    if (oact && mem_copy_in(oact, &cur_sig->act[sig], SA_SIZE) < 0)
         return -LE_FAULT;
     if (act) {
         guest_sigaction n;
         if (mem_copy_out(&n, act, SA_SIZE) < 0)
             return -LE_FAULT;
-        sigactions[sig] = n;
+        cur_sig->act[sig] = n;
     }
     return 0;
 }
@@ -433,14 +443,14 @@ int64_t sig_kill(uint64_t pid64, uint64_t sig)
     if (sig > SIG_MAX)
         return -LE_INVAL;
     /* This process is the only one, so pid 0 and negative pids also mean it. */
-    if (pid > 0 && pid != GUEST_PID)
+    if (pid > 0 && pid != proc_cur()->pid)
         return -LE_SRCH;
     if (sig == 0)
         return 0;
     cpu_t *t = process_target((int)sig);
     if (!t)
         return -LE_SRCH;
-    raise_for(t, (int)sig, SI_USER, GUEST_PID);
+    raise_for(t, (int)sig, SI_USER, proc_cur()->pid);
     return 0;
 }
 
@@ -453,7 +463,7 @@ static int64_t thread_kill(uint64_t tid, uint64_t sig)
         return -LE_SRCH;
     if (sig == 0)
         return 0;
-    raise_for(t, (int)sig, SI_TKILL, GUEST_PID);
+    raise_for(t, (int)sig, SI_TKILL, proc_cur()->pid);
     return 0;
 }
 
@@ -461,7 +471,7 @@ int64_t sig_tkill(uint64_t tid, uint64_t sig) { return thread_kill(tid, sig); }
 
 int64_t sig_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
 {
-    if ((int32_t)tgid != GUEST_PID)
+    if ((int32_t)tgid != proc_cur()->pid)
         return -LE_SRCH;
     return thread_kill(tid, sig);
 }

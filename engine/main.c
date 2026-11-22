@@ -17,6 +17,7 @@ EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); 
 #include "host.h"
 #include "loader.h"
 #include "mem.h"
+#include "proc.h"
 #include "prof.h"
 #include "sched.h"
 #include "signals.h"
@@ -108,6 +109,7 @@ int main(int argc, char **argv)
     int gargc = argc - i;
     const char *path = gargv[0];
 
+    proc_init(); // the initial process: its address space, fd table and signal handlers
     if (vfs_init(g_root, path, gargc, gargv) < 0) {
         fprintf(stderr, "xiaoji: root path too long\n");
         return 2;

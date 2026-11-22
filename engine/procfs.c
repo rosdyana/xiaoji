@@ -10,12 +10,10 @@
 
 #include "loader.h"
 #include "mem.h"
+#include "proc.h"
 #include "sched.h"
 
 /* The guest pid. The main thread's tid is the process pid (see syscall.c). */
-#define PROC_PID 1000
-#define PROC_PPID 1
-#define PROC_PGRP 1000
 
 typedef struct {
     char *p;
@@ -89,9 +87,9 @@ static void build_stat(sbuf *b)
         vsize += e - s;
         va = e;
     }
-    f[0] = PROC_PPID;                       /* 4 ppid */
-    f[1] = PROC_PGRP;                       /* 5 pgrp */
-    f[2] = PROC_PGRP;                       /* 6 session */
+    f[0] = proc_cur()->ppid;                       /* 4 ppid */
+    f[1] = proc_cur()->pgid;                       /* 5 pgrp */
+    f[2] = proc_cur()->sid;                       /* 6 session */
     f[4] = -1;                              /* 8 tpgid */
     f[5] = 4194304;                         /* 9 flags */
     f[14] = 20;                             /* 18 priority */
@@ -104,7 +102,7 @@ static void build_stat(sbuf *b)
     uint64_t slo, shi;
     loader_stack_range(&slo, &shi);
     f[24] = (long long)(shi - 16);
-    sb_fmt(b, "%d (%s) S", PROC_PID, sched_name());
+    sb_fmt(b, "%d (%s) S", proc_cur()->pid, sched_name());
     for (int i = 0; i < 49; i++) {
         if (i == 21) /* 25 rsslim: unlimited */
             sb_fmt(b, " 18446744073709551615");

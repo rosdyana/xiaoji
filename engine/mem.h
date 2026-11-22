@@ -23,6 +23,11 @@
 
 /* A fault in a guest access longjmps to the buffer set here (NULL: no buffer, so
  * the process exits). Returns the previous buffer. */
+/* Address spaces. mem_mm_switch installs m (flushing the TLBs and translation caches). */
+typedef struct mm mm_t;
+mm_t *mem_mm_new(void);
+void mem_mm_switch(mm_t *m);
+
 jmp_buf *mem_set_fault_jmp(jmp_buf *jb);
 void mem_fault_info(uint64_t *addr, int *code);
 uint64_t mem_cur_pc(void);

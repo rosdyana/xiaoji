@@ -1,6 +1,7 @@
 #ifndef XIAOJI_SIGNALS_H
 #define XIAOJI_SIGNALS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "cpu_a64.h"
@@ -8,6 +9,11 @@
 #define SIGILL_N 4
 #define SIGSEGV_N 11
 #define ILL_ILLOPC 1 /* si_code for SIGILL */
+
+/* Per-process handler tables. sig_tab_switch makes t the running table. */
+typedef struct sigtab sigtab_t;
+size_t sig_tab_size(void); /* bytes for one zeroed table */
+void sig_tab_switch(sigtab_t *t);
 
 /* Syscalls. Each returns the Linux result (negative errno) unless noted. */
 int64_t sig_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oact, uint64_t sigsetsize);

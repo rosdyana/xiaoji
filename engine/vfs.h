@@ -44,6 +44,11 @@ typedef struct {
 
 /* host_root NULL means the host root "/". prog is the guest path of the
  * program (for /proc/self/exe) and argv its arguments (for /proc/self/cmdline). */
+/* Per-process fd tables. vfs_fdtab_switch makes t the running table. */
+typedef struct fdtab fdtab_t;
+fdtab_t *vfs_fdtab_new(void);
+void vfs_fdtab_switch(fdtab_t *t);
+
 int vfs_init(const char *host_root, const char *prog, int argc, char **argv);
 
 /* Resolves path (relative to dirfd, or the guest cwd for LAT_FDCWD) component by
