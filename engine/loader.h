@@ -1,0 +1,11 @@
+/* Initial process state: the Linux stack with argv, envp and auxv. */
+#ifndef XIAOJI_LOADER_H
+#define XIAOJI_LOADER_H
+
+#include "cpu_a64.h"
+#include "elf.h"
+
+/* Maps the 8 MiB stack and sets c->sp. Returns 0 or -1. */
+int loader_setup_stack(cpu_t *c, const elf_info *ei, int argc, char **argv, int envc, char **envp);
+
+#endif

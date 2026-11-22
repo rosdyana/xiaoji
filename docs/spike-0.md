@@ -91,3 +91,33 @@ Engine design notes:
 ## Parallel track: trimmed AOSP 13 build
 
 The build runs on the remote machine `build-host`: x86_64, i7-12700 with 20 threads, 64 GB RAM, Ubuntu 20.04, in `~/xiaoji-aosp`. It's a shallow, partial-clone sync of `android13-release`, followed by a baseline `sdk_phone64_arm64` build (the same product as the prebuilt guest, build `TE1A.220922.034`, `sdk_phone64_arm64-userdebug`) and then a trimmed `vendor/xiaoji` product. That product sets `low_ram`, flattens APEXes, and keeps only Launcher3, SystemUI, Settings, PackageInstaller and DocumentsUI.
+
+## M0 results
+
+M0 is the ELF loader, the software guest page table, the A64 integer interpreter, the M0 syscalls and the auxv stack. `make test` runs `tests/run.sh`, which compares each freestanding guest program with a native run in the builder VM, for the engine and for `node build/wasm-node/xiaoji.js`.
+
+| Case | Engine (macOS) | Node (wasm) |
+|---|---|---|
+| `hello-O0`, `hello-O2` | PASS | PASS |
+| `args-O0`, `args-O2` | PASS | PASS |
+| `arith-O0`, `arith-O2` | PASS | PASS |
+| `control-O0`, `control-O2` | PASS | PASS |
+| `memory-O0`, `memory-O2` | PASS | PASS |
+| `glibc_hello-O2` (stretch) | XFAIL | XFAIL |
+
+Summary from `make test`: 20 passed, 0 failed, 2 XFAIL. The XFAIL is `unimplemented A64 instruction 0x4e010c20 at pc 0x40ff44`: glibc uses a SIMD instruction, and vector data processing is outside M0.
+
+Instruction rate for `control-O2` (4,577,199 instructions, `XIAOJI_STATS=1`):
+
+| Runner | Time | Rate |
+|---|---|---|
+| Native (macOS arm64, `build/xiaoji`) | 0.064 s | about 71.5 M instructions/s (3 runs: 71.3 to 71.6) |
+| Node (`build/wasm-node/xiaoji.js`) | 0.091 s | about 50 M instructions/s (runs: 49.7 to 50.4) |
+
+Conditions: battery power, Low Power Mode on (`pmset`: `lowpowermode 1`), runs of about 64 ms (native) and 91 ms (Node). Re-measure on AC power with Low Power Mode off before quoting these numbers.
+
+Notes from bringing up M0:
+- `args` prints `AT_HWCAP & 3`. The engine reports 0x3, and the native kernel reports 0x2fb3ffff.
+- Guest tests are built with `-mno-outline-atomics`. Without it gcc 14 emits calls to `__aarch64_ldadd*` helpers that `-nostdlib` cannot link.
+- Test loops are written so gcc emits no NEON code (volatile indices and volatile byte accesses). The engine rejects vector data processing.
+- Accesses with address bits 48 to 55 set (after masking the top byte) are a segfault, exit 139.

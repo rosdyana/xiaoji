@@ -1,0 +1,54 @@
+/* Guest memory: a software page table over host pages (see plan, "Memory model"). */
+#ifndef XIAOJI_MEM_H
+#define XIAOJI_MEM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define MEM_PAGE_SIZE 4096u
+#define MEM_PROT_R 1u
+#define MEM_PROT_W 2u
+#define MEM_PROT_X 4u
+#define MEM_VA_LIMIT (1ull << 48)
+
+/* Mapping. Addresses and lengths must be page aligned. Pages that are already
+ * mapped keep their contents and get the new protection. Return 0 or -1. */
+int mem_map(uint64_t va, uint64_t len, unsigned prot);
+void mem_unmap(uint64_t va, uint64_t len);
+/* Returns -1 (and changes nothing) if any page in the range is unmapped. */
+int mem_protect(uint64_t va, uint64_t len, unsigned prot);
+/* 1 if every page in the range is mapped, 0 otherwise. */
+int mem_is_mapped(uint64_t va, uint64_t len);
+/* 1 if no page in the range is mapped, 0 otherwise. */
+int mem_range_free(uint64_t va, uint64_t len);
+/* Returns a free, page-aligned range of len bytes, preferring hint if it is free.
+ * Searches downward from 0x7000_0000_0000. Returns 0 if nothing fits. */
+uint64_t mem_find_free(uint64_t len, uint64_t hint);
+
+/* Guest-side accesses. These never return on a fault: they print the segfault
+ * message and exit with status 139. Little-endian, unaligned and page-crossing
+ * accesses work. */
+uint8_t mem_read8(uint64_t va);
+uint16_t mem_read16(uint64_t va);
+uint32_t mem_read32(uint64_t va);
+uint64_t mem_read64(uint64_t va);
+void mem_read128(uint64_t va, uint64_t out[2]); /* out[0] = low 64 bits */
+void mem_write8(uint64_t va, uint8_t v);
+void mem_write16(uint64_t va, uint16_t v);
+void mem_write32(uint64_t va, uint32_t v);
+void mem_write64(uint64_t va, uint64_t v);
+void mem_write128(uint64_t va, const uint64_t in[2]);
+/* Instruction fetch: requires execute permission. */
+uint32_t mem_fetch32(uint64_t va);
+/* The CPU records the current pc here so faults can report it. */
+void mem_set_pc(uint64_t pc);
+
+/* Non-faulting accessors for syscalls and the loader. They return 0 on
+ * success and -1 if a page is unmapped or lacks the permission. */
+int mem_copy_in(uint64_t va, const void *src, size_t len);
+int mem_copy_out(void *dst, uint64_t va, size_t len);
+int mem_set(uint64_t va, uint8_t byte, size_t len);
+/* Length of the NUL-terminated string at va, or -1 on a fault. */
+int64_t mem_strlen(uint64_t va);
+
+#endif
