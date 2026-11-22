@@ -1,0 +1,4 @@
+# B4a: the classpath variables init derives (engine/init.c) are the ones derive_classpath writes
+# (the guest's own binary, run in the engine into /cache). The expected output is the four values.
+service classpath /system/bin/sh -c "/system/bin/toybox printenv BOOTCLASSPATH; /system/bin/toybox printenv DEX2OATBOOTCLASSPATH; /system/bin/toybox printenv SYSTEMSERVERCLASSPATH; /system/bin/toybox printenv STANDALONE_SYSTEMSERVER_JARS; /system/bin/setprop xiaoji.exit 1"
+    oneshot

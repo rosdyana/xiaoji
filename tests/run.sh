@@ -181,7 +181,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     case "$name" in glibc_hello*) stretch=1 ;; esac
     # prop-* programs need the engine's property service, which the native run lacks:
     # they are expectation cases (PROP_CASES below), not oracle cases.
-    case "$name" in prop-*) continue ;; esac
+    case "$name" in prop-*|initsock-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -338,6 +338,101 @@ if [ -f "build/rootfs$BINDER_TEST" ]; then
             fail=$((fail + 1))
         fi
     done
+fi
+
+# Init (B4a): the built-in init (--init) starts servicemanager and a oneshot that lists the
+# services, then stops init through the xiaoji.exit property. Stdout must equal
+# tests/expect/init-smoke.out and the exit code must be 0. Engine and Node.
+INIT_SMOKE="--init tests/init/smoke.rc --root build/rootfs --init-timeout 60"
+if [ -d build/rootfs/system/bin ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" $INIT_SMOKE >"$OUT/init-smoke.$runner.out" 2>"$OUT/init-smoke.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" $INIT_SMOKE >"$OUT/init-smoke.$runner.out" 2>"$OUT/init-smoke.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/init-smoke.$runner.out" tests/expect/init-smoke.out; then
+            echo "PASS  init-smoke $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-smoke $runner (exit $rc)"
+            diff tests/expect/init-smoke.out "$OUT/init-smoke.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
+# Init classpaths (B4a): the four classpath variables init derives from the classpath fragments
+# must equal the guest's derive_classpath output (tests/expect/init-classpath.out, made by running
+# /apex/com.android.sdkext/bin/derive_classpath in the engine). Engine and Node.
+if [ -d build/rootfs/system/bin ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/init-classpath.$runner.out" tests/expect/init-classpath.out; then
+            echo "PASS  init-classpath $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-classpath $runner (exit $rc)"
+            diff tests/expect/init-classpath.out "$OUT/init-classpath.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
+# Init cases (B4a): each config runs under --init and must print tests/expect/<name>.out, exit 0.
+# initsock is the program the socket case runs (tests/guest/initsock.c), copied into the guest.
+if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/initsock-O0 ]; then
+    mkdir -p build/rootfs/data/local/tmp
+    cp build/tests/guest/initsock-O0 build/rootfs/data/local/tmp/initsock
+fi
+for case_name in init-sockets init-ctl; do
+    case "$case_name" in
+    init-sockets) init_rc=tests/init/sockets.rc ;;
+    init-ctl) init_rc=tests/init/ctl.rc ;;
+    esac
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init "$init_rc" --root build/rootfs --init-timeout 90 >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init "$init_rc" --root build/rootfs --init-timeout 90 >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/$case_name.$runner.out" "tests/expect/$case_name.out"; then
+            echo "PASS  $case_name $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  $case_name $runner (exit $rc)"
+            diff "tests/expect/$case_name.out" "$OUT/$case_name.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+done
+
+# Zygote (B4a), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc and waits for its class
+# preload (about 40 s natively). The log must show "...preloaded N classes". Not in the default run,
+# which is kept short; the boot is stopped by --init-timeout.
+if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
+    XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
+        >"$OUT/boot.out" 2>"$OUT/boot.err"
+    if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err"; then
+        echo "PASS  zygote preload (XIAOJI_BOOT)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  zygote preload (XIAOJI_BOOT): no preloaded-classes line in $OUT/boot.err"
+        fail=$((fail + 1))
+    fi
 fi
 
 # binderLibTest (B3): libbinder end to end, with the real servicemanager and the forked

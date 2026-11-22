@@ -1,0 +1,10 @@
+# Init-made sockets (B4a): init binds /dev/socket/xiaoji for the server and passes its fd as
+# ANDROID_SOCKET_xiaoji. The client connects by path, and then stops init.
+export ANDROID_ROOT /system
+
+service server /data/local/tmp/initsock server
+    socket xiaoji stream 660 root system
+    oneshot
+
+service client /system/bin/sh -c "/data/local/tmp/initsock client; /system/bin/setprop xiaoji.exit 1"
+    oneshot

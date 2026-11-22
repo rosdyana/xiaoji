@@ -253,7 +253,7 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 break;
             }
             if (procfs_dir(cand)) {
-                if (last)
+                if (last && !procfs_task_dir(cand))
                     return -LE_NOENT;
                 strcpy(cur, cand);
                 continue;
@@ -265,7 +265,7 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 continue;
             }
             if (!strcmp(cand, "/proc/self") || !strcmp(cand, "/proc/self/fd")) {
-                if (last)
+                if (last && !procfs_task_dir(cand))
                     return -LE_NOENT;
                 strcpy(cur, cand);
                 continue;
@@ -360,6 +360,11 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
 
     /* A path that ends in "." (perms/.) names the synthetic directory it was resolved to. */
     if (out->syn == SYN_NONE && !out->is_link && selinuxfs_kind(cur) == SELFS_DIR) {
+        out->exists = 1;
+        out->syn = SYN_DIR;
+    }
+
+    if (out->syn == SYN_NONE && !out->is_link && procfs_task_dir(cur)) { /* task and fd listings */
         out->exists = 1;
         out->syn = SYN_DIR;
     }
@@ -1092,6 +1097,25 @@ static uint8_t child_dtype(const char *dir_host, const char *name)
     }
 }
 
+/* /proc/self/fd: the index-th open descriptor of the running table, in number order. */
+static int fd_child(const char *guest, int index, const char **name)
+{
+    static char buf[16];
+    if (strcmp(guest, "/proc/self/fd") || index < 0)
+        return 0;
+    int k = 0;
+    for (int i = 0; i < VFS_MAX_FD; i++) {
+        if (!cur_fdt->slots[i].desc)
+            continue;
+        if (k++ == index) {
+            snprintf(buf, sizeof buf, "%d", i);
+            *name = buf;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* getdents of a synthetic directory: ".", "..", then its children. dpos is the index of
  * the next entry. */
 static int64_t syn_getdents(vfs_fd *f, uint8_t *buf, size_t cap)
@@ -1104,7 +1128,9 @@ static int64_t syn_getdents(vfs_fd *f, uint8_t *buf, size_t cap)
             name = ".";
         } else if (f->dpos == 1) {
             name = "..";
-        } else if (!selinuxfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir)) {
+        } else if (!selinuxfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
+                   !procfs_task_child(f->guest, (int)(f->dpos - 2), &name) &&
+                   !fd_child(f->guest, (int)(f->dpos - 2), &name)) {
             break;
         }
         size_t nl = strlen(name);
@@ -1252,6 +1278,9 @@ int vfs_stat_res(const vfs_res *r, host_stat *out)
     }
     if (rc)
         return rc;
+    /* A path that bind made a socket node: the placeholder file reports as a socket. */
+    if (r->syn == SYN_NONE && sock_is_fsnode(r->guest))
+        out->mode = (out->mode & ~(uint32_t)0170000) | 0140000;
     out->uid = 0; /* the root-run oracle reports uid and gid 0 */
     out->gid = 0;
     return 0;
@@ -1336,21 +1365,36 @@ int vfs_stat_props(host_stat *out)
     return 0;
 }
 
-int vfs_socket(int cloexec, int dgram)
+int vfs_socket_adopt(sock_t *s, int cloexec, int nonblock)
 {
     int slot = free_fd_from(0);
-    if (slot < 0)
+    if (slot < 0) {
+        sock_unref(s); /* the description never took the reference */
         return -LE_MFILE;
-    sock_t *s = sock_new(dgram);
-    if (!s)
-        die_oom();
+    }
     vfs_fd *f = desc_new();
     f->kind = VFS_SOCK;
     f->sock = s;
-    f->lflags = LO_RDWR;
+    f->lflags = LO_RDWR | (nonblock ? LO_NONBLOCK : 0);
     slot_install(slot, f, cloexec != 0);
     return slot;
 }
+
+int vfs_socket(int cloexec, int type, int nonblock)
+{
+    if (free_fd_from(0) < 0)
+        return -LE_MFILE;
+    sock_t *s = sock_new(type);
+    if (!s)
+        return -LE_NOMEM;
+    return vfs_socket_adopt(s, cloexec, nonblock);
+}
+
+void vfs_desc_ref(vfs_fd *d)
+{
+    d->refs++;
+}
+
 
 int vfs_load_file(const char *path, uint8_t **data, size_t *len, char *canon, size_t cap)
 {

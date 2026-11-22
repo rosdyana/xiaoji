@@ -1,0 +1,9 @@
+# B4a: init's service lifecycle. looper is stopped, started and restarted with ctl.* properties;
+# crasher exits at once, so init restarts it until its crash-loop limit stops it. The driver polls
+# init.svc.* (it never sleeps for a fixed time), then stops init through xiaoji.exit.
+service looper /system/bin/toybox sleep 100
+
+service crasher /system/bin/toybox false
+
+service driver /system/bin/sh -c "i=0; until test $(/system/bin/getprop init.svc.looper) = running; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; echo looper $(/system/bin/getprop init.svc.looper); /system/bin/setprop ctl.stop looper; i=0; until test $(/system/bin/getprop init.svc.looper) = stopped; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; echo after stop $(/system/bin/getprop init.svc.looper); /system/bin/setprop ctl.start looper; i=0; until test $(/system/bin/getprop init.svc.looper) = running; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; echo after start $(/system/bin/getprop init.svc.looper); /system/bin/setprop ctl.restart looper; /system/bin/toybox sleep 1; echo after restart $(/system/bin/getprop init.svc.looper); i=0; until test $(/system/bin/getprop init.svc.crasher) = stopped; do i=$((i+1)); [ $i -gt 300 ] && break; /system/bin/toybox sleep 0.1; done; echo crasher $(/system/bin/getprop init.svc.crasher); /system/bin/setprop ctl.stop looper; /system/bin/setprop xiaoji.exit 1"
+    oneshot

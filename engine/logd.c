@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "host.h"
 #include "logd.h"
 #include "proc.h"
+#include "sched.h"
 
 #define LOGD_HDR_LEN 11
 /* log_id values from liblog's log.h: MAIN, RADIO, SYSTEM and CRASH are text. */
@@ -61,6 +63,18 @@ static void print_datagram(const uint8_t *buf, size_t n)
     size_t msg_end = find_nul(buf, msg_start, n);
     /* The sender is the calling process: the datagram carries no pid. */
     proc_t *p = proc_cur();
+    /* XIAOJI_STAMP=1: each line starts with the time since the first line and the instructions run
+     * so far, so a milestone's cost can be read from the log. */
+    static int stamp = -1;
+    static uint64_t t0;
+    if (stamp < 0) {
+        const char *e = getenv("XIAOJI_STAMP");
+        stamp = e && e[0] == '1';
+        t0 = host_monotonic_ns();
+    }
+    if (stamp)
+        fprintf(stderr, "[%llu ms %llu insn] ", (unsigned long long)((host_monotonic_ns() - t0) / 1000000ull),
+                (unsigned long long)sched_icount());
     fprintf(stderr, "%c/%.*s(%d): %.*s\n", prio_letter(prio), (int)(tag_end - (LOGD_HDR_LEN + 1)),
             (const char *)buf + LOGD_HDR_LEN + 1, p ? p->pid : 0, (int)(msg_end - msg_start),
             (const char *)buf + msg_start);

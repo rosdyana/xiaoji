@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "init.h"
 #include "memfd.h"
 #include "props.h"
 #include "sched.h"
@@ -439,8 +440,13 @@ uint32_t props_set(const char *name, size_t n, const char *value, size_t vlen)
     if (vlen >= PROP_VALUE_MAX && !ro)
         return PROP_ERROR_INVALID_VALUE;
     if (n >= 4 && !memcmp(name, "ctl.", 4)) {
-        /* init acts on these (start, stop, restart a service). B4 will; for now, log. */
-        fprintf(stderr, "xiaoji: property service: %.*s=%.*s (ctl: not acted on)\n", (int)n, name,
+        /* init acts on these (start, stop, restart a service), between slices. Without init
+         * they are logged and ignored. */
+        if (init_active()) {
+            init_ctl_request(name, n, value, vlen);
+            return PROP_SUCCESS;
+        }
+        fprintf(stderr, "xiaoji: property service: %.*s=%.*s (ctl: no init)\n", (int)n, name,
                 (int)vlen, value);
         return PROP_SUCCESS;
     }
@@ -458,6 +464,7 @@ uint32_t props_set(const char *name, size_t n, const char *value, size_t vlen)
         bump_area_serial();
     }
     area_flush();
+    init_prop_changed(name, n, value, vlen);
     return PROP_SUCCESS;
 }
 

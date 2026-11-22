@@ -120,10 +120,41 @@ int procfs_dir(const char *guest)
 {
     const char *rest;
     if (live_proc(guest, &rest))
-        return rest[0] == 0 || !strcmp(rest, "/attr");
-    return !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
+        return rest[0] == 0 || !strcmp(rest, "/attr") || !strcmp(rest, "/task");
+    return !strcmp(guest, "/proc/self/task") || !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
            !strcmp(guest, "/sys/devices/system/cpu") || !strcmp(guest, "/proc/self/attr") ||
            !strcmp(guest, "/proc/thread-self") || !strcmp(guest, "/proc/thread-self/attr");
+}
+
+int procfs_task_dir(const char *guest)
+{
+    int pid = 0;
+    const char *rest = NULL;
+    if (!strcmp(guest, "/proc/self/task") || !strcmp(guest, "/proc/self/fd"))
+        return 1;
+    return procfs_pid_path(guest, &pid, &rest) && rest && !strcmp(rest, "/task");
+}
+
+/* The index-th entry of a /proc/<pid>/task (or /proc/self/task) directory: its thread id. */
+int procfs_task_child(const char *guest, int index, const char **name)
+{
+    static char buf[24];
+    int pid = 0;
+    const char *rest = NULL;
+    proc_t *p = NULL;
+    if (!strcmp(guest, "/proc/self/task"))
+        p = proc_cur();
+    else if (procfs_pid_path(guest, &pid, &rest) && rest && !strcmp(rest, "/task"))
+        p = proc_find(pid);
+    if (!p || index < 0)
+        return 0;
+    cpu_t *ts[SCHED_MAX_THREADS];
+    int n = sched_threads_of(p, ts, SCHED_MAX_THREADS);
+    if (index >= n)
+        return 0;
+    snprintf(buf, sizeof buf, "%llu", (unsigned long long)ts[index]->tid);
+    *name = buf;
+    return 1;
 }
 
 /* The last component of a process's program path (its name, when it is not the caller). */

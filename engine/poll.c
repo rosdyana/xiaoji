@@ -84,13 +84,24 @@ uint32_t poll_revents(vfs_fd *f, uint32_t events)
         if (tfd_readable(f->obj))
             r |= PX_IN;
         break;
+    case VFS_SOCK: {
+        int readable, writable, hup;
+        sock_state(f->sock, &readable, &writable, &hup);
+        if (readable)
+            r |= PX_IN;
+        if (writable)
+            r |= PX_OUT;
+        if (hup)
+            r |= PX_HUP;
+        break;
+    }
     case VFS_EPOLL:
         break; /* an epoll fd is not itself polled (nesting is not modelled) */
     case VFS_DIR:
         r |= PX_IN;
         break;
     default:
-        /* Regular files, memfds, synthetic files, and sockets (their reads never block). */
+        /* Regular files, memfds and synthetic files (their reads never block). */
         r |= PX_IN | PX_OUT;
         break;
     }

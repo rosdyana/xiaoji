@@ -49,6 +49,11 @@
 #define LE_ISCONN 106
 #define LE_NOTCONN 107
 #define LE_CONNREFUSED 111
+#define LE_DOM 33
+#define LE_DESTADDRREQ 89
+#define LE_NOPROTOOPT 92
+#define LE_ADDRINUSE 98
+#define LE_ADDRNOTAVAIL 99
 
 /* open(2) flags as the guest passes them. */
 #define LO_RDONLY 00

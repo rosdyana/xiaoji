@@ -15,6 +15,16 @@ struct proc;
  * exits. Returns the process exit status. */
 int sched_run(cpu_t *main_cpu);
 
+/* init mode (init.c): no thread for the initial process. tick runs between slices and when
+ * nothing is runnable; deadline gives the host time of init's next timer (0 for none). Returns
+ * the initial process's exit status when init sets its exited flag. */
+int sched_run_init(void (*tick)(void), uint64_t (*deadline)(void));
+/* init: a new child of the initial process (its address space, descriptors and handlers are
+ * copies). It has no thread until sched_start_thread. NULL when out of memory. */
+struct proc *sched_proc_new_child(void);
+/* init: the main thread of a process at pc with stack sp, named name (traced if trace). 0, or -1. */
+int sched_start_thread(struct proc *p, uint64_t pc, uint64_t sp, const char *name, int trace);
+
 /* Ends the whole process (exit_group, unimplemented instructions). The calling
  * thread stops at once. */
 void sched_exit_process(uint64_t code);

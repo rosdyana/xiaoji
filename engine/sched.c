@@ -430,24 +430,64 @@ static void finish_process(proc_t *p)
     sched_wake_key((uint64_t)(uintptr_t)p); /* a vfork parent waiting for this process */
 }
 
-int sched_run(cpu_t *main_cpu)
+/* Idle in init mode: sleep until init's next deadline, or at most IDLE_POLL_NS, so that init
+ * notices its stop flag and its timers. */
+#define IDLE_POLL_NS 10000000ull
+static void idle_wait(uint64_t (*deadline)(void))
 {
-    thread_t *m = add_thread(main_cpu, TID_MAIN, proc_cur());
-    if (!m) {
-        fprintf(stderr, "xiaoji: out of host memory\n");
-        return 1;
+    uint64_t now = host_monotonic_ns();
+    uint64_t dl = deadline ? deadline() : 0;
+    if (dl && dl <= now)
+        return;
+    uint64_t wait = IDLE_POLL_NS;
+    if (dl && dl - now < wait)
+        wait = dl - now;
+    host_sleep_ns(wait);
+}
+
+/* The scheduler loop. main_cpu starts the initial process's main thread. In init mode
+ * (main_cpu NULL) the initial process has no thread: tick runs between slices and whenever
+ * nothing is runnable, and deadline gives the host time of init's next timer (0 for none). */
+static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(void))
+{
+    uint64_t idle_since = 0;
+    int idle_reported = 0;
+    if (main_cpu) {
+        thread_t *m = add_thread(main_cpu, TID_MAIN, proc_cur());
+        if (!m) {
+            fprintf(stderr, "xiaoji: out of host memory\n");
+            return 1;
+        }
+        memcpy(m->comm, init_name, sizeof m->comm);
+        if (prof_on)
+            prof_thread_new(TID_MAIN, m->comm);
     }
-    memcpy(m->comm, init_name, sizeof m->comm);
-    if (prof_on)
-        prof_thread_new(TID_MAIN, m->comm);
     cur_slot = 0;
     init_proc = proc_cur();
     init_proc->exited = 0;
 
     while (!init_proc->exited) {
         expire_timers(host_monotonic_ns());
+        if (tick) {
+            tick();
+            if (init_proc->exited)
+                break;
+        }
         thread_t *t = pick();
         if (!t) {
+            if (tick) {
+                /* Nothing runnable: after 5 s, print the threads once (a hang, not slow work). */
+                uint64_t now = host_monotonic_ns();
+                if (!idle_since)
+                    idle_since = now;
+                if (!idle_reported && now - idle_since > 5000000000ull) {
+                    idle_reported = 1;
+                    fprintf(stderr, "xiaoji: init: nothing has been runnable for 5 s\n");
+                    report_deadlock();
+                }
+                idle_wait(deadline);
+                continue;
+            }
             if (!wait_for_timers()) {
                 report_deadlock();
                 init_proc->exit_code = DEADLOCK_STATUS;
@@ -488,6 +528,44 @@ int sched_run(cpu_t *main_cpu)
     }
     /* Unreaped threads (the process ended while they lived) add their counts. */
     return init_proc->exit_code;
+}
+
+int sched_run(cpu_t *main_cpu)
+{
+    return run_loop(main_cpu, NULL, NULL);
+}
+
+int sched_run_init(void (*tick)(void), uint64_t (*deadline)(void))
+{
+    return run_loop(NULL, tick, deadline);
+}
+
+proc_t *sched_proc_new_child(void)
+{
+    /* Before the loop starts, init is the running process (init_main switches to it). */
+    proc_t *parent = init_proc ? init_proc : proc_cur();
+    uint64_t pid = next_tid;
+    proc_t *child = proc_fork(parent, (int)pid, 0);
+    if (child)
+        next_tid++;
+    return child;
+}
+
+int sched_start_thread(proc_t *p, uint64_t pc, uint64_t sp, const char *name, int trace)
+{
+    cpu_t start;
+    memset(&start, 0, sizeof start);
+    start.pc = pc;
+    start.sp = sp;
+    start.trace = trace;
+    thread_t *t = add_thread(&start, p->pid, p);
+    if (!t)
+        return -1;
+    memset(t->comm, 0, sizeof t->comm);
+    strncpy(t->comm, name, sizeof t->comm - 1);
+    if (prof_on)
+        prof_thread_new((uint64_t)p->pid, t->comm);
+    return 0;
 }
 
 void sched_exit_process(uint64_t code)

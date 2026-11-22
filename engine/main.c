@@ -17,6 +17,7 @@
 EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); });
 #endif
 #include "host.h"
+#include "init.h"
 #include "linux.h"
 #include "logd.h"
 #include "loader.h"
@@ -74,6 +75,8 @@ int main(int argc, char **argv)
     char *envs[MAX_ENV];
     const char *props[MAX_PROP];
     int nenv = 0, nprop = 0, trace = 0, stats = 0, logcat = 0, root_given = 0;
+    const char *init_config = NULL;
+    uint64_t init_timeout = 0;
     int i = 1;
 
     for (; i < argc; i++) {
@@ -115,16 +118,34 @@ int main(int argc, char **argv)
             stats = 1;
             continue;
         }
+        if (!strcmp(a, "--init")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            init_config = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--init-timeout")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            init_timeout = strtoull(argv[++i], NULL, 10);
+            continue;
+        }
         if (a[0] == '-')
             return usage(stderr);
         break; /* PROGRAM starts here; "--" is optional */
     }
-    if (i >= argc)
+    /* --init runs the built-in init (init.c) instead of a program; it needs a root. */
+    static char *no_argv[1] = {NULL};
+    if (init_config && !root_given) {
+        fprintf(stderr, "xiaoji: --init needs --root\n");
+        return 2;
+    }
+    if (!init_config && i >= argc)
         return usage(stderr);
 
-    char **gargv = &argv[i];
-    int gargc = argc - i;
-    const char *path = gargv[0];
+    char **gargv = init_config ? no_argv : &argv[i];
+    int gargc = init_config ? 0 : argc - i;
+    const char *path = init_config ? "/init" : gargv[0];
 
     proc_init(); // the initial process: its address space, fd table and signal handlers
     if (vfs_init(g_root, path, gargc, gargv) < 0) {
@@ -136,6 +157,22 @@ int main(int argc, char **argv)
         fprintf(stderr, "xiaoji: cannot create the property area\n");
         return 2;
     }
+
+    const char *stats_env = getenv("XIAOJI_STATS");
+    stats_on = stats || (stats_env && stats_env[0] == '1');
+    const char *logcat_env = getenv("XIAOJI_LOGCAT");
+    logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
+    const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
+    sig_set_debug_faults(faults_env && faults_env[0] == '1');
+    stats_t0 = host_monotonic_ns();
+    if (stats_on)
+        atexit(print_stats);
+    prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit
+    if (init_config) {
+        init_set_trace(trace);
+        return init_main(init_config, init_timeout);
+    }
+
 
     /* With no --root, a relative program path is a host path (the M0 tests). */
     uint8_t *img = NULL;
@@ -177,16 +214,6 @@ int main(int argc, char **argv)
     c->sp = sp;
     c->pc = entry;
 
-    const char *stats_env = getenv("XIAOJI_STATS");
-    stats_on = stats || (stats_env && stats_env[0] == '1');
-    const char *logcat_env = getenv("XIAOJI_LOGCAT");
-    logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
-    const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
-    sig_set_debug_faults(faults_env && faults_env[0] == '1');
-    stats_t0 = host_monotonic_ns();
-    if (stats_on)
-        atexit(print_stats);
-    prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit
 #ifdef __EMSCRIPTEN__
     xn_run_start();
 #endif

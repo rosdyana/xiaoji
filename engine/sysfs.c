@@ -12,6 +12,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "pipe.h"
 #include "proc.h"
 #include "sched.h"
 #include "signals.h"
@@ -19,6 +20,7 @@
 #include "props.h"
 #include "selinuxfs.h"
 #include "sock.h"
+#include "sockcall.h"
 #include "vfs.h"
 
 #define SYS_GETCWD 17
@@ -51,10 +53,6 @@
 #define SYS_WRITE 64
 #define SYS_READV 65
 #define SYS_WRITEV 66
-#define SYS_SOCKET 198
-#define SYS_CONNECT 203
-#define SYS_SENDTO 206
-#define SYS_RECVFROM 207
 #define SYS_PREAD64 67
 #define SYS_READLINKAT 78
 #define SYS_NEWFSTATAT 79
@@ -169,6 +167,9 @@ static int64_t copy_statfs(uint64_t va, const host_statfs *s, uint64_t ftype)
  * not used. */
 static int64_t fs_read(int fd, uint64_t buf, uint64_t n)
 {
+    vfs_fd *sf = vfs_get(fd);
+    if (sf && sf->kind == VFS_SOCK)
+        return sockcall_read(fd, buf, n);
     size_t want = n < IO_CHUNK ? (size_t)n : IO_CHUNK;
     int64_t r = vfs_read(fd, iobuf, want);
     if (r == -LE_AGAIN && vfs_pipe_block(fd))
@@ -235,35 +236,6 @@ out:
     return res;
 }
 
-/* A datagram socket: the cnt segments (va, len pairs in ent) are gathered into one
- * message, which is written with one sock_write. The size is capped (a datagram is one
- * unit for the endpoint). */
-#define DGRAM_MAX 65536
-static int64_t dgram_send(int fd, const uint64_t *ent, uint64_t cnt)
-{
-    uint64_t total = 0;
-    for (uint64_t i = 0; i < cnt; i++) {
-        total += ent[2 * i + 1];
-        if (total > DGRAM_MAX)
-            return -LE_MSGSIZE;
-    }
-    uint8_t *msg = malloc(total ? (size_t)total : 1);
-    if (!msg)
-        return -LE_NOMEM;
-    uint64_t off = 0;
-    for (uint64_t i = 0; i < cnt; i++) {
-        size_t len = (size_t)ent[2 * i + 1];
-        if (len && mem_copy_out(msg + off, ent[2 * i], len) < 0) {
-            free(msg);
-            return -LE_FAULT;
-        }
-        off += len;
-    }
-    int64_t w = vfs_write(fd, msg, (size_t)total);
-    free(msg);
-    return w;
-}
-
 static int64_t fs_write(int fd, uint64_t buf, uint64_t n)
 {
     vfs_fd *f = vfs_get(fd);
@@ -272,10 +244,8 @@ static int64_t fs_write(int fd, uint64_t buf, uint64_t n)
         seg_len[0] = n;
         return pipe_write_segs(fd, 1);
     }
-    if (f && f->kind == VFS_SOCK && sock_is_dgram(f->sock)) {
-        uint64_t one[2] = {buf, n};
-        return dgram_send(fd, one, 1);
-    }
+    if (f && f->kind == VFS_SOCK)
+        return sockcall_write(fd, buf, n);
     uint64_t done = 0;
     do {
         size_t chunk = n - done < IO_CHUNK ? (size_t)(n - done) : IO_CHUNK;
@@ -335,56 +305,6 @@ static int64_t pipe_writev(int fd, uint64_t iov, uint64_t cnt)
     return pipe_write_segs(fd, cnt);
 }
 
-/* Sockets (sock.h): AF_UNIX stream and datagram sockets that the engine serves. socket
- * makes an unconnected one. connect takes a sockaddr_un path, which only an engine
- * endpoint answers. sendto and recvfrom take no address on a connected socket, so they
- * are read and write. A datagram write is one message (see dgram_send). */
-#define SOCK_AF_UNIX 1
-#define SOCK_STREAM_TYPE 1
-#define SOCK_DGRAM_TYPE 2
-#define SOCK_TYPE_MASK 0xF
-#define SOCK_CLOEXEC_FLAG 0x80000
-#define SOCK_NONBLOCK_FLAG 0x800
-
-static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto)
-{
-    if (domain != SOCK_AF_UNIX)
-        return -LE_AFNOSUPPORT;
-    uint64_t kind = type & SOCK_TYPE_MASK;
-    if ((kind != SOCK_STREAM_TYPE && kind != SOCK_DGRAM_TYPE) || proto != 0)
-        return -LE_PROTONOSUPPORT;
-    /* SOCK_NONBLOCK is accepted and ignored: the endpoints never block. */
-    return vfs_socket((type & SOCK_CLOEXEC_FLAG) != 0, kind == SOCK_DGRAM_TYPE);
-}
-
-static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t alen)
-{
-    vfs_fd *f = vfs_get((int)(int32_t)fd);
-    if (!f)
-        return -LE_BADF;
-    if (f->kind != VFS_SOCK)
-        return -LE_NOTSOCK;
-    if (alen < 3 || alen > 110) /* sizeof(sockaddr_un) is 110 */
-        return -LE_INVAL;
-    uint8_t sa[110];
-    if (mem_copy_out(sa, addr, (size_t)alen) < 0)
-        return -LE_FAULT;
-    if (sa[0] != SOCK_AF_UNIX || sa[1] != 0)
-        return -LE_AFNOSUPPORT;
-    size_t plen = (size_t)alen - 2;
-    if (sa[2] == 0) /* abstract and unnamed addresses are not served */
-        return -LE_NOENT;
-    size_t n = 0;
-    while (n < plen && sa[2 + n])
-        n++;
-    if (n == plen) /* not NUL-terminated */
-        return -LE_INVAL;
-    char path[sizeof sa];
-    memcpy(path, sa + 2, n);
-    path[n] = 0;
-    return sock_connect(f->sock, path);
-}
-
 /* pipe2(int fds[2], flags): the read end in fds[0], the write end in fds[1]. */
 static int64_t sys_pipe2(uint64_t fds_va, uint64_t flags)
 {
@@ -413,6 +333,8 @@ static int64_t fs_readv(int fd, uint64_t iov, uint64_t cnt)
     vfs_fd *pf = vfs_get(fd);
     if (pf && pf->kind == VFS_PIPE)
         return pipe_readv(fd, iov, cnt);
+    if (pf && pf->kind == VFS_SOCK)
+        return sockcall_readv(fd, iov, cnt);
     int64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
         uint64_t ent[2];
@@ -437,22 +359,8 @@ static int64_t fs_writev(int fd, uint64_t iov, uint64_t cnt)
     vfs_fd *pf = vfs_get(fd);
     if (pf && pf->kind == VFS_PIPE)
         return pipe_writev(fd, iov, cnt);
-    if (pf && pf->kind == VFS_SOCK && sock_is_dgram(pf->sock)) {
-        if (cnt == 0)
-            return dgram_send(fd, NULL, 0);
-        uint64_t *ent = malloc((size_t)cnt * 2 * sizeof *ent);
-        if (!ent)
-            return -LE_NOMEM;
-        for (uint64_t i = 0; i < cnt; i++) {
-            if (mem_copy_out(ent + 2 * i, iov + i * 16, 16) < 0) {
-                free(ent);
-                return -LE_FAULT;
-            }
-        }
-        int64_t w = dgram_send(fd, ent, cnt);
-        free(ent);
-        return w;
-    }
+    if (pf && pf->kind == VFS_SOCK)
+        return sockcall_writev(fd, iov, cnt);
     int64_t total = 0;
     for (uint64_t i = 0; i < cnt; i++) {
         uint64_t ent[2];
@@ -636,7 +544,159 @@ static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
         return -LE_NOENT;
     if (r.syn != SYN_NONE)
         return -LE_PERM;
-    return (flags & LAT_REMOVEDIR) ? host_rmdir(r.host) : host_unlink(r.host);
+    if (flags & LAT_REMOVEDIR)
+        return host_rmdir(r.host);
+    int urc = host_unlink(r.host);
+    if (urc == 0)
+        sock_fsnode_del(r.guest); /* a socket node goes with its file */
+    return urc;
+}
+
+/* Ownership and capabilities are not modelled. stat reports uid and gid 0 for every file, so a
+ * chown names an existing file (or descriptor) and changes nothing. A process is root, so
+ * capget reports the full set (the version-3 layout); capset is accepted and ignored. */
+static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t flags)
+{
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    int rc = get_path(a1, path, sizeof path);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(a0), path, (flags & 0x100) == 0, &r);
+    if (rc)
+        return rc;
+    return r.exists || r.is_link ? 0 : -LE_NOENT;
+}
+
+/* unshare(flags). Namespaces are not modelled: the guest has one mount table, one network and
+ * one set of ids. CLONE_NEWNS succeeds and changes nothing (zygote asks for a private mount
+ * namespace before it specializes an app; the synthetic root is shared by every process). Other
+ * namespace flags are EINVAL, and so is CLONE_FILES, which would need a copy of the descriptors. */
+/* mount(source, target, type, flags, data). The guest has one mount table that the engine
+ * serves (the synthetic /dev, /proc and /sys, and the root). Only a change of propagation (MS_SHARED,
+ * MS_SLAVE, MS_PRIVATE, MS_UNBINDABLE) is accepted, on an existing target: propagation between
+ * mount namespaces is not modelled, so it changes nothing. Any other mount is EPERM. */
+static int64_t sys_mount(uint64_t target_va, uint64_t flags)
+{
+    const uint64_t MS_PROPAGATION = (1ull << 17) | (1ull << 18) | (1ull << 19) | (1ull << 20);
+    if (!(flags & MS_PROPAGATION))
+        return -LE_PERM;
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    int rc = get_path(target_va, path, sizeof path);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(LAT_FDCWD, path, 1, &r);
+    if (rc)
+        return rc;
+    return r.exists ? 0 : -LE_NOENT;
+}
+
+/* membarrier(cmd, flags): guest threads run one at a time on the host thread, so every memory
+ * barrier already holds. QUERY reports the global and the private expedited commands (and their
+ * registration); the commands themselves succeed. */
+static int64_t sys_membarrier(uint64_t cmd, uint64_t flags)
+{
+    const int64_t supported = (1 << 0) | (1 << 3) | (1 << 4);
+    if (flags)
+        return -LE_INVAL;
+    if (cmd == 0)
+        return supported;
+    if (cmd == 1 || cmd == 8 || cmd == 16)
+        return 0;
+    return -LE_INVAL;
+}
+
+/* process_vm_readv(pid, local, liovcnt, remote, riovcnt, flags): reads the calling process's own
+ * memory (ART's SafeCopy does, through getpid()). Another pid is ESRCH (no such process) or EPERM.
+ * A remote range that cannot be read (unmapped, or PROT_NONE) ends the copy: the count so far is
+ * returned, and EFAULT when nothing was copied. */
+static int64_t sys_process_vm_readv(uint64_t pid, uint64_t liov, uint64_t liovcnt, uint64_t riov,
+                                    uint64_t riovcnt, uint64_t flags)
+{
+    if (flags || liovcnt > IOV_MAX || riovcnt > IOV_MAX)
+        return -LE_INVAL;
+    if ((int64_t)pid != proc_cur()->pid)
+        return proc_find((int)pid) ? -LE_PERM : -LE_SRCH;
+    int64_t total = 0;
+    uint64_t li = 0, lbase = 0, llen = 0, ri = 0, rbase = 0, rlen = 0;
+    int lok = 0, rok = 0;
+    for (;;) {
+        if (!lok || llen == 0) {
+            if (li >= liovcnt)
+                break;
+            uint8_t e[16];
+            if (mem_copy_out(e, liov + li * 16, 16) < 0)
+                return total ? total : -LE_FAULT;
+            lbase = 0;
+            llen = 0;
+            for (int k = 0; k < 8; k++) {
+                lbase |= (uint64_t)e[k] << (8 * k);
+                llen |= (uint64_t)e[8 + k] << (8 * k);
+            }
+            li++;
+            lok = 1;
+            continue;
+        }
+        if (!rok || rlen == 0) {
+            if (ri >= riovcnt)
+                break;
+            uint8_t e[16];
+            if (mem_copy_out(e, riov + ri * 16, 16) < 0)
+                return total ? total : -LE_FAULT;
+            rbase = 0;
+            rlen = 0;
+            for (int k = 0; k < 8; k++) {
+                rbase |= (uint64_t)e[k] << (8 * k);
+                rlen |= (uint64_t)e[8 + k] << (8 * k);
+            }
+            ri++;
+            rok = 1;
+            continue;
+        }
+        size_t n = llen < rlen ? (size_t)llen : (size_t)rlen;
+        if (n > IO_CHUNK)
+            n = IO_CHUNK;
+        if (mem_copy_out(iobuf, rbase, n) < 0)
+            return total ? total : -LE_FAULT;
+        if (mem_copy_in(lbase, iobuf, n) < 0)
+            return total ? total : -LE_FAULT;
+        lbase += n;
+        llen -= n;
+        rbase += n;
+        rlen -= n;
+        total += (int64_t)n;
+    }
+    return total;
+}
+
+static int64_t sys_unshare(uint64_t flags)
+{
+    const uint64_t CLONE_NEWNS_FLAG = 0x00020000ull;
+    if (flags & ~CLONE_NEWNS_FLAG)
+        return -LE_INVAL;
+    return 0;
+}
+
+static int64_t sys_capget(uint64_t hdr_va, uint64_t data_va)
+{
+    uint8_t h[8];
+    if (mem_copy_out(h, hdr_va, sizeof h) < 0)
+        return -LE_FAULT;
+    const uint32_t cap_v3 = 0x20080522u;
+    uint32_t version = (uint32_t)h[0] | (uint32_t)h[1] << 8 | (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
+    if (version != cap_v3) {
+        for (int i = 0; i < 4; i++)
+            h[i] = (uint8_t)(cap_v3 >> (8 * i));
+        mem_copy_in(hdr_va, h, 4);
+        return data_va ? -LE_INVAL : 0;
+    }
+    if (!data_va)
+        return 0;
+    uint8_t d[24];
+    for (int i = 0; i < 24; i++)
+        d[i] = (i % 12) < 8 ? 0xff : 0; /* effective and permitted full, inheritable empty */
+    return mem_copy_in(data_va, d, sizeof d) < 0 ? -LE_FAULT : 0;
 }
 
 static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
@@ -699,6 +759,11 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t cnt)
     return r;
 }
 
+/* Pipe capacity (F_SETPIPE_SZ, F_GETPIPE_SZ). The ring is fixed at PIPE_CAP, so a set reports
+ * that capacity back: the guest's debuggerd sets a size on its crash pipe and then checks it. */
+#define LF_SETPIPE_SZ 1031
+#define LF_GETPIPE_SZ 1032
+
 static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
     int ifd = (int)(int32_t)fd;
@@ -706,6 +771,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     if (!f)
         return -LE_BADF;
     switch ((int)cmd) {
+    case LF_SETPIPE_SZ:
+    case LF_GETPIPE_SZ:
+        if (f->kind != VFS_PIPE)
+            return -LE_BADF;
+        if (cmd == LF_SETPIPE_SZ && (arg == 0 || arg > (1u << 20)))
+            return -LE_INVAL;
+        return (int64_t)PIPE_CAP;
     case LF_DUPFD:
         return vfs_dup(ifd, (int)arg, 0, 0);
     case LF_DUPFD_CLOEXEC:
@@ -949,6 +1021,14 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_UNLINKAT: *ret = sys_unlinkat(a[0], a[1], a[2]); return 1;
     case SYS_FCHMODAT: *ret = sys_fchmodat(a[0], a[1], a[2]); return 1;
     case SYS_FCHMOD: *ret = vfs_fchmod((int)(int32_t)a[0], (uint32_t)a[1]); return 1;
+    case 54: /* fchownat */ *ret = sys_fchownat(a[0], a[1], a[4]); return 1;
+    case 55: /* fchown */ *ret = vfs_get((int)(int32_t)a[0]) ? 0 : -LE_BADF; return 1;
+    case 40: /* mount */ *ret = sys_mount(a[1], a[3]); return 1;
+    case 283: /* membarrier */ *ret = sys_membarrier(a[0], a[1]); return 1;
+    case 97: /* unshare */ *ret = sys_unshare(a[0]); return 1;
+    case 270: /* process_vm_readv */ *ret = sys_process_vm_readv(a[0], a[1], a[2], a[3], a[4], a[5]); return 1;
+    case 90: /* capget */ *ret = sys_capget(a[0], a[1]); return 1;
+    case 91: /* capset */ *ret = 0; return 1;
     case SYS_FACCESSAT2: *ret = sys_faccessat(a[0], a[1], a[2], a[3]); return 1;
     case SYS_GETDENTS64: *ret = sys_getdents64(a[0], a[1], a[2]); return 1;
     case SYS_FSTATFS: *ret = sys_fstatfs(a[0], a[1]); return 1;
@@ -957,16 +1037,10 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_DUP: *ret = vfs_dup((int)(int32_t)a[0], 0, 0, 0); return 1;
     case SYS_DUP3: *ret = sys_dup3(a[0], a[1], a[2]); return 1;
     case SYS_PIPE2: *ret = sys_pipe2(a[0], a[1]); return 1;
-    case SYS_SOCKET: *ret = sys_socket(a[0], a[1], a[2]); return 1;
-    case SYS_CONNECT: *ret = sys_connect(a[0], a[1], a[2]); return 1;
-    case SYS_SENDTO:
-        if (a[4]) { /* a destination on a connected stream */
-            *ret = -LE_ISCONN;
-            return 1;
-        }
-        *ret = fs_write((int)(int32_t)a[0], a[1], a[2]);
+    case 198: case 199: case 200: case 201: case 202: case 203: case 204: case 205:
+    case 206: case 207: case 208: case 209: case 210: case 211: case 212: case 242:
+        *ret = sockcall_run(nr, a);
         return 1;
-    case SYS_RECVFROM: *ret = fs_read((int)(int32_t)a[0], a[1], a[2]); return 1;
     case SYS_GETCWD: *ret = sys_getcwd(a[0], a[1]); return 1;
     case SYS_CHDIR: *ret = sys_chdir(a[0]); return 1;
     case SYS_FCHDIR: *ret = vfs_fchdir((int)(int32_t)a[0]); return 1;

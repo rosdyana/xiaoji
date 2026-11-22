@@ -410,16 +410,18 @@ static int fp_from_int(cpu_t *c, uint32_t insn)
 }
 
 /* FCVTNS/FCVTNU, FCVTPS/FCVTPU, FCVTMS/FCVTMU, FCVTZS/FCVTZU: to integer with
- * rounding mode rmode (0 nearest, 1 up, 2 down, 3 toward zero). Saturates;
- * NaN gives 0. */
+ * rounding mode rmode (0 nearest, 1 up, 2 down, 3 toward zero). FCVTAS/FCVTAU (opcode 4 and 5,
+ * rmode 0) round to nearest with ties away from zero. Saturates; NaN gives 0. */
 static int fp_to_int(cpu_t *c, uint32_t insn)
 {
     unsigned sf = insn >> 31, type = (insn >> 22) & 3, rmode = (insn >> 19) & 3, uns = (insn >> 16) & 1;
+    unsigned op = (insn >> 16) & 7;
     unsigned rn = (insn >> 5) & 31, rd = insn & 31;
-    if (type > 1 || !fp_default(c))
+    int away = op >= 4; /* FCVTAS, FCVTAU */
+    if (type > 1 || !fp_default(c) || (away && rmode != 0))
         return -1;
     double x = type == 0 ? (double)as_f((uint32_t)c->v[rn][0]) : as_d(c->v[rn][0]);
-    double r = rmode == 0 ? rint(x) : rmode == 1 ? ceil(x) : rmode == 2 ? floor(x) : trunc(x);
+    double r = away ? round(x) : rmode == 0 ? rint(x) : rmode == 1 ? ceil(x) : rmode == 2 ? floor(x) : trunc(x);
     uint64_t out;
     if (x != x) {
         out = 0;
@@ -667,8 +669,153 @@ static int shift_imm(cpu_t *c, uint32_t insn)
 
 /* ---------- three registers of the same type ---------- */
 
+/* Lane access for the by-element forms: a lane of esz bytes at byte offset off. */
+static uint64_t el_rd(const uint8_t *b, unsigned off, unsigned esz)
+{
+    uint64_t v = 0;
+    memcpy(&v, b + off, esz);
+    return v;
+}
+
+static void el_wr(uint8_t *b, unsigned off, unsigned esz, uint64_t v)
+{
+    memcpy(b + off, &v, esz);
+}
+
+/* FMULX: like FMUL, except that zero times infinity is +-2.0 (sign: the xor of the signs). */
+static float fmulx_f(float x, float y)
+{
+    if ((x == 0 && isinf(y)) || (isinf(x) && y == 0))
+        return (signbit(x) != 0) != (signbit(y) != 0) ? -2.0f : 2.0f;
+    return x * y;
+}
+
+static double fmulx_d(double x, double y)
+{
+    if ((x == 0 && isinf(y)) || (isinf(x) && y == 0))
+        return (signbit(x) != 0) != (signbit(y) != 0) ? -2.0 : 2.0;
+    return x * y;
+}
+
+/* FMAX, FMIN and the NM forms on doubles (the float forms are exact in double). A NaN operand
+ * propagates for FMAX and FMIN; for the NM forms the other operand is returned when one is a quiet NaN.
+ * Zeros of opposite sign: the maximum is +0 and the minimum is -0. */
+static double fp_maxmin(double x, double y, int is_min, int nm)
+{
+    if (isnan(x) || isnan(y)) {
+        if (nm && isnan(x) != isnan(y))
+            return isnan(x) ? y : x;
+        return isnan(x) ? x : y;
+    }
+    if (x == 0 && y == 0)
+        return is_min ? (signbit(x) ? x : y) : (signbit(x) ? y : x);
+    return is_min ? (x < y ? x : y) : (x > y ? x : y);
+}
+
+/* Vector floating-point three-same (opcodes 0x18 to 0x1F; single with sz=0, double with sz=1,
+ * the arrangement 2S, 4S or 2D). The pair of U and a selects the operation (ARM DDI 0487,
+ * "Advanced SIMD three same"). Pairwise forms (FADDP, FMAXP, ...) take adjacent pairs of the
+ * concatenation Vn:Vm. Compares write all-ones or zero per lane. NaNs: FMAX and FMIN return the
+ * first NaN operand; FMAXNM and FMINNM return the other operand when one is a NaN. */
+static int fp_three_same(cpu_t *c, uint32_t insn)
+{
+    unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, a = (insn >> 23) & 1, sz = (insn >> 22) & 1;
+    unsigned rm = (insn >> 16) & 31, opc = (insn >> 11) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
+    unsigned dsz = q ? 16 : 8, esz = sz ? 8 : 4, lanes = dsz / esz;
+    if ((sz && !q) || !fp_default(c))
+        return -1;
+    enum { OP_NONE, OP_MAXNM, OP_MINNM, OP_MLA, OP_MLS, OP_ADD, OP_SUB, OP_ABD, OP_MULX, OP_MUL,
+           OP_CEQ, OP_CGE, OP_CGT, OP_ACGE, OP_ACGT, OP_MAX, OP_MIN, OP_RECPS, OP_RSQRTS, OP_DIV };
+    int pair = 0, op = OP_NONE;
+    switch (opc) {
+    case 0x18: pair = u; op = a ? OP_MINNM : OP_MAXNM; break;
+    case 0x19: if (u) return -1; op = a ? OP_MLS : OP_MLA; break;
+    case 0x1A: pair = u && !a; op = !u ? (a ? OP_SUB : OP_ADD) : (a ? OP_ABD : OP_ADD); break;
+    case 0x1B: if (!u) { op = OP_MULX; } else if (!a) { op = OP_MUL; } else return -1; break;
+    case 0x1C: op = !u ? OP_CEQ : a ? OP_CGT : OP_CGE; break;
+    case 0x1D: if (!u) return -1; op = a ? OP_ACGT : OP_ACGE; break;
+    case 0x1E: pair = u; op = a ? OP_MIN : OP_MAX; break;
+    case 0x1F: if (!u) { op = a ? OP_RSQRTS : OP_RECPS; } else { if (a) return -1; op = OP_DIV; } break;
+    default: return -1;
+    }
+    if (pair && !(opc == 0x18 || opc == 0x1E || opc == 0x1A))
+        return -1;
+    if (opc == 0x1A && u && !a) { op = OP_ADD; pair = 1; }
+    if (opc == 0x18 && u) pair = 1;
+    if (opc == 0x1E && u) pair = 1;
+    uint8_t n[16], m[16], d[16], r[16];
+    rd_v(c, rn, n);
+    rd_v(c, rm, m);
+    rd_v(c, rd, d);
+    memset(r, 0, sizeof r);
+    for (unsigned i = 0; i < lanes; i++) {
+        uint64_t x, y, acc = el_rd(d, i * esz, esz), res = 0;
+        if (pair) {
+            unsigned k0 = 2 * i, k1 = 2 * i + 1;
+            x = k0 < lanes ? el_rd(n, k0 * esz, esz) : el_rd(m, (k0 - lanes) * esz, esz);
+            y = k1 < lanes ? el_rd(n, k1 * esz, esz) : el_rd(m, (k1 - lanes) * esz, esz);
+        } else {
+            x = el_rd(n, i * esz, esz);
+            y = el_rd(m, i * esz, esz);
+        }
+        double dx = sz ? as_d(x) : (double)as_f((uint32_t)x), dy = sz ? as_d(y) : (double)as_f((uint32_t)y);
+        double dacc = sz ? as_d(acc) : (double)as_f((uint32_t)acc);
+        int is_mask = op == OP_CEQ || op == OP_CGE || op == OP_CGT || op == OP_ACGE || op == OP_ACGT;
+        if (is_mask) {
+            int ok;
+            if (op == OP_CEQ) ok = dx == dy;
+            else if (op == OP_CGE) ok = dx >= dy;
+            else if (op == OP_CGT) ok = dx > dy;
+            else if (op == OP_ACGE) ok = fabs(dx) >= fabs(dy);
+            else ok = fabs(dx) > fabs(dy);
+            res = ok ? (sz ? ~0ull : 0xFFFFFFFFull) : 0;
+        } else {
+            double v;
+            switch (op) {
+            case OP_MLA: v = dacc + dx * dy; break; /* fused below */
+            case OP_MLS: v = dacc - dx * dy; break;
+            case OP_ADD: v = dx + dy; break;
+            case OP_SUB: v = dx - dy; break;
+            case OP_ABD: v = fabs(dx - dy); break;
+            case OP_MULX: v = sz ? fmulx_d(dx, dy) : (double)fmulx_f((float)dx, (float)dy); break;
+            case OP_MUL: v = dx * dy; break;
+            case OP_DIV: v = dx / dy; break;
+            case OP_RECPS: v = 2.0 - dx * dy; break;
+            case OP_RSQRTS: v = (3.0 - dx * dy) / 2.0; break;
+            case OP_MAX: v = fp_maxmin(dx, dy, 0, 0); break;
+            case OP_MIN: v = fp_maxmin(dx, dy, 1, 0); break;
+            case OP_MAXNM: v = fp_maxmin(dx, dy, 0, 1); break;
+            case OP_MINNM: v = fp_maxmin(dx, dy, 1, 1); break;
+            default: return -1;
+            }
+            if (sz) {
+                double out = v;
+                if (op == OP_MLA) out = fma(dx, dy, dacc);
+                else if (op == OP_MLS) out = fma(-dx, dy, dacc);
+                else if (op == OP_MULX) out = fmulx_d(dx, dy);
+                res = d_bits(out);
+            } else {
+                float out = (float)v;
+                if (op == OP_MLA) out = fmaf((float)dx, (float)dy, (float)dacc);
+                else if (op == OP_MLS) out = fmaf(-(float)dx, (float)dy, (float)dacc);
+                else if (op == OP_MULX) out = fmulx_f((float)dx, (float)dy);
+                else if (op == OP_RECPS || op == OP_RSQRTS || op == OP_DIV || op == OP_MUL || op == OP_ADD ||
+                         op == OP_SUB || op == OP_ABD || op == OP_MAX || op == OP_MIN || op == OP_MAXNM ||
+                         op == OP_MINNM)
+                    out = (float)v;
+                res = f_bits(out);
+            }
+        }
+        el_wr(r, i * esz, esz, res);
+    }
+    wr_v(c, rd, r, dsz);
+    return 0;
+}
+
 static int three_same(cpu_t *c, uint32_t insn)
 {
+    if (((insn >> 11) & 0x1F) >= 0x18) /* vector floating point */
+        return fp_three_same(c, insn);
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
     unsigned rm = (insn >> 16) & 31, opc = (insn >> 11) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
     unsigned dsz = q ? 16 : 8, esz = 1u << size, lanes = dsz / esz;
@@ -927,8 +1074,67 @@ static int three_diff(cpu_t *c, uint32_t insn)
 
 /* ---------- two registers, miscellaneous ---------- */
 
+static uint64_t to_int_sat(double x, unsigned mode, unsigned bits, int uns);
+
+/* Vector floating-point two-register miscellaneous (0 Q U 01110 a 10000 opcode 10): FABS and FNEG
+ * (opcode 01111, a=1), FRINT (11000, 11001), FCVT to integer (11010, 11011, 11100) and SCVTF and
+ * UCVTF (11101, a=0), FSQRT (11111, U=1, a=1). Single (sz=0, 2S or 4S) and double (sz=1, 2D). */
+static int fp_two_misc(cpu_t *c, uint32_t insn)
+{
+    unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, a = (insn >> 23) & 1, sz = (insn >> 22) & 1;
+    unsigned opc = (insn >> 12) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
+    unsigned dsz = q ? 16 : 8, esz = sz ? 8 : 4, lanes = dsz / esz;
+    if ((sz && !q) || !fp_default(c))
+        return -1;
+    uint8_t n[16], r[16];
+    rd_v(c, rn, n);
+    memset(r, 0, sizeof r);
+    for (unsigned i = 0; i < lanes; i++) {
+        uint64_t xb = el_rd(n, i * esz, esz), out;
+        double x = sz ? as_d(xb) : (double)as_f((uint32_t)xb);
+        if (opc == 0x0F && a) { /* FABS (U=0), FNEG (U=1) */
+            if (sz)
+                out = u ? xb ^ (1ull << 63) : xb & ~(1ull << 63);
+            else
+                out = u ? (xb ^ 0x80000000u) : (xb & 0x7FFFFFFFu);
+        } else if (opc == 0x1F && u && a) { /* FSQRT */
+            out = sz ? d_bits(sqrt(x)) : f_bits(sqrtf(as_f((uint32_t)xb)));
+        } else if (opc == 0x1D && !a) { /* SCVTF (U=0), UCVTF (U=1) from an integer lane */
+            if (sz)
+                out = d_bits(u ? (double)xb : (double)(int64_t)xb);
+            else
+                out = f_bits(u ? (float)(uint32_t)xb : (float)(int32_t)(uint32_t)xb);
+        } else if (opc == 0x18 || opc == 0x19) { /* FRINT: N, P, A (0x18); M, Z, X, I (0x19) */
+            double v;
+            if (opc == 0x18 && !u && !a) v = rint(x);      /* FRINTN */
+            else if (opc == 0x18 && !u && a) v = ceil(x);  /* FRINTP */
+            else if (opc == 0x18 && u && !a) v = round(x); /* FRINTA */
+            else if (opc == 0x19 && !u && !a) v = floor(x); /* FRINTM */
+            else if (opc == 0x19 && !u && a) v = trunc(x);  /* FRINTZ */
+            else if (opc == 0x19 && u) v = rint(x);         /* FRINTX, FRINTI */
+            else return -1;
+            out = sz ? d_bits(v) : f_bits((float)v);
+        } else if (opc == 0x1A || opc == 0x1B || opc == 0x1C) { /* FCVT{N,P}, FCVT{M,Z}, FCVTA{S,U} */
+            unsigned mode = opc == 0x1A ? (a ? 2 : 0) : opc == 0x1B ? (a ? 3 : 1) : 4;
+            if (opc == 0x1C && a)
+                return -1;
+            out = to_int_sat(x, mode, esz * 8, (int)u);
+        } else {
+            return -1;
+        }
+        el_wr(r, i * esz, esz, out);
+    }
+    wr_v(c, rd, r, dsz);
+    return 0;
+}
+
 static int two_misc(cpu_t *c, uint32_t insn)
 {
+    {
+        unsigned fopc = (insn >> 12) & 0x1F;
+        if (fopc >= 0x18 || (fopc == 0x0F && ((insn >> 23) & 1)))
+            return fp_two_misc(c, insn);
+    }
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
     unsigned opc = (insn >> 12) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
     unsigned dsz = q ? 16 : 8, esz = 1u << size, lanes = dsz / esz;
@@ -1509,6 +1715,47 @@ static int scalar_addp(cpu_t *c, uint32_t insn)
 
 static int scalar_simd(cpu_t *c, uint32_t insn)
 {
+    /* DUP (element), scalar: 01 0 11110000 imm5 0000 1 Rn Rd. The element goes to the low bits
+     * of Vd and the rest of the register is zeroed. */
+    if (((insn >> 21) & 0xFF) == 0xF0 && ((insn >> 10) & 0x1F) == 0x01) {
+        unsigned log2, imm5 = (insn >> 16) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
+        unsigned esz = imm5_size(imm5, &log2);
+        if (!esz)
+            return -1;
+        uint8_t n[16], r[16];
+        rd_v(c, rn, n);
+        uint64_t v = getel(n, esz, imm5 >> (log2 + 1));
+        memset(r, 0, sizeof r);
+        putel(r, esz, 0, v);
+        wr_v(c, rd, r, 16);
+        return 0;
+    }
+    /* Pairwise scalar FP (U=1, bits 21:17 = 11000, bits 11:10 = 10): the two lanes of Vn, with
+     * opcode 01100 (FMAXNMP, FMINNMP with a=1), 01101 (FADDP) and 01111 (FMAXP, FMINP with a=1). */
+    if (((insn >> 29) & 1) && ((insn >> 17) & 0x1F) == 0x18 && ((insn >> 10) & 3) == 2) {
+        unsigned a = (insn >> 23) & 1, sz = (insn >> 22) & 1, opc = (insn >> 12) & 0x1F;
+        unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+        if (!fp_default(c) || a > 1 || !((opc == 0x0C) || (opc == 0x0D && !a) || (opc == 0x0F)))
+            return -1;
+        if (opc == 0x0D && a)
+            return -1;
+        unsigned esz = sz ? 8 : 4;
+        uint8_t n[16];
+        rd_v(c, rn, n);
+        uint64_t xb = getel(n, esz, 0), yb = getel(n, esz, 1);
+        if (sz) {
+            double x = as_d(xb), y = as_d(yb), r;
+            if (opc == 0x0D) r = x + y;
+            else r = fp_maxmin(x, y, a, opc == 0x0C);
+            put_fd(c, rd, d_bits(r));
+        } else {
+            float x = as_f((uint32_t)xb), y = as_f((uint32_t)yb), r;
+            if (opc == 0x0D) r = x + y;
+            else r = (float)fp_maxmin((double)x, (double)y, a, opc == 0x0C);
+            put_fs(c, rd, f_bits(r));
+        }
+        return 0;
+    }
     /* Pairwise scalar (bits 21:17 = 11000, bits 16:12 = 11011, bits 11:10 = 10): ADDP. */
     if (((insn >> 17) & 0x1F) == 0x18 && ((insn >> 12) & 0x1F) == 0x1B && ((insn >> 10) & 3) == 2)
         return scalar_addp(c, insn);
@@ -1555,6 +1802,70 @@ static int scalar_simd(cpu_t *c, uint32_t insn)
 
 /* ---------- dispatch ---------- */
 
+/* Vector x indexed element: 0 Q U 01111 size L M Rm opcode H 0 Rn Rd. Vm supplies one lane,
+ * the index being H:L (32- and 64-bit lanes, Rm is M:Rm) or H:L:M (16-bit lanes, Rm is four
+ * bits). FP (opcode 1, 5 and 9, with size bit 1 set): FMLA (u=0, opcode 1), FMLS (u=0, opcode 5),
+ * FMUL (u=0, opcode 9) and FMULX (u=1, opcode 9). Integer: MUL (u=0, opcode 8), MLA (u=1,
+ * opcode 0) and MLS (u=1, opcode 4), on 16- and 32-bit lanes. */
+static int by_element(cpu_t *c, uint32_t insn)
+{
+    unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
+    unsigned l = (insn >> 21) & 1, m = (insn >> 20) & 1, h = (insn >> 11) & 1;
+    unsigned rmlo = (insn >> 16) & 15, opc = (insn >> 12) & 0xF;
+    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+    unsigned dsz = q ? 16 : 8;
+    uint8_t n[16], d[16], r[16], mv[16];
+    rd_v(c, rn, n);
+    rd_v(c, rd, d);
+    memset(r, 0, sizeof r);
+    if ((size & 2) && (opc == 1 || opc == 5 || opc == 9)) { /* FP: size bit 1 is set */
+        int fp_op = (u == 0 && (opc == 1 || opc == 5 || opc == 9)) || (u == 1 && opc == 9);
+        unsigned sz = size & 1;
+        if (!fp_op || !fp_default(c) || (sz && (!q || l)))
+            return -1;
+        unsigned esz = sz ? 8 : 4, lanes = dsz / esz;
+        unsigned idx = sz ? h : (h << 1) | l;
+        rd_v(c, (m << 4) | rmlo, mv);
+        uint64_t eb = el_rd(mv, idx * esz, esz);
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t xb = el_rd(n, i * esz, esz), db = el_rd(d, i * esz, esz), rb;
+            if (sz) {
+                double x = as_d(xb), y = as_d(eb), acc = as_d(db);
+                double res = opc == 1 ? fma(x, y, acc) : opc == 5 ? fma(-x, y, acc) : u ? fmulx_d(x, y) : x * y;
+                rb = d_bits(res);
+            } else {
+                float x = as_f((uint32_t)xb), y = as_f((uint32_t)eb), acc = as_f((uint32_t)db);
+                float res = opc == 1 ? fmaf(x, y, acc) : opc == 5 ? fmaf(-x, y, acc) : u ? fmulx_f(x, y) : x * y;
+                rb = f_bits(res);
+            }
+            el_wr(r, i * esz, esz, rb);
+        }
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
+    /* Integer forms: 16-bit lanes (size 1) or 32-bit lanes (size 2). */
+    if (!((u == 0 && opc == 8) || (u == 1 && (opc == 0 || opc == 4))) || (size != 1 && size != 2))
+        return -1;
+    unsigned esz = size == 1 ? 2 : 4, lanes = dsz / esz;
+    unsigned idx = esz == 2 ? (h << 2) | (l << 1) | m : (h << 1) | l;
+    unsigned rm = esz == 2 ? rmlo : (m << 4) | rmlo;
+    rd_v(c, rm, mv);
+    uint64_t mask = esz == 2 ? 0xFFFFull : 0xFFFFFFFFull;
+    uint64_t e = el_rd(mv, idx * esz, esz);
+    for (unsigned i = 0; i < lanes; i++) {
+        uint64_t x = el_rd(n, i * esz, esz), acc = el_rd(d, i * esz, esz), res;
+        if (opc == 8)
+            res = x * e;
+        else if (opc == 0)
+            res = acc + x * e;
+        else
+            res = acc - x * e;
+        el_wr(r, i * esz, esz, res & mask);
+    }
+    wr_v(c, rd, r, dsz);
+    return 0;
+}
+
 int simd_exec(cpu_t *c, uint32_t insn)
 {
     unsigned top = (insn >> 24) & 0x1F; /* bits 28..24 */
@@ -1569,7 +1880,7 @@ int simd_exec(cpu_t *c, uint32_t insn)
             unsigned op = (insn >> 16) & 7;
             if (op == 6 || op == 7)
                 return fmov_gen(c, insn);
-            if (op < 2)
+            if (op < 2 || op == 4 || op == 5)
                 return fp_to_int(c, insn);
             if (op < 4)
                 return fp_from_int(c, insn);
@@ -1638,8 +1949,10 @@ int simd_exec(cpu_t *c, uint32_t insn)
             }
         }
     }
-    if (top == 0x0F) { /* modified immediate, or shift by immediate: both have bit 10 set */
-        if (!((insn >> 10) & 1) || ((insn >> 23) & 1))
+    if (top == 0x0F) { /* by element (bit 10 clear), modified immediate or shift by immediate */
+        if (!((insn >> 10) & 1))
+            return by_element(c, insn);
+        if ((insn >> 23) & 1)
             return -1;
         if (((insn >> 19) & 0xF) == 0)
             return modified_imm(c, insn);

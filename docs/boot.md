@@ -824,3 +824,314 @@ path exercised is `abort()` (a `rt_tgsigqueueinfo` with `SI_QUEUE`, which is del
   pid, not a kernel credential.
 - The engine's `SYS_SOCKET` case in `syscall.c` (EACCES) is dead code: `sysfs_call` handles
   socket(2) first. Left as it was.
+
+## B4a: AF_UNIX sockets between guest processes
+
+Status: **B4a sockets, init and zygote (to the blocker below) are in the engine, uncommitted.** The socket
+section is step 1 (`tests/guest/unixsock.c`, 35 checks, the same output in the native engine, in Node and
+natively in the builder VM). The init section follows it, and the zygote section comes last.
+
+### Design as built
+
+- **Files.** `engine/sock.c` and `engine/sock.h` (the socket objects, names, queues, connect and
+  accept, blocking, options), `engine/sockcall.c` and `engine/sockcall.h` (the syscalls 198 to 212
+  and 242: marshalling of guest memory, descriptors and `msghdr`), and the hooks in `engine/vfs.c`
+  (`vfs_socket`, `vfs_socket_adopt`, `vfs_desc_ref`, the `S_IFSOCK` stat override), `engine/poll.c`
+  (readiness), and `engine/sysfs.c` (`read`, `readv`, `write`, `writev` on a socket go to
+  `sockcall`). The endpoints (property service, logd) keep their ops table.
+- **Objects.** A `sock_t` is owned by open file descriptions (one reference each, `refs`) and by
+  two internal holds (`hold`): a pending server-side stream socket is held by its listener's accept
+  queue, and a connected datagram socket holds its destination. The last description runs the
+  close effects (`sock_unref` then `sock_release`): the name is unbound, the peer gets `peer_gone`
+  (a hangup) and its `peer` pointer is cleared, queued messages are dropped (their descriptions are
+  released), and pending connections are abandoned. The object is freed when no description and no
+  hold is left.
+- **Names.** Abstract names (a leading NUL) are kept in a list of live bound sockets. A path is a
+  guest path: `bind` makes a placeholder file (`O_CREAT|O_EXCL`) and records the canonical path in
+  `fs_list`, which `stat` reports as `S_IFSOCK`. The name as given (`disp`) is what `getsockname`,
+  `getpeername` and a message's sender report, so a path under a symlink (macOS `/tmp`) keeps its
+  spelling. A missing parent directory makes the path its own name (this is how
+  `/dev/socket/property_service` reaches the endpoints).
+- **Connect (as native).** A stream `connect` queues a server-side socket on the listener and
+  returns 0 at once, without waiting for `accept`. It fails with EAGAIN (nonblocking) or blocks
+  (`sock_block` on the listener) when the backlog is full: a listener takes `backlog + 1` pending
+  connections, as Linux does. ECONNREFUSED when a socket node exists with no listener, ENOENT when
+  the path does not exist. The plan's "EINPROGRESS for nonblocking" is **not** used: native
+  connect on a local socket never returns it.
+- **Blocking.** A blocked call parks with `sched_block_restart` on the socket's key (its address).
+  Every change (queue, accept queue, state) wakes the key and `poll_notify`. A call changes nothing
+  before it parks, so a restart is safe. Timeouts (`SO_RCVTIMEO`, `SO_SNDTIMEO`) keep a per-thread
+  deadline (`sock_block`), so a rerun does not extend it; a success or another error clears it.
+- **Stream sends.** A blocking stream send sends in 64 KiB chunks. Its progress is kept in
+  `cpu_t.io_done` (as pipe writes do), and the descriptions of `SCM_RIGHTS` go only with the first
+  send that succeeds. A restart never sends twice. SIGPIPE is raised only when nothing was sent (the
+  kernel's `unix_stream_sendmsg` rule); the partial-then-EPIPE case is not tested.
+- **Messages.** A datagram or seqpacket send is one message, and it is sent whole (EMSGSIZE beyond
+  the receiver's buffer). A stream read stops at a message that carries descriptions, so the
+  descriptions arrive with the data that was sent with them. `MSG_PEEK` holds the descriptions
+  instead of moving them. `MSG_TRUNC` returns the full length of a truncated message. `MSG_WAITALL`
+  on a stream waits for the buffer's length (or EOF), without consuming anything until then.
+- **Descriptors.** `SCM_RIGHTS` holds the sender's descriptions (`vfs_desc_hold`) and the receiver
+  installs them (`vfs_desc_install`, cloexec from `MSG_CMSG_CLOEXEC`). A control buffer that is too
+  small drops the rest with `MSG_CTRUNC`. `SCM_CREDENTIALS` is delivered when the receiver has
+  `SO_PASSCRED`.
+- **Credentials.** `SO_PEERCRED` is the peer's pid at connect time (uid and gid are 0, as the
+  engine runs as root). Pids are the guest pids.
+- **Options.** `SO_TYPE`, `SO_ERROR` (always 0: there is no pending connect error), `SO_ACCEPTCONN`,
+  `SO_DOMAIN`, `SO_PROTOCOL`, `SO_PASSCRED`, `SO_PEERCRED` (read only), `SO_SNDBUF` and `SO_RCVBUF`
+  (set to twice the request, capped as Linux caps `rmem_max`, minimum 4608; default 425984), and
+  `SO_SNDTIMEO` and `SO_RCVTIMEO`. Other options are ENOPROTOOPT.
+- **Readiness.** `poll_revents` asks `sock_state`: readable (queued data, a pending connection, or
+  end of file), writable (room in the peer's queue; always for a datagram), and HUP (the peer
+  closed). The old "always readable" stub is gone for real sockets. Endpoints are still always
+  ready.
+
+### Test
+
+- `tests/guest/unixsock.c` (freestanding, built by `make guest-tests`; `make test` runs it as
+  `unixsock-O0` and `unixsock-O2`, in the engine and in Node, against the native output): 35 lines.
+  It covers socketpair (stream, seqpacket, datagram), message boundaries, truncation, `MSG_PEEK`,
+  end of file on peer close, `shutdown(SHUT_WR)` with EPIPE, `SO_TYPE`, `SO_RCVBUF`,
+  `SO_RCVTIMEO` (EAGAIN), `ppoll` readiness, a bound path (`S_IFSOCK`, `getsockname`), a
+  nonblocking accept (EAGAIN), `SO_ACCEPTCONN`, the backlog (two queued, then EAGAIN), ECONNREFUSED
+  after the listener closes, ENOENT, an abstract name with data, a stream server with a forked
+  client, `SCM_RIGHTS` (a pipe's write end passed to the child), `SO_PEERCRED` (the child's pid),
+  a seqpacket server with a forked client, a blocking write of 1 MiB to a slow reader across fork,
+  a blocked `ppoll` (a pending accept) and a blocked `epoll_pwait` (data, then the hangup),
+  `SCM_CREDENTIALS` with `SO_PASSCRED`, and `getpeername` (unnamed, and ENOTCONN).
+- Output identical in the native engine, in Node, and natively in the builder VM.
+- `logd`: `xiaoji --logcat --root build/rootfs -- /system/bin/log -p w -t mytag hello` prints
+  `W/mytag(1000): hello`.
+
+### Gaps (B4a sockets)
+
+- Autobind (`bind` with a length of 2) is EINVAL; there is no autobound abstract name.
+- `connect` never returns EINPROGRESS (the native behaviour for local sockets).
+- The placeholder file is a regular file on the host. If the path is unlinked and a regular file
+  is made at it later, `stat` still reports `S_IFSOCK` (the name stays in `fs_list`).
+- `SCM_CREDENTIALS` on send uses the sending process's pid; a credential the sender sets is not
+  checked. Uid and gid are always 0.
+- `SO_ERROR` is always 0. `SO_REUSEADDR`, `SO_KEEPALIVE` and the other socket options are ENOPROTOOPT.
+- A control buffer is capped at 64 KiB, and a message's descriptions are capped at 253.
+- The receiver's buffer (`SO_RCVBUF`) limits the bytes queued per socket. A seqpacket or datagram
+  sender waits when the receiver's queue is full, with no message count limit.
+- The SIGPIPE rule for a send that is partly done and then hits EPIPE follows the kernel source; it
+  is not checked natively.
+
+### B4a: the built-in init (`--init CONFIG`)
+
+Status: **done (uncommitted), tested in the engine and in Node.** Files: `engine/init.c`,
+`engine/init.h`. Hooks: `engine/sched.c` (`run_loop`, `sched_run_init`, `sched_proc_new_child`,
+`sched_start_thread`), `engine/main.c` (`--init`, `--init-timeout`), `engine/props.c` (`ctl.*` and
+`xiaoji.exit`), `engine/sock.c` (`sock_fsnode_del`), `engine/sockcall.c` (registry-only nodes under
+`/dev/socket`), `engine/sysfs.c` (`unlinkat` drops a socket node).
+
+- **Run.** `xiaoji --init image/xiaoji.rc --root build/rootfs [--init-timeout SECS]`. `--root` is
+  required. The program argument is not used. Logs (`xiaoji: init: ...`) go to stderr; the services'
+  stdout and stderr are the engine's (init's table holds 0, 1 and 2).
+- **No thread for init.** The initial process has no guest thread. `sched.c` calls init's tick
+  between slices and whenever nothing is runnable. Every spawn, restart and stop happens there, never
+  inside a guest syscall. When nothing is runnable, the loop sleeps at most 10 ms (or until init's next
+  restart), so a SIGINT or the timeout is seen. After 5 s with nothing runnable, the thread table is
+  printed once (`report_deadlock`), so a hang is not mistaken for slow work.
+- **Stopping.** init stops when `xiaoji.exit` is set (any value, through the property service), on
+  SIGINT, or at `--init-timeout`. It kills the services with SIGKILL and removes their socket nodes.
+  The engine exits with status 0.
+- **Spawning.** A service is a fork of the initial process (its address space and descriptors are
+  copies, so it inherits the sockets init made for it, with cloexec off), then the program is loaded
+  with the same loader as `main`. Its thread starts at the entry point. init closes its own copies of
+  the sockets after the fork. A failed load releases the child.
+
+#### Config format (a subset of Android's `.rc`)
+
+```
+export NAME VALUE              # global environment (top level or in an on-block)
+property NAME VALUE            # a property set at boot (top level)
+on early-init                  # an on-block: export, setprop and mkdir lines, in order
+    mkdir /data/dalvik-cache 0771
+service NAME PATH ARGS...      # ARGS may be "double quoted" (the quotes group words)
+    socket NAME stream|dgram|seqpacket MODE [user group [context]]   # /dev/socket/NAME
+    oneshot                    # not restarted after it exits
+    disabled                   # not started at boot (ctl.start starts it)
+    setenv K V                 # service environment
+    restart_delay_ms N         # engine option: delay before a restart (default 1000)
+```
+
+Other `.rc` options (`class`, `user`, `group`, `critical`, `onrestart`, `task_profiles`, `priority`,
+and so on) are accepted and ignored. `import` is not followed. Unknown directives are reported on
+stderr.
+
+- **Start order.** The services that are not `disabled`, in file order.
+- **Restarts and crash loops.** A service that is not `oneshot` and was not stopped is restarted
+  after its delay. Four exits within 60 s stop it for good (`crash-looping; not restarting`).
+- **Properties.** init sets `init.svc.<name>` to `running`, `restarting` or `stopped`.
+- **`ctl.start`, `ctl.stop`, `ctl.restart`** (value: the service name) are queued by the property
+  service and acted on between slices. A restart kills the process and starts a new one at once.
+- **Global environment and classpaths.** The `export` lines, then BOOTCLASSPATH,
+  DEX2OATBOOTCLASSPATH, SYSTEMSERVERCLASSPATH and STANDALONE_SYSTEMSERVER_JARS, derived at start.
+  Derivation follows `derive_classpath.cpp` (the remote tree): the fragments
+  `/apex/com.android.art/etc/classpaths/bootclasspath.pb`, then `/system/etc/classpaths/...`, then the
+  `/apex/*` ones in name order, deduplicated (for the system-server list, the system fragment comes
+  first). Jars are filtered by `min_sdk_version` and `max_sdk_version` against `ro.build.version.sdk`
+  (codenames S, T, U, V map to 31 to 35). The `.pb` files are parsed as protobuf by hand.
+  **Check:** `tests/init/classpath.rc` prints the four values, and they equal the output of the guest's
+  own `/apex/com.android.sdkext/bin/derive_classpath` run in the engine (`tests/expect/init-classpath.out`).
+  They are longer than the hand-written list in `tools/guest-env.sh` (31 jars against 12), which is
+  left unchanged, since the ART cases depend on it.
+
+#### Sockets made by init
+
+- `socket NAME TYPE MODE` makes an AF_UNIX socket bound to `/dev/socket/NAME` and passes it as
+  `ANDROID_SOCKET_NAME=<fd>`. init does not `listen`: Android's `LocalServerSocket` does (it calls
+  `impl.listen` in its constructor, checked on the remote tree).
+- **Deviation from the plan.** `/dev/socket` is not a real directory. `/dev`, `/proc` and `/sys` are
+  served by the engine and never read from the host, so a socket node under `/dev/socket` is a name
+  in the engine's registry, with no file. `stat` of such a node is ENOENT (a `stat` of a node under
+  `/tmp` is `S_IFSOCK`). `unlinkat` of a bound path drops its name. Connecting to a name that is not
+  bound and has no socket node is ENOENT, and to a name whose socket has closed is ECONNREFUSED.
+- **Test.** `tests/init/sockets.rc` runs `tests/guest/initsock.c` twice. The server checks that
+  `getsockname` reports `/dev/socket/xiaoji`, listens, accepts and answers; the client connects by
+  path (retrying until the server listens) and then stops init. Output: `server: name ok`,
+  `server: got ping`, `client: got pong`.
+
+#### Tests (`make test`, each in the engine and in Node)
+
+- `init-smoke`: `tests/init/smoke.rc`. servicemanager, and a oneshot that runs `service list` after
+  `service check manager` succeeds, then sets `xiaoji.exit`. Expected: `tests/expect/init-smoke.out`.
+- `init-classpath`: the four classpath variables (above).
+- `init-sockets`: the init-made socket (above).
+- `init-ctl`: `tests/init/ctl.rc`. `ctl.stop`, `ctl.start` and `ctl.restart` on a service, observed
+  through `getprop init.svc.looper`. A crash-looping service ends `stopped`. The driver polls with
+  `until`, never with a fixed sleep for the states it checks.
+- SIGINT was checked by hand: the engine exits and a sleeping service is killed, with no process left.
+
+#### Gaps (init)
+
+- A service's child processes are not killed when the service stops (they are reparented to init and
+  keep the service's sockets, so a restarted service can see EADDRINUSE). Android's init kills the
+  process group.
+- Services run with the engine's ids (root). `user` and `group` are not applied.
+- `ro.product.cpu.abilist` and `abilist64` are set in `image/xiaoji.rc`, not derived. Android's init
+  derives them from `ro.<partition>.product.cpu.abilist*` (`property_initialize_ro_cpu_abilist`); the
+  values are what that derivation gives this image.
+- `init.environ.rc` is copied into `image/xiaoji.rc` (its imports are not followed).
+- No SELinux labels, no property contexts, no `persist.*`, no uevents, no cgroups.
+### B4a: zygote
+
+Status: **zygote preloads its classes and resources (milestone b) and calls its fork of system_server
+(milestone c, the call). The fork is refused by ART's descriptor allowlist, so system_server does not
+start.** The config is `image/xiaoji.rc`: the `early-init` exports of `init.environ.rc`, the
+servicemanager block and the zygote64 block of the Android 13 rc files (verbatim, options the engine
+does not model ignored), plus the properties and `mkdir` lines below. Run it with `--logcat`,
+`XIAOJI_STAMP=1` (each line then starts with `[ms insn]`: milliseconds and instructions since the first
+log line) and `--init-timeout`.
+
+#### Milestones
+
+One run of the native engine on the Mac (AC power, Low Power Mode off), `XIAOJI_STAMP=1`:
+
+| Milestone | Logcat line (source: `ZygoteInit.java`, `AndroidRuntime`) | Elapsed | Instructions |
+|---|---|---|---|
+| (a) app_process starts ART in zygote mode | `I/AndroidRuntime: Using default boot image` | 2.05 s | 140.8 M |
+| (b) classes preloaded | `I/Zygote: ...preloaded 16252 classes in 29078ms.` | 38.1 s | 2.31 G |
+| (b) resources preloaded | `I/Zygote: ...preloaded 41 resources in 59ms.` | 38.5 s | 2.33 G |
+| (c) zygote calls forkSystemServer | `Zygote.forkSystemServer` in the stack below | 50.2 s | 3.15 G |
+| (c) system_server forked | not reached | | |
+| (d) system_server | not reached | | |
+
+The class preload is 29 s of guest time (the guest clock), about 2.2 G instructions after (a): about
+60 M instructions per second overall on this machine. The second zygote (pid 1010) is a restart after the fork
+failure, not a second boot; its preload takes the same instructions.
+
+#### The blocker (now)
+
+```
+F/zygote64(1002): jni_internal.cc:825] JNI FatalError called: (system_server) Not allowlisted (37): /dev/stdin
+F/zygote64(1002): runtime.cc:675] Runtime aborting...
+  at com.android.internal.os.Zygote.nativeForkSystemServer(Native method)
+  at com.android.internal.os.Zygote.forkSystemServer(Zygote.java:479)
+```
+
+ART's `fd_utils` (run in the child, after the fork, to close the descriptors zygote does not
+allow) reads `/proc/self/fd`, then the target of each descriptor with `readlink`. Descriptor 37 is an
+`open("/dev/stdin")`, and the engine reports its target as `/dev/stdin`. On a device the target of
+stdin is `/dev/null`, which is allowed. So the fix is to give services a stdin that is `/dev/null` (init
+opens it as descriptor 0 of a service, as Android's init does) and to make `open("/dev/stdin")` report
+the target of descriptor 0. This is not done yet: the engine currently names its stdio descriptors
+after `/dev/stdin`, `/dev/stdout`, `/dev/stderr` (`engine/vfs.c`, `std_names`). The next step is to
+check `fd_utils.cpp` on the remote for the exact allowlist rule before changing the names.
+
+#### Engine changes made for zygote
+
+Real implementations unless marked as a stub.
+
+- **Instructions.** FCVTAS and FCVTAU (scalar, rounding ties away); vector by-element FMLA, FMLS, FMUL
+  and FMULX (single and double), and MUL, MLA and MLS (16- and 32-bit lanes); vector floating-point
+  three-same (FADD, FSUB, FMUL, FDIV, FMAX, FMIN, FMAXNM, FMINNM, FMLA, FMLS, FMULX, FABD, FRECPS,
+  FRSQRTS, FCMEQ, FCMGE, FCMGT, FACGE, FACGT, and the pairwise forms); vector floating-point
+  two-register miscellaneous (FABS, FNEG, FSQRT, SCVTF, UCVTF, FRINT*, FCVT* to integer); scalar DUP
+  (element); scalar FP pairwise (FADDP, FMAXNMP, FMAXP, FMINNMP, FMINP). FMAX, FMIN and the NM forms
+  give +0 for the maximum and -0 for the minimum of two zeros, and propagate or ignore NaN as the
+  architecture says (`fp_maxmin`). FPCR non-default modes are refused, as before.
+- **Oracle.** `tests/guest/fpvec.c` runs 71 of these forms on fixed inputs (signed zeros, infinities,
+  NaN, ties, negatives) through inline assembly and prints the raw results. Native and engine output are
+  byte-identical, in the engine and in Node (`make test`).
+- **Syscalls.** `process_vm_readv` (270) for the caller's own pid: copies between the caller's ranges and
+  returns the bytes copied before an unreadable range (EFAULT when nothing was copied). ART's `SafeCopy`
+  calls it on its own pid. `/proc/self/task` and `/proc/<pid>/task` list the threads (ZygoteHooks reads
+  the list), and `/proc/self/fd` lists the open descriptors (the fd walk of ART's fork). `clock_gettime`
+  accepts CLOCK_BOOTTIME, MONOTONIC_COARSE and REALTIME_COARSE.
+- **Credentials** (`engine/cred.c`): each process has real, effective, saved and filesystem uids and gids,
+  and its supplementary groups; a fork copies them. The set*id family, setgroups and getgroups follow
+  `kernel/sys.c`. A process with effective uid 0 is privileged. Socket credentials (`SO_PEERCRED` and
+  `SCM_CREDENTIALS`) use the effective uid and gid. The ids are not used for access checks (stat reports
+  uid and gid 0 for every file).
+- **Named stubs** (where the guest asks for something the engine does not model):
+  - `unshare(CLONE_NEWNS)` succeeds with no effect (one mount table is shared). Other namespace flags,
+    and CLONE_FILES, are EINVAL.
+  - `mount` with a propagation change only (MS_SHARED, MS_SLAVE, MS_PRIVATE, MS_UNBINDABLE) succeeds on
+    an existing target with no effect. Any other mount is EPERM.
+  - `membarrier`: QUERY reports the global and private expedited commands. Guest threads run one at a time
+    on one host thread, so every barrier already holds.
+  - `fchownat` and `fchown` succeed on an existing path or descriptor with no effect (no ownership model).
+  - `capget` (version 3) reports the full set for a root process; `capset` is accepted and ignored.
+- **fcntl**: F_SETPIPE_SZ and F_GETPIPE_SZ on a pipe report the fixed 64 KiB capacity.
+
+#### Properties and directories set in the config (and why)
+
+- `ro.product.cpu.abilist` and `ro.product.cpu.abilist64` = `arm64-v8a`. Without them ART aborts with
+  "Unable to determine ABI list". init derives them from `ro.<partition>.product.cpu.abilist*`
+  (`property_initialize_ro_cpu_abilist`); the engine does not derive them yet.
+- `ro.zygote.disable_gl_preload` = `true`. There is no OpenGL ES driver, and libEGL aborts the preload
+  without one. ZygoteInit skips its GL preload when this is set (`PROPERTY_DISABLE_OPENGL_PRELOADING`).
+- `mkdir /data/dalvik-cache` and `mkdir /data/dalvik-cache/arm64` (ART's cache). They persist in
+  `build/rootfs/data` between runs (the `mkdir` is a no-op when they exist).
+
+#### Known log lines (not fatal, recorded so they are not mistaken for the blocker)
+
+- `memfd_create failed: Invalid argument, no memfd support` then `Failed to create JIT Code Cache` and
+  `Missing code cache, cannot create JIT`: the JIT is off in this boot, and zygote carries on without it.
+  The engine's `memfd_create` accepts only MFD_CLOEXEC; ART asks for more (sealing), so the JIT is
+  disabled rather than made to work.
+- `libprocessgroup`: `RC file was not initialized properly`, `controller cpuset is not found`. There are
+  no cgroups, so task profiles do nothing.
+- `Error opening /proc/mounts` (no `/proc/mounts`), `Unable to find pattern file` (no `/proc/sys/...`
+  boot_id), `JKS KeyStore not available` (a Java security provider, from a missing keystore file).
+
+#### Missing daemons, and their effect so far
+
+- **hwservicemanager**: disabled in the rc file and not started. zygote's preload does not need it.
+- **logd**: not needed. liblog writes to `/dev/socket/logdw`, which the engine serves (its sink), so
+  logcat lines go to stderr.
+- **lmkd, vold, netd, installd, apexd, statsd, and the rest**: not started. Effects: no cgroups (above),
+  no storage mounts (vold: `/proc/mounts` is missing and there is no mount table), no GPU (EGL is off),
+  and `/apex` is the extracted rootfs, not images mounted by apexd.
+- **Crash dump**: debuggerd's helper cannot read `/proc/<pid>` of a crashed process, so a fatal signal ends
+  in SIGABRT with no tombstone.
+
+#### Repeatability
+
+- A boot writes only the `dalvik-cache` directories under `build/rootfs/data` (the test harness copies its
+  own test binaries there too).
+- `XIAOJI_BOOT=1 tests/run.sh` runs the boot and passes when the log has `...preloaded N classes`. It takes
+  about 60 s more than the default run, so it is opt-in. It stops with `--init-timeout 90`.

@@ -13,6 +13,11 @@ int procfs_known(const char *guest);
 int procfs_pid_path(const char *guest, int *pid, const char **rest);
 /* 1 if guest path is a directory on the way to a synthetic file (not listable). */
 int procfs_dir(const char *guest);
+/* The index-th entry of a /proc/<pid>/task (or /proc/self/task) directory: its thread id, in *name
+ * (a static buffer). 1 if there is one, 0 for the end or for another path. */
+int procfs_task_child(const char *guest, int index, const char **name);
+/* 1 for a task directory (/proc/self/task, /proc/<pid>/task): listable, unlike other directories. */
+int procfs_task_dir(const char *guest);
 
 /* Generates the contents of a synthetic file (malloc'd, the caller frees it).
  * Returns 0, or -1 if the path is not synthetic or the memory is short. */

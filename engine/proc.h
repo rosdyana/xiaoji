@@ -11,6 +11,16 @@
  * Its threads are in the scheduler. A process ends when its last thread goes (or
  * on exit_group, or a fatal signal). It is then a zombie until its parent reaps it;
  * its address space and fd table are released at once (pipes see end of file). */
+#define CRED_MAX_GROUPS 32
+
+/* A process's credentials (cred.c): the real, effective, saved and filesystem ids. A fork copies
+ * them. A new process (init or the initial one) is root. */
+typedef struct {
+    uint32_t ruid, euid, suid, fsuid, rgid, egid, sgid, fsgid;
+    uint32_t groups[CRED_MAX_GROUPS];
+    int ngroups;
+} proc_cred_t;
+
 typedef struct proc {
     int pid, ppid, pgid, sid;
     mm_t *mm;
@@ -18,6 +28,7 @@ typedef struct proc {
     sigtab_t *sig;
     uint64_t brk_base, brk_cur;
     uint32_t umask;
+    proc_cred_t cred;
     int dumpable;
     int exited;      /* ended: its threads are going away */
     int exit_code;   /* the exit status (exit_group's code, or 128+sig for a fatal signal) */

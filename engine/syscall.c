@@ -11,6 +11,7 @@
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
+#include "cred.h"
 #include "proc.h"
 #include "prof.h"
 #include "props.h"
@@ -82,7 +83,6 @@
 #define SYS_FLOCK 32
 #define SYS_GETRLIMIT 163
 
-#define GUEST_ROOT_ID 0 /* uid and gid: the oracle runs as root */
 #define PAGE_MASK 4095ull
 #define RLIM_INFINITY (~0ull)
 #define RLIMIT_STACK 3
@@ -118,9 +118,21 @@ const char *syscall_name(uint64_t nr)
     case 65: return "readv";
     case 66: return "writev";
     case 198: return "socket";
+    case 199: return "socketpair";
+    case 200: return "bind";
+    case 201: return "listen";
+    case 202: return "accept";
     case 203: return "connect";
+    case 204: return "getsockname";
+    case 205: return "getpeername";
     case 206: return "sendto";
     case 207: return "recvfrom";
+    case 208: return "setsockopt";
+    case 209: return "getsockopt";
+    case 210: return "shutdown";
+    case 211: return "sendmsg";
+    case 212: return "recvmsg";
+    case 242: return "accept4";
     case 67: return "pread64";
     case 78: return "readlinkat";
     case 79: return "newfstatat";
@@ -540,9 +552,9 @@ static int64_t sys_uname(uint64_t buf)
 static int64_t sys_clock_gettime(uint64_t clk, uint64_t tp)
 {
     uint64_t ns;
-    if (clk == 0)
+    if (clk == 0 || clk == 5) /* REALTIME, REALTIME_COARSE */
         ns = host_realtime_ns();
-    else if (clk == 1)
+    else if (clk == 1 || clk == 6 || clk == 7) /* MONOTONIC, MONOTONIC_COARSE, BOOTTIME (no suspend) */
         ns = host_monotonic_ns();
     else
         return -LE_INVAL;
@@ -1139,11 +1151,13 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_CLOCK_NANOSLEEP:
         *ret = sys_clock_nanosleep(a[0], a[1], a[2]);
         return;
+    case 143: case 144: case 145: case 146: case 147: case 148: case 149: case 150: case 151:
+    case 152: case 158: case 159:
     case SYS_GETUID:
     case SYS_GETEUID:
     case SYS_GETGID:
     case SYS_GETEGID:
-        *ret = GUEST_ROOT_ID;
+        *ret = cred_syscall(nr, a);
         return;
     case SYS_GETTIMEOFDAY:
         *ret = sys_gettimeofday(a[0], a[1]);

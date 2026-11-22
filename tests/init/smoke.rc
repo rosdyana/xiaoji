@@ -1,0 +1,14 @@
+# The init smoke test (B4a): run with --init and --root build/rootfs.
+# servicemanager is the context manager. The oneshot waits until it answers, lists the services,
+# then sets xiaoji.exit, which stops init (and the services) through the property service.
+export ANDROID_ROOT /system
+export ANDROID_DATA /data
+export ANDROID_ART_ROOT /apex/com.android.art
+
+service servicemanager /system/bin/servicemanager
+    user system
+    group system readproc
+    critical
+
+service smoke /system/bin/sh -c "i=0; until /system/bin/service check manager | /system/bin/toybox grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; /system/bin/service list; /system/bin/setprop xiaoji.exit 1"
+    oneshot

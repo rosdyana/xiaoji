@@ -89,6 +89,7 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     c->pgid = parent->pgid;
     c->sid = parent->sid;
     c->umask = parent->umask;
+    c->cred = parent->cred;
     c->dumpable = parent->dumpable;
     c->brk_base = parent->brk_base;
     c->brk_cur = parent->brk_cur;
