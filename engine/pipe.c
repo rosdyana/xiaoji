@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "linux.h"
+#include "poll.h"
 #include "sched.h"
 
 struct pipe {
@@ -16,7 +17,19 @@ struct pipe {
 
 /* The wait key of a pipe is its address: every thread blocked on it is woken on any
  * change, and each re-checks its own condition. */
-static void changed(pipe_t *p) { sched_wake_key((uint64_t)(uintptr_t)p); }
+static void changed(pipe_t *p)
+{
+    sched_wake_key((uint64_t)(uintptr_t)p);
+    poll_notify();
+}
+
+void pipe_state(const pipe_t *p, int *readable, int *writable, int *readers, int *writers)
+{
+    *readable = p->count > 0;
+    *writable = p->count < PIPE_CAP;
+    *readers = p->readers;
+    *writers = p->writers;
+}
 
 pipe_t *pipe_new(void)
 {

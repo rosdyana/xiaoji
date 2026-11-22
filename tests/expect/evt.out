@@ -1,0 +1,40 @@
+efd fd ok 1
+efd read 8
+efd value 5
+efd empty -11
+efd after write 3
+efd short read -22
+sem read 8
+sem value 1
+sem read2 1
+sem empty -11
+ep fd ok 1
+ep add 0
+ep add again -17
+ep wait empty 0
+ep wait ready 1
+ep event 1
+ep data 42
+ep mod 0
+ep mod data 7
+ep del 0
+ep del again -2
+tfd fd ok 1
+tfd read unarmed -11
+tfd settime 0
+tfd gettime 0
+tfd armed 1
+tfd read early -11
+tfd epoll wait 1
+tfd epoll data 3
+tfd expirations 1
+tfd blocking read 8
+tfd blocking count 1
+ppoll timeout 0
+ppoll timeout revents 0
+ppoll ready 1
+ppoll revents 1
+efd blocking read 8
+efd blocking value 7
+wait child 1
+done

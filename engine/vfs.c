@@ -15,7 +15,10 @@
 
 #include "host.h"
 #include "linux.h"
+#include "binder.h"
+#include "fdobj.h"
 #include "pipe.h"
+#include "poll.h"
 #include "procfs.h"
 #include "props.h"
 #include "proc.h"
@@ -131,6 +134,7 @@ static vfs_syn syn_of(const char *p)
     if (!strcmp(p, "/dev/urandom") || !strcmp(p, "/dev/random")) return SYN_RANDOM;
     if (!strcmp(p, "/proc/self/cmdline")) return SYN_DATA;
     if (procfs_known(p)) return SYN_DATA; /* generated at open, see vfs_open */
+    if (binder_device(p) >= 0) return SYN_BINDER;
     return SYN_NONE;
 }
 
@@ -383,6 +387,14 @@ static void desc_unref(vfs_fd *f)
         pipe_close(f->pipe, (f->lflags & LO_ACCMODE) == LO_WRONLY);
     if (f->kind == VFS_SOCK)
         sock_unref(f->sock);
+    if (f->kind == VFS_BINDER)
+        binder_release(f->binder); /* the last description of a proc: its death */
+    if (f->kind == VFS_EVENTFD)
+        efd_free(f->obj);
+    if (f->kind == VFS_TIMERFD)
+        tfd_free(f->obj);
+    if (f->kind == VFS_EPOLL)
+        poll_epoll_free(f->obj);
     free(f->guest);
     free(f->host);
     free(f->data);
@@ -427,6 +439,57 @@ int vfs_close(int fd)
     cur_fdt->slots[fd].cloexec = 0;
     desc_unref(f);
     return 0;
+}
+
+static void obj_free(vfs_kind kind, void *obj)
+{
+    if (kind == VFS_EVENTFD)
+        efd_free(obj);
+    else if (kind == VFS_TIMERFD)
+        tfd_free(obj);
+    else if (kind == VFS_EPOLL)
+        poll_epoll_free(obj);
+}
+
+int vfs_obj_new(vfs_kind kind, void *obj, int cloexec, uint32_t lflags)
+{
+    int slot = free_fd_from(0);
+    if (slot < 0) {
+        obj_free(kind, obj);
+        return -LE_MFILE;
+    }
+    vfs_fd *d = desc_new();
+    d->kind = kind;
+    d->obj = obj;
+    d->lflags = lflags;
+    d->guest = xstrdup(kind == VFS_EVENTFD ? "anon_inode:[eventfd]"
+                       : kind == VFS_TIMERFD ? "anon_inode:[timerfd]" : "anon_inode:[eventpoll]");
+    slot_install(slot, d, cloexec != 0);
+    return slot;
+}
+
+vfs_fd *vfs_desc_hold(int fd)
+{
+    vfs_fd *f = vfs_get(fd);
+    if (f)
+        f->refs++;
+    return f;
+}
+
+int vfs_desc_install(vfs_fd *d, int cloexec)
+{
+    int slot = free_fd_from(0);
+    if (slot < 0) {
+        desc_unref(d);
+        return -LE_MFILE;
+    }
+    slot_install(slot, d, cloexec != 0);
+    return slot;
+}
+
+void vfs_desc_drop(vfs_fd *d)
+{
+    desc_unref(d);
 }
 
 int vfs_pipe2(int out[2], uint32_t flags)
@@ -484,10 +547,24 @@ int vfs_cloexec_set(int fd, int on)
 int vfs_pipe_block(int fd)
 {
     vfs_fd *f = vfs_get(fd);
-    if (!f || f->kind != VFS_PIPE || (f->lflags & LO_NONBLOCK))
+    if (!f || (f->lflags & LO_NONBLOCK))
         return 0;
-    sched_block_restart((uint64_t)(uintptr_t)f->pipe);
-    return 1;
+    if (f->kind == VFS_PIPE) {
+        sched_block_restart((uint64_t)(uintptr_t)f->pipe);
+        return 1;
+    }
+    if (f->kind == VFS_EVENTFD) {
+        sched_block_restart((uint64_t)(uintptr_t)f->obj);
+        return 1;
+    }
+    if (f->kind == VFS_TIMERFD) {
+        /* A timer read blocks until its next expiry, so the wait carries that deadline. */
+        uint64_t dl = 0;
+        int has = tfd_deadline(f->obj, &dl);
+        sched_block_restart_until((uint64_t)(uintptr_t)f->obj, has, dl);
+        return 1;
+    }
+    return 0;
 }
 
 fdtab_t *vfs_fdtab_new(void)
@@ -641,6 +718,20 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     if (!r.exists && !(lflags & LO_CREAT))
         return -LE_NOENT;
 
+    if (r.syn == SYN_BINDER) {
+        if (lflags & LO_DIRECTORY)
+            return -LE_NOTDIR;
+        binder_proc_t *bp = binder_open(binder_device(r.guest));
+        if (!bp)
+            return -LE_NOMEM;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_BINDER;
+        f->binder = bp;
+        f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
+        f->guest = xstrdup(r.guest);
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     if (r.syn != SYN_NONE) {
         if (lflags & LO_DIRECTORY)
             return -LE_NOTDIR;
@@ -784,6 +875,10 @@ int64_t vfs_read(int fd, void *buf, size_t n)
             return -LE_BADF;
         return pipe_read(f->pipe, buf, n);
     case VFS_SOCK: return sock_read(f->sock, buf, n);
+    case VFS_BINDER: return -LE_INVAL; /* binder fds have no read: work comes through BINDER_WRITE_READ */
+    case VFS_EVENTFD: return efd_read(f->obj, buf, n);
+    case VFS_TIMERFD: return tfd_read(f->obj, buf, n);
+    case VFS_EPOLL: return -LE_INVAL;
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -803,6 +898,10 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_MEMFD: return memfd_pread(f->mfd, buf, n, off);
     case VFS_PIPE:
     case VFS_SOCK: return -LE_SPIPE;
+    case VFS_BINDER: return -LE_INVAL;
+    case VFS_EVENTFD:
+    case VFS_TIMERFD:
+    case VFS_EPOLL: return -LE_SPIPE;
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -823,6 +922,10 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
             return -LE_BADF;
         return (int64_t)n; /* /dev/null, /dev/zero and /dev/random discard writes */
     case VFS_SOCK: return sock_write(f->sock, buf, n);
+    case VFS_BINDER: return -LE_INVAL;
+    case VFS_EVENTFD: return efd_write(f->obj, buf, n);
+    case VFS_TIMERFD: return -LE_INVAL;
+    case VFS_EPOLL: return -LE_INVAL;
     case VFS_MEMFD: {
         if (f->ro_area)
             return -LE_BADF;
@@ -853,6 +956,10 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
         return -LE_BADF;
     case VFS_PIPE:
     case VFS_SOCK:
+    case VFS_BINDER:
+    case VFS_EVENTFD:
+    case VFS_TIMERFD:
+    case VFS_EPOLL:
         return -LE_SPIPE;
     case VFS_DIR:
         if (whence == 0 && off == 0) { /* SEEK_SET 0 rewinds */

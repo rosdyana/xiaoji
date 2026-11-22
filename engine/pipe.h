@@ -16,6 +16,9 @@ typedef struct pipe pipe_t;
 pipe_t *pipe_new(void); /* NULL when out of host memory */
 /* An open file description for one end was created (write 1: the write end). */
 void pipe_open(pipe_t *p, int write);
+/* Readiness for poll: readable (data is queued), writable (room for a byte), and the
+ * number of readers and writers. */
+void pipe_state(const pipe_t *p, int *readable, int *writable, int *readers, int *writers);
 /* A description for one end was released. Frees the pipe when both ends are gone. */
 void pipe_close(pipe_t *p, int write);
 /* n > 0 bytes read; 0 at end of file (no writers left and the ring is empty);

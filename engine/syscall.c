@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "binder.h"
 #include "exec.h"
 #include "host.h"
 #include "linux.h"
@@ -320,6 +321,18 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
         /* The property area is read-only to guests: no shared writable view. */
         if (f->ro_area && type == LMAP_SHARED && (p & 2))
             return -LE_ACCES;
+        if (f->kind == VFS_BINDER) {
+            /* The receive buffer: a memfd the binder proc owns, mapped read-only. */
+            memfd_t *m = NULL;
+            int rc = binder_mmap_prepare(f->binder, len, (p & LPROT_WRITE) != 0, &m);
+            if (rc)
+                return rc;
+            f->mfd = m;
+            int64_t base = mmap_memfd(addr, len, p, LMAP_SHARED, flags, f, off);
+            if (base >= 0)
+                binder_mmap_done(f->binder, (uint64_t)base);
+            return base;
+        }
         if (f->kind == VFS_MEMFD)
             return mmap_memfd(addr, len, p, type, flags, f, off);
         if (f->kind == VFS_DIR || f->kind == VFS_SYN || !f->host)
@@ -1147,9 +1160,6 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_CLOCK_GETTIME:
         *ret = sys_clock_gettime(a[0], a[1]);
-        return;
-    case SYS_IOCTL:
-        *ret = -LE_NOTTY;
         return;
     case SYS_PRLIMIT64:
         *ret = sys_prlimit64(a[1], a[3]);

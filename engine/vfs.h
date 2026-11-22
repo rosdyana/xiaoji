@@ -14,8 +14,8 @@
 #define VFS_PATH_MAX 4096
 #define VFS_MAX_FD 1024
 
-typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE, VFS_SOCK } vfs_kind;
-typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA } vfs_syn;
+typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE, VFS_SOCK, VFS_BINDER, VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL } vfs_kind;
+typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA, SYN_BINDER } vfs_syn;
 
 /* An open file description: the offset, the status flags and the object. Every fd
  * that refers to it (dup, fork) shares it; it is freed when refs drops to 0. */
@@ -37,6 +37,8 @@ typedef struct {
     pipe_t *pipe;    /* VFS_PIPE: the pipe; lflags (LO_RDONLY or LO_WRONLY) says which end */
     sock_t *sock;    /* VFS_SOCK: the socket (sock.h) */
     int ro_area;     /* VFS_MEMFD: the property area, read-only (PROT_WRITE is refused) */
+    void *binder;    /* VFS_BINDER: the binder proc (binder.h); released with the description */
+    void *obj;       /* VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL: the object (fdobj.h, poll.h) */
 } vfs_fd;
 
 /* A descriptor: a slot in a process's fd table. The close-on-exec flag is per slot;
@@ -121,6 +123,18 @@ int vfs_stat_props(host_stat *out);
 /* chmod of an open file (pipes and memfds accept and ignore it). */
 int vfs_fchmod(int fd, uint32_t mode);
 int vfs_statfs_fd(int fd, host_statfs *out);
+
+/* Descriptions, for passing an fd to another process (binder). vfs_desc_hold takes a
+ * reference on the description of fd (NULL if fd is not open). vfs_desc_install puts a
+ * held description in the running table and returns its fd (the reference moves into
+ * the table); on failure it drops the reference and returns -LE_*. vfs_desc_drop gives
+ * back a reference that was never installed. */
+/* A new fd for an object of kind (eventfd, timerfd or epoll). The description takes obj;
+ * on failure obj is freed. Returns the fd or -LE_*. */
+int vfs_obj_new(vfs_kind kind, void *obj, int cloexec, uint32_t lflags);
+vfs_fd *vfs_desc_hold(int fd);
+int vfs_desc_install(vfs_fd *d, int cloexec);
+void vfs_desc_drop(vfs_fd *d);
 
 /* Reads a program or interpreter through the guest namespace. canon receives
  * its canonical guest path. */

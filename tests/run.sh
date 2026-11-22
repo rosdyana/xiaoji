@@ -252,7 +252,7 @@ fi
 # so there is no oracle; stdout must equal tests/expect/<name>.out and the exit code
 # must be 0. Properties live in the engine process, so each case is one sh -c, where
 # setprop and getprop share the store.
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -260,6 +260,7 @@ prop_argv() {
     prop-ro) ARGV=(/system/bin/sh -c '/system/bin/setprop ro.xiaoji.once a; echo rc=$?; /system/bin/setprop ro.xiaoji.once b 2>/dev/null; echo rc=$?; /system/bin/getprop ro.xiaoji.once; /system/bin/setprop ro.hardware x 2>/dev/null; echo rc=$?') ;;
     prop-list) ARGV=(/system/bin/sh -c 'n=$(/system/bin/getprop | /system/bin/toybox grep -c "^\["); names=$(/system/bin/getprop | /system/bin/toybox sed "s/^\[\([^]]*\)\].*/\1/"); sorted=$(printf "%s\n" "$names" | /system/bin/toybox sort); if [ "$n" -gt 100 ] && [ "$names" = "$sorted" ]; then echo above 100 and sorted; fi') ;;
     prop-wait) ARGV=(/data/local/tmp/prop-wait) ;;
+    evt) ARGV=(/data/local/tmp/evt) ;;
     esac
 }
 
@@ -297,6 +298,11 @@ if [ -d build/rootfs/system/bin ]; then
         mkdir -p build/rootfs/data/local/tmp
         cp build/tests/guest/prop-wait-O0 build/rootfs/data/local/tmp/prop-wait
     fi
+    # Event objects (B3): eventfd, timerfd, epoll and ppoll (tests/guest/evt.c).
+    if [ -f build/tests/guest/evt-O0 ]; then
+        mkdir -p build/rootfs/data/local/tmp
+        cp build/tests/guest/evt-O0 build/rootfs/data/local/tmp/evt
+    fi
     for name in $PROP_CASES; do
         prop_argv "$name"
         check_expect engine engine "$name"
@@ -304,6 +310,32 @@ if [ -d build/rootfs/system/bin ]; then
             check_expect node node "$name"
         fi
     done
+fi
+
+# Binder (B3): the AOSP driver conformance test. Three cases need a context manager
+# (the device runs servicemanager as one); this engine cannot run servicemanager yet
+# (its Access constructor needs SELinux status, see docs/boot.md, B3), so they are
+# skipped here and reported. The other 14 must pass, in the engine and in Node.
+BINDER_TEST=/data/nativetest64/binderDriverInterfaceTest/binderDriverInterfaceTest
+BINDER_FILTER='-*SetContextMgrBusy:*.Transaction:*.RequestDeathNotification'
+if [ -f "build/rootfs$BINDER_TEST" ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --root build/rootfs -- "$BINDER_TEST" --gtest_brief=1 --gtest_filter="$BINDER_FILTER" >"$OUT/binder.$runner.out" 2>&1
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --root build/rootfs -- "$BINDER_TEST" --gtest_brief=1 --gtest_filter="$BINDER_FILTER" >"$OUT/binder.$runner.out" 2>&1
+        else
+            continue
+        fi
+        if grep -q '\[  PASSED  \] 14 tests\.' "$OUT/binder.$runner.out"; then
+            echo "PASS  binder-driver 14 cases $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  binder-driver 14 cases $runner"
+            fail=$((fail + 1))
+        fi
+    done
+    echo "SKIP  binder-driver SetContextMgrBusy, Transaction, RequestDeathNotification: need a context manager (servicemanager, docs/boot.md B3)"
 fi
 
 echo

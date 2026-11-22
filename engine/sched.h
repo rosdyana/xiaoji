@@ -79,6 +79,9 @@ void sched_exit_signal(int sig);
  * (sched_wake): the call restarts after the handler, except a part-done pipe write,
  * which returns the bytes it wrote. No EINTR is returned. */
 void sched_block_restart(uint64_t key);
+/* As sched_block_restart, and the thread also wakes (to rerun) at the host monotonic
+ * deadline, if has_deadline. */
+void sched_block_restart_until(uint64_t key, int has_deadline, uint64_t deadline);
 void sched_wake_key(uint64_t key);
 /* The cpu of the running thread (the one whose syscall is being run). */
 cpu_t *sched_cur_cpu(void);

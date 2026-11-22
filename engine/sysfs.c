@@ -5,6 +5,9 @@
 
 #include <string.h>
 
+#include "binder.h"
+#include "fdobj.h"
+#include "poll.h"
 #include "host.h"
 #include "linux.h"
 #include "mem.h"
@@ -16,6 +19,15 @@
 #include "vfs.h"
 
 #define SYS_GETCWD 17
+#define SYS_IOCTL 29
+#define SYS_EPOLL_CREATE1 20
+#define SYS_EPOLL_CTL 21
+#define SYS_EPOLL_PWAIT 22
+#define SYS_EVENTFD2 19
+#define SYS_PPOLL 73
+#define SYS_TIMERFD_CREATE 85
+#define SYS_TIMERFD_SETTIME 86
+#define SYS_TIMERFD_GETTIME 87
 #define SYS_FTRUNCATE 46
 #define SYS_DUP 23
 #define SYS_DUP3 24
@@ -729,9 +741,140 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t len)
     return 0;
 }
 
+/* eventfd2(initval, flags). */
+static int64_t sys_eventfd2(uint64_t init, uint64_t flags)
+{
+    if (flags & ~(uint64_t)(EFD_SEMAPHORE | LO_NONBLOCK | LO_CLOEXEC))
+        return -LE_INVAL;
+    void *o = efd_new((uint32_t)init, (flags & EFD_SEMAPHORE) != 0);
+    if (!o)
+        return -LE_NOMEM;
+    return vfs_obj_new(VFS_EVENTFD, o, (flags & LO_CLOEXEC) != 0,
+                       LO_RDWR | (uint32_t)(flags & LO_NONBLOCK));
+}
+
+/* timerfd_create(clockid, flags). The clocks are CLOCK_MONOTONIC and CLOCK_BOOTTIME; both
+ * are the host's monotonic clock in the engine. */
+static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags)
+{
+    if (clockid != 1 && clockid != 7)
+        return -LE_INVAL;
+    if (flags & ~(uint64_t)(LO_NONBLOCK | LO_CLOEXEC))
+        return -LE_INVAL;
+    void *o = tfd_new((int)clockid);
+    if (!o)
+        return -LE_NOMEM;
+    return vfs_obj_new(VFS_TIMERFD, o, (flags & LO_CLOEXEC) != 0,
+                       LO_RDONLY | (uint32_t)(flags & LO_NONBLOCK));
+}
+
+/* A struct itimerspec in guest memory: interval (sec, nsec), then value (sec, nsec). */
+static void put_itimer(uint8_t *b, uint64_t interval_ns, uint64_t value_ns)
+{
+    uint64_t v[4] = {interval_ns / 1000000000ull, interval_ns % 1000000000ull,
+                     value_ns / 1000000000ull, value_ns % 1000000000ull};
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 8; k++)
+            b[8 * i + k] = (uint8_t)(v[i] >> (8 * k));
+}
+
+/* Reads a timespec (sec, nsec) into ns. Negative or out-of-range fields are EINVAL. */
+static int get_timespec_ns(const uint8_t *b, uint64_t *ns)
+{
+    int64_t s = 0, n = 0;
+    for (int k = 7; k >= 0; k--) {
+        s = (int64_t)(((uint64_t)s << 8) | b[k]);
+        n = (int64_t)(((uint64_t)n << 8) | b[8 + k]);
+    }
+    if (s < 0 || n < 0 || n >= 1000000000)
+        return -LE_INVAL;
+    if (s > 1000000000)
+        s = 1000000000;
+    *ns = (uint64_t)s * 1000000000ull + (uint64_t)n;
+    return 0;
+}
+
+/* timerfd_settime(fd, flags, new, old). */
+static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_va, uint64_t old_va)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_TIMERFD)
+        return -LE_INVAL;
+    if (flags & ~(uint64_t)TFD_TIMER_ABSTIME)
+        return -LE_INVAL;
+    uint8_t it[32];
+    if (mem_copy_out(it, new_va, sizeof it) < 0)
+        return -LE_FAULT;
+    uint64_t interval_ns = 0, value_ns = 0;
+    int rc = get_timespec_ns(it, &interval_ns);
+    if (rc)
+        return rc;
+    rc = get_timespec_ns(it + 16, &value_ns);
+    if (rc)
+        return rc;
+    if (old_va) {
+        uint64_t remain = 0, iv = 0;
+        tfd_gettime(f->obj, &remain, &iv);
+        uint8_t old[32];
+        put_itimer(old, iv, remain);
+        if (mem_copy_in(old_va, old, sizeof old) < 0)
+            return -LE_FAULT;
+    }
+    tfd_settime(f->obj, (flags & TFD_TIMER_ABSTIME) != 0, value_ns, interval_ns);
+    return 0;
+}
+
+/* timerfd_gettime(fd, cur). */
+static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t cur_va)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_TIMERFD)
+        return -LE_INVAL;
+    uint64_t remain = 0, iv = 0;
+    tfd_gettime(f->obj, &remain, &iv);
+    uint8_t cur[32];
+    put_itimer(cur, iv, remain);
+    return mem_copy_in(cur_va, cur, sizeof cur) < 0 ? -LE_FAULT : 0;
+}
+
+/* epoll_create1(flags): only EPOLL_CLOEXEC is valid. */
+static int64_t sys_epoll_create1(uint64_t flags)
+{
+    if (flags & ~(uint64_t)LO_CLOEXEC)
+        return -LE_INVAL;
+    void *ep = poll_epoll_new();
+    if (!ep)
+        return -LE_NOMEM;
+    return vfs_obj_new(VFS_EPOLL, ep, (flags & LO_CLOEXEC) != 0, LO_RDONLY);
+}
+
+/* ioctl. Only binder fds take ioctls; any other fd is ENOTTY. */
+static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_BINDER)
+        return -LE_NOTTY;
+    return binder_ioctl(f->binder, (uint32_t)cmd, arg, (f->lflags & LO_NONBLOCK) != 0);
+}
+
 int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
 {
     switch (nr) {
+    case SYS_IOCTL: *ret = sys_ioctl(a[0], a[1], a[2]); return 1;
+    case SYS_EVENTFD2: *ret = sys_eventfd2(a[0], a[1]); return 1;
+    case SYS_EPOLL_CREATE1: *ret = sys_epoll_create1(a[0]); return 1;
+    case SYS_EPOLL_CTL: *ret = poll_epoll_ctl((int)(int32_t)a[0], (int)(int32_t)a[1], (int)(int32_t)a[2], a[3]); return 1;
+    case SYS_EPOLL_PWAIT: *ret = poll_epoll_wait((int)(int32_t)a[0], a[1], (int32_t)a[2], (int32_t)a[3]); return 1;
+    case SYS_PPOLL: *ret = poll_ppoll(a[0], a[1], a[2], a[3], a[4]); return 1;
+    case SYS_TIMERFD_CREATE: *ret = sys_timerfd_create(a[0], a[1]); return 1;
+    case SYS_TIMERFD_SETTIME: *ret = sys_timerfd_settime(a[0], a[1], a[2], a[3]); return 1;
+    case SYS_TIMERFD_GETTIME: *ret = sys_timerfd_gettime(a[0], a[1]); return 1;
     case SYS_FTRUNCATE: *ret = sys_ftruncate(a[0], a[1]); return 1;
     case SYS_MEMFD_CREATE: *ret = sys_memfd_create(a[0], a[1]); return 1;
     case SYS_OPENAT: *ret = sys_openat(a[0], a[1], a[2], a[3]); return 1;

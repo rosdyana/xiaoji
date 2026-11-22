@@ -176,6 +176,13 @@ void sched_block_restart(uint64_t key)
     block_current(TS_RESTART, key, 0, 0, 0);
 }
 
+void sched_block_restart_until(uint64_t key, int has_deadline, uint64_t deadline)
+{
+    thread_t *t = cur();
+    t->cpu.pc -= 4;
+    block_current(TS_RESTART, key, 0, has_deadline, deadline);
+}
+
 void sched_block_vfork(uint64_t key, int64_t ret)
 {
     thread_t *t = cur();
@@ -305,6 +312,10 @@ static void expire_timers(uint64_t now)
             ret = -(int64_t)LE_TIMEDOUT;
         else if (t->state == TS_SIGWAIT)
             ret = -(int64_t)LE_AGAIN;
+        if (t->state == TS_RESTART) { /* a timed restart reruns its call, which checks its deadline */
+            wake_restart(t);
+            continue;
+        }
         wake(t, ret);
     }
 }
