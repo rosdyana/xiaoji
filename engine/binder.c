@@ -117,6 +117,7 @@ typedef struct {
     int32_t sender_pid;
     uint32_t sender_euid;
     uint64_t data_size, offsets_size, buffer, offsets;
+    uint64_t buffers_size; /* the scatter-gather area (BC_*_SG only; 0 otherwise) */
 } btd_t;
 
 /* ---------- objects ---------- */
@@ -221,7 +222,6 @@ struct bthread {
 
 typedef struct {
     bnode_t *mgr;
-    int mgr_ext;
 } bctx_t;
 
 struct bproc {
@@ -696,9 +696,15 @@ typedef struct {
     bproc_t *src, *dst;
     uint8_t *data;
     uint64_t dsize;
-    uint64_t sg_end; /* end of the buffer so far (relative to the buffer start) */
+    /* The scatter-gather area: the next free offset, and its end (both relative to the buffer
+     * start). The area starts after the data and the offsets, and is buffers_size long. */
+    uint64_t sg_cur, sg_lim;
     uint32_t nobj;
+    uint64_t *offs;    /* the offsets array (object offsets), valid while the objects are read */
     int64_t *obj_blob; /* per object: its scatter-gather blob, or -1 */
+    /* binder_validate_fixup's state: the last object fixed up (0: none) and the minimum fixup
+     * offset within it. */
+    uint64_t last_obj, last_min;
     struct {
         uint8_t *data;
         uint64_t len, at;
@@ -708,6 +714,13 @@ typedef struct {
         uint64_t field, blob_at; /* a buffer address field to patch once the buffer exists */
     } *fix;
     uint32_t nfix, cap_fix;
+    /* A parent's slot to patch with a child's address once the buffer exists: at offset poff of
+     * blob blob, the address of the child blob at offset at. */
+    struct {
+        uint32_t blob;
+        uint64_t poff, at;
+    } *pfix;
+    uint32_t npfix, cap_pfix;
     bfdref_t *fds;
     uint32_t nfds, cap_fds;
 } xlate_t;
@@ -770,6 +783,50 @@ static int xl_fix(xlate_t *x, uint64_t field, uint64_t blob_at)
     return 0;
 }
 
+#define BINDER_BUFFER_FLAG_HAS_PARENT 0x1u
+
+/* binder_validate_fixup (Linux 6.12, drivers/android/binder.c). A fixup inside the parent object at
+ * parent_obj, at offset fixup_off, is allowed when the last object fixed up is that parent or one of
+ * its parents, and the fixups inside one object come at increasing offsets. An offset of 0 is the
+ * driver's "no object" sentinel: nothing is fixed up until another object has been. */
+static int xl_fixup_ok(xlate_t *x, uint64_t parent_obj, uint64_t fixup_off)
+{
+    if (!x->last_obj)
+        return 0;
+    uint64_t cur = x->last_obj, min = x->last_min;
+    while (cur != parent_obj) {
+        const uint8_t *o = x->data + cur;
+        /* The state only holds PTR objects, and each step goes to an earlier object (the parent
+         * index of an object is checked when it is translated), so this ends. */
+        if (cur + 40 > x->dsize || ld32(o) != OBJ_PTR || !(ld32(o + 4) & BINDER_BUFFER_FLAG_HAS_PARENT))
+            return 0;
+        min = ld64(o + 32) + 8;
+        uint64_t pi = ld64(o + 24);
+        if (pi >= x->nobj)
+            return 0;
+        cur = x->offs[pi];
+    }
+    return fixup_off >= min;
+}
+
+/* Records a parent slot to patch once the buffer exists (binder_fixup_parent's deferred fixup). */
+static int xl_pfix(xlate_t *x, uint32_t blob, uint64_t poff, uint64_t at)
+{
+    if (x->npfix == x->cap_pfix) {
+        uint32_t cap = x->cap_pfix ? x->cap_pfix * 2 : 4;
+        void *np = realloc(x->pfix, cap * sizeof *x->pfix);
+        if (!np)
+            return -LE_NOMEM;
+        x->pfix = np;
+        x->cap_pfix = cap;
+    }
+    x->pfix[x->npfix].blob = blob;
+    x->pfix[x->npfix].poff = poff;
+    x->pfix[x->npfix].at = at;
+    x->npfix++;
+    return 0;
+}
+
 /* Translates the object at data offset off, which is object number idx. */
 static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
 {
@@ -819,7 +876,11 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
         if (off + 40 > x->dsize)
             return -LE_INVAL;
         uint64_t va = ld64(obj + 8), len = ld64(obj + 16);
+        uint32_t flags = ld32(obj + 4);
         if (len > MAP_CAP)
+            return -LE_INVAL;
+        /* The driver's bound: the buffer must fit in the scatter-gather area that is left. */
+        if (len > x->sg_lim - x->sg_cur)
             return -LE_INVAL;
         if (x->nblobs == x->cap_blobs) {
             uint32_t cap = x->cap_blobs ? x->cap_blobs * 2 : 4;
@@ -836,25 +897,51 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
             free(blob);
             return -LE_FAULT;
         }
-        uint64_t at = ALIGN8(x->sg_end);
-        x->sg_end = at + len;
-        x->blobs[x->nblobs].data = blob;
-        x->blobs[x->nblobs].len = len;
-        x->blobs[x->nblobs].at = at;
-        x->obj_blob[idx] = (int64_t)x->nblobs;
+        uint64_t at = x->sg_cur;
+        x->sg_cur = at + ALIGN8(len);
+        uint32_t bi = x->nblobs;
+        x->blobs[bi].data = blob;
+        x->blobs[bi].len = len;
+        x->blobs[bi].at = at;
+        x->obj_blob[idx] = (int64_t)bi;
         x->nblobs++;
-        return xl_fix(x, off + 8, at);
+        int rc = xl_fix(x, off + 8, at);
+        if (rc)
+            return rc;
+        if (flags & BINDER_BUFFER_FLAG_HAS_PARENT) {
+            uint64_t parent = ld64(obj + 24), poff = ld64(obj + 32);
+            /* binder_validate_ptr: the parent is an earlier PTR object of this transaction. */
+            if (parent >= idx || x->obj_blob[parent] < 0)
+                return -LE_INVAL;
+            uint32_t pb = (uint32_t)x->obj_blob[parent];
+            if (!xl_fixup_ok(x, x->offs[parent], poff))
+                return -LE_INVAL;
+            /* binder_fixup_parent: the slot must lie inside the parent. */
+            if (x->blobs[pb].len < 8 || poff > x->blobs[pb].len - 8)
+                return -LE_INVAL;
+            rc = xl_pfix(x, pb, poff, at);
+            if (rc)
+                return rc;
+        }
+        /* binder_transaction: every PTR object is the last one fixed up, at minimum offset 0. */
+        x->last_obj = off;
+        x->last_min = 0;
+        return 0;
     }
     case OBJ_FDA: {
         if (off + 32 > x->dsize)
             return -LE_INVAL;
         uint64_t nfds = ld64(obj + 8), parent = ld64(obj + 16), poff = ld64(obj + 24);
-        /* The parent is an earlier PTR object; the array lies inside its blob. */
+        /* binder_validate_ptr: the parent is an earlier PTR object; the array lies inside its blob. */
         if (parent >= idx || x->obj_blob[parent] < 0)
             return -LE_INVAL;
+        uint64_t pobj = x->offs[parent];
         uint32_t bi = (uint32_t)x->obj_blob[parent];
+        if (!xl_fixup_ok(x, pobj, poff))
+            return -LE_INVAL;
         uint64_t blen = x->blobs[bi].len;
-        if (poff % 4 || poff > blen || nfds > (blen - poff) / 4)
+        /* binder_translate_fd_array: an empty array needs no room in the parent. */
+        if (nfds && (poff % 4 || poff > blen || nfds > (blen - poff) / 4))
             return -LE_INVAL;
         for (uint64_t i = 0; i < nfds; i++) {
             uint8_t *fp = x->blobs[bi].data + poff + 4 * i;
@@ -865,6 +952,8 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
             if (rc)
                 return rc;
         }
+        x->last_obj = pobj;
+        x->last_min = poff + 4 * nfds;
         return 0;
     }
     default:
@@ -890,6 +979,7 @@ static void xl_free(xlate_t *x)
         free(x->blobs[i].data);
     free(x->blobs);
     free(x->fix);
+    free(x->pfix);
     free(x->obj_blob);
     free(x->data);
 }
@@ -908,7 +998,8 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
     x.src = src;
     x.dst = dst;
     *err = 0;
-    if (d->data_size > MAP_CAP || d->offsets_size > MAP_CAP || d->offsets_size % 8) {
+    if (d->data_size > MAP_CAP || d->offsets_size > MAP_CAP || d->offsets_size % 8 ||
+        d->buffers_size > MAP_CAP || d->buffers_size % 8) {
         *err = -LE_INVAL;
         return NULL;
     }
@@ -939,16 +1030,19 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
         *err = -LE_INVAL;
         goto out;
     }
-    x.sg_end = ALIGN8(ALIGN8(x.dsize) + d->offsets_size);
+    /* The buffer: the data, the offsets, then the scatter-gather area of buffers_size bytes. */
+    x.sg_cur = ALIGN8(x.dsize) + d->offsets_size;
+    x.sg_lim = x.sg_cur + d->buffers_size;
+    x.offs = offs;
     for (uint32_t i = 0; i < x.nobj; i++) {
         *err = xl_object(&x, i, offs[i]);
         if (*err)
             goto out;
     }
-    uint64_t secctx_at = 0, total = x.sg_end;
+    uint64_t secctx_at = 0, total = x.sg_lim;
     if (secctx) {
         /* The context string (SELINUX_CTX and its NUL, 14 bytes) fits in 16. */
-        secctx_at = ALIGN8(x.sg_end);
+        secctx_at = x.sg_lim;
         total = secctx_at + 16;
     }
     if (total < 8)
@@ -978,6 +1072,9 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
     }
     for (uint32_t i = 0; i < x.nfix; i++)
         st64(x.data + x.fix[i].field, dst->map_va + a->off + x.fix[i].blob_at);
+    /* A child's address goes into its parent's blob, before the blobs are written. */
+    for (uint32_t i = 0; i < x.npfix; i++)
+        st64(x.blobs[x.pfix[i].blob].data + x.pfix[i].poff, dst->map_va + a->off + x.pfix[i].at);
     if (buf_write(dst, a->off, x.data, (size_t)x.dsize) < 0 ||
         buf_write(dst, a->off + ALIGN8(x.dsize), obytes, (size_t)d->offsets_size) < 0) {
         *err = -LE_NOMEM;
@@ -1032,7 +1129,8 @@ out:
 /* ---------- commands and returns ---------- */
 
 /* binder_transaction_data, from the guest's bytes (the handle is the low word of target). */
-static void btd_parse(const uint8_t *p, btd_t *d)
+/* binder_transaction_data (64 bytes); with sg, binder_transaction_data_sg adds buffers_size. */
+static void btd_parse(const uint8_t *p, btd_t *d, int sg)
 {
     d->target = ld64(p);
     d->cookie = ld64(p + 8);
@@ -1044,6 +1142,7 @@ static void btd_parse(const uint8_t *p, btd_t *d)
     d->offsets_size = ld64(p + 40);
     d->buffer = ld64(p + 48);
     d->offsets = ld64(p + 56);
+    d->buffers_size = sg ? ld64(p + 64) : 0;
 }
 
 static void queue_txn_complete(bthread_t *t)
@@ -1387,8 +1486,8 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
         return;
     }
     int oneway = (d->flags & TF_ONE_WAY) != 0;
-    int secctx = (node->flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX) ||
-                 (node == dst->ctx->mgr && dst->ctx->mgr_ext);
+    /* The security context is sent when the target node asks for it (the driver's rule). */
+    int secctx = (node->flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX) != 0;
     int err = 0;
     xl_sender = t;
     btxn_t *x = txn_build(b, dst, d, secctx, &err);
@@ -1454,7 +1553,7 @@ static int bcmd(bproc_t *b, bthread_t *t, uint32_t cmd, const uint8_t *arg)
     case BC_REPLY:
     case BC_REPLY_SG: {
         btd_t d;
-        btd_parse(arg, &d);
+        btd_parse(arg, &d, cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG);
         cmd_send(b, t, &d, cmd == BC_REPLY || cmd == BC_REPLY_SG);
         return 0;
     }
@@ -1635,7 +1734,6 @@ int64_t binder_ioctl(binder_proc_t *b, uint32_t cmd, uint64_t arg, int nonblock)
             return -LE_NOMEM;
         mgr_counts_acked(n);
         b->ctx->mgr = n;
-        b->ctx->mgr_ext = 0;
         return 0;
     }
     case BINDER_SET_CONTEXT_MGR_EXT: {
@@ -1643,12 +1741,12 @@ int64_t binder_ioctl(binder_proc_t *b, uint32_t cmd, uint64_t arg, int nonblock)
             return -LE_FAULT;
         if (b->ctx->mgr)
             return -LE_BUSY;
+        /* The flags are the node's (FLAT_BINDER_FLAG_TXN_SECURITY_CTX, ACCEPTS_FDS, ...). */
         bnode_t *n = node_new(b, ld64(buf + 8), ld64(buf + 16), ld32(buf + 4));
         if (!n)
             return -LE_NOMEM;
         mgr_counts_acked(n);
         b->ctx->mgr = n;
-        b->ctx->mgr_ext = 1;
         return 0;
     }
     case BINDER_THREAD_EXIT:

@@ -34,6 +34,16 @@ static const struct {
     {"/sys/fs/selinux/class/service_manager/perms/add", SELFS_FILE, "1\n"},
     {"/sys/fs/selinux/class/service_manager/perms/find", SELFS_FILE, "2\n"},
     {"/sys/fs/selinux/class/service_manager/perms/list", SELFS_FILE, "3\n"},
+    /* hwservice_manager (the HIDL service manager's class, system/sepolicy private/access_vectors):
+     * without it libselinux reports "Unknown class", and hwservicemanager denies its own add (so the
+     * HIDL manager is not registered, and Watchdog's lookup of it fails). The index is the next free
+     * one after service_manager's; the access decision is still allow-all. */
+    {"/sys/fs/selinux/class/hwservice_manager", SELFS_DIR, NULL},
+    {"/sys/fs/selinux/class/hwservice_manager/index", SELFS_FILE, "61\n"},
+    {"/sys/fs/selinux/class/hwservice_manager/perms", SELFS_DIR, NULL},
+    {"/sys/fs/selinux/class/hwservice_manager/perms/add", SELFS_FILE, "1\n"},
+    {"/sys/fs/selinux/class/hwservice_manager/perms/find", SELFS_FILE, "2\n"},
+    {"/sys/fs/selinux/class/hwservice_manager/perms/list", SELFS_FILE, "3\n"},
 };
 
 #define NTREE (sizeof tree / sizeof tree[0])

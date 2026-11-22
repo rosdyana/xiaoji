@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "flat-type-hierarchy",
+        "value": "*",
+        "files": [
+          "web/index.html"
+        ],
+        "createdAt": "2026-11-22T20:21:40.060Z",
+        "reason": "Claude decided: web/index.html is an internal dev/test harness for running the engine (M4 plan: minimal and functional, no design work); the product UI will be built separately"
+      }
+    ]
+  }
+}

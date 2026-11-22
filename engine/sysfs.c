@@ -41,6 +41,10 @@
 #define SYS_FCNTL 25
 #define SYS_MKDIRAT 34
 #define SYS_UNLINKAT 35
+#define SYS_RENAMEAT 38
+#define SYS_RENAMEAT2 276
+#define SYS_FSYNC 82
+#define SYS_FDATASYNC 83
 #define SYS_FACCESSAT 48
 #define SYS_FCHMOD 52
 #define SYS_FCHMODAT 53
@@ -557,6 +561,51 @@ static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
     return urc;
 }
 
+/* renameat(olddirfd, old, newdirfd, new), and renameat2 with its flags. Both names are resolved
+ * without following a last link (a rename moves the link itself), and the move is a host rename.
+ * The RENAME_* flags are not modelled (EINVAL for any flag). Renaming across mounts is EXDEV on
+ * Linux; that check is not made (a gap, docs/boot.md, B4c part 2). */
+static int64_t sys_renameat(uint64_t odfd, uint64_t a1, uint64_t ndfd, uint64_t a3, uint64_t flags)
+{
+    static char from[VFS_PATH_MAX], to[VFS_PATH_MAX];
+    static vfs_res rf, rt;
+    if (flags)
+        return -LE_INVAL;
+    int rc = get_path(a1, from, sizeof from);
+    if (rc)
+        return rc;
+    rc = get_path(a3, to, sizeof to);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(odfd), from, 0, &rf);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(ndfd), to, 0, &rt);
+    if (rc)
+        return rc;
+    if (!rf.exists && !rf.is_link)
+        return -LE_NOENT;
+    if (rf.ro || rt.ro)
+        return -LE_ROFS;
+    if (rf.syn != SYN_NONE || rt.syn != SYN_NONE)
+        return -LE_PERM;
+    return host_rename(rf.host, rt.host);
+}
+
+/* fsync and fdatasync: a host file is synced; a memfd or a directory has nothing to sync (0); other
+ * descriptors (pipes, sockets, eventfds, epoll) are EINVAL, as on Linux. */
+static int64_t sys_fsync(uint64_t fd)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind == VFS_FILE && f->hfd >= 0)
+        return host_fsync(f->hfd);
+    if (f->kind == VFS_MEMFD || f->kind == VFS_DIR)
+        return 0;
+    return -LE_INVAL;
+}
+
 /* Ownership and capabilities are not modelled. stat reports uid and gid 0 for every file, so a
  * chown names an existing file (or descriptor) and changes nothing. A process is root, so
  * capget reports the full set (the version-3 layout); capset is accepted and ignored. */
@@ -1052,6 +1101,10 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_FACCESSAT: *ret = sys_faccessat(a[0], a[1], a[2], 0); return 1;
     case SYS_MKDIRAT: *ret = sys_mkdirat(a[0], a[1], a[2]); return 1;
     case SYS_UNLINKAT: *ret = sys_unlinkat(a[0], a[1], a[2]); return 1;
+    case SYS_RENAMEAT: *ret = sys_renameat(a[0], a[1], a[2], a[3], 0); return 1;
+    case SYS_RENAMEAT2: *ret = sys_renameat(a[0], a[1], a[2], a[3], a[4]); return 1;
+    case SYS_FSYNC:
+    case SYS_FDATASYNC: *ret = sys_fsync(a[0]); return 1;
     case SYS_FCHMODAT: *ret = sys_fchmodat(a[0], a[1], a[2]); return 1;
     case SYS_FCHMOD: *ret = vfs_fchmod((int)(int32_t)a[0], (uint32_t)a[1]); return 1;
     case 54: /* fchownat */ *ret = sys_fchownat(a[0], a[1], a[4]); return 1;

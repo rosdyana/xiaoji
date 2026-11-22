@@ -49,6 +49,8 @@ int host_fchmod(int fd, uint32_t mode);
 int host_mkdir(const char *path, uint32_t mode);
 int host_unlink(const char *path);
 int host_rmdir(const char *path);
+int host_rename(const char *from, const char *to);
+int host_fsync(int fd);
 /* Returns the link length (truncated to cap) or -LE_*. */
 int64_t host_readlink(const char *path, char *buf, size_t cap);
 

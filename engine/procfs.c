@@ -109,7 +109,7 @@ int procfs_known(const char *guest)
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
         is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
-        !strcmp(guest, "/proc/self/mountinfo"))
+        !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo"))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
@@ -298,6 +298,29 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         sb_fmt(&b, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\n\text4\n");
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
+    } else if (!strcmp(guest, "/proc/meminfo")) {
+        /* An engine stub: a fixed 2 GiB guest with 1 GiB free and nothing cached or swapped. The
+         * keys are the ones libmeminfo reads (system/memory/libmeminfo, kDefaultSysMemInfoTags). The
+         * parser makes one read of up to 4095 bytes, so the file must stay under that. */
+        sb_fmt(&b, "MemTotal:        2097152 kB\n"
+                   "MemFree:         1048576 kB\n"
+                   "MemAvailable:    1048576 kB\n"
+                   "Buffers:               0 kB\n"
+                   "Cached:                0 kB\n"
+                   "Shmem:                 0 kB\n"
+                   "Slab:                  0 kB\n"
+                   "SReclaimable:          0 kB\n"
+                   "SUnreclaim:            0 kB\n"
+                   "KReclaimable:          0 kB\n"
+                   "KernelStack:           0 kB\n"
+                   "PageTables:            0 kB\n"
+                   "VmallocUsed:           0 kB\n"
+                   "Mapped:                0 kB\n"
+                   "Active:                0 kB\n"
+                   "Inactive:              0 kB\n"
+                   "Unevictable:           0 kB\n"
+                   "SwapTotal:             0 kB\n"
+                   "SwapFree:              0 kB\n");
     } else if (is_self_attr(guest)) {
         sb_fmt(&b, "%s", proc_cur()->attr_current);
     } else {

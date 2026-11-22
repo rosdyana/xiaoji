@@ -1,0 +1,11 @@
+# B4c part 2: lazy services. "lazy" declares its interface (aidl/lazytest) and is disabled, so init starts
+# it only when ctl.interface_start names that interface (servicemanager's lazy AIDL start does this). The
+# driver then uses ctl.interface_stop and ctl.interface_restart on the same interface, and sends an unknown
+# interface, which must be ignored. It polls init.svc.lazy (it never sleeps for a fixed time), then stops
+# init through xiaoji.exit.
+service lazy /system/bin/toybox sleep 100
+    interface aidl lazytest
+    disabled
+
+service driver /system/bin/sh -c "/system/bin/setprop ctl.interface_start aidl/lazytest; i=0; until test $(/system/bin/getprop init.svc.lazy) = running; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; echo lazy $(/system/bin/getprop init.svc.lazy); /system/bin/setprop ctl.interface_stop aidl/lazytest; i=0; until test $(/system/bin/getprop init.svc.lazy) = stopped; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; echo after stop $(/system/bin/getprop init.svc.lazy); /system/bin/setprop ctl.interface_restart aidl/lazytest; i=0; until test $(/system/bin/getprop init.svc.lazy) = running; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; echo after restart $(/system/bin/getprop init.svc.lazy); /system/bin/setprop ctl.interface_start aidl/nosuch; /system/bin/toybox sleep 0.2; echo unknown $(/system/bin/getprop init.svc.lazy); /system/bin/setprop xiaoji.exit 1"
+    oneshot

@@ -39,6 +39,8 @@
 #define INIT_CTLQ 32
 #define INIT_MAX_JARS 256
 #define INIT_MAX_FRAG 64
+#define INIT_MAX_IFACE 16 /* stock HAL blocks declare several interfaces (audio, for one) */
+#define INIT_IFACE_MAX 128
 #define INIT_RESTART_NS 1000000000ull
 #define INIT_CRASH_WINDOW_NS 60000000000ull
 #define INIT_CRASH_LIMIT 4
@@ -65,6 +67,10 @@ typedef struct {
     int nenv;
     sockdef_t socks[INIT_MAX_SOCK];
     int nsocks;
+    /* "interface <kind> <name>": the interfaces the service provides, as "<kind>/<name>" (aidl/x, or a
+     * HIDL fully qualified name and its instance). ctl.interface_* acts on the declaring service. */
+    char iface[INIT_MAX_IFACE][INIT_IFACE_MAX];
+    int niface;
     int oneshot, disabled;
     uint64_t restart_delay_ns;
     /* runtime */
@@ -212,6 +218,17 @@ static void genv_set(const char *k, const char *v)
     }
 }
 
+/* The service that provides an interface ("aidl/name" or "<fqname>/<instance>"), or NULL. Looks at
+ * the services read so far (parse time) or all of them (after parsing). */
+static svc_t *iface_find(const char *full)
+{
+    for (int i = 0; i < nsvc; i++)
+        for (int k = 0; k < svcs[i].niface; k++)
+            if (!strcmp(svcs[i].iface[k], full))
+                return &svcs[i];
+    return NULL;
+}
+
 static int parse_config(char *text)
 {
     svc_t *cur = NULL;
@@ -290,6 +307,19 @@ static int parse_config(char *text)
             cur->disabled = 1;
         } else if (!strcmp(tok[0], "setenv") && n >= 3 && cur->nenv < INIT_MAX_OPT) {
             cur->env[cur->nenv++] = env_string(tok[1], tok[2]);
+        } else if (!strcmp(tok[0], "interface") && n >= 3) {
+            char full[INIT_IFACE_MAX];
+            int len = snprintf(full, sizeof full, "%s/%s", tok[1], tok[2]);
+            if (cur->niface == INIT_MAX_IFACE || len < 0 || (size_t)len >= sizeof full) {
+                fprintf(stderr, "xiaoji: init: line %d: bad interface\n", lineno);
+                return -1;
+            }
+            /* Android's init refuses a second definition of an interface (ServiceParser::ParseInterface). */
+            if (iface_find(full)) {
+                fprintf(stderr, "xiaoji: init: line %d: interface %s redefined\n", lineno, full);
+                return -1;
+            }
+            snprintf(cur->iface[cur->niface++], INIT_IFACE_MAX, "%s", full);
         } else if (!strcmp(tok[0], "restart_delay_ms") && n >= 2) {
             cur->restart_delay_ns = strtoull(tok[1], NULL, 10) * 1000000ull;
         }
@@ -879,19 +909,50 @@ void init_ctl_request(const char *action, size_t alen, const char *svc, size_t s
 {
     if (!active)
         return;
-    int a = 0;
+    int a = 0, by_iface = 0;
     if (alen == 9 && !memcmp(action, "ctl.start", 9))
         a = CTL_START;
     else if (alen == 8 && !memcmp(action, "ctl.stop", 8))
         a = CTL_STOP;
     else if (alen == 11 && !memcmp(action, "ctl.restart", 11))
         a = CTL_RESTART;
+    else if (alen == 19 && !memcmp(action, "ctl.interface_start", 19)) {
+        a = CTL_START;
+        by_iface = 1;
+    } else if (alen == 18 && !memcmp(action, "ctl.interface_stop", 18)) {
+        a = CTL_STOP;
+        by_iface = 1;
+    } else if (alen == 21 && !memcmp(action, "ctl.interface_restart", 21)) {
+        a = CTL_RESTART;
+        by_iface = 1;
+    }
     if (!a) {
         fprintf(stderr, "xiaoji: init: %.*s is not a ctl action\n", (int)alen, action);
         return;
     }
-    if (ctl_n == INIT_CTLQ || slen >= sizeof ctlq[0].svc)
+    if (by_iface) {
+        /* Android's init: the interface names a service (HandleControlMessage, FindInterface). The
+         * queue then holds the service's name, which is short. */
+        char iname[INIT_IFACE_MAX];
+        if (slen >= sizeof iname) {
+            fprintf(stderr, "xiaoji: init: could not find interface (name too long) for %.*s\n", (int)alen, action);
+            return;
+        }
+        memcpy(iname, svc, slen);
+        iname[slen] = 0;
+        svc_t *s = iface_find(iname);
+        if (!s) {
+            fprintf(stderr, "xiaoji: init: Control message: Could not find '%s' for %.*s\n", iname, (int)alen, action);
+            return;
+        }
+        svc = s->name;
+        slen = strlen(s->name);
+    }
+    if (ctl_n == INIT_CTLQ || slen >= sizeof ctlq[0].svc) {
+        fprintf(stderr, "xiaoji: init: %.*s for %.*s dropped (queue full or name too long)\n", (int)alen, action,
+                (int)slen, svc);
         return;
+    }
     ctlq[ctl_n].action = a;
     memcpy(ctlq[ctl_n].svc, svc, slen);
     ctlq[ctl_n].svc[slen] = 0;

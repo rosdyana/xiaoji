@@ -206,6 +206,16 @@ int host_rmdir(const char *path)
     return rmdir(path) == 0 ? 0 : neg_errno();
 }
 
+int host_rename(const char *from, const char *to)
+{
+    return rename(from, to) == 0 ? 0 : neg_errno();
+}
+
+int host_fsync(int fd)
+{
+    return fsync(fd) == 0 ? 0 : neg_errno();
+}
+
 int64_t host_readlink(const char *path, char *buf, size_t cap)
 {
     ssize_t n = readlink(path, buf, cap);

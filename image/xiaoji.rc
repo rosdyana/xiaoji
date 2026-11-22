@@ -21,6 +21,11 @@ on early-init
     # these). zygote's bind mounts (/storage) are made in its own mount namespace (engine/mntns.c, B4c).
     mkdir /mnt/user 0755
     mkdir /mnt/user/0 0755
+    # installd's directories (init.rc's on-init block makes these). The engine's mkdir takes the path only:
+    # the mode is 0771 and the owner is the engine's, whatever the rc says.
+    mkdir /data/misc
+    mkdir /data/misc/user
+    mkdir /data/misc/installd
 
 service servicemanager /system/bin/servicemanager
     class core animation
@@ -68,6 +73,44 @@ service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-s
     onrestart restart wificond
     task_profiles ProcessCapacityHigh
     critical window=${zygote.critical_window.minute:-off} target=zygote-fatal
+
+# The system suspend HAL (B4c part 2): the real daemon, with the Android 13 block of its rc, verbatim
+# ("capabilities" is ignored). The engine has no /sys/power, so the daemon keeps running (it handles wake
+# locks and collects stats) and does not suspend the device: its own main.cpp describes this for hosts
+# without platform suspend. system_server's PowerManager waits for it (ISystemSuspend/default).
+service system_suspend /system/bin/hw/android.system.suspend@1.0-service
+    class early_hal
+    user system
+    group system wakelock
+    capabilities BLOCK_SUSPEND
+
+# installd (B4c part 2): the real daemon, the block of its rc (the "on early-boot" directories of that file
+# are for sdcardfs extensions, which the engine does not have; they are not run). system_server's Installer
+# waits for it.
+service installd /system/bin/installd
+    class main
+
+# The power stats HAL (B4c part 2): the mock implementation, the block of its rc from the rootfs. Its
+# interface line is what lets init map ctl.interface_* to it; it is started at boot like the others.
+service vendor.power.stats-hal-1-0-mock /vendor/bin/hw/android.hardware.power.stats@1.0-service.mock
+    interface android.hardware.power.stats@1.0::IPowerStats default
+    class hal
+    user system
+    group system
+
+# The power HAL (B4c part 2): the example implementation (the Android 13 block of AOSP's power-default.rc, with
+# class and user as the engine reads them). It serves IPower/default, which system_server's PowerManager waits
+# for, and it does not touch /sys. It cannot link yet: android.hardware.power-V3-ndk.so is only in the VNDK APEX
+# (/apex/com.android.vndk.current), which the flat linker config (tools/gen-ldconfig.py) does not search. So the
+# service is disabled, and its interface line lets servicemanager's lazy start (ctl.interface_start
+# aidl/android.hardware.power.IPower/default) start it on demand. docs/boot.md, B4c part 2, has the experiment
+# and the decision that is needed.
+service vendor.power-default /vendor/bin/hw/android.hardware.power-service.example
+    interface aidl android.hardware.power.IPower/default
+    disabled
+    class hal
+    user nobody
+    group system
 
 # init derives ro.product.cpu.abilist* from ro.<partition>.product.cpu.abilist* (property_service.cpp,
 # property_initialize_ro_cpu_abilist). The engine does not derive them yet: these are the values that

@@ -1309,7 +1309,7 @@ mounts, umount2 with and without MNT_DETACH, unshare and clone with CLONE_NEWNS)
 native. Zygote's storage mount passes, and system_server enters "Entered the Android system server!" (d1). The
 HIDL service manager now runs. The boot stops in `startBootstrapServices` (d2 begun, not done): servicemanager
 and system_server wait for `apexservice`, init refuses the lazy AIDL start that would provide it, and the
-engine's deadlock check ends the run (see "The current blocker").** The timings below were taken on battery with
+engine's deadlock check ends the run (see "The current blocker"). B4c part 2 (below) supersedes that blocker section; its state is the current one.** The timings below were taken on battery with
 Low Power Mode on (see "Conditions"); they are not the AC, Low Power Mode off figures the benchmark rule needs.
 
 ### The namespace design
@@ -1521,3 +1521,304 @@ java.util.NoSuchElementException
   not tested for this.
 - hwbinder: the scatter-gather buffer fix-up (the `hw-Parcel` error above), which blocks HIDL lookups.
 - init: `ctl.interface_start` is not supported, so lazy AIDL services do not start.
+
+## B4c part 2: lazy services, APEX, the hwbinder fix, and the bootstrap services (d2 begun)
+
+Status: **the three decisions are implemented and tested. APEX: system_server uses the flattened APEX manager and no
+longer waits for `apexservice`. Lazy services: `interface <kind> <name>` and `ctl.interface_start|stop|restart` work
+(init test). hwbinder: the scatter-gather parent fixup is implemented, and a guest test matches the Linux driver's
+answers on the builder VM's kernel. The boot gets through the zygote, system_server's entry (d1),
+`startBootstrapServices` and `StartPowerManager` (d2 begun). It stops at the next wait, and the cause is a linker
+decision, not a missing binary: the vendor HALs need VNDK-only NDK libraries, which the flat linker config does not
+search. The experiment is in "The blocker". d2 is not done; d3, d4 and d5 are not reached.**
+
+### Files
+
+- `engine/binder.c`: the scatter-gather area from `buffers_size`, the parent fixup and its ordering rules, the FDA
+  ordering, and the security-context rule (the node flag only).
+- `engine/init.c`: `interface <kind> <name>` in a service (up to 16 per service), and `ctl.interface_start|stop|restart`
+  (mapped to the declaring service when the request is made).
+- `engine/props.c`: `ro.apex.updatable=false` (an engine value, so it wins over `vendor/build.prop`).
+- `engine/selinuxfs.c`: the `hwservice_manager` class (the access decision is unchanged: allow-all).
+- `engine/procfs.c`: `/proc/meminfo`, a fixed stub (see "Other engine changes").
+- `engine/sysfs.c`, `engine/host.c`, `engine/host.h`: `renameat` (38), `renameat2` (276, no flags), `fsync` (82) and
+  `fdatasync` (83).
+- `image/xiaoji.rc`: the `installd` and `system_suspend` services, the power stats HAL, the power HAL (disabled, started
+  by its lazy interface), and the `installd` directories.
+- `tests/guest/binder-sg.c` (new): the scatter-gather test. `tests/init/interface.rc` and
+  `tests/expect/init-interface.out` (new): the init test. `tests/run.sh`: the `binder-sg` oracle runs under `sudo -n`,
+  the `init-interface` case is added, and the `XIAOJI_BOOT` check now also requires `StartPowerManager`.
+
+### Decision 1: APEX (`ro.apex.updatable=false`)
+
+- `frameworks/base/services/core/java/com/android/server/pm/ApexManager.java` (AOSP, read on the remote): the singleton
+  is `ApexManagerImpl` only when `ApexProperties.updatable().orElse(false)` is true, and otherwise
+  `ApexManagerFlattenedApex`. The only `waitForService("apexservice")` is in `ApexManagerImpl.waitForApexService`.
+- `build/rootfs/vendor/build.prop` sets `ro.apex.updatable=true` (line 57). The engine's own values override the build.prop
+  files (`engine_props` in `engine/props.c`), so the engine value is the one that counts.
+- Checked in the guest: a oneshot's `getprop ro.apex.updatable` prints `false`.
+- Result: no `apexservice` line in any boot since the change (the B4c run had "Waited one second for apexservice" and
+  the lazy-start request). `apexd` is not started, and the flattened manager does not call `apexservice`.
+
+### Decision 2: lazy services (`interface`, and `ctl.interface_*`)
+
+- AOSP (read on the remote): `ServiceParser::ParseInterface` (`interface <kind> <name>`, with `aidl` or a fully
+  qualified HIDL name; a second definition of the same `kind/name` is an error), and `init.cpp`'s `HandleControlMessage`.
+  There a `ctl.interface_<action>` value is looked up with `FindInterface` (the full `aidl/<name>` or
+  `<fqname>/<instance>`), and `ctl.<action>` with `FindService`.
+- The engine: `interface` is parsed into the service (up to 16 per service, each up to 127 bytes), and a second
+  definition is an error at parse time. `ctl.interface_start|stop|restart` maps the value to the declaring service when
+  the request is made, so the queue holds the short service name. An unknown interface logs Android's text,
+  `Could not find '<name>' for ctl.interface_start`, and is ignored. A dropped request is logged too (the queue is full,
+  or the name is too long), where it used to be silent.
+- The servicemanager and hwservicemanager requests are `ctl.interface_start` with `aidl/<name>` and `<fqname>/<instance>`
+  (`frameworks/native/cmds/servicemanager/ServiceManager.cpp:548`, `system/hwservicemanager/ServiceManager.cpp:258`).
+  In the boots these reach init and get the expected answer.
+- **Test:** `tests/init/interface.rc` declares a disabled `lazy` service with `interface aidl lazytest`. The driver starts
+  it with `ctl.interface_start aidl/lazytest`, stops it with `ctl.interface_stop`, restarts it with `ctl.interface_restart`,
+  and sends an unknown interface. Expected stdout, in `tests/expect/init-interface.out`: `lazy running`,
+  `after stop stopped`, `after restart running`, `unknown running`. Engine and Node: PASS.
+- The lazy path is also exercised by the real power HAL (run10, below): servicemanager finds `IPower/default` in the device
+  VINTF manifest, asks init for `aidl/android.hardware.power.IPower/default`, and init starts the service.
+- Gaps: no fully-qualified-name validation (Android's `FQName` checks), so a malformed `interface` name is accepted. A
+  disabled service's `init.svc.<name>` property is not set until it starts.
+
+### Decision 3: the hwbinder scatter-gather fix
+
+**The driver's rules.** The builder VM has the Linux 6.12 source of `drivers/android/binder.c`
+(`/home/rosdyanakusuma/xbuild/linux-6.12.117`, in the VM). The running kernel is 7.2 (OrbStack), and these rules were
+not compared against the 7.2 source. The rules followed:
+
+- A BINDER_TYPE_PTR object's bytes are copied into the target buffer's scatter-gather area, which starts after the data
+  and the offsets and is `buffers_size` long (`BC_TRANSACTION_SG`, `BC_REPLY_SG`). Each copy is 8-byte aligned, and the
+  object's `buffer` becomes the target address. A buffer longer than the area left is `BR_FAILED_REPLY` (`too large buffer`).
+- A child with `BINDER_BUFFER_FLAG_HAS_PARENT` names its parent by index in the offsets array. The parent must be an
+  earlier PTR object of the same transaction (`binder_validate_ptr`). The child's address goes into the parent's bytes at
+  `parent_offset`, which must leave room for 8 bytes in the parent (`binder_fixup_parent`).
+- Fixups must be in order (`binder_validate_fixup`). The last object fixed up is kept, with the minimum offset for a fixup
+  in it. A fixup is allowed only when the parent is that object or one of its parents, and it must not be below the minimum.
+  Every PTR object resets the state to itself at minimum 0. A BINDER_TYPE_FDA sets it to its parent, at the end of its fd
+  array. Offset 0 is the sentinel for "no object", so an object at data offset 0 cannot be fixed up (this is why the test
+  puts a pad word first).
+- BINDER_TYPE_FDA: the parent is validated the same way, and the fd array must lie inside the parent's bytes (only when the
+  array is not empty).
+
+**What the engine does** (`engine/binder.c`). `btd_parse` reads `buffers_size` for the SG commands. The area is
+`buffers_size` bytes after `ALIGN8(data)` and the offsets, and the buffer is allocated at that full size. A PTR advances
+the area cursor by `ALIGN8(length)`. The child's address is recorded (`xl_pfix`) and written into the parent's copied bytes
+just before the blobs are written (the address is the target address). The ordering check is `xl_fixup_ok`, which follows
+`binder_validate_fixup`. The FDA branch follows the driver's order.
+
+**The test** (`tests/guest/binder-sg.c`). A forked server is the context manager (set with `BINDER_SET_CONTEXT_MGR_EXT` and
+`FLAT_BINDER_FLAG_ACCEPTS_FDS`). The client sends requests with `BC_TRANSACTION_SG` and `TF_ACCEPT_FDS`. Each request checks
+what the driver delivered, and the server replies with a status word that the client prints. The cases are the ones
+libhwbinder sends (its `verifyBufferObject` compares the child's address with the one at `parent_offset`), plus the
+malformed ones:
+
+| Case | What it sends | Native (kernel) and engine |
+|---|---|---|
+| parent-embedded | PTR parent, child with HAS_PARENT at offset 8 | reply status 7 (pointer, child, parent) |
+| fda | PTR parent with an fd slot, and an FDA for a pipe | reply status 12 (parent, fd) |
+| forward-parent | the child's parent is itself | BR_FAILED_REPLY |
+| offset-out | the child's slot runs past its parent | BR_FAILED_REPLY |
+| nonptr-parent | the parent is a BINDER_TYPE_FD object | BR_FAILED_REPLY |
+| no-flag | a PTR with the flag clear, whose parent fields are ignored | reply status 2 (child) |
+| reply-embedded | the server replies with BC_REPLY_SG, embedded | pointer 1, child 1, parent 1 |
+| two-children | two children of one parent at offsets 0 and 8 (in order) | reply status 23 (pointer, child, parent, second) |
+| out-of-order | the same children at 8, then 0 | BR_FAILED_REPLY |
+
+- The oracle is the builder VM's kernel (`sudo -n build/tests/guest/binder-sg-O0`, since `/dev/binder` is root-only there).
+  `tests/run.sh` runs it that way, and the engine and Node runs must match it byte for byte.
+- The kernel's own log (`dmesg`) names the rules it applied. For the first attempt, which put the parent at data offset 0,
+  it says `got transaction with out-of-order buffer fixup` and `failed to fixup parent`. The out-of-order case gets the same
+  line. Before `ACCEPTS_FDS` was set on the manager, it said `got transaction with fd, 6, but target does not allow fds`.
+- Red check: the engine with only the parent patch disabled reports `parent-embedded: reply status 6 (pointer 0 ...)`. The
+  fixed engine reports 7, the same as the kernel.
+- The constants were checked against the builder VM's `linux/android/binder.h` (a small program printed them).
+
+**What the boot shows.** Before the fix, run3 (the B4c part 1 run, `build/tests/boot/run3.err` lines 687-688):
+`E/hw-Parcel(1002): Buffer in parent 0x6ffd6fece2d0 differs from embedded buffer 0x6ffd64c1c100`, then
+`E/HidlServiceManagement(1009): getService: ... BAD_VALUE`. The direction is corrected here: pid 1002 is hwservicemanager,
+which reads system_server's request, so the parent slot was wrong in the request that hwservicemanager received (the B4c
+text said "the reply"). After the fix there is no `hw-Parcel` line in any boot. The Watchdog's lookup of
+`android.hidl.manager@1.0::IServiceManager/default` succeeds in run8 (the `HwBinder: Starting thread pool for getting` lines at
+62.8 s and 98.2 s, and no `NoSuchElementException`).
+
+The `NoSuchElementException` of run4 (85.7 s) had a different cause, fixed separately: hwservicemanager could not register
+itself, because `hwservice_manager` was an unknown SELinux class (see "Other engine changes").
+
+### Other engine changes
+
+- **`hwservice_manager` SELinux class** (`engine/selinuxfs.c`): index 61, and `add`, `find`, `list` as 1, 2 and 3 (AOSP
+  `system/sepolicy/private/access_vectors`). Without it, libselinux said `Unknown class hwservice_manager`, and
+  hwservicemanager denied its own registration (`Missing permissions to add IBase`). Both lines are absent from every boot
+  since. The access decision is still allow-all, as B3 designed it.
+- **Security-context rule** (`engine/binder.c`, a binder behaviour change, listed on its own): the security context is sent
+  when the target node has `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`, as the driver does. Before, a manager set with the EXT ioctl
+  always got it. servicemanager's `ProcessState::becomeContextManager` passes that flag
+  (`frameworks/native/libs/binder/ProcessState.cpp:191-196`), so servicemanager is unchanged. `make test` (the binder
+  conformance cases and servicemanager) is green with the rule.
+- **`/proc/meminfo`** (`engine/procfs.c`): a fixed stub, a 2 GiB guest with 1 GiB free and nothing cached or swapped. The
+  keys are the ones libmeminfo reads (`kDefaultSysMemInfoTags`), and the file is under the 4095 bytes its single read takes.
+  Before: `Failed to open file :/proc/meminfo` and `SysMemInfo read failed`, which failed the ActivityManagerService
+  constructor. After: the ActivityManagerService starts.
+- **`renameat` (38), `renameat2` (276, no flags), `fsync` (82), `fdatasync` (83)**: `installd` called rename and fsync and
+  got `Function not implemented`. Rename is a host rename of the two resolved names (the read-only and synthetic checks as
+  `unlinkat`). Sync is a host `fsync` for a host file; a memfd and a directory are 0; other descriptors are EINVAL. Gaps: the
+  RENAME_* flags are EINVAL, and renaming across mounts is not EXDEV.
+- **`installd` directories** (`image/xiaoji.rc`, the early-init block): `/data/misc`, `/data/misc/user` and
+  `/data/misc/installd`, as AOSP's `init.rc` makes them. The engine's `mkdir` takes only the path, so every directory is 0771
+  and the owner is not set (a gap; installd does not depend on the modes here).
+
+### The services added to `image/xiaoji.rc`
+
+Each block is the rc of the stock file, with the options the engine does not model ignored by init.
+
+| Service | Binary (rootfs) | Source of the block | State |
+|---|---|---|---|
+| `system_suspend` | `/system/bin/hw/android.system.suspend@1.0-service` | `system/hardware/interfaces/suspend/1.0/default/android.system.suspend@1.0-service.rc` (`capabilities` ignored) | Runs. Its `main.cpp` keeps it running without suspend when `/sys/power/wakeup_count` or `/sys/power/state` cannot be opened, which is the engine's case. Logs the missing `/sys/power` files and continues. One crash (SIGSEGV) after a system_server restart, not diagnosed (see the gaps). |
+| `installd` | `/system/bin/installd` | `frameworks/native/cmds/installd/installd.rc` (the service block; its `on early-boot` is sdcardfs setup and is not run) | Runs, once the directories above and rename and fsync exist. |
+| `vendor.power.stats-hal-1-0-mock` | `/vendor/bin/hw/android.hardware.power.stats@1.0-service.mock` | the rootfs's `vendor/etc/init/android.hardware.power.stats@1.0-service.rc` | Runs. Its `interface` line is parsed, and it registers `IPowerStats/default`. Logs `/sys/bus/iio/devices/` missing and continues. |
+| `vendor.power-default` | `/vendor/bin/hw/android.hardware.power-service.example` | `hardware/interfaces/power/aidl/default/power-default.rc` (`class` and `user` kept) | Disabled, with `interface aidl android.hardware.power.IPower/default`, so servicemanager's lazy start starts it. It cannot link yet (the VNDK library, below). |
+
+### The linker decision (the blocker)
+
+- The example power HAL needs `android.hardware.power-V3-ndk.so`, and the lights HAL needs `android.hardware.light-V2-ndk.so`.
+  Both exist only in the VNDK APEX (`/apex/com.android.vndk.current/lib64`), not in `/system/lib64`. `tools/gen-ldconfig.py`
+  leaves the VNDK APEX out of the one flat namespace, on purpose (its docstring: VNDK holds vendor builds of system libraries
+  with other ABIs). So a vendor binary fails to link: `CANNOT LINK EXECUTABLE ... library "android.hardware.power-V3-ndk.so"
+  not found` (run10, every lazy start).
+- **Why not add the VNDK APEX to the search path as it is.** The VNDK copy of `libbinder.so` is built with `__ANDROID_VNDK__`,
+  so its `kDefaultDriver` is `/dev/vndbinder` (`frameworks/native/libs/binder/ProcessState.cpp:51-54`). A process that picks it
+  up through a broad search path talks to the vendor binder, not `/dev/binder`. That is what an earlier draft of this section
+  got wrong: it blamed the empty `/dev/vndbinder` (no `vndservicemanager`), and the experiment below shows that is not the
+  cause for this HAL.
+- **Experiment 1 (the cause).** A scratch rc with the system `servicemanager`, and the power HAL with `LD_LIBRARY_PATH` set to a
+  directory that holds only a symlink to `android.hardware.power-V3-ndk.so` (so libbinder stays the system copy). Result: the
+  HAL uses `/dev/binder`, and `servicemanager` logs `Found android.hardware.power.IPower/default in device VINTF manifest.`
+  `service check android.hardware.power.IPower/default` prints `found`. No `vndservicemanager` was needed.
+- **Experiment 2 (the next stop).** A full boot with that scratch rc (run9, the `build/tests/boot/b4c2-run9.err` log): IPower
+  registers at about 33.3 s, and `StartPowerManager` completes in 46 ms. The next wait is `LightsService`, which waits for the
+  light HAL (`waitForDeclaredService`). The light example needs the VNDK-only `android.hardware.light-V2-ndk.so`, so it is
+  not added yet. The Watchdog then kills system_server at 103 s (main thread in `LightsService.VintfHalCache.get`). In the second
+  system_server of that run (after the kill), `system_suspend` crashed (SIGSEGV, exit status 139), not diagnosed. The scratch
+  directory and rc were removed afterwards.
+- **The decision needed (not made here).** Two options, both real:
+  - (A) Search `/apex/com.android.vndk.current/${LIB}` in the flat namespace after `/system` (and after the system APEXes).
+    System libraries such as `libbinder.so` still resolve to `/system` first, so processes keep `/dev/binder`. Only
+    libraries that exist nowhere else (`power-V3-ndk`, `light-V2-ndk`) come from the VNDK APEX. This changes
+    `tools/gen-ldconfig.py`, and the rootfs `linkerconfig` is regenerated from it. The risk is the one its docstring names:
+    a process could load a VNDK build of a library that `/system` lacks.
+  - (B) A vendor namespace for vendor binaries (the AOSP model). Vendor binaries then get VNDK's `libbinder` and
+    `/dev/vndbinder`, and the vendor HALs need `vndservicemanager` on that device. That binary is not in the rootfs (the stock
+    vendor partition does not have it, as far as the `debugfs rdump` in `tools/extract-rootfs.sh` shows). It is in the AOSP
+    tree (`frameworks/native/cmds/servicemanager`, module `vndservicemanager`), and not in `out/target/product/xiaoji_arm64`.
+    Building it is a remote `m vndservicemanager`, which I have not started.
+- Until one of these is chosen, the power HAL stays disabled, and the boot stops at `StartPowerManager` (d2 begun). The
+  `XIAOJI_BOOT` check requires that line.
+
+### Milestones (B4c part 2)
+
+Timings are elapsed guest time, with the instruction count. The power state is `pmset -g` taken before the run.
+
+| Milestone | Logcat line | AC, LPM off (run8) | Battery, LPM on (run4) |
+|---|---|---|---|
+| (a) app_process starts ART | `I/AndroidRuntime: Using default boot image` | 1.8 s, 0.21 G | 3.2 s, 0.18 G |
+| (b) classes preloaded | `I/Zygote: ...preloaded 16252 classes` | 22.8 s (16.9 s of preload), 2.38 G | 38.5 s (28.5 s), 2.35 G |
+| (c) system_server forked | `I/Zygote: System server process N has been created` | 29.9 s, 3.22 G | 50.8 s, 3.19 G |
+| (d1) system_server starts | `I/SystemServer: Entered the Android system server!` | 30.4 s, 3.27 G | 51.8 s, 3.24 G |
+| (d2) startBootstrapServices begins | `D/SystemServerTiming: startBootstrapServices` | 32.8 s, 3.51 G | 55.7 s, 3.48 G |
+| (d2) StartPowerManager (inside it) | `D/SystemServerTiming: StartPowerManager` | 33.5 s, 3.58 G | 56.8 s, 3.55 G |
+| (d2) startBootstrapServices done | not reached (the linker decision) | | |
+| (d3) startCoreServices done | not reached | | |
+| (d4) startOtherServices | not reached | | |
+| (d5) System now ready / Boot completed | not reached | | |
+
+- Power state: run8 was taken with `lowpowermode 0`, "Now drawing from 'AC Power'". run4 was taken with `lowpowermode 1` on
+  battery (the charge was not recorded for run 4; a charge reading was taken before run 1). These are single runs, not
+  benchmarks. The AC figures are the ones comparable with the benchmark rule (AC, Low Power Mode off), one run each.
+- The Watchdog (`WAITED_HALF` at 62.8 s in run8) kills system_server at 103.4 s, because the main thread is blocked in
+  `PowerManagerService.nativeInit` (run8, before the power HAL was made disabled). With the power HAL disabled (run10), the
+  stop is the same `StartPowerManager` point, and the main thread waits in `PowerManagerService` for `IPower`.
+- The boot check (`XIAOJI_BOOT=1`) requires the preload, the fork, the d1 entry and `StartPowerManager`. The
+  `StartPowerManager` line appeared in every boot that reached it (runs 4, 6, 7, 8, 9, 10 and the check runs).
+
+### The current stop, with the log
+
+Run10 (the committed rc), AC power:
+
+```
+[32685 ms 3571873877 insn] D/SystemServerTiming(1014): StartPowerManager
+[32714 ms 3574652850 insn] I/servicemanager(1001): Found android.hardware.power.IPower/default in device VINTF manifest.
+[32716 ms 3574882357 insn] I/servicemanager(1001): Since 'android.hardware.power.IPower/default' could not be found, trying to start it as a lazy AIDL service
+[32749 ms 3577532340 insn] F/linker(1054): CANNOT LINK EXECUTABLE "/vendor/bin/hw/android.hardware.power-service.example": library "android.hardware.power-V3-ndk.so" not found: needed by main executable
+xiaoji: init: vendor.power-default exited (status 1)
+```
+
+The same line repeats about once a second, from each lazy request (113 in the run). Run9 (the experiment, power-only directory): `Found android.hardware.power.IPower/default in device VINTF manifest.` at 33.3 s, then `StartPowerManager took to complete: 46ms`, then the `LightsService` wait.
+
+### Deadlock lines (diagnostic, reported, not changed)
+
+`xiaoji: init: nothing has been runnable for 5 s` and `xiaoji: deadlock: every thread is blocked and none can wake` appear in
+these boots, and they are misleading. In `engine/sched.c` (`run_loop`), `idle_since` is set at the first moment nothing is
+runnable (lines 484-485), and it is never cleared when `pick()` returns a thread. So the 5 s is wall-clock time since the first
+idle moment, not continuous idleness: time spent running threads in between counts too. Threads that sleep with deadlines
+(servicemanager's one-second waits, for example) are then reported as "none can wake". The run continues after the lines,
+and it ends only at `--init-timeout` (the lines are a diagnostic). The fix would reset `idle_since` and `idle_reported` when
+a thread is picked, and say "none can wake" only when no thread has a deadline. Per the instruction, the threshold is not
+raised and the detector is not changed here.
+
+### Tests
+
+- `make test`: 160 passed, 0 failed, 0 xfail (the baseline was 154). The new cases are `binder-sg-O0` and `binder-sg-O2`
+  (engine and Node, against the builder VM's kernel) and `init-interface` (engine and Node). The `binder-driver` 17 cases
+  still pass (engine and Node).
+- `XIAOJI_JIT=0 make test`: 160 passed, 0 failed, 0 xfail.
+- `make test-web`: all web checks passed.
+- `XIAOJI_BOOT=1 make test`: 161 passed, 0 failed, 0 xfail. The boot check requires the preload, the fork, the d1 entry and
+  `StartPowerManager`, with `--init-timeout 90`.
+- Warnings: `cc -std=c11 -Wall -Wextra -Wno-unused-parameter -O2` and `emcc` with the same flags, one file at a time, are clean
+  for `engine/binder.c`, `init.c`, `procfs.c`, `props.c`, `sysfs.c`, `host.c` and `selinuxfs.c`. The guest test builds clean with
+  `gcc -Wall -Wextra`.
+- No `xiaoji` process is left running after the runs (checked with `ps`).
+
+### Gaps (B4c part 2)
+
+- The linker decision (above): the VNDK APEX is not searched, so the power HAL is disabled, and the lights HAL is not added.
+- accept_fds is not enforced: the driver refuses FDA and FD objects for a target node that does not accept them.
+- The scatter-gather area is allocated at its full `buffers_size`, as the driver does. The security-context slot is after
+  the area (the driver puts it at the end): the placement differs, the contents do not.
+- `FQName` validation of `interface` names is not done. The engine's `mkdir` takes only the path (modes and owners are not
+  applied).
+- A system_server restart is followed by a SIGSEGV in `system_suspend` (exit status 139), seen once in run9. Not diagnosed.
+- The deadlock diagnostic (above).
+- Unimplemented syscalls seen in the boots: 282 (`userfaultfd`, ART falls back), 26 (`inotify_init1`).
+- Non-fatal, not fixed: `/vendor/etc/public.libraries.txt` missing (SystemConfig), `/sys/bus/iio/devices` (the power stats
+  mock), `/data/misc/critical-events` (CriticalEventLog), cgroups (`/dev/cgroup_info`), boot_id, and the HIDL "must be in VINTF
+  manifest" line for `android.frameworks.stats@1.0::IStats` (system_server carries on).
+- Components not decided yet, and not reached: the lights, sensors, health, thermal and other HALs of the stock table; lmkd,
+  statsd, storaged, netd and vold; the telephony, NFC and Bluetooth services. `docs/features.md` has rows for the radio and
+  connectivity features but none for power or suspend, which system_server needs at boot (so they belong to the base).
+
+### Component table (B4c part 2)
+
+| Component | Choice | State | Why |
+|---|---|---|---|
+| zygote, system_server, servicemanager | real, unchanged | runs; d1 reached | B4a to B4c |
+| hwservicemanager | real, from the Android 13 block | runs; registers itself | needs the `hwservice_manager` class |
+| SELinux | synthetic, allow-all, permissive | `hwservice_manager` class added (data only) | no compiled policy |
+| apexservice (apexd) | not started | not needed: `ro.apex.updatable=false` (flattened manager) | APEX updates are not installed |
+| `ctl.interface_*` | real init semantics | implemented, tested | servicemanager's lazy starts |
+| `/proc/meminfo` | engine stub, fixed 2 GiB | ActivityManager starts | the kernel's file has no equivalent here |
+| `renameat`, `renameat2`, `fsync`, `fdatasync` | engine, host-backed | installd runs | syscalls installd needs |
+| `system_suspend` | real daemon, from its rc | runs in its no-suspend mode | no `/sys/power`; its source describes this mode |
+| `installd` | real daemon, from its rc | runs | system_server's Installer waits for it |
+| `vendor.power.stats-hal-1-0-mock` | real mock HAL, from its rc | runs; IPowerStats registers | the stock mock; no `/sys/bus/iio` |
+| `vendor.power-default` (IPower) | real example HAL, from its rc, disabled, lazy | cannot link: VNDK-only NDK library | the linker decision (A or B) |
+| lights HAL (ILights) | not added | system_server waits for it (the next stop) | needs `light-V2-ndk` from the VNDK APEX: the same decision |
+| `vndservicemanager` | not in the rootfs; not built | not needed on the `/dev/binder` path; needed only for option (B) | a remote build would be needed |
+| `/dev/binder`, `/dev/hwbinder` | engine binder devices | the scatter-gather fixup is in | |
+| `/dev/vndbinder` | engine binder device, no context manager | not used by the current path | option (B) |
+| Watchdog | real | fires after the main thread is blocked | consequence of the stop |
+| cgroups, boot_id, userfaultfd | missing or ENOSYS | non-fatal | not decided |
+| Other HALs, lmkd, statsd, storaged, netd, vold; telephony, NFC, Bluetooth | not decided | not reached | after d2 |

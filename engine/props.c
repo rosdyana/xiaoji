@@ -386,6 +386,10 @@ static const char *const engine_props[][2] = {
     {"ro.zygote", "zygote64"},
     {"ro.xiaoji.engine", "b2"},
     {"ro.property_service.version", "2"}, /* the client uses protocol 2 only at 2 or more */
+    /* APEX: the rootfs shows APEXes as plain directories under /apex (a flattened build), and xiaoji
+     * installs no APEX updates. With this, ApexManager uses ApexManagerFlattenedApex, which does not
+     * wait for apexservice (vendor/build.prop says true, and an override is needed to win). */
+    {"ro.apex.updatable", "false"},
 };
 
 int props_init(const char *const *overrides, int noverrides)

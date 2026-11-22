@@ -79,9 +79,10 @@ make_oracle() {
     if [ -f "$rc" ] && [ "$rc" -nt "$bin" ]; then
         return 0
     fi
-    # mountns makes mounts: its oracle runs as root (passwordless sudo in the builder VM).
+    # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
+    # oracles run as root (passwordless sudo in the builder VM).
     local runas=""
-    case "$name" in mountns-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -427,10 +428,11 @@ if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/initsock-O0 ]; then
     mkdir -p build/rootfs/data/local/tmp
     cp build/tests/guest/initsock-O0 build/rootfs/data/local/tmp/initsock
 fi
-for case_name in init-sockets init-ctl; do
+for case_name in init-sockets init-ctl init-interface; do
     case "$case_name" in
     init-sockets) init_rc=tests/init/sockets.rc ;;
     init-ctl) init_rc=tests/init/ctl.rc ;;
+    init-interface) init_rc=tests/init/interface.rc ;;
     esac
     for runner in engine node; do
         if [ "$runner" = engine ]; then
@@ -454,19 +456,21 @@ done
 
 # Zygote (B4a, B4b, B4c), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc. The log must show
 # the class preload ("...preloaded N classes"), the fork of system_server (zygote's own
-# "System server process N has been created", B4b milestone c) and system_server's entry ("Entered
-# the Android system server!", B4c milestone d1). About 52 s natively. Not in the
-# default run, which is kept short; the boot is stopped by --init-timeout.
+# "System server process N has been created", B4b milestone c), system_server's entry ("Entered
+# the Android system server!", B4c milestone d1) and the furthest deterministic point of
+# startBootstrapServices, "StartPowerManager" (B4c part 2, milestone d2 begun). About 56 s natively.
+# Not in the default run, which is kept short; the boot is stopped by --init-timeout.
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
-        grep -q 'Entered the Android system server!' "$OUT/boot.err"; then
-        echo "PASS  zygote preload, system_server fork and its entry (XIAOJI_BOOT, B4c milestone d1)"
+        grep -q 'Entered the Android system server!' "$OUT/boot.err" &&
+        grep -q 'SystemServerTiming([0-9]*): StartPowerManager' "$OUT/boot.err"; then
+        echo "PASS  zygote preload, system_server fork, its entry and StartPowerManager (XIAOJI_BOOT, B4c part 2 d2)"
         pass=$((pass + 1))
     else
-        echo "FAIL  zygote boot (XIAOJI_BOOT): no preload or no system_server fork line in $OUT/boot.err"
+        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry or StartPowerManager line is missing in $OUT/boot.err"
         fail=$((fail + 1))
     fi
 fi
