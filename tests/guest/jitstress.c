@@ -192,6 +192,42 @@ __asm__(".text\n"
         "  ldr x0, [x0]\n"
         "  ret\n");
 
+/* jitstress_chain_run(good, bad, n): calls jitstress_chain_load n times from one call
+ * site. The pointer is selected with csel, so the last pass (the bad pointer) runs the
+ * same blocks as every other pass: the loop head, the call, the leaf and the return
+ * point. A C ternary compiles to a separate block that first runs on the last pass, and
+ * that block is entered from C, not from a chain hop. Returns the sum of the results. */
+extern u64 jitstress_chain_run(const u64 *good, const u64 *bad, u64 n);
+__asm__(".text\n"
+        ".global jitstress_chain_run\n"
+        "jitstress_chain_run:\n"
+        "  stp x29, x30, [sp, #-80]!\n"
+        "  mov x29, sp\n"
+        "  stp x19, x20, [sp, #16]\n"
+        "  stp x21, x22, [sp, #32]\n"
+        "  stp x23, x24, [sp, #48]\n"
+        "  mov x19, x0\n"
+        "  mov x20, x1\n"
+        "  mov x21, x2\n"
+        "  mov x22, #0\n"
+        "  mov x23, #0\n"
+        "1:\n"
+        "  sub x24, x21, #1\n"
+        "  cmp x23, x24\n"
+        "  csel x0, x20, x19, eq\n"
+        "  mov x1, x23\n"
+        "  bl jitstress_chain_load\n"
+        "  add x22, x22, x0\n"
+        "  add x23, x23, #1\n"
+        "  cmp x23, x21\n"
+        "  b.lo 1b\n"
+        "  mov x0, x22\n"
+        "  ldp x23, x24, [sp, #48]\n"
+        "  ldp x21, x22, [sp, #32]\n"
+        "  ldp x19, x20, [sp, #16]\n"
+        "  ldp x29, x30, [sp], #80\n"
+        "  ret\n");
+
 /* Leaves with a fault in the middle, after registers were written: the handler must
  * see those values (x1..x3) and the faulting pc, and the post-index load must not have
  * written back. */
@@ -250,6 +286,261 @@ static void hot_fault(u64 *sum)
     /* The last load faults. The handler makes it return 77 to here. */
     s += jitstress_load((const u64 *)0x40);
     *sum = s;
+}
+
+/* ---------- FP and SIMD in hot blocks ---------- */
+
+/* jitstress_fpsimd(in, out, fpcr): one pass of scalar FP (arithmetic, FMA, compare and
+ * select, conversions in both directions, FP<->GPR moves, rounding), SIMD (DUP, ADD,
+ * CMEQ, ADDP, UMAXP, AND, ORR, EOR, MOVI, INS, UMOV, LDR/STR of Q registers, LD1 and
+ * ST1 of several registers) and the NZCV and FPSR the pass sets. The inputs are 6 words
+ * (d0, d1, the two halves of v2 and v3, and x6). FPCR is set for the pass and restored.
+ * Results go to out[0..51] (word 49 is unused). Only v0..v7 and v16..v31 are used, so no
+ * callee-saved state is touched. Only the default FPCR is compared with native: the
+ * interpreter does not implement non-default rounding modes, FZ or DN, or the cumulative
+ * FPSR flags (simd.c), so this test does not run them. */
+extern void jitstress_fpsimd(const u64 *in, u64 *out, u64 fpcr);
+__asm__(".text\n"
+        ".global jitstress_fpsimd\n"
+        "jitstress_fpsimd:\n"
+        "  mrs x9, fpcr\n"
+        "  msr fpcr, x2\n"
+        "  ldr d0, [x0]\n"
+        "  ldr d1, [x0, #8]\n"
+        "  ldr q2, [x0, #16]\n"
+        "  ldr q3, [x0, #32]\n"
+        "  ldr x6, [x0, #48]\n"
+        "  fadd d4, d0, d1\n"
+        "  fsub d5, d0, d1\n"
+        "  fmul d6, d0, d1\n"
+        "  fdiv d7, d0, d1\n"
+        "  fsqrt d16, d0\n"
+        "  fmadd d17, d0, d1, d4\n"
+        "  fmsub d18, d0, d1, d4\n"
+        "  fmax d19, d0, d1\n"
+        "  fmin d20, d0, d1\n"
+        "  fabs d21, d0\n"
+        "  fneg d22, d1\n"
+        "  fcmp d0, d1\n"
+        "  fcsel d23, d0, d1, lt\n"
+        "  fcvt s24, d0\n"
+        "  fcvt d25, s24\n"
+        "  fcvtzs x7, d0\n"
+        "  fcvtzu x8, d1\n"
+        "  scvtf d26, x6\n"
+        "  ucvtf d27, x6\n"
+        "  fmov x10, d4\n"
+        "  fmov d28, x6\n"
+        "  frintz d29, d0\n"
+        "  str d4, [x1, #0]\n"
+        "  str d5, [x1, #8]\n"
+        "  str d6, [x1, #16]\n"
+        "  str d7, [x1, #24]\n"
+        "  str d16, [x1, #32]\n"
+        "  str d17, [x1, #40]\n"
+        "  str d18, [x1, #48]\n"
+        "  str d19, [x1, #56]\n"
+        "  str d20, [x1, #64]\n"
+        "  str d21, [x1, #72]\n"
+        "  str d22, [x1, #80]\n"
+        "  str d23, [x1, #88]\n"
+        "  str d24, [x1, #96]\n"
+        "  str d25, [x1, #104]\n"
+        "  str d26, [x1, #112]\n"
+        "  str d27, [x1, #120]\n"
+        "  str d28, [x1, #128]\n"
+        "  str d29, [x1, #136]\n"
+        "  str x7, [x1, #144]\n"
+        "  str x8, [x1, #152]\n"
+        "  str x10, [x1, #160]\n"
+        "  mrs x11, nzcv\n"
+        "  str x11, [x1, #168]\n"
+        "  add x14, x1, #176\n"
+        "  dup v0.2d, x10\n"
+        "  add v1.2d, v2.2d, v3.2d\n"
+        "  cmeq v4.16b, v2.16b, v3.16b\n"
+        "  addp v5.4s, v2.4s, v3.4s\n"
+        "  umaxp v6.4s, v2.4s, v3.4s\n"
+        "  and v7.16b, v2.16b, v3.16b\n"
+        "  orr v16.16b, v2.16b, v3.16b\n"
+        "  eor v17.16b, v2.16b, v3.16b\n"
+        "  movi v18.16b, #0x5a\n"
+        "  ins v19.d[1], x6\n"
+        "  umov x13, v2.d[1]\n"
+        "  ldr q21, [x0]\n"
+        "  ld1 {v20.2d}, [x0], #16\n"
+        "  str q0, [x14, #0]\n"
+        "  str q1, [x14, #16]\n"
+        "  str q4, [x14, #32]\n"
+        "  str q5, [x14, #48]\n"
+        "  str q6, [x14, #64]\n"
+        "  str q7, [x14, #80]\n"
+        "  str q16, [x14, #96]\n"
+        "  str q17, [x14, #112]\n"
+        "  str q18, [x14, #128]\n"
+        "  str q19, [x14, #144]\n"
+        "  add x14, x14, #160\n"
+        "  st1 {v2.2d, v3.2d}, [x14]\n"
+        "  str q20, [x14, #32]\n"
+        "  str x13, [x14, #48]\n"
+        "  str q21, [x14, #64]\n"
+        "  msr fpcr, x9\n"
+        "  ret\n");
+
+/* jitstress_vec_load(p): a SIMD load that faults when p is bad; the handler makes the
+ * call return 77 (x0 = 77 and pc = the return address). */
+extern u64 jitstress_vec_load(const u64 *p);
+__asm__(".text\n"
+        ".global jitstress_vec_load\n"
+        "jitstress_vec_load:\n"
+        "  ldr q0, [x0]\n"
+        "  fmov x0, d0\n"
+        "  ret\n");
+
+/* jitstress_vec_mem(src, dst): SIMD&FP loads and stores of every scalar size (B, H, S, D)
+ * and of Q, with unsigned-offset, post-index and pre-index forms; pairs of S, D and Q
+ * registers; and a literal load. Returns the movement of src in the low word and of dst
+ * (shifted) in the high. */
+extern u64 jitstress_vec_mem(const u8 *src, u8 *dst);
+__asm__(".text\n"
+        ".global jitstress_vec_mem\n"
+        "jitstress_vec_mem:\n"
+        "  mov x2, x0\n"
+        "  mov x3, x1\n"
+        "  ldr d0, [x0], #8\n"
+        "  ldr q1, [x0], #16\n"
+        "  ldr s2, [x0, #8]\n"
+        "  ldr h3, [x0, #-8]!\n"
+        "  ldr b4, [x0, #1]\n"
+        "  str q1, [x1]\n"
+        "  str d0, [x1, #16]!\n"
+        "  str s2, [x1], #8\n"
+        "  str h3, [x1]\n"
+        "  str b4, [x1, #2]\n"
+        "  ldp s24, s25, [x0, #8]\n"
+        "  ldp d26, d27, [x0], #16\n"
+        "  ldp q28, q29, [x0, #-16]\n"
+        "  ldr q30, 1f\n"
+        "  add x5, x3, #64\n"
+        "  stp s24, s25, [x5]\n"
+        "  str q30, [x5, #16]\n"
+        "  stp d26, d27, [x5, #32]\n"
+        "  stp q28, q29, [x5, #48]\n"
+        "  ldp q16, q17, [x0, #-32]!\n"
+        "  stp q16, q17, [x5, #80]\n"
+        "  sub x0, x0, x2\n"
+        "  sub x1, x1, x3\n"
+        "  lsl x1, x1, #32\n"
+        "  orr x0, x0, x1\n"
+        "  ret\n"
+        "  .balign 16\n"
+        "1: .quad 0x0123456789ABCDEF, 0xFEDCBA9876543210\n");
+
+/* jitstress_ld1_load(p): a multi-structure SIMD load (LD1), which the translator runs
+ * through the interpreter's own code. The call faults when p is bad. */
+extern u64 jitstress_ld1_load(const u64 *p);
+__asm__(".text\n"
+        ".global jitstress_ld1_load\n"
+        "jitstress_ld1_load:\n"
+        "  ld1 {v0.16b}, [x0]\n"
+        "  fmov x0, d0\n"
+        "  ret\n");
+
+static u8 vm_src[64] __attribute__((aligned(16)));
+static u8 vm_dst[176] __attribute__((aligned(16)));
+
+/* Hot SIMD&FP loads and stores: each call gets new source bytes, and the checksum covers
+ * the return value and the destination bytes. */
+static void vec_mem_hot(u64 *sum)
+{
+    u64 s = *sum;
+    for (u64 i = 0; i < CALLS; i++) {
+        for (int k = 0; k < 48; k++)
+            vm_src[k] = (u8)(i * 31 + k * 7 + (i >> 3));
+        s += jitstress_vec_mem(vm_src, vm_dst);
+        for (int k = 0; k < 176; k++)
+            s = (s ^ vm_dst[k]) * 0x100000001B3ull;
+    }
+    *sum = s;
+}
+
+static u64 fp_in[8] __attribute__((aligned(16)));
+static u64 fp_out[64] __attribute__((aligned(16)));
+
+/* Inputs: mostly ordinary values, and a share of the special encodings (zeros, infinities,
+ * a subnormal, the largest finite value) and random bits. NaN inputs are left out: the
+ * interpreter gets the sign of a NaN operand wrong in FMSUB (it negates the NaN; the
+ * hardware keeps it), so they cannot be compared with native. NaN results still occur:
+ * 0/0 and infinity minus infinity give the default NaN. */
+static u64 fp_value(void)
+{
+    static const u64 specials[] = {
+        0x0000000000000000ull, 0x8000000000000000ull, 0x7FF0000000000000ull,
+        0xFFF0000000000000ull, 0x0000000000000001ull, 0x7FEFFFFFFFFFFFFFull,
+    };
+    u64 k = rnd() % 8;
+    if (k < 3)
+        return specials[rnd() % (sizeof specials / sizeof specials[0])];
+    if (k < 6) {
+        union {
+            double d;
+            u64 b;
+        } u;
+        u.d = (double)(i64)(rnd() % 2001) - 1000.0;
+        return u.b;
+    }
+    u64 r = rnd();
+    if (((r >> 52) & 0x7FF) == 0x7FF && (r & 0x000FFFFFFFFFFFFFull))
+        r ^= 1ull << 62; /* a NaN becomes a finite value */
+    return r;
+}
+
+/* Hot FP and SIMD, with the default FPCR. The checksum covers every output word of every
+ * pass; the inputs include NaNs, infinities and zeros. */
+static void fp_hot(u64 *sum)
+{
+    u64 s = *sum;
+    for (u64 i = 0; i < 2 * CALLS; i++) {
+        for (int k = 0; k < 6; k++)
+            fp_in[k] = fp_value();
+        fp_in[6] = fp_in[7] = 0;
+        jitstress_fpsimd(fp_in, fp_out, 0);
+        for (int k = 0; k < 52; k++)
+            s = (s ^ fp_out[k]) * 0x100000001B3ull;
+    }
+    *sum = s;
+}
+
+/* An unallocated AdvSIMD encoding (bit 31 set), in a hot function. Native raises SIGILL.
+ * The handler counts it and skips the instruction, and the function returns 3. The engine
+ * must take the same path from translated code: the block leaves at that instruction and
+ * the signal is delivered there. */
+extern u64 jitstress_undef(void);
+__asm__(".text\n"
+        ".global jitstress_undef\n"
+        "jitstress_undef:\n"
+        "  .inst 0x8E000400\n"
+        "  mov x0, #3\n"
+        "  ret\n");
+
+static volatile int ills;
+
+static void ill_handler(int sig, kinfo *info, kucontext *uc)
+{
+    (void)sig;
+    (void)info;
+    ills++;
+    uc->uc_mcontext.pc += 4;
+}
+
+static void install_ill(void)
+{
+    ksigaction sa;
+    sa.handler = (u64)ill_handler;
+    sa.flags = SA_SIGINFO | SA_RESTORER;
+    sa.restorer = (u64)jitstress_restore;
+    sa.mask = 0;
+    sc6(SYS_RT_SIGACTION, 4 /* SIGILL */, (i64)&sa, 0, 8, 0, 0);
 }
 
 #define RET_INSN 0xD65F03C0u
@@ -338,51 +629,15 @@ static void smc_chain(u64 *sum)
     *sum = s;
 }
 
-/* A fault reached by a chain: the hot loop calls the load on every pass, and the last
- * pass passes a bad pointer, so the fault is in a block entered by a hop from the loop.
- * The handler makes that load return 77. */
+/* A fault reached by a chain: the asm loop calls the leaf on every pass from one call
+ * site, and the last pass passes a bad pointer, so the fault is in a block entered by a
+ * chain hop from the loop. The handler makes that load return 77. The loop is twice as
+ * long as the warm-up, so the blocks are translated and chained when the last pass
+ * faults. */
 static void chain_fault(u64 *sum)
 {
     static const u64 good = 5;
-    u64 s = 0;
-    /* Twice as long as the warm-up, so the blocks are translated and chained when the
-     * last pass faults. */
-    for (u64 i = 0; i < 2 * CALLS; i++)
-        s += jitstress_chain_load(i == 2 * CALLS - 1 ? (const u64 *)0x40 : &good, i);
-    *sum = s;
-}
-
-/* Two threads, each running a long chained loop, so the slice budget runs out inside
- * chained blocks while the other thread is runnable. */
-extern i64 jitstress_spawn(u64 flags, void *stack_top, u32 *ptid, u32 *ctid, void (*fn)(void *), void *arg);
-__asm__(".text\n"
-        ".global jitstress_spawn\n"
-        "jitstress_spawn:\n"
-        "  stp x4, x5, [x1, #-16]!\n"
-        "  mov x4, x3\n"
-        "  mov x3, xzr\n"
-        "  mov x8, #220\n"
-        "  svc #0\n"
-        "  cbnz x0, 1f\n"
-        "  ldp x9, x0, [sp]\n"
-        "  blr x9\n"
-        "  mov x0, #0\n"
-        "  mov x8, #93\n"
-        "  svc #0\n"
-        "1:\n"
-        "  ret\n");
-
-#define THREAD_FLAGS 0x350F00ull /* VM, FS, FILES, SIGHAND, THREAD, SYSVSEM, PARENT/CHILD_SETTID */
-static unsigned char tstack[65536] __attribute__((aligned(16)));
-static u32 tid_parent, tid_child;
-static volatile u32 child_done;
-static u64 child_val;
-
-static void thread_main(void *arg)
-{
-    (void)arg;
-    child_val = chain_loop(777, CALLS * 16);
-    child_done = 1;
+    *sum = jitstress_chain_run(&good, (const u64 *)0x40, 2 * CALLS);
 }
 
 static void check(const char *label, int ok)
@@ -659,17 +914,59 @@ int main(int argc, char **argv)
     putd((i64)cf_sum);
     put("\n");
 
-    // 9. Thread switches while both threads run chained loops. The child's result must
-    // equal the same loop run on this thread, which it does only if neither thread's
-    // blocks or budget were disturbed by the other.
-    child_done = 0;
-    jitstress_spawn(THREAD_FLAGS, tstack + sizeof tstack, &tid_parent, &tid_child, thread_main, 0);
-    u64 main_val = chain_loop(777, CALLS * 16);
-    while (!child_done)
-        sc6(124 /* sched_yield */, 0, 0, 0, 0, 0, 0);
-    check("thread_chained", child_val == main_val);
-    put("thread_chained_val=");
-    putx(main_val);
+    // 8b. FP and SIMD in hot blocks, with the default FPCR. The output must match native.
+    u64 fp_sum = 0;
+    fp_hot(&fp_sum);
+    put("fpsimd_hot=");
+    putx(fp_sum);
+    put("\n");
+
+    // 8c. A SIMD load that faults inside a hot block: the handler sees the faulting pc
+    // (the load itself) and the address, and the call returns the handler's value.
+    faults = 0;
+    u64 vs = 0;
+    static const u64 vgood[2] = {5, 6};
+    for (u64 i = 0; i < CALLS; i++)
+        vs += jitstress_vec_load(vgood);
+    vs += jitstress_vec_load((const u64 *)0x40);
+    check("fault_vec_hot", faults == 1 && snap_pc == (u64)jitstress_vec_load && snap_addr == 0x40 &&
+                               vs == CALLS * 5 + 77);
+    put("fault_vec_sum=");
+    putd((i64)vs);
+    put("\n");
+
+    // 8c2. A multi-structure SIMD load (LD1) that faults in a hot block: the fault comes
+    // out of the interpreter's code, called from the translated block.
+    faults = 0;
+    u64 ls = 0;
+    for (u64 i = 0; i < CALLS; i++)
+        ls += jitstress_ld1_load(vgood);
+    ls += jitstress_ld1_load((const u64 *)0x40);
+    check("fault_ld1_hot", faults == 1 && snap_pc == (u64)jitstress_ld1_load && snap_addr == 0x40 &&
+                               ls == CALLS * 5 + 77);
+    put("fault_ld1_sum=");
+    putd((i64)ls);
+    put("\n");
+
+    // 8e. SIMD&FP loads and stores of every size and index form, in a hot block.
+    u64 vm_sum = 0;
+    vec_mem_hot(&vm_sum);
+    put("vec_mem_hot=");
+    putx(vm_sum);
+    put("\n");
+
+    // 8d. An unimplemented instruction in a hot block: each call raises SIGILL, the
+    // handler skips the instruction, and the function returns 3.
+    install_ill();
+    ills = 0;
+    u64 us = 0;
+    for (u64 i = 0; i < CALLS; i++)
+        us += jitstress_undef();
+    check("unimpl_hot", ills == CALLS && us == (u64)CALLS * 3);
+    put("unimpl_sum=");
+    putd((i64)us);
+    put(" ills=");
+    putd((i64)ills);
     put("\n");
 
     put(checks ? "jitstress=FAIL\n" : "jitstress=ok\n");

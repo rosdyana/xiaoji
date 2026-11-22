@@ -34,4 +34,8 @@ int jit_page_is_code(const uint8_t *host_page);
 /* XIAOJI_STATS=1 line for the translator. total_insns is the engine's count. */
 void jit_print_stats(uint64_t total_insns);
 
+/* Runs one AdvSIMD/FP/SIMD load/store instruction as the interpreter does (cpu_a64.c).
+ * Returns 0, or 1 if the engine does not implement it. Wasm builds only. */
+int cpu_exec_simd(cpu_t *c, uint32_t insn, uint64_t pc);
+
 #endif

@@ -422,3 +422,96 @@ Item 2 (HINT-space NOPs, barriers other than CLREX, PRFM): tried, no measurable 
 Instruction counts are identical with the JIT on and off for jitstress, control, memory, simd and glibc_hello.
 
 Gates at this state: `make test`: 62 passed, 0 failed, 0 xfail; `XIAOJI_JIT=0 tests/run.sh`: 62 passed; threshold-1 build (`-DJIT_HOT=1`): 62 passed. emcc `-c -Wall -Wextra` for `jit.c` and `mem.c`: no warnings; clang native `mem.c`: no warnings.
+
+
+### T2 (part 2): FP/SIMD, reclamation, and what did not help
+
+Done: item 3 (FP and SIMD), item 5 (reclamation), and both open issues. Item 4 (lazy flags) was built, measured and reverted, since it did not help. Item 2 stays reverted. HEAD for these numbers is `b2b71cd` (item 1).
+
+Deviations from the plan:
+- Item 4 is reverted, as the plan allows when it does not help.
+- The jitstress thread section moved to a new file, `tests/guest/jitthreads.c` (reason below).
+- `tests/run.sh` has a new instruction-count check: the deterministic cases must count the same with the JIT on and off.
+- The batch and capacity constants are `-D` overridable, with the same defaults.
+- FP arithmetic is not translated to wasm f64. It goes through the interpreter's own code (see item 3).
+
+**Bite test for chained-fault pc correctness (issue 1).** `fault_chained` now calls the leaf through `jitstress_chain_run`, an asm loop that selects the pointer with `csel`. Every pass runs the same blocks, and the last pass enters the faulting block through a chain hop. The old C ternary put the bad pointer in a separate block that first ran on the last pass, and the dispatcher entered it, which set `run_start` and hid the bug. `run_start` is read only by `jit_fault`, so the test sees it through the instruction count. The count check is new in `tests/run.sh`. Evidence on the final program (store removed, then restored):
+
+| jitstress | JIT on | JIT off | run.sh |
+|---|---|---|---|
+| O0, store removed | 115922199 | 115922202 | FAIL |
+| O2, store removed | 30967366 | 30967369 | FAIL |
+| O0, restored | 115922202 | 115922202 | PASS |
+| O2, restored | 30967369 | 30967369 | PASS |
+
+With the store removed, `run.sh` gives 78 passed and 2 failed (both jitstress icount lines). Restored, it gives 80 passed.
+
+**Thread counts and the count check.** The jitstress thread section waited with `sched_yield` in a loop. Its JIT-on count gave 157 in one run and 190 in another, while the JIT-off count stayed at 190 across three runs. The section moved to `jitthreads.c`, and the main thread waits on a futex. The first version of that wait was `while (!child_done) futex_wait`, which is stable in five runs per mode. The version that always makes the call, `do { futex_wait } while (!child_done)`, gives 25625244 at O0 and 10517263 at O2 in every run, with the JIT on and off (five runs each). `jitthreads` is in the count check. The working explanation is the race over whether the child has finished when the main thread checks, which the always-call form removes. I did not isolate the jitstress variation fully. The `threads` case still varies between runs (4809066 and 4809122 with the JIT on), is not checked, and was not investigated.
+
+**Batch policy (issue 2): measured, not changed.** Hello medians, 5 interleaved runs, on the pre-item-3 build:
+
+| Variant | hello-jit, JIT on | hello-int, JIT on | jitstress C dispatches |
+|---|---|---|---|
+| default (batch 64, tick 8192) | 2.123 s | 2.932 s | 410,757 |
+| tick 512 | 2.171 s | 3.102 s | 397,108 |
+| batch 16, tick 512 | 2.111 s | 3.082 s | 397,108 |
+| batch 1 | 2.268 s | 3.238 s | 387,869 |
+
+Compiling sooner removes only about 6% of the jitstress dispatches, and no Hello median improves, so the default stays. Hello's C dispatches are not mainly batch waits.
+
+**Item 3: FP and SIMD in translated code.**
+- The x111 group (scalar FP and AdvSIMD data processing) and LD1/ST1 of structures (multiple and single) run through `cpu_exec_simd` (`cpu_a64.c`, wasm builds only). It calls the simd.c entry points (`simd_exec`, `simd_ldst_multi`, `simd_ldst_single`) directly, so the results are the interpreter's, bit for bit, by construction.
+- Translated inline: LDR and STR of B, H, S, D and Q (unsigned offset, pre-index, post-index, register offset), SIMD&FP LDP and STP of S, D and Q (all index modes), and SIMD literal loads. The interpreter's V branches (`ldst_single`, `ldst_pair`, `ldst_literal`) were read and mirrored: the same scales, the same zeroing of the high word of a scalar load, and the same access order. A Q access writes its low word before it reads or writes the high word, as `mem_read128` and `mem_write128` do, so a fault in the high half leaves the same register state.
+- Not translated: the unallocated encodings, which end the block, and the interpreter raises SIGILL for them.
+- Synchronisation: the GPRs and NZCV written so far are stored before each helper call. The GPRs, SP and NZCV the call may have written are reloaded after it. `v[]`, FPCR and FPSR are never cached. A store that changes translated code exits the block (SMC). An encoding the engine does not implement takes the interpreter's SIGILL path from inside the block: the block charges the instruction, the handler runs, and the block leaves.
+- jitstress coverage (`tests/guest/jitstress.c`): `jitstress_fpsimd` runs 24000 passes of scalar FP (arithmetic, FMA, compare and select, conversions both ways, FP and GPR moves, FRINTZ), SIMD (DUP, ADD, CMEQ, ADDP, UMAXP, AND, ORR, EOR, MOVI, INS, UMOV, LD1 and ST1, Q loads and stores) and NZCV. NaN inputs are excluded (see below); zeros and infinities are included, and NaN results (0/0, infinity minus infinity) still occur. `vec_mem_hot` covers every scalar size and index form, the pairs, and the literal. `fault_vec_hot` faults inside a hot SIMD load (inline path), and `fault_ld1_hot` faults inside a hot LD1 (the helper path, through the longjmp). `unimpl_hot` runs an unallocated encoding in a hot block (native SIGILL, 12000 times). All outputs match the native oracle on the native engine and on the Node interpreter (`XIAOJI_JIT=0`), and on the translator.
+- NaN check (the gate's NaN clause): `fpdiag`, the NaN-inclusive generator of the 24000 passes, gives identical output under Node with the JIT on and off (91.0% of its instructions translated). Against native it differs only in the FMSUB case below.
+- Measured: the first version of `cpu_exec_simd` called `exec`. It gave hello-jit 1.999 s to 1.946 s (5 runs), hello-int 2.987 s to 2.985 s (8 runs), with C dispatches down 65% (hello-jit, 19.8M to 6.4M) and 47% (hello-int, 28.8M to 15.2M). That version is discarded: it slowed the JIT-off interpreter by 27 to 35% (see the performance finding), so its timings are only evidence for the mechanism.
+
+Interpreter findings, reported and not fixed (the test avoids them):
+1. `simd.c` implements FP only with the default FPCR. A non-default RMode, FZ, DN or AHP makes the instruction unimplemented (SIGILL), and the cumulative FPSR flags are not updated (simd.c, line 89). So rounding modes, flush-to-zero, default-NaN mode and FPSR cannot be compared with native. The jitstress FP kernel runs only the default FPCR.
+2. FMSUB with a NaN in `Dn` flips the NaN's sign. Example from the scratch diagnostic: `d0 = 0x7ff8000000000001`, `fmsub d18, d0, d1, d4` gives `0x7ff8000000000001` on native and `0xfff8000000000001` in the engine (interpreter and translator alike). The jitstress FP inputs exclude NaN operands.
+
+Performance finding: the first version of `cpu_exec_simd` called the static `exec`. Making it `always_inline`, or calling it through a `noinline` wrapper, still slowed the JIT-off interpreter by 25 to 35% (hello-int off, 6.2 s to 8.5 s). Any second call site of a static dispatch function in `cpu_a64.c` changes how `run_loop` is compiled. A helper that calls only the simd.c entry points, with `exec` untouched, does not slow it (the stubbed variant matches the final build).
+
+**Item 4: lazy flags (tried, reverted).** NZCV was deferred into dedicated locals (the operands for SUB and ADD, the result for logic), computed at block exits and slow paths, and compared directly for the conditions that allow it. Interleaved, 8 runs: hello-jit 2.115 s to 2.128 s, hello-int 3.175 s to 3.252 s. No gain: a block that sets flags still computes NZCV at its exit, so the only saving is for flag sets overwritten inside the same block.
+
+**Item 5: reclamation.** Invalidated block records go on a free list, after being unlinked from the hash table. A record's table slot is `tbase + record index`, so the slot is reused with the record. Table entries are cleared only at a full flush. Pages are not removed one at a time. When a batch would pass the block or page cap, `translate_batch` drops everything (chain cache, hash, pages, blocks, table slots) and retranslates. The flush never runs from `jit_page_changed`, which can run under a live block. The tiny-cap build (`-DJIT_MAX_BLOCKS=256 -DJIT_PAGE_LIMIT=64 -DJIT_BATCH=16 -DJIT_HOT=1`) passes the whole suite, and hello-jit does 5034 full flushes there with correct output. The default build does none in these tests. Item 5 was not timed on its own: the final-against-HEAD delta below is items 3 and 5 combined, with the inline SIMD forms.
+
+**Final numbers.** Node, engine time from `XIAOJI_STATS=1`, 8 interleaved runs each, medians (AC power, Low Power Mode off, load average 3 to 4.5):
+
+| Case | HEAD `b2b71cd` | final | Range (HEAD / final) |
+|---|---|---|---|
+| hello-jit, JIT on | 2.096 s | 1.938 s (-7.5%) | 2.07 to 2.93 / 1.89 to 3.34 |
+| hello-jit, JIT off | 3.045 s | 3.194 s (+4.9%) | 3.02 to 3.36 / 3.05 to 3.47 |
+| hello-int, JIT on | 2.957 s | 2.850 s (-3.6%) | 2.94 to 3.06 / 2.77 to 2.93 |
+| hello-int, JIT off | 6.264 s | 6.518 s (+4.1%) | 6.00 to 7.10 / 6.24 to 8.53 |
+
+The JIT-off cost is real across sessions: +0.7% and +1.9% in an earlier session (3.052 s to 3.074 s and 6.220 s to 6.340 s), and +2.4% (6.131 s to 6.280 s) with a stubbed helper, which rules out the helper calls. Its source is not isolated. The likely cause is the code layout of the larger translator, but I did not verify that. The JIT-on gains are the same order in both sessions.
+
+Counters, one run each (HEAD, then final):
+- hello-jit: translated 83.9% then 87.3%; blocks 1677 in 321 modules then 1672 in 311; block runs 6.11M then 2.33M; C dispatches 19.75M then 6.36M; chain hits 43.5M then 45.7M.
+- hello-int: translated 91.5% then 93.1%; blocks 1959 in 357 modules then 1957 in 343; block runs 10.61M then 6.76M; C dispatches 28.76M then 15.24M; chain hits 106.4M then 108.5M.
+
+Hello's instruction count varies by about 0.1M between runs, with the JIT on and off (as noted above), so it is not used as a check.
+
+Gates (final tree):
+- `make`, `make wasm`, `make wasm-node`: exit 0. `make test`: 80 passed, 0 failed, 0 xfail. (Was 62 before: the count now includes jitthreads and the count checks.)
+- `XIAOJI_JIT=0 tests/run.sh`: 80 passed, 0 failed.
+- `-DJIT_HOT=1` build, full suite: 80 passed, 0 failed.
+- Tiny caps (`-DJIT_MAX_BLOCKS=256 -DJIT_PAGE_LIMIT=64 -DJIT_BATCH=16 -DJIT_HOT=1`), full suite: 80 passed, 0 failed.
+- Instruction counts, JIT on equal to JIT off, at O0 and O2: arith, control, jitstress, jitthreads, memory, signals, simd (`run.sh` icount lines).
+- Warnings: clang `-Wall -Wextra` on the native sources (all but `jit.c`): none. `emcc -O3 -c -Wall -Wextra` on every engine file, `jit.c` included: none.
+- The native build is unchanged apart from the wasm-only code, which is inside `#ifdef __EMSCRIPTEN__`. The native suite passes.
+
+Power state (`pmset -g`): "Now drawing from 'AC Power'", `lowpowermode 0`, `displaysleep 120`. Timing caveat: during parts of the session, desktop apps (a Chrome helper at about 200% CPU) and a separate job of the same user (a `chunk.py` build with eight workers) loaded the machine. Timings taken in those windows were discarded, and every comparison is interleaved.
+
+What remains:
+- Hello still makes 6.4M C dispatches in the JIT-on run (45.7M chain hits). Batch timing was not the cause, and the rest was not analysed.
+- FP arithmetic still goes through the helper. Direct wasm would need NaN, rounding and flush handling, and the interpreter is exact only for the default FPCR anyway.
+- Register caching across blocks (the plan's optional item) was not started.
+- Partial state for SIMD accesses that fault in the high half matches the interpreter by construction, but no test covers it: a test needs an unmapped page after a mapped one.
+- The interpreter findings above (non-default FPCR and FPSR, FMSUB NaN sign) are open.
+- The `threads` count variation is not investigated.
+- The JIT-off cost of +2 to +5% is not isolated.
+- The web build has not been run in a browser.

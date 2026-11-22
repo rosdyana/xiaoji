@@ -110,6 +110,29 @@ check() {
     return 1
 }
 
+# The instruction count the Node build reports (XIAOJI_STATS=1) with the JIT on (1) or
+# off (0).
+icount_of() {
+    env XIAOJI_STATS=1 XIAOJI_JIT="$1" node "$NODE_JS" "$2" $3 2>&1 >/dev/null |
+        sed -n 's/^xiaoji: \([0-9][0-9]*\) instructions in .*/\1/p' | tail -n 1
+}
+
+# A deterministic case must count the same instructions with the JIT on and off. Hello
+# and the threads case vary from run to run, so they are not checked. jitthreads waits on a
+# futex the same way every run, so its count is checked.
+check_icount() {
+    local name=$1 bin=$2 args=$3 on off
+    on=$(icount_of 1 "$bin" "$args")
+    off=$(icount_of 0 "$bin" "$args")
+    if [ -n "$on" ] && [ "$on" = "$off" ]; then
+        echo "PASS  $name icount (jit on = jit off = $on)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  $name icount (jit on $on, jit off $off)"
+        fail=$((fail + 1))
+    fi
+}
+
 run_case() {
     local name=$1 stretch=$2
     local bin="build/tests/guest/$name" args
@@ -127,6 +150,9 @@ run_case() {
     check engine engine "$name" "$bin" "$args" "$stretch"
     if [ -f "$NODE_JS" ]; then
         check node node "$name" "$bin" "$args" "$stretch"
+        case "${name%-O?}" in
+        jitstress | jitthreads | control | arith | memory | signals | simd) check_icount "$name" "$bin" "$args" ;;
+        esac
     fi
 }
 

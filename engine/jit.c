@@ -36,25 +36,37 @@
 #define JIT_HOT 1000 /* block entries before a block is queued for translation */
 #endif
 #define JIT_MAX_INSNS 64
-#define JIT_BATCH 64
+#ifndef JIT_BATCH
+#define JIT_BATCH 64 /* queued blocks that compile together */
+#endif
+#ifndef JIT_MAX_BLOCKS
 #define JIT_MAX_BLOCKS 16384
+#endif
 #define JIT_BHASH 8192 /* block hash buckets, power of two */
+#ifndef JIT_PAGES
 #define JIT_PAGES 8192 /* host page table slots, power of two */
-#define JIT_PAGE_LIMIT (JIT_PAGES * 3 / 4)
+#endif
+#ifndef JIT_PAGE_LIMIT
+#define JIT_PAGE_LIMIT (JIT_PAGES * 3 / 4) /* pages with code (or ever used) before a full flush */
+#endif
 #define JIT_CNT 4096 /* lossy entry counters, power of two */
+#ifndef JIT_TICK
 #define JIT_TICK 8192 /* dispatch misses between flushes of a partial batch */
+#endif
 
 /* Imports of the generated modules, in the order of their function indices. */
 #define IMP_LD 0
 #define IMP_ST 1
 #define IMP_PURE 2
-#define N_IMPORTS 3
+#define IMP_SIMD 3
+#define N_IMPORTS 4
 
 /* Types of the generated functions. */
 #define TY_BLOCK 0 /* (i32) -> i32 */
 #define TY_LD 1    /* (i64 va, i64 pc, i32 size) -> i64 */
 #define TY_ST 2    /* (i64 va, i64 v, i64 pc, i32 size) -> i32 (1: a code page changed) */
 #define TY_PURE 3  /* (i32 op, i64 a, i64 b, i32 sf) -> i64 */
+#define TY_SIMD 4  /* (i32 cpu, i32 insn, i64 pc) -> i32 (jit_simd) */
 
 /* Wasm locals of a block: 0 is the cpu pointer. */
 #define L_X(r) (1 + (r)) /* x0..x30: locals 1..31 */
@@ -68,8 +80,9 @@
 #define L_NZCV 39 /* i32 */
 #define L_I0 40   /* i32: set when a store changed a code page */
 #define L_I1 41   /* i32: the TLB entry of the access being probed */
+#define L_I2 42   /* i32: the result of jit_simd */
 #define N_LOCALS_I64 38
-#define N_LOCALS_I32 3
+#define N_LOCALS_I32 4
 
 #define OFF_X(r) ((uint32_t)(offsetof(cpu_t, x) + 8 * (r)))
 #define OFF_SP ((uint32_t)offsetof(cpu_t, sp))
@@ -79,6 +92,7 @@
 #define OFF_STOP ((uint32_t)offsetof(cpu_t, stop))
 #define OFF_SIG_PENDING ((uint32_t)offsetof(cpu_t, sig_pending))
 #define OFF_SIG_MASK ((uint32_t)offsetof(cpu_t, sig_mask))
+#define OFF_V(r) ((uint32_t)(offsetof(cpu_t, v) + 16 * (r))) /* the low word; +8 is the high word */
 
 /* Operations of jit_pure. */
 enum {
@@ -250,7 +264,10 @@ typedef struct {
 
 static int jit_on = -1; /* -1 until read from XIAOJI_JIT */
 static Blk blks[JIT_MAX_BLOCKS];
-static int nblks;
+static int32_t blk_hwm;       /* block records ever used since the last flush */
+static int32_t blk_free_head; /* released records, linked through next_hash; -1 = none */
+static int nlive;             /* valid blocks */
+static int32_t tbase = -1;    /* table index of block record 0 (the slots are tbase + index) */
 static int32_t bhash[JIT_BHASH];
 static PageEnt pages[JIT_PAGES];
 static int npages;
@@ -269,7 +286,8 @@ static uint32_t inval_seq; /* bumped whenever a page with code is dropped */
 static uint32_t tlb_rd_base, tlb_wr_base, tlb_stride, tlb_page_off;
 
 static uint64_t st_dispatch, st_block_runs, st_insns, st_blocks, st_untranslatable,
-    st_refused, st_modules, st_compile_fail, st_inv_pages, st_inv_blocks, st_faults, st_smc_exits;
+    st_refused, st_modules, st_compile_fail, st_inv_pages, st_inv_blocks, st_faults, st_smc_exits,
+    st_flushes;
 
 /* Block chaining. A block whose exit is known to the generated code tail-calls chain_fn
  * (a function of its module), which looks the next pc up in fast[] and tail-calls that
@@ -289,7 +307,11 @@ static int chain_on = -1; /* -1 until decided; wasm builds with tail calls only 
 
 /* Compiles the module at buf (len bytes) and installs its nfuncs functions in the
  * table. Returns the first table index, or -1 if the module did not compile. */
-int js_jit_compile(const uint8_t *buf, int len, int nfuncs);
+int js_jit_compile(const uint8_t *buf, int len, int nfuncs, const int32_t *slots);
+
+/* The first free index of the function table, and a call that empties a range of it. */
+int js_jit_table_base(void);
+void js_jit_clear_table(int first, int n);
 
 /* 1 if this browser validates a module with return_call (the tail-call proposal).
  * Chaining needs it; without it, blocks return to C as before. */
@@ -309,6 +331,7 @@ static int jit_enabled(void)
         jit_on = !(e && e[0] == '0');
         for (int i = 0; i < JIT_BHASH; i++)
             bhash[i] = -1;
+        blk_free_head = -1;
         uintptr_t rd, wr;
         mem_jit_tlb(&rd, &wr, &tlb_stride, &tlb_page_off);
         tlb_rd_base = (uint32_t)rd;
@@ -385,9 +408,16 @@ static Blk *blk_find(uintptr_t host, uint64_t vpage)
 
 static Blk *blk_new(uintptr_t host, uint64_t vpage, PageEnt *pe)
 {
-    if (nblks >= JIT_MAX_BLOCKS)
+    int32_t idx;
+    if (blk_free_head >= 0) {
+        idx = blk_free_head;
+        blk_free_head = blks[idx].next_hash;
+    } else if (blk_hwm < JIT_MAX_BLOCKS) {
+        idx = blk_hwm++;
+    } else {
         return NULL;
-    int32_t idx = nblks++;
+    }
+    nlive++;
     Blk *b = &blks[idx];
     uint32_t h = blk_hash(host, vpage);
     b->host = host;
@@ -401,23 +431,64 @@ static Blk *blk_new(uintptr_t host, uint64_t vpage, PageEnt *pe)
     return b;
 }
 
+/* Takes a block out of its hash bucket, so lookups no longer find it. */
+static void blk_unlink(int32_t idx)
+{
+    int32_t *p = &bhash[blk_hash(blks[idx].host, blks[idx].vpage)];
+    while (*p >= 0 && *p != idx)
+        p = &blks[*p].next_hash;
+    if (*p == idx)
+        *p = blks[idx].next_hash;
+}
+
+/* A page with code changed: its blocks are dropped and their records released for reuse
+ * (the record index is also the table slot, so the slot is reused with it). Reads each
+ * block's page link before the record is released. This runs under translated code (a
+ * store), so it never flushes anything; see jit_flush_all. */
 void jit_page_changed(const uint8_t *host_page)
 {
     PageEnt *pe = page_find((uintptr_t)host_page, 0);
     if (!pe || !pe->code)
         return;
-    for (int32_t i = pe->head; i >= 0; i = blks[i].next_page) {
-        if (blks[i].fn >= 0)
-            fast_drop(((uint64_t)blks[i].vpage << 12) | (blks[i].host & 0xFFF), blks[i].fn);
-        if (blks[i].valid) {
-            blks[i].valid = 0;
+    int32_t i = pe->head;
+    while (i >= 0) {
+        Blk *b = &blks[i];
+        int32_t next = b->next_page;
+        if (b->fn >= 0)
+            fast_drop(((uint64_t)b->vpage << 12) | (b->host & 0xFFF), b->fn);
+        if (b->valid) {
+            b->valid = 0;
             st_inv_blocks++;
+            nlive--;
         }
+        blk_unlink(i);
+        b->fn = -1;
+        b->next_hash = blk_free_head;
+        blk_free_head = i;
+        i = next;
     }
     pe->code = 0;
     pe->head = -1;
     st_inv_pages++;
     inval_seq++;
+}
+
+/* Drops every block, page entry and chain-cache entry, and empties the table slots the
+ * blocks used. Called only from translate_batch, which runs between dispatches, so no
+ * translated code is running and nothing still refers to the blocks. */
+static void jit_flush_all(void)
+{
+    if (blk_hwm && tbase >= 0)
+        js_jit_clear_table(tbase, blk_hwm);
+    memset(fast, 0, sizeof fast);
+    for (int i = 0; i < JIT_BHASH; i++)
+        bhash[i] = -1;
+    memset(pages, 0, sizeof pages);
+    npages = 0;
+    blk_hwm = 0;
+    blk_free_head = -1;
+    nlive = 0;
+    st_flushes++;
 }
 
 int jit_page_is_code(const uint8_t *host_page)
@@ -992,6 +1063,62 @@ static void pure_call(Gen *g, uint32_t op, unsigned sf)
     lget(g, L_T1);
     i32c(g, (int32_t)sf);
     calli(g, IMP_PURE);
+}
+
+/* ---------- AdvSIMD, scalar FP and SIMD load/store ---------- */
+
+/* These instructions run through the interpreter's own code (jit_simd, which calls
+ * cpu_exec_simd), so their results, flags and faults are the interpreter's, bit for bit.
+ * Their vector and FP registers, FPCR and FPSR live only in cpu_t, so the generated code
+ * does not cache them. Only the general registers and NZCV need synchronising: the ones
+ * written so far are stored before the call, and the ones the call may have written are
+ * reloaded after it. The block does not end here. */
+static void reload_gpr(Gen *g, unsigned r)
+{
+    if (r >= 31)
+        return;
+    touch(g, r);
+    lget(g, 0);
+    memop(g, W_I64_LOAD, 3, OFF_X(r));
+    lset(g, L_X(r));
+}
+
+static int tr_simd(Gen *g, uint32_t insn)
+{
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31;
+    flush(g, g->written, g->nzcv_written);
+    lget(g, 0);
+    i32c(g, (int32_t)insn);
+    i64c(g, (int64_t)g->pc);
+    calli(g, IMP_SIMD);
+    lset(g, L_I2);
+    /* The call may have written a general register (FMOV, UMOV, a base with writeback),
+     * SP, or NZCV (FCMP, FCCMP). Reload them from cpu_t before anything reads them. */
+    reload_gpr(g, rd);
+    reload_gpr(g, rn);
+    touch(g, 31);
+    lget(g, 0);
+    memop(g, W_I64_LOAD, 3, OFF_SP);
+    lset(g, L_SP);
+    lget(g, 0);
+    memop(g, W_I32_LOAD, 2, OFF_NZCV);
+    lset(g, L_NZCV);
+    /* Nonzero: bit 0, not implemented (the SIGILL path already set the pc and the
+     * registers); bit 1, a store changed translated code. The block ends either way. */
+    lget(g, L_I2);
+    o8(g, W_IF);
+    buf_put(g->o, 0x40);
+    lget(g, L_I2);
+    i32c(g, 1);
+    o8(g, W_I32_AND);
+    o8(g, W_IF);
+    buf_put(g->o, 0x40);
+    exit_finish(g, g->cur_n, EXIT_JUMP);
+    o8(g, W_ELSE);
+    exit_kind(g, g->pc + 4, g->cur_n, EXIT_SMC);
+    o8(g, W_END);
+    o8(g, W_END);
+    return 1;
 }
 
 /* ---------- instruction translation ---------- */
@@ -1643,12 +1770,48 @@ static int tr_branch(Gen *g, uint32_t insn)
     return 0; /* SVC, system instructions and everything else */
 }
 
+/* Stores local src into the word at byte offset half (0 or 8) of SIMD&FP register r. */
+static void v_put(Gen *g, unsigned r, unsigned half, uint32_t src)
+{
+    lget(g, 0);
+    lget(g, src);
+    memop(g, W_I64_STORE, 3, OFF_V(r) + half);
+}
+
+/* Pushes one word of SIMD&FP register r: half 0 (low) or 8 (high). */
+static void v_get(Gen *g, unsigned r, unsigned half)
+{
+    lget(g, 0);
+    memop(g, W_I64_LOAD, 3, OFF_V(r) + half);
+}
+
 static int tr_ldst_literal(Gen *g, uint32_t insn)
 {
     unsigned opc = insn >> 30, V = (insn >> 26) & 1, rt = insn & 31;
-    if (V)
-        return 0;
     uint64_t addr = g->pc + (sext((insn >> 5) & 0x7FFFF, 19) << 2);
+    if (V) { /* SIMD&FP: S, D or Q (opc 3 is unallocated) */
+        if (opc == 3)
+            return 0;
+        if (opc == 2) {
+            i64c(g, (int64_t)addr);
+            mem_ld(g, 8);
+            lset(g, L_T2);
+            v_put(g, rt, 0, L_T2);
+            i64c(g, (int64_t)(addr + 8));
+            mem_ld(g, 8);
+            lset(g, L_T3);
+            v_put(g, rt, 8, L_T3);
+            return 1;
+        }
+        i64c(g, (int64_t)addr);
+        mem_ld(g, opc == 0 ? 4 : 8);
+        lset(g, L_T2);
+        v_put(g, rt, 0, L_T2);
+        i64c(g, 0);
+        lset(g, L_T3);
+        v_put(g, rt, 8, L_T3);
+        return 1;
+    }
     switch (opc) {
     case 0:
         i64c(g, (int64_t)addr);
@@ -1677,9 +1840,13 @@ static int tr_ldst_pair(Gen *g, uint32_t insn)
     unsigned rt = insn & 31, rt2 = (insn >> 10) & 31, rn = (insn >> 5) & 31;
     int64_t imm7 = (int64_t)sext((insn >> 15) & 0x7F, 7);
     unsigned bytes, dsf = 1, sign = 0;
-    if (mode > 3 || V)
+    if (mode > 3)
         return 0;
-    if (opc == 0) {
+    if (V) { /* SIMD&FP: S, D or Q (opc 3 is unallocated) */
+        if (opc == 3)
+            return 0;
+        bytes = opc == 0 ? 4 : opc == 1 ? 8 : 16;
+    } else if (opc == 0) {
         bytes = 4;
         dsf = 0;
     } else if (opc == 2) {
@@ -1699,7 +1866,36 @@ static int tr_ldst_pair(Gen *g, uint32_t insn)
         o8(g, W_I64_ADD);
     }
     lset(g, L_T1); /* address of the first access */
-    if (L) {
+    if (V) {
+        /* SIMD&FP: each register is one word of bytes, or two words for Q, in the order the
+         * interpreter accesses them: the first register, then the second. A register of
+         * S or D is zeroed above its word on a load. */
+        unsigned wsz = bytes == 16 ? 8 : bytes, nw = bytes == 16 ? 2 : 1;
+        for (unsigned k = 0; k < 2; k++) {
+            unsigned r = k ? rt2 : rt;
+            for (unsigned w = 0; w < nw; w++) {
+                unsigned half = 8 * w, aoff = k * bytes + half;
+                lget(g, L_T1);
+                if (aoff) {
+                    i64c(g, aoff);
+                    o8(g, W_I64_ADD);
+                }
+                if (L) {
+                    mem_ld(g, wsz);
+                    lset(g, L_T2);
+                    v_put(g, r, half, L_T2);
+                } else {
+                    v_get(g, r, half);
+                    mem_st(g, wsz);
+                }
+            }
+            if (L && nw == 1) {
+                i64c(g, 0);
+                lset(g, L_T3);
+                v_put(g, r, 8, L_T3);
+            }
+        }
+    } else if (L) {
         lget(g, L_T1);
         mem_ld(g, bytes);
         lset(g, L_T2);
@@ -1746,7 +1942,10 @@ static int tr_ldst_single(Gen *g, uint32_t insn)
     unsigned size = insn >> 30, V = (insn >> 26) & 1, opc = (insn >> 22) & 3;
     unsigned mode = (insn >> 24) & 3, bit21 = (insn >> 21) & 1, sub = (insn >> 10) & 3;
     unsigned rt = insn & 31, rn = (insn >> 5) & 31;
-    if (V)
+    /* SIMD&FP registers (V): size is the access size, and opc<1> with size 0 selects 128
+     * bits (q). Other opc values with V are the FP and SIMD loads and stores of B..D. */
+    unsigned q = V && (opc >> 1);
+    if (q && size)
         return 0;
     if ((insn & 0x3FFFFC00u) == 0x38BFC000u) { /* LDAPR and variants: a plain load */
         rd_(g, rn, 1, 1);
@@ -1754,7 +1953,7 @@ static int tr_ldst_single(Gen *g, uint32_t insn)
         wr(g, rt, size == 3, 0);
         return 1;
     }
-    if (size == 3 && opc == 2) { /* PRFM forms: hints */
+    if (!V && size == 3 && opc == 2) { /* PRFM forms: hints */
         if (mode == 1)
             return 1;
         if (mode == 0 && !bit21 && sub == 0)
@@ -1762,12 +1961,12 @@ static int tr_ldst_single(Gen *g, uint32_t insn)
         if (mode == 0 && bit21 && sub == 2)
             return 1;
     }
-    if (opc == 3 && size >= 2)
+    if (!V && opc == 3 && size >= 2)
         return 0;
-    unsigned scale = size, bytes = 1u << scale;
-    int is_load = opc != 0;
-    int sign_ext = opc >= 2;
-    unsigned dsf = (opc == 2) || (opc == 1 && size == 3);
+    unsigned scale = q ? 4 : size, bytes = q ? 16 : 1u << size;
+    int is_load = V ? (opc & 1) : opc != 0;
+    int sign_ext = !V && opc >= 2;
+    unsigned dsf = !V && ((opc == 2) || (opc == 1 && size == 3));
     int wb = 0;
     int64_t wb_imm = 0;
 
@@ -1818,7 +2017,39 @@ static int tr_ldst_single(Gen *g, uint32_t insn)
         return 0;
     }
 
-    if (is_load) {
+    if (V) {
+        /* The register is v[rt], low word first. A scalar load zeroes the high word. */
+        if (is_load) {
+            /* The low word is written before the high one is read, as mem_read128 does, so
+             * a fault in the high half leaves the same register state. */
+            lget(g, L_T1);
+            mem_ld(g, q ? 8 : bytes);
+            lset(g, L_T2);
+            v_put(g, rt, 0, L_T2);
+            if (q) {
+                lget(g, L_T1);
+                i64c(g, 8);
+                o8(g, W_I64_ADD);
+                mem_ld(g, 8);
+                lset(g, L_T3);
+            } else {
+                i64c(g, 0);
+                lset(g, L_T3);
+            }
+            v_put(g, rt, 8, L_T3);
+        } else {
+            lget(g, L_T1);
+            v_get(g, rt, 0);
+            mem_st(g, q ? 8 : bytes);
+            if (q) {
+                lget(g, L_T1);
+                i64c(g, 8);
+                o8(g, W_I64_ADD);
+                v_get(g, rt, 8);
+                mem_st(g, 8);
+            }
+        }
+    } else if (is_load) {
         lget(g, L_T1);
         mem_ld(g, bytes);
         if (sign_ext) {
@@ -1853,13 +2084,20 @@ static int tr_ldst(Gen *g, uint32_t insn)
 {
     if (((insn >> 24) & 0x3F) == 0x08) /* exclusives and ordered accesses */
         return 0;
+    if ((insn >> 26) & 1) { /* SIMD&FP loads and stores */
+        if (((insn >> 27) & 7) == 7)
+            return tr_ldst_single(g, insn); /* LDR and STR of B, H, S, D and Q registers */
+        if (((insn >> 24) & 0x3F) == 0x0C || ((insn >> 24) & 0x3F) == 0x0D)
+            return tr_simd(g, insn); /* LD1/ST1 of structures: the interpreter's own code */
+        /* SIMD&FP literals and pairs fall through to the general code below */
+    }
     if (((insn >> 27) & 7) == 3 && ((insn >> 24) & 3) == 0)
         return tr_ldst_literal(g, insn);
     if (((insn >> 27) & 7) == 5)
         return tr_ldst_pair(g, insn);
     if (((insn >> 27) & 7) == 7)
         return tr_ldst_single(g, insn);
-    return 0; /* SIMD&FP and multi-structure accesses */
+    return 0;
 }
 
 static int tr_insn(Gen *g, uint32_t insn)
@@ -1873,7 +2111,9 @@ static int tr_insn(Gen *g, uint32_t insn)
         return tr_ldst(g, insn);
     if ((op0 & 0x7) == 0x5)
         return tr_dp_reg(g, insn);
-    return 0; /* SIMD&FP and reserved */
+    if ((op0 & 0x7) == 0x7)
+        return tr_simd(g, insn);
+    return 0; /* reserved and SVE */
 }
 
 /* ---------- blocks ---------- */
@@ -2072,7 +2312,7 @@ static void build_module(int nf, int chain)
     }
 
     s->n = 0;
-    buf_uleb(s, 4);
+    buf_uleb(s, 5);
     type_entry(s, 1, &i32t, 1, i32t);
     {
         const uint8_t p[] = {i64t, i64t, i32t};
@@ -2085,6 +2325,10 @@ static void build_module(int nf, int chain)
     {
         const uint8_t p[] = {i32t, i64t, i64t, i32t};
         type_entry(s, 4, p, 1, i64t);
+    }
+    {
+        const uint8_t p[] = {i32t, i32t, i64t};
+        type_entry(s, 3, p, 1, i32t);
     }
     section(&mod_buf, 1, s);
 
@@ -2107,6 +2351,10 @@ static void build_module(int nf, int chain)
     buf_name(s, "pure");
     buf_put(s, 0x00);
     buf_uleb(s, TY_PURE);
+    buf_name(s, "e");
+    buf_name(s, "simd");
+    buf_put(s, 0x00);
+    buf_uleb(s, TY_SIMD);
     if (chain) { /* the table the chain tail-calls through */
         buf_name(s, "e");
         buf_name(s, "t");
@@ -2154,6 +2402,12 @@ static Gen gen; /* reused for every block: its buffers keep their memory */
 
 static void translate_batch(void)
 {
+    if (tbase < 0)
+        tbase = js_jit_table_base();
+    /* At a cap, start over: every block, page and slot is released, and the queued
+     * entries (which are only pcs) are translated into the empty cache. */
+    if (nlive + qlen > JIT_MAX_BLOCKS || npages + qlen > JIT_PAGE_LIMIT)
+        jit_flush_all();
     int nf = 0;
     int fidx[JIT_BATCH];
     int new_code = 0;
@@ -2201,12 +2455,14 @@ static void translate_batch(void)
     if (nf) {
         build_module(nf, chain_on);
         st_modules++;
-        int base = js_jit_compile(mod_buf.p, (int)mod_buf.n, nf);
-        if (base < 0) {
+        int32_t slots[JIT_BATCH];
+        for (int i = 0; i < nf; i++)
+            slots[i] = tbase + fidx[i];
+        if (js_jit_compile(mod_buf.p, (int)mod_buf.n, nf, slots) < 0) {
             st_compile_fail++;
         } else {
             for (int i = 0; i < nf; i++) {
-                blks[fidx[i]].fn = base + i;
+                blks[fidx[i]].fn = slots[i];
                 st_blocks++;
             }
         }
@@ -2296,7 +2552,7 @@ void jit_print_stats(uint64_t total_insns)
             "xiaoji: jit %s: %llu of %llu instructions in translated code (%.1f%%); "
             "%llu blocks in %llu modules (%llu refused, %llu not translatable, %llu compile failures); "
             "%llu block runs of %llu dispatches, %llu chain hits; %llu faults in translated code; "
-            "%llu self-modifying exits; %llu pages and %llu blocks invalidated\n",
+            "%llu self-modifying exits; %llu pages and %llu blocks invalidated; %llu full flushes\n",
             jit_on ? "on" : "off", (unsigned long long)st_insns, (unsigned long long)total_insns,
             total_insns ? 100.0 * (double)st_insns / (double)total_insns : 0.0,
             (unsigned long long)st_blocks, (unsigned long long)st_modules,
@@ -2304,7 +2560,7 @@ void jit_print_stats(uint64_t total_insns)
             (unsigned long long)st_compile_fail, (unsigned long long)st_block_runs,
             (unsigned long long)st_dispatch, (unsigned long long)st_chain_hits, (unsigned long long)st_faults,
             (unsigned long long)st_smc_exits, (unsigned long long)st_inv_pages,
-            (unsigned long long)st_inv_blocks);
+            (unsigned long long)st_inv_blocks, (unsigned long long)st_flushes);
 }
 
 /* ---------- helpers called from generated code ---------- */
@@ -2331,6 +2587,16 @@ EMSCRIPTEN_KEEPALIVE int32_t jit_st(uint64_t va, uint64_t v, uint64_t pc, uint32
     default: mem_write64(va, v); break;
     }
     return inval_seq != before;
+}
+
+/* The helper of tr_simd: runs one AdvSIMD/FP/SIMD load or store as the interpreter does.
+ * Returns bit 0 if the engine does not implement it, and bit 1 if the instruction's store
+ * changed translated code. */
+EMSCRIPTEN_KEEPALIVE int32_t jit_simd(cpu_t *c, uint32_t insn, uint64_t pc)
+{
+    uint32_t before = inval_seq;
+    int r = cpu_exec_simd(c, insn, pc);
+    return r | (inval_seq != before ? 2 : 0);
 }
 
 EMSCRIPTEN_KEEPALIVE uint64_t jit_pure(uint32_t op, uint64_t a, uint64_t b, uint32_t sf)

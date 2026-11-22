@@ -1026,6 +1026,34 @@ static void mem_fault(cpu_t *c)
     sig_segv_fatal(addr, c->pc);
 }
 
+#ifdef __EMSCRIPTEN__
+/* For the translator (jit.c): runs one AdvSIMD or FP instruction, or an LD1/ST1 of
+ * several structures or of one structure, with the steps run_loop takes for it. Those
+ * are the same calls exec makes, made here directly. It must not call exec, or the
+ * static ldst and the other dispatch functions: a second caller of those changes how
+ * run_loop is compiled, and the interpreter slowed by a fifth or more. (unimplemented
+ * is called only on the failure path.) The caller has stored the registers the
+ * instruction reads, and charges the instruction count. Returns 0 when it ran, or 1
+ * when the engine does not implement it (the SIGILL path has run, as in run_loop). */
+int cpu_exec_simd(cpu_t *c, uint32_t insn, uint64_t pc)
+{
+    int r;
+    mem_set_pc(pc);
+    c->pc = pc + 4;
+    if (((insn >> 25) & 7) == 7)
+        r = simd_exec(c, insn);
+    else if (((insn >> 24) & 0x3F) == 0x0C)
+        r = simd_ldst_multi(c, insn);
+    else
+        r = simd_ldst_single(c, insn);
+    if (r < 0) {
+        unimplemented(c, insn, pc);
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 /* The instruction loop. Pending signals are delivered at each instruction boundary.
  * A fault longjmps out of the instruction, so budget spent on that instruction is
  * not subtracted: the slice can run slightly long, which only affects fairness. */
