@@ -32,6 +32,9 @@ proc_t *proc_init(void)
     p->pgid = INIT_PGID;
     p->sid = INIT_PID;
     p->umask = INIT_UMASK;
+    p->dumpable = 1;       /* SUID_DUMP_USER, as Linux starts a process */
+    p->timerslack = 50000; /* the default timer slack, in ns */
+    p->capbset = PROC_CAPS_ALL;
     p->mm = mem_mm_new();
     p->fds = vfs_fdtab_new();
     p->sig = calloc(1, sig_tab_size());
@@ -91,6 +94,12 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     c->umask = parent->umask;
     c->cred = parent->cred;
     c->dumpable = parent->dumpable;
+    c->keepcaps = parent->keepcaps;
+    c->no_new_privs = parent->no_new_privs;
+    c->securebits = parent->securebits;
+    c->subreaper = parent->subreaper;
+    c->timerslack = parent->timerslack;
+    c->capbset = parent->capbset;
     c->brk_base = parent->brk_base;
     c->brk_cur = parent->brk_cur;
     c->vfork = vfork != 0;

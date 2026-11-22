@@ -130,6 +130,21 @@ int main(int argc, char **argv)
             init_timeout = strtoull(argv[++i], NULL, 10);
             continue;
         }
+        if (!strcmp(a, "--init-stdio")) {
+            /* null (the default, as on a device): services get /dev/null on 0, 1 and 2.
+             * host: services keep the engine's own stdio (for debugging only; the names
+             * are then /dev/stdin and so on, which ART's fd allowlist refuses). */
+            if (i + 1 >= argc)
+                return usage(stderr);
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "host"))
+                init_set_stdio_host(1);
+            else if (!strcmp(mode, "null"))
+                init_set_stdio_host(0);
+            else
+                return usage(stderr);
+            continue;
+        }
         if (a[0] == '-')
             return usage(stderr);
         break; /* PROGRAM starts here; "--" is optional */

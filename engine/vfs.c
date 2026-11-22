@@ -25,6 +25,9 @@
 #include "proc.h"
 #include "sched.h"
 
+/* Readlink text of a description (defined with desc_new below). */
+static const char *fd_link_text(const vfs_fd *f, char *buf, size_t n);
+
 #define MAX_SYMLINKS 40
 #define NAME_MAX_LEN 255
 #define RESOLVE_BUF (2 * VFS_PATH_MAX)
@@ -289,7 +292,8 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                     long n = strtol(cand + 14, NULL, 10);
                     if (n < 0 || n >= VFS_MAX_FD || !cur_fdt->slots[n].desc)
                         return -LE_NOENT;
-                    target = cur_fdt->slots[n].desc->guest;
+                    static char lbuf[64];
+                    target = fd_link_text(cur_fdt->slots[n].desc, lbuf, sizeof lbuf);
                 }
                 if (last && !follow) {
                     out->is_link = 1;
@@ -408,6 +412,24 @@ static vfs_fd *desc_new(void)
     d->refs = 1;
     d->hfd = -1;
     return d;
+}
+
+/* The inode of a pipe or a socket is numbered when it is made (vfs_pipe, vfs_socket_adopt): both
+ * ends of a pipe share it, and a dup shares the description. Numbers come from a counter, so they
+ * do not depend on addresses (ASLR) or collide. fstat and the readlink text of /proc/self/fd/N both
+ * use it. */
+
+/* What readlink of /proc/self/fd/N reports for a description, as Linux names it. A socket is
+ * socket:[ino], a pipe pipe:[ino]; the others keep their names (a file's path, a memfd's
+ * /memfd:NAME (deleted), anon_inode:[eventfd] and the like). buf is at least 64 bytes. */
+static const char *fd_link_text(const vfs_fd *f, char *buf, size_t n)
+{
+    if (f->kind == VFS_SOCK || f->kind == VFS_PIPE) {
+        snprintf(buf, n, "%s:[%llu]", f->kind == VFS_SOCK ? "socket" : "pipe",
+                 (unsigned long long)f->ino);
+        return buf;
+    }
+    return f->guest ? f->guest : "anon_inode:[unknown]";
 }
 
 /* Drops one reference to a description; the last one releases its host fd and
@@ -546,6 +568,7 @@ int vfs_pipe2(int out[2], uint32_t flags)
     static int serial;
     char guest[48];
     snprintf(guest, sizeof guest, "pipe:[%d]", ++serial);
+    const uint64_t ino = 0x40000000ull + (uint64_t)serial;
     int cloexec = (flags & LO_CLOEXEC) != 0;
     uint32_t nb = flags & LO_NONBLOCK;
     vfs_fd *rd = desc_new(), *wr = desc_new();
@@ -555,6 +578,7 @@ int vfs_pipe2(int out[2], uint32_t flags)
     wr->lflags = LO_WRONLY | nb;
     rd->guest = xstrdup(guest);
     wr->guest = xstrdup(guest);
+    rd->ino = wr->ino = ino;
     pipe_open(p, 0);
     pipe_open(p, 1);
     slot_install(r, rd, cloexec);
@@ -1295,7 +1319,7 @@ int vfs_stat_fd(int fd, host_stat *out)
     if (f->kind == VFS_PIPE) {
         memset(out, 0, sizeof *out);
         out->dev = 0x11;
-        out->ino = 0x4000u + (uint64_t)fd;
+        out->ino = f->ino;
         out->mode = LS_IFIFO | 0600;
         out->nlink = 1;
         out->blksize = 4096;
@@ -1305,7 +1329,7 @@ int vfs_stat_fd(int fd, host_stat *out)
     if (f->kind == VFS_SOCK) {
         memset(out, 0, sizeof *out);
         out->dev = 0x10;
-        out->ino = 0x4000u + (uint64_t)fd;
+        out->ino = f->ino;
         out->mode = 0140777; /* S_IFSOCK */
         out->nlink = 1;
         out->blksize = 4096;
@@ -1372,9 +1396,11 @@ int vfs_socket_adopt(sock_t *s, int cloexec, int nonblock)
         sock_unref(s); /* the description never took the reference */
         return -LE_MFILE;
     }
+    static uint64_t sock_serial;
     vfs_fd *f = desc_new();
     f->kind = VFS_SOCK;
     f->sock = s;
+    f->ino = 0x40000000ull + 0x1000000ull + ++sock_serial;
     f->lflags = LO_RDWR | (nonblock ? LO_NONBLOCK : 0);
     slot_install(slot, f, cloexec != 0);
     return slot;

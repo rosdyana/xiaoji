@@ -1,0 +1,7 @@
+# The services' stdio (B4b): init gives each service /dev/null on 0, 1 and 2, as Android's init
+# does. The probe's stdout is therefore /dev/null, so it writes its report to a file (--out), and
+# it lists descriptors 0 to 2 too (--stdio). Its shell then stops init.
+export ANDROID_ROOT /system
+
+service probe /system/bin/sh -c "/data/local/tmp/fdnames --stdio --out /data/local/tmp/fdnames-init.txt; /system/bin/setprop xiaoji.exit 1"
+    oneshot

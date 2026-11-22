@@ -40,6 +40,7 @@ typedef struct {
     int ro_area;     /* VFS_MEMFD: the property area, read-only (PROT_WRITE is refused) */
     void *binder;    /* VFS_BINDER: the binder proc (binder.h); released with the description */
     void *obj;       /* VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL: the object (fdobj.h, poll.h) */
+    uint64_t ino;    /* VFS_PIPE, VFS_SOCK: the inode, numbered at creation (both pipe ends share it) */
 } vfs_fd;
 
 /* A descriptor: a slot in a process's fd table. The close-on-exec flag is per slot;

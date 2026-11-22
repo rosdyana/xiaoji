@@ -1,0 +1,15 @@
+fd 0: /dev/null
+fd 1: /dev/null
+fd 2: /dev/null
+fd 3: /data/local/tmp/fdnames-init.txt
+fd 4: pipe:[N] ino=match type=fifo
+fd 5: pipe:[N] ino=match type=fifo
+fd 6: socket:[N] ino=match type=sock
+fd 7: socket:[N] ino=match type=sock
+fd 8: socket:[N] ino=match type=sock
+fd 9: anon_inode:[eventfd]
+fd 10: anon_inode:[eventpoll]
+fd 11: anon_inode:[timerfd]
+fd 12: /memfd:x (deleted)
+fd 13: pipe:[N] ino=match type=fifo
+pipe ends share an inode: yes

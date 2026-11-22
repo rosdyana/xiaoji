@@ -928,7 +928,7 @@ Status: **done (uncommitted), tested in the engine and in Node.** Files: `engine
 
 - **Run.** `xiaoji --init image/xiaoji.rc --root build/rootfs [--init-timeout SECS]`. `--root` is
   required. The program argument is not used. Logs (`xiaoji: init: ...`) go to stderr; the services'
-  stdout and stderr are the engine's (init's table holds 0, 1 and 2).
+  stdin, stdout and stderr are `/dev/null` (B4b; `--init-stdio host` keeps the engine's).
 - **No thread for init.** The initial process has no guest thread. `sched.c` calls init's tick
   between slices and whenever nothing is runnable. Every spawn, restart and stop happens there, never
   inside a guest syscall. When nothing is runnable, the loop sleeps at most 10 ms (or until init's next
@@ -1018,9 +1018,9 @@ stderr.
 - No SELinux labels, no property contexts, no `persist.*`, no uevents, no cgroups.
 ### B4a: zygote
 
-Status: **zygote preloads its classes and resources (milestone b) and calls its fork of system_server
-(milestone c, the call). The fork is refused by ART's descriptor allowlist, so system_server does not
-start.** The config is `image/xiaoji.rc`: the `early-init` exports of `init.environ.rc`, the
+Status: **zygote preloads its classes and resources (milestone b) and forks system_server (milestone c).
+The descriptor allowlist refusal of B4a is fixed (B4b). system_server then stops at its storage bind
+mount, which needs mount namespaces (B4b, the blocker).** The config is `image/xiaoji.rc`: the `early-init` exports of `init.environ.rc`, the
 servicemanager block and the zygote64 block of the Android 13 rc files (verbatim, options the engine
 does not model ignored), plus the properties and `mkdir` lines below. Run it with `--logcat`,
 `XIAOJI_STAMP=1` (each line then starts with `[ms insn]`: milliseconds and instructions since the first
@@ -1036,30 +1036,19 @@ One run of the native engine on the Mac (AC power, Low Power Mode off), `XIAOJI_
 | (b) classes preloaded | `I/Zygote: ...preloaded 16252 classes in 29078ms.` | 38.1 s | 2.31 G |
 | (b) resources preloaded | `I/Zygote: ...preloaded 41 resources in 59ms.` | 38.5 s | 2.33 G |
 | (c) zygote calls forkSystemServer | `Zygote.forkSystemServer` in the stack below | 50.2 s | 3.15 G |
-| (c) system_server forked | not reached | | |
+| (c) system_server forked | not reached (B4a: refused by the allowlist; see B4b) | | |
 | (d) system_server | not reached | | |
 
 The class preload is 29 s of guest time (the guest clock), about 2.2 G instructions after (a): about
 60 M instructions per second overall on this machine. The second zygote (pid 1010) is a restart after the fork
 failure, not a second boot; its preload takes the same instructions.
 
-#### The blocker (now)
+#### The B4a blocker (fixed in B4b)
 
-```
-F/zygote64(1002): jni_internal.cc:825] JNI FatalError called: (system_server) Not allowlisted (37): /dev/stdin
-F/zygote64(1002): runtime.cc:675] Runtime aborting...
-  at com.android.internal.os.Zygote.nativeForkSystemServer(Native method)
-  at com.android.internal.os.Zygote.forkSystemServer(Zygote.java:479)
-```
-
-ART's `fd_utils` (run in the child, after the fork, to close the descriptors zygote does not
-allow) reads `/proc/self/fd`, then the target of each descriptor with `readlink`. Descriptor 37 is an
-`open("/dev/stdin")`, and the engine reports its target as `/dev/stdin`. On a device the target of
-stdin is `/dev/null`, which is allowed. So the fix is to give services a stdin that is `/dev/null` (init
-opens it as descriptor 0 of a service, as Android's init does) and to make `open("/dev/stdin")` report
-the target of descriptor 0. This is not done yet: the engine currently names its stdio descriptors
-after `/dev/stdin`, `/dev/stdout`, `/dev/stderr` (`engine/vfs.c`, `std_names`). The next step is to
-check `fd_utils.cpp` on the remote for the exact allowlist rule before changing the names.
+`F/zygote64: JNI FatalError called: (system_server) Not allowlisted (37): /dev/stdin`. The fd walk of the
+fork (`FileDescriptorTable::Create`, `fd_utils.cpp`) skips 0 to 2 and reads the target of every other
+descriptor. Descriptor 37 shared the description of a stdio descriptor, and the engine named that
+description `/dev/stdin`. The fix is in B4b.
 
 #### Engine changes made for zygote
 
@@ -1131,7 +1120,186 @@ Real implementations unless marked as a stub.
 
 #### Repeatability
 
-- A boot writes only the `dalvik-cache` directories under `build/rootfs/data` (the test harness copies its
-  own test binaries there too).
+- A boot writes only the `dalvik-cache` directories under `build/rootfs/data`, and `/mnt/user/0` under
+  `build/rootfs/mnt` (B4b; the test harness copies its own test binaries to `data` too).
 - `XIAOJI_BOOT=1 tests/run.sh` runs the boot and passes when the log has `...preloaded N classes`. It takes
   about 60 s more than the default run, so it is opt-in. It stops with `--init-timeout 90`.
+
+## B4b: system_server (in progress)
+
+Status: **the descriptor allowlist blocker of B4a is fixed. Zygote forks system_server (milestone c),
+and the child passes ART's fd checks. system_server then stops at its storage bind mount. A correct fix
+gives each process a mount table and makes `vfs_resolve` honour it, which changes path resolution for
+every syscall. The boot is stopped here for that decision (see "The blocker"). Milestones (d1) to (d5)
+are not reached, and the daemon and HAL table below is empty for that reason.**
+
+### Files
+
+- `engine/vfs.c`, `engine/vfs.h`: the Linux-style readlink text of `/proc/self/fd/N` for sockets and pipes
+  (`fd_link_text`), and the inode of a pipe or socket, numbered at creation (`vfs_fd.ino`), used by fstat
+  and by the link.
+- `engine/init.c`, `engine/init.h`: `svc_stdio_null` (the services' stdio), `init_set_stdio_host`.
+- `engine/main.c`: `--init-stdio null|host`.
+- `engine/syscall.c`, `engine/linux.h`, `engine/proc.h`, `engine/proc.c`: `prctl` (the subset below),
+  with per-process state that a fork copies.
+- `image/xiaoji.rc`: `mkdir /mnt/user` and `/mnt/user/0` (the on-init directories of `init.rc`).
+- `tests/guest/fdnames.c`, `tests/guest/prctl.c`: new deterministic guest tests (`make test`, native
+  oracle, engine and Node).
+- `tests/init/stdio.rc`, `tests/expect/init-stdio.out`: the services' stdio (below).
+- `tests/run.sh`: `--init-stdio host` for the four init cases that read a service's stdout; the new
+  `init-stdio` case; the `XIAOJI_BOOT=1` check now also requires the system_server fork line.
+
+### Services' stdio (fixes the allowlist blocker)
+
+- **Default `--init-stdio null`.** Each service's fds 0, 1 and 2 are `/dev/null` (the engine's
+  synthetic `SYN_NULL`), opened once O_RDWR and dup'd onto 0, 1 and 2. This is Android's `SetupStdio`
+  (`system/core/init/service_utils.cpp` on the remote tree). The engine's own root process keeps its host
+  stdio, which the tests rely on.
+- **Why the blocker happened.** ART's table (`fd_utils.cpp`, `FileDescriptorTable::Create`) skips 0
+  to 2 and reads the target of every other descriptor. Descriptor 37 shared the description of a stdio
+  descriptor, and the engine names a description by its name, so the link read `/dev/stdin`, which is not
+  allowlisted. With `/dev/null` on the stdio descriptors, the same shared description reads `/dev/null`,
+  which is allowlisted.
+- **`--init-stdio host`** keeps the engine's own stdio for the services, for debugging. The names are
+  then `/dev/stdin`, `/dev/stdout` and `/dev/stderr`, and zygote fails the allowlist again. The four init
+  cases that read service stdout (`init-smoke`, `init-classpath`, `init-sockets`, `init-ctl`) run with it.
+- **Test.** `tests/init/stdio.rc` runs `fdnames --stdio --out ...` as a oneshot under the default
+  stdio. The report goes to a file, since stdout is `/dev/null`. It must equal `tests/expect/init-stdio.out`
+  (fds 0 to 2 read `/dev/null`), with an empty stdout and exit 0, in the engine and in Node.
+
+### Linux-style fd names and inodes
+
+`readlink /proc/self/fd/N` (the last component, not followed) reports what Linux reports:
+
+| Kind | Before | Now | fstat |
+|---|---|---|---|
+| pipe (both ends and dups) | `pipe:[serial]` | `pipe:[ino]` | S_IFIFO, ino per pipe |
+| socket | no name (NULL, a crash on readlink) | `socket:[ino]` | S_IFSOCK, ino per socket |
+| eventfd, timerfd, epoll | `anon_inode:[...]` | unchanged | unchanged |
+| memfd | `/memfd:NAME (deleted)` | unchanged | S_IFREG |
+| files, devices | the guest path | unchanged | unchanged |
+
+- The inode of a pipe or socket was `0x4000 + slot`, so a dup had a different inode from the original.
+  It is now numbered when the object is made, from a counter (`vfs_fd.ino`): a pipe's both ends share
+  the pipe's serial (`0x40000000 + serial`), a socket gets `0x41000000 + serial` from `vfs_socket_adopt`,
+  and a dup shares its description. The digits in the link are the same number that `fstat` reports.
+  The numbers do not depend on addresses, so they are the same on every run.
+- Following `/proc/self/fd/N` (a `stat` through the link) still names the link text, so it is ENOENT for
+  a pipe or socket, as it was for a pipe. This is a gap, not a fidelity claim.
+- **Test:** `tests/guest/fdnames.c` opens each kind in a fixed order and prints the normalised link and
+  whether the inode matches. Its output is byte-identical natively (builder VM) and in the engine.
+
+### `prctl` (the zygote and system_server subset)
+
+Implemented in `sys_prctl`, with the Linux answers: dumpable (default 1, as Linux starts a process; was
+0), set dumpable (0 or 1), `PR_SET/GET_KEEPCAPS`, `PR_CAPBSET_READ` (all of bits 0 to 40, which is the
+oracle's `CapBnd` 0x1ffffffffff) and `PR_CAPBSET_DROP` (uid 0 only, else EPERM), `PR_SET/GET_SECUREBITS`,
+`PR_SET/GET_NO_NEW_PRIVS` (the setting to 1 only), `PR_SET/GET_PDEATHSIG` (recorded only; no signal is
+sent), `PR_SET/GET_TIMERSLACK` (default 50000), `PR_SET/GET_CHILD_SUBREAPER`, the tagged-address control
+(none: 0), `PR_SET_PTRACER` (accepted with no effect, as the oracle's Yama does), and the existing name
+and VMA options. The state is per process and a fork copies it. **Test:** `tests/guest/prctl.c` (as an
+ordinary user, so the bounding-set drop is not in it), byte-identical natively and in the engine.
+
+### Milestones (B4b)
+
+One run of the native engine on the Mac (AC power), `XIAOJI_STAMP=1`, the log of the stop at the blocker:
+
+| Milestone | Logcat line | Elapsed | Instructions |
+|---|---|---|---|
+| (a) app_process starts ART | `I/AndroidRuntime: Using default boot image` | 2.05 s | 140.8 M |
+| (b) classes preloaded | `I/Zygote: ...preloaded 16252 classes in 28782ms.` | 37.7 s | 2.31 G |
+| (b) resources preloaded | `I/Zygote: ...preloaded 41 resources in 59ms.` | 38.2 s | 2.33 G |
+| (c) system_server forked | `I/Zygote: System server process 1008 has been created` | 49.9 s | 3.15 G |
+| (d1) system_server starts | `SystemServer: Entered the Android system server!` | not reached | |
+| (d2) startBootstrapServices done | not reached | | |
+| (d3) startCoreServices done | not reached | | |
+| (d4) startOtherServices | not reached | | |
+| (d5) System now ready / Boot completed | not reached | | |
+
+The fd blocker of B4a was at 50.1 s and 3.15 G, so (c) moved only by the fork itself.
+
+### The blocker (now): the storage bind mount
+
+```
+[49934 ms 3153317007 insn] I/Zygote(1002): System server process 1008 has been created
+[49937 ms 3153374140 insn] F/zygote64(1008): jni_internal.cc:825] JNI FatalError called: (system_server) frameworks/base/core/jni/com_android_internal_os_Zygote.cpp:792: Failed to mount /mnt/user/0 to /storage: Operation not permitted
+```
+
+- `nativeForkSystemServer` calls `SpecializeCommon` with `MOUNT_EXTERNAL_DEFAULT` (Zygote.cpp line
+  2202, hard-coded), so every system_server runs `ensureInAppMountNamespace` (`unshare(CLONE_NEWNS)`)
+  and then `BindMount("/mnt/user/0", "/storage")`.
+- The engine has one mount table: `unshare(CLONE_NEWNS)` is a no-op, and any bind mount is EPERM (the
+  propagation-only `mount` stub is the one thing that succeeds).
+- **Why this is a stop, not a patch.** A bind mount is per-process state that every later path lookup
+  must honour. A global alias would give every process the same `/storage` view, and apps need
+  different per-user and per-app binds (`BindMountStorageToLowerFs`), so one table is wrong for them too.
+  The emulation that is correct is a mount table per process (copied by `unshare(CLONE_NEWNS)`; a plain fork shares it, as on Linux),
+  with bind aliases applied in `vfs_resolve`. That changes path resolution for every syscall, so it needs
+  a decision, not a local fix. Options, for the decision: (1) per-process mount tables in the VFS, the
+  correct one; (2) a global `/storage` alias, which is quick but wrong for apps; (3) a different
+  `/storage` source per process, set by the engine, which only hides the problem for system_server.
+  The mount-namespace rule the engine must follow: a plain `fork` shares the parent's mount namespace on
+  Linux, and only `CLONE_NEWNS` (by `clone` or `unshare`) makes a copy (`mount_namespaces(7)`).
+- After the abort, init restarts zygote (`started zygote (pid 1015)` in this run, after `zygote exited
+  (status 137, by a signal)`), and the new zygote repeats the 50 s preload and the same failure. The
+  boot test stops at `--init-timeout`.
+
+### Component choices
+
+| Component | Choice | Why |
+|---|---|---|
+| Services' stdin, stdout, stderr | `/dev/null` per service, as Android's `SetupStdio` (fixed) | ART's fd allowlist; matches a device |
+| Seccomp filter (zygote's `SetUpSeccompFilter`) | not reached: it runs after the storage mount (Zygote.cpp lines 1646 and 1578). By the code it is skipped when SELinux is not enforcing (`gIsSecurityEnforced`) | The engine's SELinux is permissive (B3). To confirm when the boot gets past the mount |
+| `PR_SET_PTRACER` (Yama) | accepted, no effect | The oracle kernel has Yama and accepts it |
+| `/mnt/user/0` tree | created by config (`mkdir`, as the on-init block of `init.rc`) | zygote's `PrepareDir` needs it |
+| `/storage` and the per-user bind mounts | **blocked** (the design question above) | Needs per-process mount namespaces |
+| hwservicemanager, HALs (power, health, light, sensors, ...), lmkd, installd, netd, vold, statsd, storaged | not decided yet | system_server has not reached the code that starts them |
+| Telephony, NFC, Bluetooth | not decided yet | Decide from docs/features.md when system_server reaches them |
+
+### Profile (observation only, not optimised)
+
+`XIAOJI_PROFILE=1`, the window from boot start to the end of the zygote class preload. The run passed the
+preload line (`...preloaded 16252 classes`) at 70 s of profiled wall time, and the init timeout stopped it
+at 75 s, before the fork. Unprofiled, the same preload line comes at 37.7 s, so profiling roughly doubles
+the wall time. The counts below are from that run.
+
+- 7 threads, 2.43 G instructions. The zygote's main thread has 2.26 G of them.
+- Samples by mapping (592727 samples, one per 4096 instructions per thread): `libart.so` 61.0%,
+  `boot-core-icu4j.oat` 8.1%, `[anon]` 7.5%, `libdexfile.so` 5.4%, bionic `libc.so` 4.9%, `boot.oat` 4.8%,
+  `libicuuc.so` 2.3%, `liblz4.so` 1.8%. These are the complete figures.
+- Top 40 hot PCs: 42388 samples, which is 7.2% of all samples. Symbolized from `libart.so`'s `.symtab`
+  with `nm` (its text segment has file offset equal to virtual address). Shares are of the top 40, so
+  each is about 1 to 1.4% of all samples: `nterp_op_move_result` 19.9%, `ClassLinker::InitializeClass`
+  15.0%, `nterp_op_iget_object` 14.1%, `NterpCommonInvokeInstance` 7.8%, `nterp_to_nterp_instance_non_range`
+  3.6%. The other hot PCs are 14 instructions of one loop in an anonymous mapping at guest
+  0x7ff00004d880 to 0x7ff00004d9ac; the profiler does not name that mapping, so it is not symbolized.
+- What this supports: most samples are in `libart.so`, and the hottest single PCs are in ART's nterp
+  handlers and `InitializeClass`. A guest-PC profile cannot say how the rest splits between the
+  interpreter and class initialization, or what the engine's own dispatch costs. Nothing is optimised.
+
+### Tests
+
+- `make test`: 150 passed, 0 failed (was 140). The new cases are `fdnames-O0/O2` and `prctl-O0/O2`
+  (engine and Node, against the native oracle), and `init-stdio` (engine and Node). The four init cases
+  that read service stdout now pass `--init-stdio host`.
+- `XIAOJI_BOOT=1 make test`: 151 passed, 0 failed. The extra case is the boot check, which requires the
+  class preload and the system_server fork line.
+- `XIAOJI_JIT=0 make test`: 150 passed, 0 failed.
+- `make test-web`: all web checks passed (headless Chromium), exit 0.
+- Output was read unfiltered (`rtk proxy make test`) for the two plain runs.
+
+### Gaps (B4b)
+
+- Bind mounts and mount namespaces (the blocker). `unshare(CLONE_NEWNS)` is still a no-op.
+- Not exercised by any test: binder and `/dev/__properties__` descriptors, which zygote also holds. They
+  are not in `fdnames`. Zygote's check passed for them in the boot (the child reached the mount), so the
+  evidence is the boot, not a test.
+- The fork's descriptor reopen (`ReopenOrDetach`, Zygote.cpp line 2100) runs in the child before
+  `SpecializeCommon`, and the boot reached the storage mount after it. So every descriptor zygote held at
+  the fork passed the reopen.
+- `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd` are not links in the engine's `/dev`
+  (Android's init creates them). Nothing has needed them yet.
+- A stat through `/proc/self/fd/N` of a pipe or socket is ENOENT (B4b, Linux-style names section).
+- `PR_SET_PDEATHSIG` is recorded only, and `PR_SET_SECCOMP` is not implemented (zygote's filter is not
+  reached yet; see the component table).
+- Only pipes and sockets have object inodes. eventfd, timerfd, epoll and memfd keep their old inodes.

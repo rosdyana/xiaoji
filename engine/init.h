@@ -17,6 +17,10 @@ int init_active(void);
 /* --trace for the services' threads. */
 void init_set_trace(int on);
 
+/* --init-stdio: 1 keeps the engine's own stdio for the services (debugging only); 0 (the
+ * default) gives each service /dev/null on 0, 1 and 2, as Android's init does. */
+void init_set_stdio_host(int on);
+
 /* A ctl.start, ctl.stop or ctl.restart property (action) for a service (svc). Queued: init
  * acts between slices, never inside the property call. */
 void init_ctl_request(const char *action, size_t alen, const char *svc, size_t slen);

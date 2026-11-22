@@ -343,7 +343,7 @@ fi
 # Init (B4a): the built-in init (--init) starts servicemanager and a oneshot that lists the
 # services, then stops init through the xiaoji.exit property. Stdout must equal
 # tests/expect/init-smoke.out and the exit code must be 0. Engine and Node.
-INIT_SMOKE="--init tests/init/smoke.rc --root build/rootfs --init-timeout 60"
+INIT_SMOKE="--init tests/init/smoke.rc --root build/rootfs --init-timeout 60 --init-stdio host"
 if [ -d build/rootfs/system/bin ]; then
     for runner in engine node; do
         if [ "$runner" = engine ]; then
@@ -371,9 +371,9 @@ fi
 if [ -d build/rootfs/system/bin ]; then
     for runner in engine node; do
         if [ "$runner" = engine ]; then
-            "$ENGINE" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
+            "$ENGINE" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 --init-stdio host >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
+            node "$NODE_JS" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 --init-stdio host >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
         else
             continue
         fi
@@ -384,6 +384,34 @@ if [ -d build/rootfs/system/bin ]; then
         else
             echo "FAIL  init-classpath $runner (exit $rc)"
             diff tests/expect/init-classpath.out "$OUT/init-classpath.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
+# Init stdio (B4b): with the default --init-stdio null, a service's stdin, stdout and stderr are
+# /dev/null, so the probe writes its report to a file. The report (fdnames, tests/guest/fdnames.c)
+# must equal tests/expect/init-stdio.out. Engine and Node.
+if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/fdnames-O0 ]; then
+    mkdir -p build/rootfs/data/local/tmp
+    cp build/tests/guest/fdnames-O0 build/rootfs/data/local/tmp/fdnames
+    for runner in engine node; do
+        rm -f build/rootfs/data/local/tmp/fdnames-init.txt
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/stdio.rc --root build/rootfs --init-timeout 60 >"$OUT/init-stdio.$runner.out" 2>"$OUT/init-stdio.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/stdio.rc --root build/rootfs --init-timeout 60 >"$OUT/init-stdio.$runner.out" 2>"$OUT/init-stdio.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && [ ! -s "$OUT/init-stdio.$runner.out" ] &&
+            cmp -s build/rootfs/data/local/tmp/fdnames-init.txt tests/expect/init-stdio.out; then
+            echo "PASS  init-stdio $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-stdio $runner (exit $rc)"
+            diff tests/expect/init-stdio.out build/rootfs/data/local/tmp/fdnames-init.txt | head -n 6 | sed 's/^/        /'
             fail=$((fail + 1))
         fi
     done
@@ -402,9 +430,9 @@ for case_name in init-sockets init-ctl; do
     esac
     for runner in engine node; do
         if [ "$runner" = engine ]; then
-            "$ENGINE" --init "$init_rc" --root build/rootfs --init-timeout 90 >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
+            "$ENGINE" --init "$init_rc" --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --init "$init_rc" --root build/rootfs --init-timeout 90 >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
+            node "$NODE_JS" --init "$init_rc" --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
         else
             continue
         fi
@@ -420,17 +448,19 @@ for case_name in init-sockets init-ctl; do
     done
 done
 
-# Zygote (B4a), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc and waits for its class
-# preload (about 40 s natively). The log must show "...preloaded N classes". Not in the default run,
-# which is kept short; the boot is stopped by --init-timeout.
+# Zygote (B4a, B4b), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc. The log must show
+# the class preload ("...preloaded N classes") and the fork of system_server (zygote's own
+# "System server process N has been created", B4b milestone c). About 50 s natively. Not in the
+# default run, which is kept short; the boot is stopped by --init-timeout.
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
-    if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err"; then
-        echo "PASS  zygote preload (XIAOJI_BOOT)"
+    if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
+        grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err"; then
+        echo "PASS  zygote preload and system_server fork (XIAOJI_BOOT)"
         pass=$((pass + 1))
     else
-        echo "FAIL  zygote preload (XIAOJI_BOOT): no preloaded-classes line in $OUT/boot.err"
+        echo "FAIL  zygote boot (XIAOJI_BOOT): no preload or no system_server fork line in $OUT/boot.err"
         fail=$((fail + 1))
     fi
 fi

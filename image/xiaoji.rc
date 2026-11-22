@@ -17,6 +17,10 @@ on early-init
     export ASEC_MOUNTPOINT /mnt/asec
     mkdir /data/dalvik-cache 0771
     mkdir /data/dalvik-cache/arm64 0771
+    # The user storage tree that zygote prepares for system_server (init.rc's on-init block makes
+    # these). The mounts themselves are not made: zygote's bind mounts are refused (engine/syscall.c).
+    mkdir /mnt/user 0755
+    mkdir /mnt/user/0 0755
 
 service servicemanager /system/bin/servicemanager
     class core animation

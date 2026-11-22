@@ -92,6 +92,7 @@ typedef struct {
 
 static int active;
 static int trace_on;
+static int stdio_host;   /* --init-stdio host: services keep the engine's stdio */
 static proc_t *self;
 static svc_t svcs[INIT_MAX_SVC];
 static int nsvc;
@@ -600,6 +601,24 @@ static const char *base_name(const char *p)
     return b ? b + 1 : p;
 }
 
+/* A service's stdin, stdout and stderr: /dev/null on each (init's SetupStdio, which opens it
+ * O_RDWR and dup2s it onto 0, 1 and 2). Called in the child's table. The descriptors are not
+ * close-on-exec, so the service's children inherit them. */
+static int svc_stdio_null(void)
+{
+    int fd = vfs_open(-100, "/dev/null", LO_RDWR, 0);
+    if (fd < 0)
+        return -1;
+    for (int i = 0; i < 3; i++) {
+        if (vfs_dup(fd, i, 1, 0) < 0) {
+            vfs_close(fd);
+            return -1;
+        }
+    }
+    vfs_close(fd);
+    return 0;
+}
+
 static int svc_start(svc_t *s)
 {
     proc_switch(self);
@@ -656,10 +675,15 @@ static int svc_start(svc_t *s)
         return -1;
     }
     proc_switch(child);
-    vfs_set_prog(canon);
-    vfs_set_argv(s->argc, s->argv);
     uint64_t entry = 0, sp = 0;
-    int rc = loader_load(img, len, s->path, s->argc, s->argv, ne, envp, &entry, &sp);
+    int rc = 0;
+    if (!stdio_host && svc_stdio_null() < 0) {
+        rc = -LE_NOENT; /* reported below, with the same release as a failed load */
+    } else {
+        vfs_set_prog(canon);
+        vfs_set_argv(s->argc, s->argv);
+        rc = loader_load(img, len, s->path, s->argc, s->argv, ne, envp, &entry, &sp);
+    }
     free(img);
     proc_switch(self);
     for (int i = 0; i < s->nsocks; i++) {
@@ -844,6 +868,11 @@ int init_active(void)
 void init_set_trace(int on)
 {
     trace_on = on != 0;
+}
+
+void init_set_stdio_host(int on)
+{
+    stdio_host = on != 0;
 }
 
 void init_ctl_request(const char *action, size_t alen, const char *svc, size_t slen)

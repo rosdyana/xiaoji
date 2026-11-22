@@ -827,19 +827,87 @@ static int64_t sys_rt_sigtimedwait(cpu_t *c, uint64_t set, uint64_t info, uint64
     return sig_timedwait(c, wanted, info, poll, has, deadline);
 }
 
-static int64_t sys_prctl(uint64_t option, uint64_t arg2)
+static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5)
 {
+    proc_t *me = proc_cur();
+    /* The unused arguments must be zero for these options, as Linux checks them. */
     if (option == LPR_SET_VMA) /* anonymous VMA names are not kept; the oracle kernel returns EINVAL too */
         return -LE_INVAL;
-    if (option == LPR_GET_DUMPABLE)
-        return proc_cur()->dumpable;
-    if (option == LPR_SET_DUMPABLE) {
+    switch ((int)option) {
+    case LPR_GET_DUMPABLE:
+        return me->dumpable;
+    case LPR_SET_DUMPABLE:
         if (arg2 > 1)
             return -LE_INVAL;
-        proc_cur()->dumpable = (int)arg2;
+        me->dumpable = (int)arg2;
         return 0;
+    case LPR_SET_PDEATHSIG:
+        if (arg2 > 64)
+            return -LE_INVAL;
+        me->pdeathsig = (int)arg2;
+        return 0;
+    case LPR_GET_PDEATHSIG: {
+        int32_t v = me->pdeathsig;
+        return mem_copy_in(arg2, &v, sizeof v) < 0 ? -LE_FAULT : 0;
     }
-    if (option == LPR_SET_NAME) {
+    case LPR_GET_KEEPCAPS:
+        return me->keepcaps;
+    case LPR_SET_KEEPCAPS:
+        if (arg2 > 1)
+            return -LE_INVAL;
+        me->keepcaps = (int)arg2;
+        return 0;
+    case LPR_CAPBSET_READ:
+        if (arg2 > PROC_CAP_LAST)
+            return -LE_INVAL;
+        return (int64_t)((me->capbset >> arg2) & 1);
+    case LPR_CAPBSET_DROP:
+        if (arg2 > PROC_CAP_LAST)
+            return -LE_INVAL;
+        if (me->cred.euid != 0) /* needs CAP_SETPCAP, which only uid 0 has here */
+            return -LE_PERM;
+        me->capbset &= ~(1ull << arg2);
+        return 0;
+    case LPR_GET_SECUREBITS:
+        return me->securebits;
+    case LPR_SET_SECUREBITS:
+        if (me->cred.euid != 0)
+            return -LE_PERM;
+        me->securebits = (int)(uint32_t)arg2;
+        return 0;
+    case LPR_SET_TIMERSLACK:
+        if ((int64_t)arg2 < 0)
+            return -LE_INVAL;
+        me->timerslack = arg2 == 0 ? 50000 : (int)arg2;
+        return 0;
+    case LPR_GET_TIMERSLACK:
+        return me->timerslack;
+    case LPR_SET_CHILD_SUBREAPER:
+        me->subreaper = arg2 != 0;
+        return 0;
+    case LPR_GET_CHILD_SUBREAPER: {
+        int32_t v = me->subreaper;
+        return mem_copy_in(arg2, &v, sizeof v) < 0 ? -LE_FAULT : 0;
+    }
+    case LPR_SET_NO_NEW_PRIVS:
+        /* Only the setting to 1, with the other arguments zero, is valid (as in Linux). */
+        if (arg2 != 1 || arg3 || arg4 || arg5)
+            return -LE_INVAL;
+        me->no_new_privs = 1;
+        return 0;
+    case LPR_GET_NO_NEW_PRIVS:
+        if (arg2 || arg3 || arg4 || arg5)
+            return -LE_INVAL;
+        return me->no_new_privs;
+    case LPR_GET_TAGGED_ADDR_CTRL:
+        return 0; /* no tagged addresses (no MTE, no TBI control) */
+    case LPR_SET_TAGGED_ADDR_CTRL:
+        return arg2 == 0 && !arg3 && !arg4 && !arg5 ? 0 : -LE_INVAL;
+    case LPR_SET_PTRACER:
+        /* Accepted with no effect: the oracle kernel has Yama, which takes it (0), and the engine
+         * has no ptrace restriction to set. */
+        return 0;
+    case LPR_SET_NAME: {
         char name[16];
         int64_t n = mem_strlen(arg2);
         if (n < 0)
@@ -852,12 +920,14 @@ static int64_t sys_prctl(uint64_t option, uint64_t arg2)
         sched_set_name(name);
         return 0;
     }
-    if (option == LPR_GET_NAME) {
+    case LPR_GET_NAME: {
         uint8_t name[16];
         memcpy(name, sched_name(), sizeof name);
         return mem_copy_in(arg2, name, sizeof name) < 0 ? -LE_FAULT : 0;
     }
-    return -LE_INVAL;
+    default:
+        return -LE_INVAL;
+    }
 }
 
 /* ---------- processes: wait, process groups and sessions ---------- */
@@ -1241,7 +1311,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sig_rt_tgsigqueueinfo(a[0], a[1], a[2], a[3]);
         return;
     case SYS_PRCTL:
-        *ret = sys_prctl(a[0], a[1]);
+        *ret = sys_prctl(a[0], a[1], a[2], a[3], a[4]);
         return;
     case SYS_GETRANDOM:
         *ret = sys_getrandom(a[0], a[1]);
