@@ -1,6 +1,9 @@
 // Dev server for the web page (M4). Node only, no dependencies.
 //
 //   node web/serve.mjs [--port N] [--host H] [--coop]
+//   throttle: { mbps, rttMs } (startServer / createHandler, for the boot benchmark). Every response waits
+//   rttMs before its headers, and all bodies share one bucket of mbps (0 = no limit), so the limit holds
+//   for the worker's requests too.
 //
 // URL layout:
 //   /manifest.json          build/web/manifest.json (make build/web/manifest.json)
@@ -8,6 +11,8 @@
 //   /manifest-xiaoji.json   build/web/manifest-xiaoji.json (make build/web/manifest-xiaoji.json)
 //   /rootfs-xiaoji/<path>   build/rootfs-xiaoji/<path>: the product tree, for "Boot Android" (W1)
 //   /xiaoji.rc              image/xiaoji.rc, the boot config the page passes to --init (W1)
+//   /xj/<path>              build/web/xj/<path>: the chunk store (tools/pack.py, docs/loading.md). The chunks
+//                           and packs are named by their hash, so they are served as immutable.
 //   /<name>                 web/<name>, else build/wasm/<name>
 //
 // --coop adds Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers. Off by
@@ -29,6 +34,7 @@ export const DIRS = {
   rootfs: join(REPO, 'build', 'rootfs'),
   manifestXiaoji: join(REPO, 'build', 'web', 'manifest-xiaoji.json'),
   rootfsXiaoji: join(REPO, 'build', 'rootfs-xiaoji'),
+  xj: join(REPO, 'build', 'web', 'xj'),
   image: join(REPO, 'image'),
 };
 
@@ -60,6 +66,7 @@ async function locate(urlPath) {
   if (p === '/xiaoji.rc') return within(DIRS.image, '/xiaoji.rc');
   if (p.startsWith('/rootfs/')) return within(DIRS.rootfs, p.slice('/rootfs'.length));
   if (p.startsWith('/rootfs-xiaoji/')) return within(DIRS.rootfsXiaoji, p.slice('/rootfs-xiaoji'.length));
+  if (p.startsWith('/xj/')) return within(DIRS.xj, p.slice('/xj'.length));
   if (p === '/') p = '/index.html';
   const name = p.slice(1);
   if (!name || name.includes('/')) return null;
@@ -109,8 +116,24 @@ function send(res, status, headers, body) {
   res.end(body);
 }
 
-export function createHandler({ coop = false, log = () => {} } = {}) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
+
+// Streams src to res through the shared bucket: each chunk takes len / rate of bucket time.
+async function pipeThrottled(src, res, bucket) {
+  for await (const chunk of src) {
+    const now = Date.now();
+    bucket.free = Math.max(bucket.free, now) + chunk.length / bucket.bytesPerMs;
+    if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+    await sleep(bucket.free - Date.now());
+  }
+  res.end();
+}
+
+export function createHandler({ coop = false, log = () => {}, throttle = null } = {}) {
+  const limited = throttle && (throttle.mbps > 0 || throttle.rttMs > 0);
+  const bucket = { free: 0, bytesPerMs: throttle && throttle.mbps > 0 ? throttle.mbps * 125 : Infinity };
   return async (req, res) => {
+    if (limited && throttle.rttMs > 0) await sleep(throttle.rttMs);
     const url = new URL(req.url, 'http://localhost');
     const common = {
       'Cache-Control': 'no-store',
@@ -141,6 +164,9 @@ export function createHandler({ coop = false, log = () => {} } = {}) {
       'Content-Type': contentType(hit.file),
       'Last-Modified': st.mtime.toUTCString(),
     };
+    if (url.pathname.startsWith('/xj/chunks/') || url.pathname.startsWith('/xj/packs/')) {
+      headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+    }
     const range = parseRange(req.headers.range, size);
     if (range === 'bad') {
       return send(res, 416, { ...common, 'Content-Range': `bytes */${size}` }, '');
@@ -152,19 +178,21 @@ export function createHandler({ coop = false, log = () => {} } = {}) {
       log(`206 ${req.method} ${url.pathname} ${range.start}-${range.end}`);
       res.writeHead(206, headers);
       if (req.method === 'HEAD') return res.end();
-      return createReadStream(hit.file, { start: range.start, end: range.end }).pipe(res);
+      const part = createReadStream(hit.file, { start: range.start, end: range.end });
+      return limited ? pipeThrottled(part, res, bucket) : part.pipe(res);
     }
     headers['Content-Length'] = String(size);
     log(`200 ${req.method} ${url.pathname} ${size}`);
     res.writeHead(200, headers);
     if (req.method === 'HEAD') return res.end();
-    return createReadStream(hit.file).pipe(res);
+    const whole = createReadStream(hit.file);
+    return limited ? pipeThrottled(whole, res, bucket) : whole.pipe(res);
   };
 }
 
 // Starts the server and resolves to { server, port, url, close() }. Port 0 picks a free port.
-export function startServer({ port = 8080, host = '127.0.0.1', coop = false, log } = {}) {
-  const handler = createHandler({ coop, log });
+export function startServer({ port = 8080, host = '127.0.0.1', coop = false, log, throttle = null } = {}) {
+  const handler = createHandler({ coop, log, throttle });
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
       if (!res.headersSent) send(res, 500, { 'Cache-Control': 'no-store' }, 'server error\n');

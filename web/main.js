@@ -152,6 +152,10 @@ $('boot').addEventListener('click', () => {
     } else if (m.type === 'fetch') {
       window.xb.fetch = { requests: m.requests, files: m.files, bytes: m.bytes };
       $('bfetch').textContent = `${m.requests} requests, ${m.files} files, ${fmtBytes(m.bytes)}`;
+    } else if (m.type === 'stats') {
+      window.xb.stats = m;
+    } else if (m.type === 'trace') {
+      window.xb.trace = m;
     } else if (m.type === 'done') {
       window.xb.done = m;
       stopBoot(`exit ${m.exitCode}`);
@@ -169,7 +173,14 @@ $('boot').addEventListener('click', () => {
     appendLog(window.xb.error);
     stopBoot('error');
   };
-  worker.postMessage({ type: 'boot', base: new URL('./', location.href).href });
+  // ?trace records the boot's file access (web/trace.js) for docs/loading.md; off by default.
+  const params = new URLSearchParams(location.search);
+  // ?boot=pack loads the chunk store and boot packs (web/chunks.js, docs/loading.md); the default is the manifest.
+  const mode = params.get('boot') === 'pack' ? 'pack' : 'manifest';
+  worker.postMessage({
+    type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
+    noPacks: params.has('nopack'),
+  });
 });
 
 $('stop').addEventListener('click', () => {

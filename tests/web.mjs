@@ -95,7 +95,8 @@ async function runBoot(chromium, baseUrl) {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   try {
-    await page.goto(baseUrl, { waitUntil: 'load' });
+    // The chunk store and boot packs (?boot=pack, docs/loading.md); the manifest path is the page's default.
+    await page.goto(baseUrl + '?boot=pack', { waitUntil: 'load' });
     const t0 = Date.now();
     await page.click('#boot');
     await page.waitForFunction(
@@ -146,7 +147,7 @@ async function main() {
   }
   const needed = ['build/wasm/xiaoji.mjs'];
   if (names.length) needed.push('build/web/manifest.json', 'build/rootfs/data/hello.dex');
-  if (bootOnly || bootToo) needed.push('build/web/manifest-xiaoji.json', 'build/rootfs-xiaoji/system/bin/init');
+  if (bootOnly || bootToo) needed.push('build/web/manifest-xiaoji.json', 'build/web/xj/manifest-xiaoji-v2.json', 'build/rootfs-xiaoji/system/bin/init');
   for (const f of needed) {
     if (!existsSync(join(ROOT, f))) {
       console.error(`missing ${f}; run make test-web (it builds the prerequisites)`);

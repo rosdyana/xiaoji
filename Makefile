@@ -26,7 +26,7 @@ GL_SPECS := $(wildcard third_party/gfxstream/*/*)
 build/gen/gen_report.txt: tools/gen-glproto.py $(GL_SPECS)
 	python3 -I tools/gen-glproto.py third_party/gfxstream build/gen
 
-.PHONY: all engine wasm wasm-node guest-tests test test-web serve image oracle clean reset-data help
+.PHONY: all engine wasm wasm-node guest-tests test test-web test-chunks serve image oracle clean reset-data help
 
 all: engine     ## default: native engine
 
@@ -83,12 +83,22 @@ build/web/manifest-xiaoji.json: tools/mkmanifest.py
 	@mkdir -p build/web
 	tools/mkmanifest.py --product build/rootfs-xiaoji $@
 
+# The chunk store for the Boot Android page (docs/loading.md, tier 1): the product tree as 128 KiB chunks, the boot
+# packs in the boot's first-read order (image/boot-order.json, made by tools/workingset.py --order-out), and
+# manifest-xiaoji-v2.json. Delete the manifest to regenerate it after the tree changes.
+XJ_CHUNK ?= 131072
+build/web/xj/manifest-xiaoji-v2.json: tools/pack.py image/boot-order.json
+	python3 -I tools/pack.py build/rootfs-xiaoji build/web/xj --order image/boot-order.json --chunk-size $(XJ_CHUNK)
+
+test-chunks: build/web/xj/manifest-xiaoji-v2.json   ## check the chunk store: every chunk hashes, every file reassembles (tests/chunks.mjs)
+	node tests/chunks.mjs
+
 test-web: wasm build/web/manifest.json   ## run the web build in headless Chromium (tests/web.mjs); XIAOJI_WEB_BOOT=1 adds the boot check
-	@if [ "$(XIAOJI_WEB_BOOT)" = 1 ]; then $(MAKE) build/web/manifest-xiaoji.json; fi
+	@if [ "$(XIAOJI_WEB_BOOT)" = 1 ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json && node tests/chunks.mjs; fi
 	node tests/web.mjs hello-jit hello-int
 
 serve: wasm build/web/manifest.json   ## dev server for the web page (web/serve.mjs), port 8080
-	@if [ -d build/rootfs-xiaoji ]; then $(MAKE) build/web/manifest-xiaoji.json; else echo "serve: no build/rootfs-xiaoji, Boot Android is off"; fi
+	@if [ -d build/rootfs-xiaoji ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json; else echo "serve: no build/rootfs-xiaoji, Boot Android is off"; fi
 	node web/serve.mjs --port 8080
 
 image:          ## download + extract the Android 13 arm64 guest -> build/rootfs
