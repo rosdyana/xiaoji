@@ -169,7 +169,7 @@ opens. Both need the product build, not the page.
 
 **Engine: lazy mmap.** The eager fill in `map_file` is why 94% of mapped bytes are read. A demand-filled mapping
 would cut the working set toward what the guest touches, which the trace does not measure (section 1). That is an
-engine change, and it is out of scope for tier 1.
+engine change, and it is out of scope for tier 1. Done in L2 (section 6.1).
 
 ## 3. Pack output (full product tree)
 
@@ -267,9 +267,11 @@ session scratch directory `/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-pr
   bandwidth bucket. It does not model TCP slow start, connection reuse or a real route.
 - The boot pack is fetched in full before the engine starts. On a slow link that delays the first instruction by
   the pack's download time (33.7 s at 50 Mbit/s here); the manifest path starts at once and waits on each file.
+  (Superseded by L2, section 6.4: the engine starts after the first pack.)
 - The boot order comes from one boot to phase 100. The boot runs on after phase 100, and in some warm runs one
   1 KB chunk outside the order was read through the fallback after phase 100. Regenerating the order from a longer
-  trace would remove it.
+  trace would remove it. (Section 6.3 takes the order from four lazy-mmap traces; a few chunks are still read
+  synchronously on some runs.)
 - A fallback chunk is not cached (the read is synchronous), and the fallback decodes with the JavaScript inflater.
 - The chunk cache holds the packed chunks of this build. A changed chunk costs its pack, not the whole boot.
 - The default page is the pack path. `?boot=manifest` is the old path, kept until the pack path has run for a
@@ -277,3 +279,151 @@ session scratch directory `/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-pr
 - Deployment is not written: there is no `_headers` file or deploy script for Cloudflare Pages. The dev server sets
   the immutable cache headers on `/xj/chunks/` and `/xj/packs/`, the layout a deploy would use.
 - The v2 manifest is 1.2 MB and is fetched on every visit (section 4).
+
+## 6. L2: lazy mmap, repack, early start
+
+L2 makes three changes: the engine fills a file mapping when the guest touches it (instead of at `mmap`), the boot
+packs are rebuilt from what the lazy boot touches, and the page starts the engine after the first pack, while the
+rest of the packs download in a second worker. Each is measured on its own below. The numbers are on one Mac, and
+most of the runs were disturbed by another agent's engine runs, so section 6.5 gives the counts and what was
+excluded.
+
+### 6.1 The switch and the knobs
+
+- Native: `--no-lazy-mmap` (or `XIAOJI_LAZY=0`) fills every file mapping at `mmap` time. The eager arm goes through
+  the same fill (`mem_map_lazy` fills every window when the switch is off), so both arms run the same binary.
+  `--lazy-window BYTES` (or `XIAOJI_LAZY_WINDOW`) sets the fill window: a power of two from 4 KiB to 1 MiB. The
+  default is 64 KiB, aligned in the file.
+- Counters: `--stats` prints the lazy file reads and their bytes after the instruction line. `--stats-at TEXT`
+  (or `XIAOJI_STATS_AT`) prints the instructions, time and reads at the first log line that contains TEXT; the A/B
+  runs stop at `Starting phase 100` this way, because the engine runs on after it.
+- Page: `?lazy=0` (the eager arm), `?lazywin=BYTES`, `?statsat` (the engine's phase 100 line in `window.xb.statsAt`),
+  and `?early=MB` (section 6.4).
+- Lazy mmap is on by default: `build/xiaoji` and the wasm build both have it.
+
+### 6.2 Does lazy mmap slow the engine?
+
+Interleaved A/B to phase 100. Each arm is 3 clean runs after one discarded warm-up run. A run is clean when no other
+engine or bench process was active during it (see 6.5). Power was AC with Low Power Mode off for every timed run.
+
+| Platform | Lazy: engine to phase 100 (s) | Eager: engine to phase 100 (s) | Engine reads to phase 100, lazy | Engine reads, eager | Instructions (G) |
+|---|---|---|---|---|---|
+| Native (`build/xiaoji`) | 45.58, 45.71, 45.87 (median 45.71) | 45.37, 45.86, 46.07 (median 45.86) | 375.6 MB (11,995 reads) | 732.8 MB (18,466 reads) | 4.745 to 4.750 (lazy), 4.722 to 4.749 (eager) |
+| Headless Chrome 157 (wasm, the page) | 38.60, 40.38, 40.63 (median 40.38) | 39.61, 40.88, 43.30 (median 40.88) | 375.8 to 376.2 MB | 732.8 MB | 4.67 to 4.68 (both) |
+
+The ranges overlap on both platforms, and the medians differ by 0.15 s (native) and 0.5 s (browser), with lazy the
+lower of the two. Neither arm is slower by a margin that separates the ranges, so no profiling and no window tuning
+were done. Lazy reads 49% fewer bytes through the engine's reads (375.6 MB against 732.8 MB, native).
+
+The first browser batch ran while the Playwright browser bundle was missing from the machine. Those runs were
+discarded. The batch used for the table above ran Google Chrome 157 through `XN_CHROME` (see 6.5), and it checked
+for foreign benches before each run but not during a run.
+
+### 6.3 Repack
+
+The boot order is now the union of four lazy-mmap traces (`tools/workingset.py` takes several traces and writes the
+union of their first-read orders; the report is for the first trace). Three traces missed five 64 KiB blocks that a
+fourth boot read (libpdfium, libpcre2, liblzma and libprofile), so the union has four. This is one more trace than the
+two or three in the plan.
+
+| | Before (`image/boot-order.json`, eager) | After (lazy, 4-trace union) |
+|---|---|---|
+| Order entries (64 KiB blocks) | 7,366 | 4,322 |
+| Boot packs | 12 | 7 |
+| Chunks in packs | 4,023 | 2,709 |
+| Pack bytes, compressed | 186.33 MB (177.7 MiB) | 102.75 MB (97.99 MiB) |
+| Pack bytes, raw (chunk sizes summed) | 440.25 MB (419.9 MiB) | 273.79 MB (261.1 MiB) |
+
+The packs are built with `tools/pack.py` at 128 KiB chunks, as before. `node tests/chunks.mjs` passes (all 10,978
+chunks hash to their names, all 3,510 files reassemble to 1,327.2 MiB). The deployed file count is 10,986, under the
+20,000 limit.
+
+Synchronous GETs at phase 100 in the boots made with the new packs: 2, 0 and 3 with the three-trace union, and 1,
+0, 5 and 1 with the four-trace union (the last of them in the web boot test). So the criterion of zero in two boots
+was not met. The chunks that are fetched synchronously are in no pack; the boot reads them on some runs and not on
+others, and the fallback path serves them. The clean measured runs show 0 to 3 synchronous GETs per boot.
+
+### 6.4 Early start
+
+- `web/packloader.js` is a module worker. It fetches the v2 manifest, computes the layout of the packs
+  (`layoutPacks` in `web/chunks.js`, the same function in both workers), and creates one `SharedArrayBuffer` for
+  the raw bytes of all pack chunks, and an `Int32Array` with one control word per pack (0 pending, 1 ready, 2 failed).
+  It then downloads the packs in order, from the chunk cache when it can, decodes and hashes each chunk, writes it
+  to the buffer, and sets the pack's control word and calls `Atomics.notify`.
+- The page creates the downloader only when `crossOriginIsolated` is true, and relays the layout to the engine's
+  worker. The engine's worker starts once pack 0 (or the packs covering `?early=MB`) is ready (`Atomics.waitAsync`).
+  A read of a chunk in a later pack blocks in `Atomics.wait` until that pack is ready, not until the chunk is
+  requested again. A chunk in no pack, or in a failed pack, is a synchronous request (the fallback).
+- The page server sends COOP and COEP by default (`web/serve.mjs`, `--no-coop` turns them off). The plan assumed the
+  page was already cross-origin isolated; it was not, because the engine did not use `SharedArrayBuffer` before this
+  change. Without isolation the page reads every chunk synchronously (`?nopack` behaves the same way).
+- The boot screen keeps the packs' progress in its detail line during the boot (`packs X of Y MB`). The download
+  phase now ends after the first pack, so the test that photographed a download at 25 to 75% now photographs the
+  detail line while packs are still arriving.
+
+Tests: `XIAOJI_WEB_BOOT=1 make test-web` passes, including the boot to phase 100 in pack mode, the warm visit with no
+pack downloads, and the download screen check (updated as above).
+
+### 6.5 Measurements and what was excluded
+
+Setup: `tools/webboot-bench.mjs` with headless Google Chrome 157 (`XN_CHROME`), a fresh profile for every cold run,
+and the warm run on the same port and profile as its cold run. "Before" is `main` at c4951f8, built in a
+`git archive` copy: its default page, the pack path with eager engine reads, the 7,366-entry order and 12 packs. "After"
+is this branch. Throttled rows use the model in `web/serve.mjs` (50 Mbit/s, one 20 ms RTT per response, one shared
+bandwidth bucket). `pmset -g` was recorded at the start and end of the batch (`lowpowermode 0`, sleep prevented by
+`powerd`); each timed run recorded `pmset -g batt` and `lowpowermode` at its start, and all of them show AC power and
+Low Power Mode off.
+
+The other agent's engine ran for much of the batch. A background sampler logged every engine and bench process whose
+working directory was not this worktree, every 2 s. A run that overlaps any sample is excluded. Of 40 boots, 16 are
+clean and 24 are excluded. The sampler started at 00:44, after the first boots; the other agent's first engine run
+that the logs show began at about 00:41, so those earlier boots are counted as clean from the logs, and they were not
+sampled directly. The clean runs per cell are: before, localhost, cold 2, warm 2; before,
+50 Mbit/s, cold 2, warm 1; after, localhost, cold 2, warm 2; after, 50 Mbit/s, cold 3, warm 2. The plan asked for 3
+per cell. The machine was not quiet enough to get them.
+
+Clean runs only, medians with the ranges in brackets:
+
+| Build | Network | Cache | n | Wall to phase 100 (s) | Engine to phase 100 (s) | First log line (s) | Wire to phase 100 (MB) | Requests | Before engine start (s) | Waits in run, packs and sync (s) | Pack GETs | Cache hits | Sync GETs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| before | localhost | cold | 2 | 43.36 (41.72 to 44.99) | 39.04 (37.96 to 40.13) | 2.95 (2.45 to 3.45) | 190.4 | 92 | 2.83 | 0.15 | 12 | 0 | 65 |
+| before | localhost | warm | 2 | 42.31 (41.87 to 42.75) | 38.06 (37.69 to 38.42) | 2.99 (2.95 to 3.04) | 1.8 | 15 | 2.94 | 0.07 | 0 | 4,023 | 65 |
+| before | 50 Mbit/s, 20 ms | cold | 2 | 73.66 (73.16 to 74.15) | 39.76 (39.20 to 40.32) | 31.07 (31.03 to 31.11) | 190.4 | 92 | 31.00 | 1.64 | 12 | 0 | 65 |
+| before | 50 Mbit/s, 20 ms | warm | 1 | 43.13 | 38.70 | 3.17 | 1.8 | 16 | 3.13 | 0.06 | 0 | 4,023 | 65 |
+| after | localhost | cold | 2 | 40.70 (39.64 to 41.76) | 39.02 (37.97 to 40.07) | 0.45 (0.45 to 0.45) | 105.1 (104.6 to 105.7) | 37 (27 to 47) | 0.39 | 0.01 | 7 | 0 | 2 (1 to 3) |
+| after | localhost | warm | 2 | 44.16 (40.57 to 47.76) | 41.75 (38.14 to 45.37) | 1.17 (1.16 to 1.19) | 1.8 | 19 (18 to 20) | 1.11 | 0.01 | 0 | 2,709 | 1 (0 to 2) |
+| after | 50 Mbit/s, 20 ms | cold | 3 | 57.43 (51.71 to 59.59) | 52.59 (44.41 to 54.77) | 3.73 (3.72 to 4.12) | 104.6 | 28 (25 to 29) | 3.69 | 14.36 (1.62 to 15.73) | 7 | 0 | 0 (0 to 1) |
+| after | 50 Mbit/s, 20 ms | warm | 2 | 40.92 (40.71 to 41.13) | 38.33 (38.07 to 38.59) | 1.37 (1.36 to 1.38) | 1.9 | 21 | 1.32 | 0.04 | 0 | 2,709 | 2 (0 to 3) |
+
+What the clean runs show:
+
+- **Bytes and requests.** Cold, the wire moved 190.4 MB (before) and 104.6 to 105.1 MB (after) to phase 100. The
+  difference is the packs: 186.3 MB before and 102.7 MB after. Warm, both moved about 1.8 MB, most of it the 1.2 MB
+  v2 manifest, which the dev server sends with `no-store`.
+- **First log line.** Cold on the throttled link it fell from 31.1 s to 3.7 s. On localhost it fell from 2.9 s to 0.45 s.
+- **Time to phase 100, wall.** Cold on the throttled link: 73.7 s before, 57.4 s after (a 22% cut). Localhost cold
+  is about the same (43.4 s, 40.7 s). Warm is about the same (42.3 s, 44.2 s, with one 47.8 s run after).
+- **Engine time.** On the throttled link the engine's own time rose, from 39.8 s to 52.6 s cold, because the engine now
+  waits for later packs inside its run (14.4 s in the median). The wall clock still falls, because the engine starts
+  while the packs arrive. On localhost the cold engine time is the same (39.0 s on both), and the warm engine time is
+  higher after (41.8 s against 38.1 s, with overlapping ranges and one 45.4 s run). I did not find the cause of the
+  warm difference. The candidates are the copy from the shared buffer into the wasm heap (`TypedArray.set` from a
+  `SharedArrayBuffer` view, which may take a slower path) and the 2,709 cache hits on each warm visit. Neither is
+  tested. With two clean warm runs per arm this is a lead, not a result.
+- **Blocked time.** The engine's blocked time is the time before its start (the module or the first pack, whichever
+  is later) plus its waits (in-run waits on packs and synchronous requests). The cold throttled runs start the engine
+  at 3.7 s, and then wait 14.4 s in the median inside the run.
+- **Instructions.** Clean runs show 4.666 to 4.676 G to phase 100 in every cell except one before run at 4.765 G, so
+  the work is the same.
+
+Limits: 2 to 3 clean runs per cell; one Mac; headless Chrome 157 (the earlier sections used Playwright's headless
+shell, which was not on the machine for these runs, so section 4 and this section are not directly comparable); the
+throttle is a model. The warm engine difference is open.
+
+### 6.6 Open items
+
+- The boot still makes 0 to 4 synchronous fetches per boot. A fuller trace set (more boots, with the contaminated ones
+  removed) would shrink that, and the fallback path is what covers it.
+- The warm engine difference on localhost (section 6.5) is unexplained.
+- Cross-origin isolation is needed for the pack path, and no deployment writes the headers yet (section 5). Without
+  them the page reads synchronously.
