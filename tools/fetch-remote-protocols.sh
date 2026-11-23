@@ -8,11 +8,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 HOST=${1:-build-host}
-SRC='xiaoji-aosp/device/generic/vulkan-cereal/protocols'
-mkdir -p build/spec/protocols
-for p in renderControl gles2 gles1; do
-    rsync -a "$HOST:$SRC/$p/" "build/spec/protocols/$p/"
-done
+# Fetches the A13 guest encoders' opcode headers and checks the vendored specs (third_party/gfxstream) against them.
 # The guest encoders: their opcode headers, and the fixed request sizes (sizeWithoutChecksum), are what
 # gen-glproto.py checks its numbers and sizes against.
 G='xiaoji-aosp/device/generic/goldfish-opengl/system'
@@ -23,4 +19,5 @@ rsync -a "$HOST:$G/GLESv1_enc/gl_opcodes.h" build/spec/guest/gles1_opcodes.h
 rsync -a "$HOST:$G/renderControl_enc/renderControl_enc.cpp" build/spec/guest/renderControl_enc.cpp
 rsync -a "$HOST:$G/GLESv2_enc/gl2_enc.cpp" build/spec/guest/gl2_enc.cpp
 rsync -a "$HOST:$G/GLESv1_enc/gl_enc.cpp" build/spec/guest/gl_enc.cpp
-python3 -I tools/gen-glproto.py build/spec/protocols build/gen --check-guest build/spec/guest
+mkdir -p build/gen-check
+python3 -I tools/gen-glproto.py third_party/gfxstream build/gen-check --check-guest build/spec/guest

@@ -1,0 +1,12 @@
+xiaoji
+Copyright 2026 the xiaoji authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes protocol specification files from gfxstream
+(https://android.googlesource.com/platform/hardware/google/gfxstream),
+Copyright The Android Open Source Project, licensed under the Apache License,
+Version 2.0. See third_party/gfxstream/README.md and third_party/gfxstream/LICENSE.
+
+Android system images and other guest software are not part of this repository;
+the tools download or build them separately under their own licenses.

@@ -13,16 +13,17 @@ ENGINE_HDR := $(wildcard engine/*.h)
 # The block translator is wasm-only: the native build leaves engine/jit.c out.
 NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
 JIT_LIB := engine/jit_lib.js
-# The GL decoders, generated from the vulkan-cereal protocol specs (tools/gen-glproto.py; docs/graphics.md, G1).
-# build/spec is fetched from the builder VM's checkout when missing (tools/fetch-remote-protocols.sh).
+# The GL decoders, generated from gfxstream's protocol specs (Apache-2.0, vendored in third_party/gfxstream;
+# tools/gen-glproto.py; docs/graphics.md, G1). tools/fetch-remote-protocols.sh checks them against the guest encoders.
 GEN_SRC := build/gen/renderControl_dec.c build/gen/gles2_dec.c build/gen/gles1_dec.c build/gen/gl_defaults.c
 GEN_INC := -Ibuild/gen
 
 $(GEN_SRC): build/gen/gen_report.txt
 
-build/gen/gen_report.txt: tools/gen-glproto.py
-	@test -d build/spec/protocols/gles2 || sh tools/fetch-remote-protocols.sh
-	python3 -I tools/gen-glproto.py build/spec/protocols build/gen
+GL_SPECS := $(wildcard third_party/gfxstream/*/*)
+
+build/gen/gen_report.txt: tools/gen-glproto.py $(GL_SPECS)
+	python3 -I tools/gen-glproto.py third_party/gfxstream build/gen
 
 .PHONY: all engine wasm wasm-node guest-tests test test-web serve image oracle clean help
 
