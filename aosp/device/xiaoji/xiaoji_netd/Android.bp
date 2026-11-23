@@ -1,0 +1,56 @@
+// xiaoji_netd: the xiaoji engine's netd (see xiaoji_netd.cpp).
+
+// IDnsResolver, copied from packages/modules/DnsResolver/binder (the V10 interface that ConnectivityService
+// uses). The DnsResolver module itself is apex_available only to com.android.resolv, so it cannot be linked
+// from the platform; the AIDL files are the same, and the generated classes are the same wire protocol.
+aidl_interface {
+    name: "xiaoji_dnsresolver_aidl",
+    local_include_dir: "aidl",
+    srcs: [
+        "aidl/android/net/IDnsResolver.aidl",
+        "aidl/android/net/ResolverHostsParcel.aidl",
+        "aidl/android/net/ResolverOptionsParcel.aidl",
+        "aidl/android/net/ResolverParamsParcel.aidl",
+        "aidl/android/net/resolv/aidl/DnsHealthEventParcel.aidl",
+        "aidl/android/net/resolv/aidl/IDnsResolverUnsolicitedEventListener.aidl",
+        "aidl/android/net/resolv/aidl/Nat64PrefixEventParcel.aidl",
+        "aidl/android/net/resolv/aidl/PrivateDnsValidationEventParcel.aidl",
+    ],
+    imports: [
+        "netd_event_listener_interface-V1",
+    ],
+    // Not frozen: this copy follows the tree's current IDnsResolver, and no other module depends on it.
+    unstable: true,
+    backend: {
+        cpp: {
+            gen_log: false,
+        },
+        java: {
+            enabled: false,
+        },
+        ndk: {
+            enabled: false,
+        },
+    },
+}
+
+cc_binary {
+    name: "xiaoji_netd",
+    srcs: ["xiaoji_netd.cpp"],
+    shared_libs: [
+        "libbinder",
+        "libbase",
+        "liblog",
+        "libutils",
+        "netd_aidl_interface-V10-cpp",
+        "xiaoji_dnsresolver_aidl-cpp",
+    ],
+    cflags: [
+        "-Wall",
+    ],
+    init_rc: ["xiaoji_netd.rc"],
+    // The stock netd (needs bpf(2) and NETLINK_ROUTE) is replaced in the product: an overriding module is installed
+    // instead of the overridden one when both are in PRODUCT_PACKAGES.
+    overrides: ["netd"],
+    apex_available: ["//apex_available:platform"],
+}

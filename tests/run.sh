@@ -676,8 +676,12 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             ! grep -q 'cgroup_info/cgroup.rc: No such file' "$OUT/boot.err" &&
             ! grep -q 'Failed to open /dev/cpuset/' "$OUT/boot.err" &&
             ! grep -q 'init: netd exited' "$OUT/boot.err" &&
-            grep -q 'libnetd_updatable_init: Initializing' "$OUT/boot.err"; }; }; then
-        echo "PASS  cgroups (B11): no cgroup.rc or cgroup v2 root error, no cpuset open error, netd reaches libnetd_updatable_init, no netd exit; zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
+            grep -q 'xiaoji_netd([0-9]*): registered netd' "$OUT/boot.err" &&
+            grep -q 'xiaoji_netd([0-9]*): registered dnsresolver' "$OUT/boot.err" &&
+            ! grep -q 'returning null INetd' "$OUT/boot.err" &&
+            grep -q 'SystemServerTiming([0-9]*): StartNetworkManagementService took to complete' "$OUT/boot.err" &&
+            grep -q 'SystemServerTiming([0-9]*): StartConnectivityService took to complete' "$OUT/boot.err"; }; }; then
+        echo "PASS  cgroups (B11) and xiaoji_netd (B12): no cgroup.rc or cgroup v2 root error, no cpuset open error, xiaoji_netd registers netd and dnsresolver, no null INetd, StartNetworkManagementService and StartConnectivityService complete, no netd exit; zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
         pass=$((pass + 1))
     else
         echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded') in $OUT/boot.err"

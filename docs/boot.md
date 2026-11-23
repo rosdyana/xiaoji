@@ -3550,3 +3550,182 @@ suite, one per runner in the Google boot run).
 - **The BPF gate** is a fundamental design issue, not a bug: the real netd needs `bpf(2)` and the BPF maps. The recommendation is
   the replacement (`xiaoji_netd`), with the BPF-dependent framework calls (BpfNetMaps, NetworkStatsService) checked for fatal
   failures when the replacement runs.
+
+## B12: xiaoji_netd (the replacement netd), the dnsresolver service, and the boot past StartConnectivityService (stops at audio)
+
+Status: **partial.** `xiaoji_netd` replaces the stock netd in the product and in the engine's rc. It registers the `netd`
+binder service (the real `android.net.INetd`, V10) and the `dnsresolver` service (`IDnsResolver`, V10, from a copy of its
+AIDL). In the product boot, `NetworkManagementService` gets a non-null `INetd` (no `returning null INetd` line), and
+`ConnectivityService` is constructed. `System now ready` and `sys.boot_completed=1` are **not** reached. Between 145 s and
+208 s the audio policy service is missing, and the watchdog kills system_server (its main thread is in `AudioService`). The
+stock audio HAL aborts at its start in this tree (below). Making audio work is a design decision, not made here.
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 1 | xiaoji_netd built and registered; NetworkManagementService gets a non-null INetd | Done. `registered netd` at 3.3 s; `StartNetworkManagementService took to complete: 15ms`; zero `returning null INetd`. |
+| 2 | Companion services as needed | `dnsresolver` done: `ConnectivityService.getDnsResolver` needs the framework's `DnsResolverServiceManager`, which is built from the `dnsresolver` binder; without it the boot died (below), and the constructor does `requireNonNull` on the interface. `netd_listener` is not registered: it is hosted by system_server (`NetdEventListenerService`), and netd is only its client. `mdns` is not served: the NSD path logs `No service published for: mdns` and goes on. |
+| 3 | NETLINK_ROUTE | Not started. No boot-path call needed it; the stock netd's NETLINK uses are gone with the stock netd. |
+| 4 | Boot progress | Partial: past `StartConnectivityService`; the watchdog kills system_server in the audio service. |
+
+### What xiaoji_netd implements
+
+Sources (`aosp/device/xiaoji/xiaoji_netd/`, copied to `~/xiaoji-aosp/device/xiaoji/xiaoji_netd/` by `tools/remote-build.sh`):
+`Android.bp`, `xiaoji_netd.cpp` (main and the hand-written methods), `xiaoji_netd.rc`, `gen_stub.py` and its output
+`xiaoji_netd_gen.h`, `gen_dnsresolver_stub.py` and its output `xiaoji_dnsresolver_gen.h`, and `aidl/` (eight DnsResolver AIDL
+files, copied from `packages/modules/DnsResolver/binder`, read only).
+
+- **INetd** (`netd_aidl_interface-V10-cpp`, generated header `INetd.h`; `gen_stub.py` asserts 107 `Status` methods):
+  - Hand-written (5): `isAlive` (true); `interfaceGetList` (`{"lo"}`); `interfaceGetCfg("lo")` (127.0.0.1/8, flags up,
+    loopback, running; other names ENODEV); `getProcSysNet` and `setProcSysNet` on `/proc/sys/net/<ipv4|ipv6>/<conf|neigh>/
+    <if>/<param>`, which is used when `/proc/sys/net` exists, otherwise `""` and success. Names with `/` or a leading `.`
+    are EINVAL.
+  - Success no-ops (87): `firewall*`, `trafficSwap*`, `bandwidth*`, `interface*` (the rest), `network*`, `tether*`,
+    `registerUnsolicitedEventListener`, `setTcpRWmemorySize`. Also the configure-only methods found by grepping the framework's
+    callers: `strictUidCleartextPenalty`, `setIPv6AddrGenMode`, `wakeupAddInterface`/`wakeupDelInterface`,
+    `idletimerAddInterface`/`idletimerRemoveInterface`, `socketDestroy`, `ipfwdEnableForwarding`/`ipfwdDisableForwarding`,
+    `ipfwdAddInterfaceForward`/`ipfwdRemoveInterfaceForward`, `trafficSetNetPermForUids`. Getters with a benign value:
+    `ipfwdEnabled` (false), `ipfwdGetRequesterList` (empty), `getFwmarkForNetwork` (empty mark). Boolean outputs are true
+    except `tetherIsEnabled` and `networkCanProtect` (false).
+  - Logged `EX_UNSUPPORTED_OPERATION` (15): `clatdStart`, `clatdStop` (464xlat, only on IPv6-only networks), the 12
+    `ipSec*` (IpSecService, for apps), and `getOemNetd`.
+  - Why the configure-only methods are no-ops and not unsupported: the framework callers catch only `RemoteException` or
+    `ServiceSpecificException` (e.g. `NetworkManagementService.setUidCleartextNetworkPolicy`), so an
+    `EX_UNSUPPORTED_OPERATION` would reach them as an unchecked exception and crash the caller.
+  - **What the boot called:** only `registerUnsolicitedEventListener` (4 times, no-op success), up to the watchdog kill. No
+    other `INetd` method was called, so none of the unsupported answers was reached. The callers of the rest were checked by
+    grep (`frameworks/base/services`, `packages/modules/Connectivity`, `packages/modules/NetworkStack`): `trafficSetNetPermForUids`
+    is only reached when `USE_NETD` (`!SdkLevel.isAtLeastT()`, `BpfNetMaps.java`), which is false on this T product.
+    The `ipfwd*` callers are Tethering and NetworkManagementService's `getIpForwardingEnabled`, which run later than the
+    boot reached.
+- **IDnsResolver** (14 methods, cpp backend, from the copied AIDL): each method is a logged no-op success;
+  `getResolverInfo` returns empty lists, `getPrefix64` returns `""`, `isAlive` is true. The boot made no DNS call.
+  **Wire compatibility (checked):** the copy declares the same 14 methods in the same order as the frozen
+  `aidl_api/dnsresolver_aidl_interface/10` (a diff of the declarations shows only type qualification and line wrapping). The
+  framework's ConnectivityService uses `dnsresolver_aidl_interface-V9-java` (`Connectivity/service/Android.bp:162`), and its
+  frozen V9 declares the same 14 methods in the same order, so the transaction codes agree. Not exercised at runtime.
+- **Why the DNS AIDL is copied.** The `dnsresolver_aidl_interface` module is `apex_available` to `com.android.resolv` only,
+  so the platform cannot link it (`platform_availability_check`). The copy is unversioned (`unstable: true`), with the
+  platform-available `netd_event_listener_interface-V1` as its import.
+- **Not served:** the `dnsproxyd` socket (bionic's resolver, so app DNS does not resolve through the engine), `fwmarkd`, and
+  the `mdns` service and socket. The rc does not create their sockets, so a client gets ENOENT (not a hang) for them. For app
+  DNS later: a `dnsproxyd` server that relays to the engine's network.
+
+**Product wiring.**
+- `aosp/device/xiaoji/xiaoji_system.mk`: `PRODUCT_PACKAGES += xiaoji_netd`. `Android.bp` has `overrides: ["netd"]`, so the
+  stock `netd` binary and `netd.rc` are not installed: checked in the product's `installed-files.txt` (no `/system/bin/netd`),
+  and `build/rootfs-xiaoji/system/bin/netd` is gone after the fetch.
+- `image/xiaoji.rc` (the only rc the engine reads: `engine/init.c` has no `etc/init` path): `service netd /system/bin/xiaoji_netd`
+  with the stock class, capabilities, group and `onrestart restart zygote`. The stock sockets (`dnsproxyd`, `fwmarkd`, `mdns`)
+  are left out. `xiaoji_netd.rc` is the module's copy (installed as `/system/etc/init/xiaoji_netd.rc`; the engine does not read
+  it). The two blocks are the same.
+- `build/rootfs-xiaoji` refreshed: `tools/remote-build.sh` (product build, exit 0) and `tools/fetch-remote-rootfs.sh` with its
+  default arguments (linkerconfig regenerated). `make reset-data` before each boot.
+- `tests/run.sh` (`XIAOJI_BOOT=1`, product): the B11 `libnetd_updatable_init: Initializing` marker is gone (the stock netd
+  printed it, xiaoji_netd does not). It asserts `xiaoji_netd([0-9]*): registered netd`, `registered dnsresolver`, no
+  `returning null INetd`, and `StartNetworkManagementService` and `StartConnectivityService took to complete`.
+
+### Milestones (product tree, final run; guest time `[ms insn]`)
+
+Run: `./build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs-xiaoji --init-timeout 300` with `XIAOJI_STAMP=1`, after
+`make reset-data`. Power: `pmset -g batt` shows `Now drawing from 'AC Power'`; `pmset -g` shows `lowpowermode 0`. Checked at 23:34 CST (2026-11-23),
+and again after the final run (see the verification table). Times vary between runs on this host (the first B12 run reached
+`InitBeforeStartServices` at 41.5 s, this run at 76.9 s), so use the instruction counts for comparison.
+
+| Milestone | time | instructions |
+|---|---|---|
+| `xiaoji_netd starting` | 0.70 s | 0.09 G |
+| `registered netd`, `registered dnsresolver` | 3.3 s | 0.24 G |
+| `InitBeforeStartServices took` 4891 ms | 76.9 s | 4.65 G |
+| `Starting phase 100` | 78.4 s | 4.73 G |
+| `Connection with lmkd established` | 98.3 s | 5.96 G |
+| `Generated and saved new ANDROID_ID` (SettingsProvider) | 107.8 s | 6.55 G |
+| `StartVibratorManagerService took` 340 ms | 109.9 s | 6.68 G |
+| `StartLockSettingsService`: BOOT FAILURE (SQLite, caught; see the engine gap below) | 130.9 s | 8.02 G |
+| `StartNetworkManagementService took` 15 ms (INetd non-null) | 131.2 s | 8.03 G |
+| `StartConnectivityService took` 990 ms (ConnectivityService constructed) | 139.1 s | 8.62 G |
+| `Service media.audio_policy didn't start` (repeated every ~5.5 s from 145 s) | 145.1 s | 9.11 G |
+| watchdog: main thread blocked in AudioService; system_server killed | 207.8 s | 13.63 G |
+
+Before the dnsresolver (the first B12 run, with the INetd stub but no `dnsresolver` binder): `NullPointerException:
+Attempt to invoke virtual method 'android.os.IBinder android.net.DnsResolverServiceManager.getService()' on a null object
+reference` at `ConnectivityService.getDnsResolver`, from `ConnectivityServiceInitializer`. system_server died and the zygote
+with it at 152.1 s (15.86 G).
+
+### Next blocker: the audio service (the stock audio HAL aborts in this tree)
+
+`AudioService` (system_server, main thread) calls `AudioProductStrategy.getAudioProductStrategies`, which waits for
+`media.audio_policy`. The product has no `audioserver` rc block (`image/xiaoji.rc` has only `onrestart restart audioserver`
+lines), and the HAL it would need is `vendor.audio-hal` (`/vendor/bin/hw/android.hardware.audio.service`).
+
+A probe in the scratchpad (`audio-probe.rc`: `image/xiaoji.rc` plus the stock `audioserver` block and the stock
+`vendor.audio-hal` block from `frameworks/av/media/audioserver/audioserver.rc` and
+`hardware/interfaces/audio/common/all-versions/default/service/android.hardware.audio.service.rc`, with the group
+`mediadrm` written as `media_drm`, the name in `engine/ids_gen.h`) shows the HAL dies at its start:
+
+```
+[987 ms 108975422 insn] F/ProcessState(1019): Binder threadpool cannot be shrunk after starting
+[987 ms 108981003 insn] F/libc(1019): Fatal signal 6 (SIGABRT), code -1 (SI_QUEUE) in tid 1019 (android.hardwar), pid 1019 (<unknown>)
+xiaoji: init: vendor.audio-hal exited (status 134, by a signal)
+...
+xiaoji: init: vendor.audio-hal is crash-looping; not restarting
+```
+
+The HAL's `main` (`service.cpp:80-82`) calls `ProcessState::self()->startThreadPool()` and then
+`ABinderProcess_setThreadPoolMaxThreadCount(1)`. libbinder's `setThreadPoolMaxThreadCount` has
+`LOG_ALWAYS_FATAL_IF(mThreadPoolStarted && maxThreads < mMaxThreads, ...)`, which is what fires. The engine only runs this code,
+so this is the tree's HAL and libbinder as built, not an engine fault. Whether a real device avoids it is not checked. The
+probe's audioserver then waits for `media.audio_policy`, and the watchdog kills system_server (probe log: one kill).
+
+**Decision for the user (not made):** make the audio path boot. Options: (a) a device-local HAL in `device/xiaoji` (a null sink
+HAL that accepts and drops samples) with the audioserver block, which is a new component; (b) patch the stock HAL's `main`
+(a `hardware/interfaces` change, outside `device/xiaoji`, not allowed here). **Recommendation:** (a), a null-sink HAL in
+`device/xiaoji`, then the goldfish audio HAL when the engine has an audio device.
+
+### Engine gaps found in the boot (not fixed here)
+
+- **Writable MAP_SHARED of a host file (SQLite WAL).** `LockSettingsService` opens `/data/system/recoverablekeystore.db` in WAL
+  mode, and SQLite maps the `-shm` file writable:
+
+  ```
+  [130940 ms 8017600727 insn] E/SystemServer(1050): BOOT FAILURE starting LockSettingsService service
+  ```
+  (the SQLite lines before it: `mmap(/data/system/recoverablekeystore.db-shm)` failing with errno 13, code 5386
+  `SQLITE_IOERR_SHMMAP`). `engine/syscall.c`, `sys_mmap`, refuses a writable `MAP_SHARED` of a host file (`only read-only
+  MAP_SHARED is supported`, EACCES). The failure is caught by `SystemServer`, and the keystore is not published. Fixing it needs
+  a coherence rule: for SQLite's `-shm` a volatile memfd per host path would do; for real files, write-back on `msync` and
+  `munmap`. A design decision, not made here. The B8 to B11 notes do not mention this failure (checked by grep). LockSettingsService
+  starts before NetworkManagementService, so the B11 runs also passed through it; its log was not kept, so whether the same
+  error appeared there is not checked.
+- **BPF maps.** `nativeBpfFdGet failed: ENOSYS` in `BpfInterfaceMapUpdater`, `NetworkStats` (five maps), `ClatCoordinator`
+  (`ingress6`, `egress4`), and `ConnectivityService: Unable to create DscpPolicyTracker`. They are logged errors at 137 to 139 s,
+  and the boot goes on. NetworkStats will fail when stats are queried. This is the B11 BPF gap (no `bpf(2)`), now visible
+  through the framework.
+- **`/proc/sys/net`** is absent: `getProcSysNet` and `setProcSysNet` answer success with no effect.
+
+### Verification (B12, final sources)
+
+Run after the last source change (the INetd categories, the rc, `overrides: ["netd"]`). Power: AC with Low Power Mode off
+at 23:34 CST and for the final product boot (the boot3 run started about 23:45). At 00:16 CST the machine was on battery
+with Low Power Mode on (`pmset -g batt`: `Now drawing from 'Battery Power'`, `lowpowermode 1`). The verification runs
+straddle that change, so the timing-dependent product boot check was run once; its milestones are the instruction counts above.
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm && tests/run.sh` | **220 passed, 0 failed, 0 xfail** |
+| `XIAOJI_JIT=0 tests/run.sh` | **220 passed, 0 failed, 0 xfail** |
+| `XIAOJI_BOOT=1 tests/run.sh` (Google image) | **221 passed, 0 failed, 0 xfail** |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (after `make reset-data`, 300 s limit) | **187 passed, 0 failed, 0 xfail** (includes the B12 assertions) |
+| `make test-web` | **all web checks passed**, with `PLAYWRIGHT_BROWSERS_PATH` set to a Chromium installed under the scratchpad. Without it, the run fails before any check: Playwright's browser is missing from `~/Library/Caches/ms-playwright` (a Mac path outside the repo, not reinstalled there). |
+| `clang` / `emcc -Wall -Wextra` | Not run: this step changed no engine C file. The INetd and DNS stubs are C++ built by the AOSP toolchain. The product build of `xiaoji_netd` has no warnings from our files after the log-format fix. |
+| `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | Empty (exit 1). A run in `xiaoji-w1` was listed earlier in the session; it was another agent's and was not touched. |
+
+### Gaps (B12)
+
+- `dnsproxyd`, `fwmarkd`, `mdns` are not served (app DNS does not work). The DNS AIDL copy has no runtime calls yet.
+- The `-shm` gap above (LockSettingsService). The BPF gap (NetworkStats and the other BPF map users, logged).
+- Audio: the decision above (system_server's watchdog kill).
+- NETLINK_ROUTE (checkpoint 3): not started.
+- The `getOemNetd`, `clatd*`, and `ipSec*` methods are unsupported: their callers are IPv6-only networks, IPsec apps, and OEM
+  code; none reached in the boot.

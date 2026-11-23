@@ -277,13 +277,11 @@ service vold /system/bin/vold --blkid_context=u:r:blkid:s0 --blkid_untrusted_con
     ioprio be 2
     group root reserved_disk
 
-# netd (B10): the Android 13 block of system/netd/server/netd.rc (class, capabilities, group and sockets as the engine
-# reads them). NetworkManagementService.create waits for it on the main thread of system_server.
-service netd /system/bin/netd
+# netd (B12): xiaoji_netd (device/xiaoji/xiaoji_netd), not the stock netd, which needs bpf(2) and NETLINK_ROUTE. The
+# stock capabilities and group, and the same "netd" binder service. The stock sockets (dnsproxyd, fwmarkd, mdns) are
+# left out: nothing listens on them yet. NetworkManagementService.create waits for this service.
+service netd /system/bin/xiaoji_netd
     class main
     capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID
     group root net_admin
-    socket dnsproxyd stream 0660 root inet
-    socket mdns stream 0660 root system
-    socket fwmarkd stream 0660 root inet
     onrestart restart zygote
