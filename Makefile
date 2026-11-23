@@ -13,6 +13,7 @@ ENGINE_HDR := $(wildcard engine/*.h)
 # The block translator is wasm-only: the native build leaves engine/jit.c out.
 NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
 JIT_LIB := engine/jit_lib.js
+.DEFAULT_GOAL := all
 # The GL decoders, generated from gfxstream's protocol specs (Apache-2.0, vendored in third_party/gfxstream;
 # tools/gen-glproto.py; docs/graphics.md, G1). tools/fetch-remote-protocols.sh checks them against the guest encoders.
 GEN_SRC := build/gen/renderControl_dec.c build/gen/gles2_dec.c build/gen/gles1_dec.c build/gen/gl_defaults.c

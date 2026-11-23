@@ -29,6 +29,7 @@ void goldfish_free(void *o);
 int64_t goldfish_read(void *o, void *buf, size_t n);
 int64_t goldfish_write(void *o, const void *buf, size_t n);
 int goldfish_readable(void *o);
+int goldfish_deadline(void *o, uint64_t *dl);
 /* The wait key of an object: a blocked reader sleeps on it and a write wakes it. */
 uint64_t goldfish_key(void *o);
 

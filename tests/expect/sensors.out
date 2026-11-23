@@ -1,0 +1,11 @@
+open ok
+mask 111 ok
+quiet before enable ok
+batch 0 acceleration:0.000000:9.810000:0.000000 ok
+sync ok
+batch 1 acceleration:0.000000:9.810000:0.000000 ok
+sync ok
+batch 2 acceleration:0.000000:9.810000:0.000000 ok
+sync ok
+quiet after disable ok
+done

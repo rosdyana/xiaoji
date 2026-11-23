@@ -192,7 +192,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # prop-* programs need the engine's property service, which the native run lacks:
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
-    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*) continue ;; esac
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -269,7 +269,7 @@ fi
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as sensors power-supply ashmem"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -280,6 +280,9 @@ prop_argv() {
     evt) ARGV=(/data/local/tmp/evt) ;;
     goldfish-pipe) ARGV=(/data/local/tmp/goldfish-pipe) ;;
     goldfish-as) ARGV=(/data/local/tmp/goldfish-as) ;;
+    sensors) ARGV=(/data/local/tmp/sensors) ;;
+    ashmem) ARGV=(/data/local/tmp/ashmem) ;;
+    power-supply) ARGV=(/system/bin/sh -c 'for d in /sys/class/power_supply/*; do echo "dir ${d##*/}"; for f in $d/*; do echo "${f##*/} $(cat $f)"; done; done') ;;
     binder-sm) ARGV=(/system/bin/sh -c "/system/bin/servicemanager & $SM_WAIT; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0") ;;
     esac
 }
@@ -332,6 +335,16 @@ if [ -d build/rootfs/system/bin ]; then
     if [ -f build/tests/guest/goldfish-as-O0 ]; then
         mkdir -p "$RFS/data/local/tmp"
         cp build/tests/guest/goldfish-as-O0 "$RFS"/data/local/tmp/goldfish-as
+    fi
+    # The goldfish qemud sensors service (B7): tests/guest/sensors.c, which speaks it as the sensors HAL does.
+    if [ -f build/tests/guest/sensors-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/sensors-O0 "$RFS"/data/local/tmp/sensors
+    fi
+    # /dev/ashmem (B7): tests/guest/ashmem.c, the ioctls libcutils and libfmq use.
+    if [ -f build/tests/guest/ashmem-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/ashmem-O0 "$RFS"/data/local/tmp/ashmem
     fi
     for name in $PROP_CASES; do
         prop_argv "$name"
@@ -559,6 +572,9 @@ done
 # thread, and RenderEngine on the GLES backend), and no GL request may go undecoded. The product tree also
 # reaches SurfaceFlinger's service and the end of StartDisplayManager; that is not required here, because the
 # builder image (build/rootfs) has no vndservicemanager and so no composer (docs/boot.md, B5).
+# On the product tree B7 adds the health and sensors HALs: the sensors HAL reports the goldfish qemud mask (6f,
+# docs/boot.md B7), both HALs register, and BatteryService receives the health HAL's first update. These are
+# the furthest deterministic points (3 of 3 runs); system_server then dies in SettingsProvider (B7, next blocker).
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
@@ -576,7 +592,11 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
           { grep -q 'StartDisplayManager took to complete' "$OUT/boot.err" &&
             ! grep -q "Since 'SurfaceFlinger' could not be found" "$OUT/boot.err" &&
             grep -q 'SystemServiceManager([0-9]*): Starting phase 100' "$OUT/boot.err" &&
-            ! grep -q 'lacks write' "$OUT/boot.err"; }; }; then
+            ! grep -q 'lacks write' "$OUT/boot.err" &&
+            grep -q 'host sensors mask=6f' "$OUT/boot.err" &&
+            grep -q 'Registered android.hardware.sensors@2.1::ISensors/default' "$OUT/boot.err" &&
+            grep -q 'Registered android.hardware.health@2.1::IHealth/default' "$OUT/boot.err" &&
+            grep -q 'BatteryService([0-9]*): health: Waited [0-9]*ms and received the update' "$OUT/boot.err"; }; }; then
         echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1)"
         pass=$((pass + 1))
     else

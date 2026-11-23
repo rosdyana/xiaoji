@@ -1,0 +1,18 @@
+open ok
+fstat chr 1
+set name 0
+size before set 0
+set size 0
+get size 8192
+set prot 3 0
+get prot 3
+set size after map -22
+child exit 0
+parent sees shared ok
+pin 0
+pin status 1
+unpin 0
+pin status after unpin 0
+bogus ashmem ioctl -25
+set size on null -25
+done

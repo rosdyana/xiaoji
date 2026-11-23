@@ -19,7 +19,7 @@ typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE, VFS_SO
                VFS_GOLDFISH } vfs_kind;
 typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA, SYN_BINDER,
                SYN_DIR, SYN_SELFS_STATUS, SYN_SELFS_ACCESS,
-               SYN_SELFS_CONTEXT, SYN_GOLDFISH } vfs_syn;
+               SYN_SELFS_CONTEXT, SYN_GOLDFISH, SYN_ASHMEM } vfs_syn;
 
 /* An open file description: the offset, the status flags and the object. Every fd
  * that refers to it (dup, fork) shares it; it is freed when refs drops to 0. */
@@ -41,6 +41,9 @@ typedef struct {
     pipe_t *pipe;    /* VFS_PIPE: the pipe; lflags (LO_RDONLY or LO_WRONLY) says which end */
     sock_t *sock;    /* VFS_SOCK: the socket (sock.h) */
     int ro_area;     /* VFS_MEMFD: the property area, read-only (PROT_WRITE is refused) */
+    int ashmem;      /* VFS_MEMFD: an /dev/ashmem region (ashmem.h) */
+    uint32_t ash_prot;   /* ashmem: the protection mask (ASHMEM_SET_PROT_MASK) */
+    int ash_unpinned;    /* ashmem: 1 after ASHMEM_UNPIN */
     void *binder;    /* VFS_BINDER: the binder proc (binder.h); released with the description */
     void *obj;       /* VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL: the object (fdobj.h, poll.h); VFS_GOLDFISH: the pipe (goldfish.h) */
     uint64_t ino;    /* VFS_PIPE, VFS_SOCK: the inode, numbered at creation (both pipe ends share it) */

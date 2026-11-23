@@ -6,6 +6,9 @@
  *   opengles:      the first 4 bytes are clientFlags (zero), then GL requests (gl_host.c, the generated decoders).
  *   GLProcessPipe: a write of int32 100 is answered with the process id, a uint64.
  *   refcount:      a write of a color-buffer handle (uint32); nothing is returned.
+ *   qemud:sensors: framed messages (4 hex digits, then the payload), the qemud sensors protocol of sensors.c.
+ *                  Its event batches are made when a read finds the time due (goldfish_read, goldfish_readable,
+ *                  and the deadline that vfs_pipe_block and poll wait on), so no thread runs for them.
  * A reply is produced during the write that asks for it, so the guest's read finds it at once.
  *
  * The address space (G1). The guest's ranchu allocator (shared/GoldfishAddressSpace, the HostMemoryAllocator
@@ -24,11 +27,12 @@
 #include "mem.h"
 #include "poll.h"
 #include "sched.h"
+#include "sensors.h"
 #include "vfs.h"
 
 /* ---------- the pipe ---------- */
 
-typedef enum { SVC_NONE, SVC_OPENGLES, SVC_PROCESS, SVC_REFCOUNT } gf_service;
+typedef enum { SVC_NONE, SVC_OPENGLES, SVC_PROCESS, SVC_REFCOUNT, SVC_SENSORS } gf_service;
 
 typedef struct {
     int kind; /* GF_PIPE; first, for goldfish_read and the others */
@@ -36,6 +40,7 @@ typedef struct {
     int flags_pending; /* opengles: the clientFlags word is not read yet */
     int broken;        /* a malformed or unknown request: the stream takes no more input */
     uint64_t puid;     /* GLProcessPipe: the id this pipe reports */
+    sns_pipe_t sns;    /* qemud:sensors: the enabled sensors and the batch schedule */
     uint8_t *in;       /* request bytes not yet decoded */
     size_t inlen, incap;
     uint8_t *out;      /* reply bytes not yet read */
@@ -166,12 +171,26 @@ uint64_t goldfish_key(void *o)
     return (uint64_t)(uintptr_t)o;
 }
 
+static void sns_pump(gfpipe_t *p);
+
 int goldfish_readable(void *o)
 {
     if (*(int *)o != GF_PIPE)
         return 0;
     gfpipe_t *p = o;
+    sns_pump(p);
     return p->outoff < p->outlen;
+}
+
+/* The time the next batch is due (host monotonic ns), when a sensor is enabled. The pipe has no other timed wait. */
+int goldfish_deadline(void *o, uint64_t *dl)
+{
+    if (*(int *)o != GF_PIPE)
+        return 0;
+    gfpipe_t *p = o;
+    if (p->svc != SVC_SENSORS)
+        return 0;
+    return sns_deadline(&p->sns, dl);
 }
 
 int64_t goldfish_read(void *o, void *buf, size_t n)
@@ -179,6 +198,7 @@ int64_t goldfish_read(void *o, void *buf, size_t n)
     if (*(int *)o != GF_PIPE)
         return -LE_INVAL;
     gfpipe_t *p = o;
+    sns_pump(p);
     size_t avail = p->outlen - p->outoff;
     if (!avail) {
         if (gf_trace())
@@ -224,6 +244,17 @@ static void reply(gfpipe_t *p, const uint8_t *src, size_t n)
 {
     if (buf_append(&p->out, &p->outlen, &p->outcap, src, n) != 0)
         p->broken = 1; /* out of memory: the stream stops */
+}
+
+/* The sensors stream makes its next batch when it is due and nothing else is waiting to be read. */
+static void sns_pump(gfpipe_t *p)
+{
+    if (p->svc != SVC_SENSORS || p->outlen > p->outoff)
+        return;
+    char b[SNS_BATCH_MAX];
+    size_t n = sns_batch(&p->sns, fdobj_now(), b, sizeof b);
+    if (n)
+        reply(p, (const uint8_t *)b, n);
 }
 
 static uint32_t rd32(const uint8_t *q)
@@ -277,6 +308,27 @@ static void process(gfpipe_t *p)
                 reply(p, id, 8);
             }
         }
+    } else if (p->svc == SVC_SENSORS) {
+        /* Frames: 4 hex digits of length, then the payload. A malformed header ends the stream. */
+        while (p->inlen >= 4) {
+            size_t len = 0;
+            for (int i = 0; i < 4; i++) {
+                char c = (char)p->in[i];
+                int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                if (d < 0) {
+                    p->broken = 1;
+                    return;
+                }
+                len = len * 16 + (size_t)d;
+            }
+            if (p->inlen < 4 + len)
+                return;
+            char rb[64];
+            size_t rl = sns_command(&p->sns, (const char *)p->in + 4, len, fdobj_now(), rb, sizeof rb);
+            in_drop(p, 4 + len);
+            if (rl)
+                reply(p, (const uint8_t *)rb, rl);
+        }
     } else {
         p->inlen = 0; /* refcount: the handles are accepted and not tracked yet */
     }
@@ -300,6 +352,9 @@ static int64_t name_service(gfpipe_t *p, const uint8_t *buf, size_t n)
         p->puid = next_puid++;
     } else if (nl == 8 && !memcmp(name, "refcount", 8)) {
         p->svc = SVC_REFCOUNT;
+    } else if (nl == 13 && !memcmp(name, "qemud:sensors", 13)) {
+        p->svc = SVC_SENSORS;
+        sns_pipe_init(&p->sns);
     } else {
         return -1;
     }
@@ -327,8 +382,10 @@ int64_t goldfish_write(void *o, const void *buf, size_t n)
     if (n > i && buf_append(&p->in, &p->inlen, &p->incap, s + i, n - i) != 0)
         return -LE_NOMEM;
     process(p);
-    if (p->outlen > p->outoff) {
-        sched_wake_key(goldfish_key(p)); /* a reader blocked on an empty reply may go on */
+    if (p->outlen > p->outoff || p->svc == SVC_SENSORS) {
+        /* A reader blocked on an empty reply may go on. A sensor command may change when a batch is due
+         * (set and set-delay), so a waiter with a deadline is woken as well. */
+        sched_wake_key(goldfish_key(p));
         poll_notify();
     }
     return (int64_t)n;

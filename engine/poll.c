@@ -119,6 +119,8 @@ uint64_t poll_timer_deadline(const vfs_fd *f)
     uint64_t dl = 0;
     if (f && f->kind == VFS_TIMERFD && tfd_deadline(f->obj, &dl))
         return dl;
+    if (f && f->kind == VFS_GOLDFISH && goldfish_deadline(f->obj, &dl))
+        return dl;
     return 0;
 }
 

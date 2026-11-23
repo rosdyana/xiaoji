@@ -21,6 +21,7 @@
 #include "fdobj.h"
 #include "pipe.h"
 #include "poll.h"
+#include "powersupply.h"
 #include "procfs.h"
 #include "props.h"
 #include "selinuxfs.h"
@@ -143,12 +144,18 @@ static vfs_syn syn_of(const char *p)
     if (procfs_known(p)) return SYN_DATA; /* generated at open, see vfs_open */
     if (binder_device(p) >= 0) return SYN_BINDER;
     if (goldfish_device(p)) return SYN_GOLDFISH;
+    if (!strcmp(p, "/dev/ashmem")) return SYN_ASHMEM;
     switch (selinuxfs_kind(p)) {
     case SELFS_FILE: return SYN_DATA;
     case SELFS_DIR: return SYN_DIR;
     case SELFS_STATUS: return SYN_SELFS_STATUS;
     case SELFS_ACCESS: return SYN_SELFS_ACCESS;
     case SELFS_CONTEXT: return SYN_SELFS_CONTEXT;
+    default: break;
+    }
+    switch (powersupply_kind(p)) {
+    case PSFS_FILE: return SYN_DATA;
+    case PSFS_DIR: return SYN_DIR;
     default: break;
     }
     return SYN_NONE;
@@ -635,7 +642,12 @@ int vfs_pipe_block(int fd)
         return 1;
     }
     if (f->kind == VFS_GOLDFISH) {
-        sched_block_restart(goldfish_key(f->obj));
+        /* The sensors stream has a batch due at a time (goldfish_deadline); other pipes have none. */
+        uint64_t dl = 0;
+        if (goldfish_deadline(f->obj, &dl))
+            sched_block_restart_until(goldfish_key(f->obj), 1, dl);
+        else
+            sched_block_restart(goldfish_key(f->obj));
         return 1;
     }
     if (f->kind == VFS_TIMERFD) {
@@ -849,6 +861,23 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
+    if (r.syn == SYN_ASHMEM) {
+        /* /dev/ashmem: a memfd of size 0 until ASHMEM_SET_SIZE, with the ashmem ioctls (ashmem.c). */
+        if (lflags & LO_DIRECTORY)
+            return -LE_NOTDIR;
+        memfd_t *m = memfd_new("dev/ashmem");
+        if (!m)
+            return -LE_NOMEM;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_MEMFD;
+        f->mfd = m;
+        f->ashmem = 1;
+        f->ash_prot = 7u;
+        f->lflags = LO_RDWR;
+        f->guest = xstrdup("/dev/ashmem");
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     if (r.syn == SYN_GOLDFISH) {
         /* /dev/goldfish_pipe: a new pipe (goldfish.c). The name is written by the guest. */
         if (lflags & LO_DIRECTORY)
@@ -894,6 +923,9 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
             return -LE_NOMEM;
         if (r.syn == SYN_DATA && selinuxfs_kind(r.guest) == SELFS_FILE &&
             selinuxfs_read(r.guest, &gen, &glen) < 0)
+            return -LE_NOMEM;
+        if (r.syn == SYN_DATA && powersupply_kind(r.guest) == PSFS_FILE &&
+            powersupply_read(r.guest, &gen, &glen) < 0)
             return -LE_NOMEM;
         vfs_fd *f = desc_new();
         f->kind = VFS_SYN;
@@ -1237,6 +1269,7 @@ static int64_t syn_getdents(vfs_fd *f, uint8_t *buf, size_t cap)
         } else if (f->dpos == 1) {
             name = "..";
         } else if (!selinuxfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
+                   !powersupply_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
                    !procfs_task_child(f->guest, (int)(f->dpos - 2), &name) &&
                    !fd_child(f->guest, (int)(f->dpos - 2), &name)) {
             break;
@@ -1424,6 +1457,12 @@ int vfs_stat_fd(int fd, host_stat *out)
         out->dev = 0x10;
         out->ino = 0x3000u + (uint64_t)fd;
         out->mode = LS_IFREG | (f->ro_area ? 0444u : 0600u);
+        if (f->ashmem) {
+            /* libcutils (ashmem-dev.cpp) takes the region for /dev/ashmem only if it is a character device
+             * with a device number: the kernel's misc device, major 10, minor 61. */
+            out->mode = 0020000u /* S_IFCHR */ | 0666u;
+            out->rdev = (10u << 8) | 61u;
+        }
         out->nlink = 1;
         out->size = memfd_size(f->mfd);
         out->blksize = 4096;

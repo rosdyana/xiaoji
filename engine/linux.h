@@ -41,6 +41,7 @@
 #define LE_LOOP 40
 #define LE_OVERFLOW 75
 #define LE_NOTSUP 95
+#define LE_NODATA 61
 #define LE_TIMEDOUT 110
 #define LE_NOTSOCK 88
 #define LE_MSGSIZE 90

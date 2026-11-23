@@ -21,6 +21,8 @@
 #include "signals.h"
 #include "syscall.h"
 #include "props.h"
+#include "ashmem.h"
+#include "xattr.h"
 #include "selinuxfs.h"
 #include "sock.h"
 #include "sockcall.h"
@@ -778,6 +780,92 @@ static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
     return host_chmod(r.host, (uint32_t)mode);
 }
 
+/* Extended attributes (xattr.h, B7). A path form names the file by its resolved guest path; an fd form by the
+ * descriptor's guest path. Synthetic files take no attributes: a set or remove is EPERM, a get is ENODATA. A
+ * read-only mount refuses a set or remove with EROFS. Syscalls 5 to 16 (arm64). */
+enum { XA_SET, XA_GET, XA_LIST, XA_REMOVE };
+
+static int64_t xattr_do(const char *file, int ro, int syn, int op, uint64_t name_va, uint64_t buf_va,
+                        uint64_t size, int flags)
+{
+    static char name[256];
+    if (op != XA_LIST) {
+        int rc = get_path(name_va, name, sizeof name);
+        if (rc)
+            return rc;
+    }
+    if ((op == XA_SET || op == XA_REMOVE) && syn)
+        return -LE_PERM;
+    if ((op == XA_SET || op == XA_REMOVE) && ro)
+        return -LE_ROFS;
+    if (op == XA_GET && syn)
+        return -LE_NODATA;
+    if (op == XA_LIST && syn)
+        return 0;
+    switch (op) {
+    case XA_SET: {
+        if (size > XATTR_VALUE_MAX)
+            return -LE_2BIG;
+        uint8_t *v = malloc(size ? (size_t)size : 1);
+        if (!v)
+            return -LE_NOMEM;
+        int64_t rc = size && mem_copy_out(v, buf_va, (size_t)size) < 0 ? -LE_FAULT : xattr_set(file, name, v, (size_t)size, flags);
+        free(v);
+        return rc;
+    }
+    case XA_GET: {
+        if (size == 0)
+            return xattr_get(file, name, NULL, 0);
+        uint8_t *v = malloc((size_t)size);
+        if (!v)
+            return -LE_NOMEM;
+        int64_t n = xattr_get(file, name, v, (size_t)size);
+        if (n > 0 && mem_copy_in(buf_va, v, (size_t)n) < 0)
+            n = -LE_FAULT;
+        free(v);
+        return n;
+    }
+    case XA_LIST: {
+        if (size == 0)
+            return xattr_list(file, NULL, 0);
+        uint8_t *v = malloc((size_t)size);
+        if (!v)
+            return -LE_NOMEM;
+        int64_t n = xattr_list(file, v, (size_t)size);
+        if (n > 0 && mem_copy_in(buf_va, v, (size_t)n) < 0)
+            n = -LE_FAULT;
+        free(v);
+        return n;
+    }
+    default:
+        return xattr_remove(file, name);
+    }
+}
+
+static int64_t xattr_path_call(uint64_t path_va, int follow, int op, uint64_t name_va, uint64_t buf_va,
+                               uint64_t size, int flags)
+{
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    int rc = get_path(path_va, path, sizeof path);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(LAT_FDCWD, path, follow, &r);
+    if (rc)
+        return rc;
+    if (!r.exists)
+        return -LE_NOENT;
+    return xattr_do(r.guest, r.ro, r.syn != SYN_NONE, op, name_va, buf_va, size, flags);
+}
+
+static int64_t xattr_fd_call(uint64_t fd, int op, uint64_t name_va, uint64_t buf_va, uint64_t size, int flags)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    return xattr_do(f->guest ? f->guest : "", 0, f->kind == VFS_SYN, op, name_va, buf_va, size, flags);
+}
+
 static int64_t sys_statfs(uint64_t a0, uint64_t a1)
 {
     static char path[VFS_PATH_MAX];
@@ -1049,6 +1137,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg)
         return -LE_BADF;
     if (f->kind == VFS_GOLDFISH)
         return goldfish_ioctl(f->obj, (uint32_t)cmd, arg); /* the address space (goldfish.c) */
+    if (f->kind == VFS_MEMFD && f->ashmem)
+        return ashmem_ioctl(f, (uint32_t)cmd, arg); /* /dev/ashmem (ashmem.c) */
     if (f->kind != VFS_BINDER)
         return -LE_NOTTY;
     return binder_ioctl(f->binder, (uint32_t)cmd, arg, (f->lflags & LO_NONBLOCK) != 0);
@@ -1089,6 +1179,19 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_FDATASYNC: *ret = sys_fsync(a[0]); return 1;
     case SYS_FCHMODAT: *ret = sys_fchmodat(a[0], a[1], a[2]); return 1;
     case SYS_FCHMOD: *ret = vfs_fchmod((int)(int32_t)a[0], (uint32_t)a[1]); return 1;
+    /* Extended attributes (xattr_do above): the l forms do not follow a final link. */
+    case 5: /* setxattr */ *ret = xattr_path_call(a[0], 1, XA_SET, a[1], a[2], a[3], (int)a[4]); return 1;
+    case 6: /* lsetxattr */ *ret = xattr_path_call(a[0], 0, XA_SET, a[1], a[2], a[3], (int)a[4]); return 1;
+    case 7: /* fsetxattr */ *ret = xattr_fd_call(a[0], XA_SET, a[1], a[2], a[3], (int)a[4]); return 1;
+    case 8: /* getxattr */ *ret = xattr_path_call(a[0], 1, XA_GET, a[1], a[2], a[3], 0); return 1;
+    case 9: /* lgetxattr */ *ret = xattr_path_call(a[0], 0, XA_GET, a[1], a[2], a[3], 0); return 1;
+    case 10: /* fgetxattr */ *ret = xattr_fd_call(a[0], XA_GET, a[1], a[2], a[3], 0); return 1;
+    case 11: /* listxattr */ *ret = xattr_path_call(a[0], 1, XA_LIST, 0, a[1], a[2], 0); return 1;
+    case 12: /* llistxattr */ *ret = xattr_path_call(a[0], 0, XA_LIST, 0, a[1], a[2], 0); return 1;
+    case 13: /* flistxattr */ *ret = xattr_fd_call(a[0], XA_LIST, 0, a[1], a[2], 0); return 1;
+    case 14: /* removexattr */ *ret = xattr_path_call(a[0], 1, XA_REMOVE, a[1], 0, 0, 0); return 1;
+    case 15: /* lremovexattr */ *ret = xattr_path_call(a[0], 0, XA_REMOVE, a[1], 0, 0, 0); return 1;
+    case 16: /* fremovexattr */ *ret = xattr_fd_call(a[0], XA_REMOVE, a[1], 0, 0, 0); return 1;
     case 54: /* fchownat */ *ret = sys_fchownat(a[0], a[1], a[4]); return 1;
     case 55: /* fchown */ *ret = vfs_get((int)(int32_t)a[0]) ? 0 : -LE_BADF; return 1;
     case 40: /* mount */ *ret = sys_mount(a[0], a[1], a[2], a[3]); return 1;

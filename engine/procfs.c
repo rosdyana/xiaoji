@@ -104,8 +104,12 @@ static int is_self_attr(const char *guest)
     return !strcmp(guest, "/proc/self/attr/current") || !strcmp(guest, "/proc/thread-self/attr/current");
 }
 
+#define BOOT_ID_PATH "/proc/sys/kernel/random/boot_id"
+
 int procfs_known(const char *guest)
 {
+    if (!strcmp(guest, BOOT_ID_PATH))
+        return 1;
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/status") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
         is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
@@ -151,6 +155,7 @@ int procfs_dir(const char *guest)
     if (live_proc(guest, &rest))
         return rest[0] == 0 || !strcmp(rest, "/attr") || !strcmp(rest, "/task");
     return !strcmp(guest, "/proc/self/task") || !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
+           !strcmp(guest, "/proc/sys") || !strcmp(guest, "/proc/sys/kernel") || !strcmp(guest, "/proc/sys/kernel/random") ||
            !strcmp(guest, "/sys/devices/system/cpu") || !strcmp(guest, "/proc/self/attr") ||
            !strcmp(guest, "/proc/thread-self") || !strcmp(guest, "/proc/thread-self/attr");
 }
@@ -305,6 +310,11 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         build_maps(&b);
     } else if (!strcmp(guest, "/proc/filesystems")) {
         sb_fmt(&b, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\n\text4\n");
+    } else if (!strcmp(guest, BOOT_ID_PATH)) {
+        /* The kernel's boot UUID (random per boot in Linux). libcutils names /dev/ashmem<boot_id> from it
+         * and falls back to /dev/ashmem when that node is absent (ashmem-dev.cpp). A fixed value keeps runs
+         * the same. */
+        sb_fmt(&b, "5c1d9a40-2f3e-4b7a-9e61-0d2c8f7a3b10\n");
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
     } else if (!strcmp(guest, "/proc/meminfo")) {

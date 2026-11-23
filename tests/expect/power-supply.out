@@ -1,0 +1,17 @@
+dir ac
+online 1
+type Mains
+dir battery
+capacity 100
+capacity_level Full
+charge_full 5000000
+charge_full_design 5000000
+current_now 0
+cycle_count 0
+health Good
+present 1
+status Full
+technology Li-ion
+temp 250
+type Battery
+voltage_now 4200000

@@ -2609,3 +2609,219 @@ separated out in that run.
 - **securebits lock** and the other securebits are not modelled (see above).
 - `/data/resource-cache` is created with the engine's mkdir, which ignores the mode and owner (`0771 system system` in the
   stock rc).
+
+## B7: the sensors and health HALs, /dev/ashmem, per-user data, and the boot past phase 100 (stops at installd's owner check)
+
+Status: **the sensors and health HALs run on the product tree, and system_server starts their services. `Starting
+phase 100` is passed (3 of 3 runs), and BatteryService receives the health HAL's first update (3 of 3 runs, 63 to 66 s
+into a 90 s run). `System now ready` is not reached. The boot stops at a decision that is not made yet, the owners of
+files (B6 deferred it): installd checks the owner of a package directory it has just created, the engine reports every
+file as root, and the check fails (next blocker 1). Behind it is a second gap, the engine has no `fcntl` record locks,
+which SQLite needs (next blocker 2).**
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 1 | Sensors pipe and its guest test | Done. `engine/sensors.c`, `engine/goldfish.c`, `tests/guest/sensors.c`, `tests/expect/sensors.out`. |
+| 2 | Health HAL, sysfs and a power_supply check | Done. `engine/powersupply.c`, the `power-supply` case (`tests/expect/power-supply.out`). The HAL opens every file it needs (below). |
+| 3 | Phase 100 passed | Done (3 of 3 runs). |
+| 4 | Boot progress | Partial: past phase 100 to BatteryService's health update. Stopped at the owner decision, then the lock gap. |
+
+### Decisions
+
+- **Sensors: the engine serves the goldfish qemud sensors protocol** on `/dev/goldfish_pipe` (service `qemud:sensors`:
+  `engine/sensors.c` for the protocol and the data, `engine/goldfish.c` for the pipe). The guest HAL is the real
+  `android.hardware.sensors@2.1-service.multihal`. The data source is `sensors_set(handle, values, n)` (the plan wrote
+  `(type, values)`; the handle is the qemud index, and `n` is the value count), so a browser bridge (DeviceMotion,
+  DeviceOrientation) can feed it later.
+- **Health: the real `android.hardware.health@2.1-service`**, with its sysfs inputs served by the engine
+  (`engine/powersupply.c`). The uevent socket and the wake alarm are not provided. Both calls fail (observed below), and
+  healthd continues past them.
+- **/dev/ashmem is served by the engine** (`engine/ashmem.c`). libcutils and libfmq use it, because `sys.use_memfd` is
+  unset in Android 13, so the device is the fix, not the property.
+- **Per-user data: `mkdir` lines in the early-init block**, standing in for vold (which the engine does not have).
+- **Not added:** an `interface` line. Neither HAL's stock rc has one (both start at boot, and the engine starts any
+  service that is not `disabled`), so the plan's "interface lines" do not apply to these two.
+- **Telephony, NFC, Bluetooth and UWB are not disabled.** None has blocked the boot yet.
+
+### Protocols implemented (with the evidence from the sources)
+
+Sources are the remote tree `~/xiaoji-aosp` on `build-host`, read only. Functions are named rather than lines, so the
+references hold after an edit.
+
+**Sensors (goldfish qemud).**
+- Pipe: `pipe:qemud:sensors` (`qemu_pipe_guest.cpp`, `qemu_pipe_open_ns`: `"pipe:%s:%s"`, written with its NUL).
+- Framing: `qemud.cpp`, `qemud_channel_send` writes `"%04x"` of the payload length, then the payload; `qemud_channel_recv`
+  reads 4 hex digits, then the body. The engine uses the same framing both ways. A zero-length send writes nothing.
+- Handshake (`multihal_sensors.cpp`, constructor): `"time:%" PRId64` (no reply), then `"list-sensors"`, and the reply is
+  parsed with `sscanf(buffer, "%u", ...)`. The engine answers with the decimal mask of the advertised handles: bits 0, 1,
+  2, 3, 5 and 6 (accelerometer, gyroscope, magnetic field, orientation, proximity, light), which is `111`. In the engine's
+  boot the HAL logs `host sensors mask=6f` (the same bits, in hex) as the first line of its log.
+- Enable and delay (`multihal_sensors.cpp`): `"set:%s:%d"` with the name from `getQemuSensorNameByHandle` (`kQemuSensorName`
+  in `sensor_list.cpp`: `acceleration`, `gyroscope`, `magnetic-field`, `orientation`, `proximity`, `light`). `"set-delay:%d"`
+  in milliseconds, at least 1. `initialize()` calls `setAllQemuSensors(true)`, so every advertised sensor is enabled.
+- Events (`multihal_sensors_qemu.cpp`, `parseQemuSensorEvent`): `testPrefix` matches `acceleration:%f:%f:%f`,
+  `gyroscope:%f:%f:%f`, `magnetic:%f:%f:%f` (the prefix is `magnetic`, not `magnetic-field`), `orientation:%f:%f:%f`,
+  `proximity:%f`, `light:%f` and `sync` (accepted, no effect). Anything else logs `don't know how to parse`. No run logged
+  that line, and no run logged a `qemud_channel` error.
+- Proximity: `sensor_list.cpp`, the proximity `SensorInfo` has `maxRange = 1.0`, so "far" is 1.0.
+
+**Health (healthd's BatteryMonitor, `system/core/healthd`).** The directory scan reads `type` in each subdirectory: `Battery`
+is the battery (unless its `scope` is `Device`), and `Mains` is a charger, which needs `online`. The battery reads `status`,
+`health`, `present`, `capacity`, `voltage_now`, `charge_full`, `charge_full_design`, `current_now`, `cycle_count`, `temp`,
+`technology` and `capacity_level` when they exist. The engine's tree (`/sys/class/power_supply`): `battery/` with `type
+Battery`, `status Full` (AC online at capacity 100), `capacity_level Full`, `health Good`, `present 1`, `capacity 100`,
+`technology Li-ion`, `voltage_now 4200000`, `current_now 0`, `charge_full 5000000`, `charge_full_design 5000000`,
+`cycle_count 0`, `temp 250`; and `ac/` with `type Mains` and `online 1`. In a boot with `XIAOJI_PS_TRACE=1` every one of
+these files is opened (by the health HAL, and by system_server's health wrapper, which reads the same files).
+
+**Health loop (`hardware/interfaces/health/utils/libhealthloop/HealthLoop.cpp`).** `WakeAlarmInit` calls
+`timerfd_create(CLOCK_BOOTTIME_ALARM, TFD_NONBLOCK)`, and `UeventInit` calls `uevent_open_socket`; on failure each logs and
+returns, and `StartLoop` continues into `MainLoop`. Both calls were observed in a traced boot (`--trace`, 25 s; the
+trace file is `trace-h.err` in the session scratchpad): `timerfd_create(0x9, 0x800)` = -22 (EINVAL; the engine's
+timerfd takes only `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`, B3), and `socket(AF_NETLINK 0x10, SOCK_RAW|CLOEXEC, NETLINK_KOBJECT_UEVENT 0xf)`
+= -97 (EAFNOSUPPORT). The HAL logs `Hal init done` after them in every run. Their messages are `KLOG` lines, which logcat
+does not show.
+
+**/dev/ashmem (`system/core/libcutils/ashmem-dev.cpp`, `system/libfmq/include/fmq/MessageQueueBase.h`).**
+- `get_ashmem_device_path` reads `/proc/sys/kernel/random/boot_id` and uses `/dev/ashmem<boot_id>`. If the file cannot be
+  read it returns an empty path, and `ashmem_create_region` fails. (The zygote logged `Failed to read
+  /proc/sys/kernel/random/boot_id`.) The open falls back to `/dev/ashmem`.
+- `__ashmem_open_locked` then requires `fstat` to show `S_ISCHR` with a nonzero `st_rdev`. The engine reports major 10,
+  minor 61 (the kernel's misc device).
+- `ashmem_create_region` sets the name and size (`ASHMEM_SET_NAME`, `ASHMEM_SET_SIZE`), and `ashmem_set_prot_region` sets the
+  mask. libfmq's `MessageQueueBase` calls it with `"MessageQueue"` and maps the fd with `mmap(..., handle->data[fdIndex],
+  ...)`. Before the device existed, the same path gave `mmap failed: 9` (EBADF) and the fatal `mReadPtr is null`.
+
+**Labels (`external/selinux/libselinux/src/android/android_platform.c`, `restorecon_sb`).** `restorecon_sb` calls
+`lgetfilecon` and goes to `err` on any failure, so a file with no label fails it. A kernel with SELinux labels every new
+file at creation, so the engine gives an unlabelled file a default label on a read: `u:object_r:unlabeled:s0`, with its NUL
+(`engine/xattr.c`). Before the fix, a new file read `?` from `ls -Z`, and `restorecon` printed `Could not set context ... No
+data available` and failed. After it, `restorecon` exits 0 and labels the file. The store (`engine/xattr.c`) keeps the
+attributes in memory for the run, keyed by the canonical guest path, with `XATTR_CREATE` and `XATTR_REPLACE`.
+
+**Per-user data (`system/core/rootdir/init.rc` lines 808 to 810 and 912 to 919; `system/vold/vold_prepare_subdirs.cpp`,
+`prepare_subdirs`).** `/data/user`, `/data/user/0`, `/data/user_de`, `/data/user_de/0`, the `system_ce`, `system_de`,
+`misc_ce`, `misc_de`, `vendor_ce` and `vendor_de` user-0 directories, and the profile directories `misc/profiles/{cur,cur/0,ref}`,
+as `mkdir` lines in `image/xiaoji.rc`'s early-init block. The engine's `mkdir` takes no mode and no owner (B6).
+
+### Milestones (product tree, `build/rootfs-xiaoji`, from a cleared `data/`, `--logcat --init-timeout 90`)
+
+Times and instruction counts are guest time (`[ms insn]` in the log). Wall clock is 90.1 s per run. Power: `pmset -g`
+shows `lowpowermode 0`, and `pmset -g batt` shows `Now drawing from 'AC Power'` (scratchpad: `pmset-b7.txt`,
+`pmset-batt-b7.txt`).
+
+| Milestone | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| Sensors HAL: `host sensors mask=6f` | 0.65 s, 0.096 G | 0.64 s, 0.096 G | 0.62 s, 0.096 G |
+| `Registered android.hardware.sensors@2.1::ISensors/default` | 2.08 s, 0.216 G | 2.34 s, 0.218 G | 1.94 s, 0.214 G |
+| `Registered android.hardware.health@2.1::IHealth/default` | 2.10 s, 0.217 G | 2.35 s, 0.219 G | 1.96 s, 0.216 G |
+| `Starting phase 100` | 47.9 s, 4.697 G | 46.9 s, 4.695 G | 45.6 s, 4.604 G |
+| `BatteryService: health: Waited 0ms and received the update` | 65.7 s, 6.494 G | 64.9 s, 6.489 G | 63.0 s, 6.395 G |
+| `FATAL EXCEPTION IN SYSTEM PROCESS` (the next blocker, below) | 66.4 s, 6.561 G | 65.6 s, 6.554 G | 63.6 s, 6.462 G |
+
+Phase 100 was 4.16 G (40.4 s) in B6. B7 reaches it later because the HALs and `/dev/ashmem` add work before it. Before the
+device existed (the first run with the two HALs) it was 4.18 G (41.0 s). Every run has no `don't know how to parse`
+line and no `qemud_channel` error from the sensors HAL, and the HAL does not abort. The product boot check in `tests/run.sh`
+requires the mask line, both registrations and the BatteryService update, with `Waited [0-9]*ms`.
+
+Run 4 (after the default label, the same command) went to phase 100 at 45.0 s (4.696 G) and to the BatteryService update at
+65.2 s (6.783 G). Its installd no longer logs `Could not set context`.
+
+### Next blocker 1: installd's owner check (the decision)
+
+With the labels fixed, installd creates the device-encrypted package directory, then checks it again in the same boot. The
+check is strict (`fs_prepare_dir_strict`, `system/core/libcutils/fs.cpp`), so an existing directory must have the owner the
+package has, and the engine's `chown` records nothing, so `stat` reports `0:0`:
+
+```
+E/cutils(1005): Expected path /data/user_de/0/com.android.uwb.resources with owner 10055:10055 but found 0:0
+E/installd(1005): Failed to prepare /data/user_de/0/com.android.uwb.resources: Success
+W/PackageManager(1047): Failed to create app data for com.android.uwb.resources, but trying to recover: com.android.server.pm.Installer$InstallerException: Failed to prepare
+```
+
+This is the owner and mode model that B6 left out (`DAC and metadata: not enforced`). It is a design decision, not a bug in
+one call. Recommendation: record the owner and mode per canonical guest path (`chown`, `fchown`, `fchownat`, `chmod`, `fchmod`,
+`fchmodat` set them; `stat` reports them, and the defaults stay root and 0755/0644 for unrecorded paths), keep the record in
+memory for the run, as the xattr store does, and clear `build/rootfs-xiaoji/data` before every product boot (the boot check
+should do this itself). Storing owners in host xattrs was rejected: it is not portable (macOS), and it would make `/data`
+state carry over between runs. The alternative is the fs_config table from the image, which the B6 notes say is not in the
+searched places of the remote tree.
+
+### Next blocker 2: record locks (SQLite)
+
+After the DE directories, SettingsProvider gets past its directory check and fails on the database's first lock:
+
+```
+E/SQLiteLog(1047): (3850) disk I/O error in "PRAGMA journal_mode"
+android.database.sqlite.SQLiteDiskIOException: disk I/O error (code 3850 SQLITE_IOERR_LOCK): , while compiling: PRAGMA journal_mode
+```
+
+SQLite takes POSIX record locks with `fcntl(F_SETLK)`. The engine's `sys_fcntl` (`engine/sysfs.c`) handles the pipe size, dup, the
+descriptor and file flags, and has no lock commands, so `F_GETLK`, `F_SETLK` and `F_SETLKW` fail. Recommendation: implement
+record locks in the engine: a table keyed by the file (the memfd or host file object) and the byte range, shared by all
+processes of the engine (a fork inherits no locks, and an exit or a close drops the process's locks, as Linux does), with
+`F_SETLKW` waiting through the restart mechanism that pipes use (B1).
+
+### The engine path after the blockers
+
+Not reached: `System now ready` and `sys.boot_completed=1`. The `Invalid path /system_ext/priv-app/Settings: No such file
+or directory` and `Invalid path /system/framework/framework-res.apk` lines from installd's path check remain unexplained
+(both files exist, and `realpath` works from the guest shell).
+
+### Tests
+
+- `make build/xiaoji && make wasm-node && tests/run.sh`: **200 passed, 0 failed.** The 194 from B6, plus `sensors`,
+  `power-supply` and `ashmem` in the engine and in Node.
+- `XIAOJI_JIT=0 tests/run.sh`: **200 passed, 0 failed.**
+- `XIAOJI_BOOT=1 tests/run.sh` (the Google image): **201 passed, 0 failed.**
+- `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product, from a cleared `data/`): **167 passed, 0 failed**,
+  the 161 from B6 plus the six new engine and Node checks. Its boot check now also requires the mask line, both
+  registrations and the BatteryService update.
+- `make test-web`: all checks passed.
+- Warnings: `clang -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter` on `engine/{sensors,goldfish,vfs,poll,powersupply,ashmem,xattr,sysfs,procfs}.c`:
+  0. `emcc` with the same flags on the same files: 0. `clang -ffreestanding -Wall -Wextra` on `tests/guest/{sensors,ashmem}.c`: 0.
+- The guest tests. `tests/guest/sensors.c` opens `/dev/goldfish_pipe`, writes `pipe:qemud:sensors`, sends `time:` and
+  `list-sensors` (checks `111`), checks that nothing is readable before an enable (an unknown command, an unadvertised
+  sensor), sends `set-delay:20` and `set:acceleration:1`, reads three batches (exact `acceleration:0.000000:9.810000:0.000000`
+  lines and `sync:<digits>`), and checks that `set:acceleration:0` stops the stream. `tests/guest/ashmem.c` checks the ioctls
+  (name, size, protection mask, pinning), `fstat` as a character device, a write shared with a forked child, EINVAL for a
+  second size after mapping, and ENOTTY for a bogus ioctl and for `/dev/null`. The `power-supply` case lists every file under
+  `/sys/class/power_supply` with its value.
+- The first build of `tests/guest/ashmem.c` in the builder VM failed with a "missing terminating" error that clang does not
+  reproduce, and a rebuild succeeded. Probably the builder read the file mid-write, but this is not confirmed.
+
+### Engine choices (not from the HAL sources)
+
+- The default batch period is 200 ms (`SENSOR_DELAY_NORMAL`) until `set-delay`. A batch is made lazily by a read or a poll
+  when its time is due. Only one batch is sent for an overdue period (nothing is caught up), and no batch is made while the
+  previous one is unread. No thread and no busy loop: the pipe's deadline goes to `sched_block_restart_until`, to ppoll and to
+  epoll, on the host clock timerfd uses.
+- Values: accelerometer (0, 9.81, 0), gyroscope (0, 0, 0), magnetic field (20, 0, -40) µT (a mid-latitude value, not measured),
+  orientation (0, 0, 0), proximity 1.0 (far), light 300 lux.
+- `sync:<us>` is the host monotonic time in microseconds, sent after each batch.
+- `/proc/sys/kernel/random/boot_id` is a fixed UUID (the kernel's is random per boot). `ro.vndk.version` (33) comes from the image.
+- `/dev/ashmem` rounds a size up to a page. Linux keeps the size as set, which matters only for a size that is not a page
+  multiple. A second `ASHMEM_SET_SIZE` is refused once a size is set, where Linux allows it until the first map.
+- An unlabelled file reads back `u:object_r:unlabeled:s0`.
+- `XIAOJI_PS_TRACE=1` prints each power-supply file open (stderr), like `XIAOJI_GF_TRACE`.
+
+### Gaps (B7)
+
+- **Boot does not reach `System now ready`.** Blockers 1 and 2 above.
+- **Persistent `/data`.** `build/rootfs-xiaoji/data` keeps what each boot writes, and installd's strict check then fails on the
+  owners left by an earlier run (`Expected path ... with owner 10055:10055 but found 0:0`). `tests/run.sh` does not clear
+  it. The runs in this document started from a cleared `data/`. When this step began the directory held 12 entries from earlier
+  boots, and it was then cleared. Its state before my first boot was not checked.
+- **Extended attributes** are keyed by path. They survive an unlink, and a rename does not move them.
+- The sensors protocol is checked against the HAL sources and by the guest test. The HAL logs no parse error, but no test
+  checks that SensorService receives events.
+- The batch period is not measured in a test (the guest sees time after the engine's, so only the order and the format are
+  checked). The schedule is in `sns_batch`.
+- Telephony, NFC, Bluetooth and UWB are still on.
+- `sys.use_memfd` stays unset, and `vold` is not modelled (the mkdir lines stand in for it).
+- `mls` is `0` in the synthetic SELinux (`engine/selinuxfs.c`). Whether that affects installd is not tested.
+- `stat` on `/proc/sys` and `/proc/sys/kernel` (directories) is ENOENT, as for `/sys/devices`.
+- `make` with no target printed `Nothing to be done` and did not rebuild `build/xiaoji` in this tree; `make build/xiaoji`
+  does. `make test` output is cut by the `rtk` filter, so the summaries here come from `tests/run.sh` run directly.

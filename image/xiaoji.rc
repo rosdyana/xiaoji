@@ -27,9 +27,35 @@ on early-init
     mkdir /data/misc
     mkdir /data/misc/user
     mkdir /data/misc/installd
+    # ART's profile directories (init.rc's block for profiles, and cur/0 from vold): installd fails to prepare a
+    # package's profile without them (B7).
+    mkdir /data/misc/profiles 0771
+    mkdir /data/misc/profiles/cur 0771
+    mkdir /data/misc/profiles/cur/0 0771
+    mkdir /data/misc/profiles/ref 0771
     # idmap2d (B6): IdmapDaemon writes under /data/resource-cache; idmap2d refuses any caller when the directory
     # is missing (UidHasWriteAccessToPath fails on Realpath). init.rc creates it 0771 system system.
     mkdir /data/resource-cache 0771
+    # The user 0 tree that vold prepares (system/vold/vold_prepare_subdirs.cpp, prepare_subdirs, and init.rc's
+    # /data/user block). The engine has no vold, so the directories are made here, by path. installd and
+    # SettingsProvider need them: ContextImpl and installd fail to create databases and app data under a
+    # missing parent (B7). The bind of /data/user/0 to /data/data is not made; /data/user/0 is the data root.
+    mkdir /data/user
+    mkdir /data/user/0
+    mkdir /data/user_de
+    mkdir /data/user_de/0
+    mkdir /data/system_ce
+    mkdir /data/system_ce/0
+    mkdir /data/system_de
+    mkdir /data/system_de/0
+    mkdir /data/misc_ce
+    mkdir /data/misc_ce/0
+    mkdir /data/misc_de
+    mkdir /data/misc_de/0
+    mkdir /data/vendor_ce
+    mkdir /data/vendor_ce/0
+    mkdir /data/vendor_de
+    mkdir /data/vendor_de/0
 
 service servicemanager /system/bin/servicemanager
     class core animation
@@ -186,3 +212,22 @@ service idmap2d /system/bin/idmap2d
     class main
     user system
     group system
+
+# The health HAL (B7): the Android 13 block of vendor/etc/init/android.hardware.health@2.1-service.rc, with class,
+# user, group and capabilities as the engine reads them. file and task_profiles are not modelled. It reads the
+# battery from /sys/class/power_supply (the engine's synthetic tree, engine/powersupply.c). Its uevent socket and
+# its CLOCK_BOOTTIME_ALARM wake alarm are optional in healthd's loop: without them it runs (docs/boot.md, B7).
+service health-hal-2-1 /vendor/bin/hw/android.hardware.health@2.1-service
+    class hal charger
+    user system
+    group system
+    capabilities WAKE_ALARM BLOCK_SUSPEND
+
+# The sensors HAL (B7): the Android 13 block of vendor/etc/init/android.hardware.sensors@2.1-service-multihal.rc,
+# with class, user, group and capabilities as the engine reads them. task_profiles and rlimit are not modelled.
+# It talks to the goldfish qemud "sensors" service (engine/sensors.c) on /dev/goldfish_pipe.
+service vendor.sensors-hal-2-1-multihal /vendor/bin/hw/android.hardware.sensors@2.1-service.multihal
+    class hal
+    user system
+    group system wakelock context_hub
+    capabilities BLOCK_SUSPEND
