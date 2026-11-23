@@ -49,6 +49,7 @@ export function onDownload(s, p) {
 export function onBootTree(s, now) {
   if (s.phase !== 'download') return;
   s.phase = 'boot';
+  s.bootAt = now;
   s.fill = 0;
   enter(s, 0, now);
 }
@@ -150,7 +151,7 @@ export function render(s, now) {
       count = `${s.stage + 1} / ${n}`;
       const parts = [];
       if (s.classes !== null && s.stage === 1) parts.push(`${s.classes.toLocaleString('en-US')} classes`);
-      parts.push(fmtSec((now - s.enteredAt) / 1000));
+      parts.push(fmtSec((now - (s.bootAt ?? s.enteredAt)) / 1000) + ' booting');
       detail = parts.join(' · ');
     }
   } else if (s.phase === 'stopped') {
