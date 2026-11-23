@@ -98,7 +98,6 @@
 #define IO_CHUNK 65536
 
 static uint64_t unimpl_seen[1024 / 64];
-static uint8_t fill_buf[IO_CHUNK];
 
 static uint64_t page_up(uint64_t x) { return (x + PAGE_MASK) & ~PAGE_MASK; }
 
@@ -239,31 +238,19 @@ static int64_t sys_brk(uint64_t want)
     return (int64_t)want;
 }
 
-/* Copies n bytes from a host fd into guest memory at va, from file offset off.
- * Bytes past the end of the file stay zero (the pages start zeroed). */
-static int fill_from_fd(int hfd, uint64_t va, uint64_t n, uint64_t off)
-{
-    uint64_t done = 0;
-    while (done < n) {
-        size_t want = n - done < IO_CHUNK ? (size_t)(n - done) : IO_CHUNK;
-        int64_t r = host_pread(hfd, fill_buf, want, off + done);
-        if (r < 0)
-            return -1;
-        if (r == 0)
-            break;
-        if (mem_poke(va + done, fill_buf, (size_t)r) < 0)
-            return -1;
-        done += (uint64_t)r;
-    }
-    return 0;
-}
-
-/* Maps len bytes of file path (open as hfd) at base, with the final protection. */
+/* Maps len bytes of the file open as hfd at base, with the final protection. The mapping
+ * keeps its own dup of hfd and reads the pages on first access (mem_map_lazy). */
 static int map_file(uint64_t base, uint64_t len, unsigned prot, const char *path, int hfd, uint64_t off)
 {
-    if (mem_map_ex(base, len, prot, path, off) < 0)
+    host_stat st;
+    if (host_stat_fd(hfd, &st) < 0 || (st.mode & 0170000) != 0100000)
+        return -1; /* only regular files are read lazily */
+    mfile_t *f = mem_file_get(hfd, st.dev, st.ino);
+    if (!f)
         return -1;
-    return fill_from_fd(hfd, base, len, off);
+    int rc = mem_map_lazy(base, len, prot, path, f, off);
+    mem_file_unref(f);
+    return rc;
 }
 
 /* Maps a tail of len bytes after a mapping whose last page is last, with the
@@ -277,16 +264,10 @@ static int map_tail(uint64_t va, uint64_t len, uint64_t last)
     memfd_t *shm = mem_region_memfd(last, &shm_start, &off);
     if (shm) /* the tail continues the same memfd view */
         return mem_map_shared(va, len, prot, shm, off + (last - shm_start) + MEM_PAGE_SIZE) < 0 ? -1 : 0;
-    if (mem_region_next(last, &s, &e, &path, &off) && path && s <= last) {
+    mfile_t *file = mem_region_file(last, &s, &off);
+    if (file && mem_region_next(last, &s, &e, &path, &off) && s <= last) {
         uint64_t toff = off + (last - s) + MEM_PAGE_SIZE;
-        if (mem_map_ex(va, len, prot, path, toff) < 0)
-            return -1;
-        int hfd = host_open(path, LO_RDONLY, 0);
-        if (hfd < 0)
-            return -1;
-        int rc = fill_from_fd(hfd, va, len, toff);
-        host_close(hfd);
-        return rc;
+        return mem_map_lazy(va, len, prot, path, file, toff) < 0 ? -1 : 0;
     }
     return mem_map(va, len, prot);
 }
@@ -537,19 +518,10 @@ static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice)
             break;
         uint64_t a = s > pos ? s : pos;
         uint64_t b = e < end ? e : end;
+        /* A file-backed page is read again from its file on its next access (mem_map_lazy);
+         * a memfd view keeps its contents (mem_drop skips shared pages). */
         mem_drop(a, b - a);
-        /* A memfd view keeps its contents (mem_drop skips shared pages), and its
-         * region path is a display name, not a host file, so there is nothing to refill. */
-        uint64_t ms, moff;
-        if (path && !mem_region_memfd(a, &ms, &moff)) {
-            int hfd = host_open(path, LO_RDONLY, 0);
-            if (hfd < 0)
-                return hfd;
-            int rc = fill_from_fd(hfd, a, b - a, off + (a - s));
-            host_close(hfd);
-            if (rc < 0)
-                return -LE_FAULT;
-        }
+        (void)path;
         pos = b;
     }
     return 0;

@@ -1029,6 +1029,12 @@ static void mem_fault(cpu_t *c)
 #ifdef __EMSCRIPTEN__
     jit_fault(c, c->pc);
 #endif
+    if (code == MEM_FAULT_BUS) {
+        if (sig_fault(c, SIGBUS_N, BUS_ADRERR, addr & MEM_UNTAG_MASK))
+            return;
+        sig_bus_fatal(addr, c->pc);
+        return;
+    }
     if (sig_fault(c, SIGSEGV_N, code, addr & MEM_UNTAG_MASK))
         return;
     sig_segv_fatal(addr, c->pc);

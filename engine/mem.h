@@ -18,6 +18,7 @@
 /* Fault codes, the Linux si_code values for SIGSEGV. */
 #define MEM_FAULT_MAPERR 1 /* SEGV_MAPERR: no mapping at the address */
 #define MEM_FAULT_ACCERR 2 /* SEGV_ACCERR: mapped, but the access is not allowed */
+#define MEM_FAULT_BUS 3    /* SIGBUS BUS_ADRERR: a file-backed page wholly past the end of its file */
 /* The top byte of a guest address is an ignored tag; Linux reports addresses without it. */
 #define MEM_UNTAG_MASK 0x00FFFFFFFFFFFFFFull
 
@@ -45,10 +46,31 @@ int mem_map(uint64_t va, uint64_t len, unsigned prot);
 /* As mem_map, and records the range as backed by host file path from offset
  * off (path NULL means anonymous). The path is copied. */
 int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint64_t off);
+/* A host file that lazily backs mappings. Each lazy mapping holds a reference; the host
+ * fd is closed when the last one goes. */
+typedef struct mfile mfile_t;
+/* The file with identity (dev, ino), opened once: the first caller's hfd is dup'ed and
+ * later callers share that copy, since a process maps one file many times and the browser
+ * has a small fd table. Returns a reference, or NULL. */
+mfile_t *mem_file_get(int hfd, uint64_t dev, uint64_t ino);
+void mem_file_unref(mfile_t *f);
+/* Maps len bytes at va as a file-backed range: page i of the range reads the file at
+ * off + (page address - va), on first access, in windows of mem_lazy_window bytes.
+ * Bytes past the end of the file read as zero in the last page; a page wholly past the
+ * end raises SIGBUS (BUS_ADRERR) on access, and the non-faulting copies return -1.
+ * path is display-only (NULL is allowed). Any existing mapping in the range is replaced.
+ * Returns 0 or -1. */
+int mem_map_lazy(uint64_t va, uint64_t len, unsigned prot, const char *path, mfile_t *f, uint64_t off);
+/* The lazy fill window in bytes (a power of two between one page and 1 MiB). */
+void mem_set_lazy_window(size_t bytes);
 /* Maps len bytes at va as a MAP_SHARED view of m from file offset off. The pages
  * are m's own pages, so every view of the same memfd sees the same bytes. Any
  * existing mapping in the range is replaced. Returns 0 or -1. */
 int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_t off);
+/* The file (mem_map_lazy) backing the region that contains va, or NULL. *start and *off are
+ * the region start and its file offset at that start. The file is borrowed: take a
+ * reference (mem_map_lazy does) to keep it. */
+mfile_t *mem_region_file(uint64_t va, uint64_t *start, uint64_t *off);
 /* The memfd backing the region that contains va, or NULL. *start and *off are
  * the region start and its file offset at that start. */
 memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off);

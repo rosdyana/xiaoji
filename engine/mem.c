@@ -19,6 +19,7 @@
  * which assumes a little-endian host (arm64, x86-64 and wasm all qualify).
  */
 #include "mem.h"
+#include "host.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -69,10 +70,26 @@ typedef struct {
     char *path;          /* host file backing, or NULL for anonymous memory */
     uint64_t off;        /* file offset of start */
     memfd_t *shm;        /* memfd backing (MAP_SHARED), or NULL; path is then display-only */
+    mfile_t *lazy;       /* file backing filled on first access (mem_map_lazy), or NULL */
 } region_t;
 
+/* A host file behind lazy mappings. The fd is owned here; the files are on one list. */
+struct mfile {
+    int hfd;
+    int refs;
+    uint64_t dev, ino;
+    mfile_t *next;
+};
+static mfile_t *files;
+
+/* Bytes filled per lazy fault (a power of two, a whole aligned window). */
+static size_t lazy_window = 65536;
+/* Set when a faulting access hit a lazy page past the end of its file: the fault is then
+ * SIGBUS, not SIGSEGV. Holds vpn + 1 of that page; 0 when none. */
+static uint64_t bus_vpn1;
+
 /* A region with no file or memfd behind it. Only these merge with neighbours. */
-static int reg_anon(const region_t *r) { return !r->path && !r->shm; }
+static int reg_anon(const region_t *r) { return !r->path && !r->shm && !r->lazy; }
 
 /* One address space: its page table and its region list. The TLBs and the fetch
  * cache are not part of it: they stay at fixed addresses (the translator bakes them
@@ -189,14 +206,22 @@ uint64_t mem_futex_key(uint64_t va, uint64_t *obj)
 static void mem_segv(uint64_t va) __attribute__((noreturn));
 static void mem_segv(uint64_t va)
 {
+    int bus = bus_vpn1 && bus_vpn1 == (((va & VA_MASK) >> 12) + 1);
+    if (bus)
+        bus_vpn1 = 0;
     if (!fault_jb) {
         fflush(stdout);
+        if (bus) {
+            fprintf(stderr, "xiaoji: bus error at 0x%llx (pc 0x%llx)\n", (unsigned long long)va,
+                    (unsigned long long)cur_pc);
+            exit(135);
+        }
         fprintf(stderr, "xiaoji: segfault at 0x%llx (pc 0x%llx)\n", (unsigned long long)va,
                 (unsigned long long)cur_pc);
         exit(139);
     }
     fault_va = va;
-    fault_code = mem_is_mapped(va & VA_MASK, 1) ? MEM_FAULT_ACCERR : MEM_FAULT_MAPERR;
+    fault_code = bus ? MEM_FAULT_BUS : mem_is_mapped(va & VA_MASK, 1) ? MEM_FAULT_ACCERR : MEM_FAULT_MAPERR;
     longjmp(*fault_jb, 1);
 }
 
@@ -226,6 +251,25 @@ static char *dup_path(const char *p)
         die_oom();
     memcpy(d, p, n);
     return d;
+}
+
+/* A new reference to a region's backing (and a copy of its path). */
+static region_t reg_copy(const region_t *r)
+{
+    region_t c = *r;
+    c.path = dup_path(r->path);
+    memfd_ref(c.shm);
+    if (c.lazy)
+        c.lazy->refs++;
+    return c;
+}
+
+/* Drops a region's references (its path, memfd and file). */
+static void reg_release(region_t *r)
+{
+    free(r->path);
+    memfd_unref(r->shm);
+    mem_file_unref(r->lazy);
 }
 
 /* Replaces regions[i..j) with n entries from src (n <= 2 is typical, but any n works). */
@@ -261,37 +305,30 @@ static void reg_clear(uint64_t a, uint64_t b)
     size_t nk = 0;
     region_t first = cur_mm->regs[i], last = cur_mm->regs[j - 1];
     if (first.start < a) {
+        keep[nk] = reg_copy(&first);
         keep[nk].start = first.start;
         keep[nk].end = a;
-        keep[nk].path = dup_path(first.path);
-        keep[nk].off = first.off;
-        keep[nk].shm = first.shm;
-        memfd_ref(first.shm);
         nk++;
     }
     if (last.end > b) {
+        keep[nk] = reg_copy(&last);
         keep[nk].start = b;
         keep[nk].end = last.end;
-        keep[nk].path = dup_path(last.path);
         keep[nk].off = last.off + (b - last.start);
-        keep[nk].shm = last.shm;
-        memfd_ref(last.shm);
         nk++;
     }
-    for (size_t k = i; k < j; k++) {
-        free(cur_mm->regs[k].path);
-        memfd_unref(cur_mm->regs[k].shm);
-    }
+    for (size_t k = i; k < j; k++)
+        reg_release(&cur_mm->regs[k]);
     reg_splice(i, j, keep, nk);
 }
 
 /* Inserts [a, b) with the given backing, replacing whatever was there. shm
  * (may be NULL) takes a reference for the new region. */
-static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off, memfd_t *shm)
+static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off, memfd_t *shm, mfile_t *lazy)
 {
     reg_clear(a, b);
     size_t i = reg_lower(a);
-    if (!path && !shm) {
+    if (!path && !shm && !lazy) {
         /* Merge with anonymous neighbours so long-lived ranges stay one entry. */
         if (i > 0 && cur_mm->regs[i - 1].end == a && reg_anon(&cur_mm->regs[i - 1])) {
             cur_mm->regs[i - 1].end = b;
@@ -307,8 +344,10 @@ static void reg_set(uint64_t a, uint64_t b, const char *path, uint64_t off, memf
             return;
         }
     }
-    region_t r = {a, b, dup_path(path), off, shm};
+    region_t r = {a, b, dup_path(path), off, shm, lazy};
     memfd_ref(shm);
+    if (lazy)
+        lazy->refs++;
     reg_splice(i, i, &r, 1);
 }
 
@@ -320,6 +359,16 @@ memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off)
     *start = cur_mm->regs[i].start;
     *off = cur_mm->regs[i].off;
     return cur_mm->regs[i].shm;
+}
+
+mfile_t *mem_region_file(uint64_t va, uint64_t *start, uint64_t *off)
+{
+    size_t i = reg_lower(va);
+    if (i >= cur_mm->nregs || cur_mm->regs[i].start > va || !cur_mm->regs[i].lazy)
+        return NULL;
+    *start = cur_mm->regs[i].start;
+    *off = cur_mm->regs[i].off;
+    return cur_mm->regs[i].lazy;
 }
 
 unsigned mem_prot_at(uint64_t va)
@@ -485,10 +534,74 @@ static void cow_break(uint64_t vpn, uint64_t *slot)
 
 /* ---------- page access ---------- */
 
+/* Fills the lazy pages of the window that holds vpn, from the region's file. Only pages with
+ * no host page yet are filled (a page that was written or holds code keeps its bytes). A page
+ * past the end of the file reads as zero up to the end and is left unfilled when it is wholly
+ * past it. *is_lazy is 0 if vpn is not in a file-backed region. Returns the host page of vpn,
+ * or NULL if it is past the end of the file (or the read failed): that access is SIGBUS. */
+static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
+{
+    uint64_t va = vpn << 12;
+    *is_lazy = 0;
+    bus_vpn1 = 0;
+    size_t i = reg_lower(va);
+    if (i >= cur_mm->nregs || cur_mm->regs[i].start > va || !cur_mm->regs[i].lazy)
+        return NULL;
+    *is_lazy = 1;
+    region_t *r = &cur_mm->regs[i];
+    int hfd = r->lazy->hfd;
+    uint64_t rstart = r->start, roff = r->off;
+    uint64_t wa = va & ~((uint64_t)lazy_window - 1), we = wa + lazy_window;
+    if (wa < rstart)
+        wa = rstart;
+    if (we > r->end)
+        we = r->end;
+    size_t want_len = (size_t)(we - wa);
+    uint8_t *buf = malloc(want_len);
+    if (!buf)
+        die_oom();
+    size_t got = 0;
+    while (got < want_len) {
+        int64_t k = host_pread(hfd, buf + got, want_len - got, roff + (wa - rstart) + got);
+        if (k <= 0)
+            break; /* end of file, or an error: the bytes read so far are the file */
+        got += (size_t)k;
+    }
+    uint8_t *result = NULL;
+    for (uint64_t pa = wa; pa < we; pa += MEM_PAGE_SIZE) {
+        uint64_t pv = pa >> 12;
+        uint64_t *ps = pte_slot(pv, 0);
+        if (!ps || !(*ps & PTE_MAPPED) || (*ps & PTE_SHARED) || (*ps & ~(uint64_t)PTE_FLAGS))
+            continue;
+        size_t at = (size_t)(pa - wa);
+        size_t have = at < got ? got - at : 0;
+        if (have == 0) {
+            if (pv == vpn)
+                bus_vpn1 = vpn + 1;
+            continue;
+        }
+        uint8_t *pg = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
+        if (!pg)
+            die_oom();
+        size_t cp = have < MEM_PAGE_SIZE ? have : MEM_PAGE_SIZE;
+        memcpy(pg, buf + at, cp);
+        memset(pg + cp, 0, MEM_PAGE_SIZE - cp);
+        host_page_changed(pg); /* a new page holds no translated code; kept for the rule */
+        *ps = (uint64_t)(uintptr_t)pg | (*ps & (uint64_t)PTE_FLAGS);
+        if (pv == vpn)
+            result = pg;
+    }
+    free(buf);
+    if (!result)
+        bus_vpn1 = vpn + 1;
+    return result;
+}
+
 /* Host page for vpn with the given permission, allocating backing if needed.
  * Returns NULL if the page is unmapped or lacks the permission. */
 static uint8_t *page_lookup(uint64_t vpn, unsigned need)
 {
+    bus_vpn1 = 0; /* a SIGBUS is only for the access that filled the lazy page */
     if (vpn >= VPN_LIMIT)
         return NULL;
     uint64_t *slot = pte_slot(vpn, 0);
@@ -513,6 +626,10 @@ static uint8_t *page_lookup(uint64_t vpn, unsigned need)
         return p;
     }
     if (!p) {
+        int is_lazy;
+        p = lazy_fill(vpn, &is_lazy);
+        if (is_lazy)
+            return p; /* a file-backed page: filled, or NULL past the end of the file */
         p = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
         if (!p)
             die_oom();
@@ -670,7 +787,7 @@ int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint6
         return -1;
     uint64_t first = va >> 12;
     uint64_t n = len >> 12;
-    reg_set(va, va + len, path, off, NULL);
+    reg_set(va, va + len, path, off, NULL, NULL);
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 1);
         uint64_t e = *slot;
@@ -684,6 +801,67 @@ int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint6
 
 int mem_map(uint64_t va, uint64_t len, unsigned prot) { return mem_map_ex(va, len, prot, NULL, 0); }
 
+mfile_t *mem_file_get(int hfd, uint64_t dev, uint64_t ino)
+{
+    for (mfile_t *f = files; f; f = f->next) {
+        if (f->dev == dev && f->ino == ino) {
+            f->refs++;
+            return f;
+        }
+    }
+    int dfd = host_dup(hfd);
+    if (dfd < 0)
+        return NULL;
+    mfile_t *f = calloc(1, sizeof *f);
+    if (!f) {
+        host_close(dfd);
+        return NULL;
+    }
+    f->hfd = dfd;
+    f->refs = 1;
+    f->dev = dev;
+    f->ino = ino;
+    f->next = files;
+    files = f;
+    return f;
+}
+
+void mem_file_unref(mfile_t *f)
+{
+    if (!f || --f->refs > 0)
+        return;
+    for (mfile_t **p = &files; *p; p = &(*p)->next) {
+        if (*p == f) {
+            *p = f->next;
+            break;
+        }
+    }
+    host_close(f->hfd);
+    free(f);
+}
+
+void mem_set_lazy_window(size_t bytes)
+{
+    if (bytes >= MEM_PAGE_SIZE && bytes <= (1u << 20) && !(bytes & (bytes - 1)))
+        lazy_window = bytes;
+}
+
+int mem_map_lazy(uint64_t va, uint64_t len, unsigned prot, const char *path, mfile_t *f, uint64_t off)
+{
+    if (!range_ok(va, len) || !f)
+        return -1;
+    mem_unmap(va, len); /* a new file mapping starts with no pages of its own */
+    reg_set(va, va + len, path, off, NULL, f);
+    uint64_t first = va >> 12;
+    uint64_t n = len >> 12;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t *slot = pte_slot(first + i, 1);
+        *slot = PTE_MAPPED | (prot & 7u); /* no host page: lazy_fill supplies it on first access */
+    }
+    tlb_flush();
+    return 0;
+}
+
 int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_t off)
 {
     if (!range_ok(va, len) || !m)
@@ -691,7 +869,7 @@ int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_
     mem_unmap(va, len);
     char path[96];
     snprintf(path, sizeof path, "/memfd:%s (deleted)", memfd_name(m));
-    reg_set(va, va + len, path, off, m);
+    reg_set(va, va + len, path, off, m, NULL);
     uint64_t first = va >> 12;
     uint64_t n = len >> 12;
     for (uint64_t i = 0; i < n; i++) {
@@ -795,12 +973,10 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
             region_t *r = &cur_mm->regs[i + k];
             uint64_t s = r->start < from ? from : r->start;
             uint64_t e = r->end > from + len ? from + len : r->end;
+            pieces[k] = reg_copy(r);
             pieces[k].start = s - from + to;
             pieces[k].end = e - from + to;
-            pieces[k].path = dup_path(r->path);
             pieces[k].off = r->off + (s - r->start);
-            pieces[k].shm = r->shm;
-            memfd_ref(r->shm);
         }
     }
     uint64_t first_src = from >> 12, first_dst = to >> 12, n = len >> 12;
@@ -815,9 +991,8 @@ int mem_move(uint64_t from, uint64_t to, uint64_t len)
     }
     reg_clear(from, from + len);
     for (size_t k = 0; k < np; k++) {
-        reg_set(pieces[k].start, pieces[k].end, pieces[k].path, pieces[k].off, pieces[k].shm);
-        free(pieces[k].path);
-        memfd_unref(pieces[k].shm);
+        reg_set(pieces[k].start, pieces[k].end, pieces[k].path, pieces[k].off, pieces[k].shm, pieces[k].lazy);
+        reg_release(&pieces[k]);
     }
     free(pieces);
     tlb_flush();
@@ -967,9 +1142,7 @@ mm_t *mem_mm_fork(mm_t *src)
             return NULL;
         }
         for (size_t i = 0; i < src->nregs; i++) {
-            dst->regs[i] = src->regs[i];
-            dst->regs[i].path = dup_path(src->regs[i].path);
-            memfd_ref(dst->regs[i].shm);
+            dst->regs[i] = reg_copy(&src->regs[i]);
         }
         dst->nregs = dst->cregs = src->nregs;
     }
@@ -1042,10 +1215,8 @@ void mem_mm_unref(mm_t *m)
         }
         free(m->l1);
     }
-    for (size_t i = 0; i < m->nregs; i++) {
-        free(m->regs[i].path);
-        memfd_unref(m->regs[i].shm);
-    }
+    for (size_t i = 0; i < m->nregs; i++)
+        reg_release(&m->regs[i]);
     free(m->regs);
     if (cur_mm == m) {
         cur_mm = NULL;

@@ -167,6 +167,14 @@ void sig_segv_fatal(uint64_t addr, uint64_t pc)
     sched_exit_signal(SIGSEGV_N);
 }
 
+void sig_bus_fatal(uint64_t addr, uint64_t pc)
+{
+    fflush(stdout);
+    fprintf(stderr, "xiaoji: bus error at 0x%llx (pc 0x%llx)\n", (unsigned long long)addr,
+            (unsigned long long)pc);
+    sched_exit_signal(SIGBUS_N);
+}
+
 static int ensure_trampoline(void)
 {
     if (cur_sig->tramp_va)
@@ -223,7 +231,7 @@ static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uin
     /* A signal that ends a rt_sigsuspend carries the mask from before the suspend. */
     put64(f + UC_SIGMASK_OFF, c->sig_suspended ? c->sig_saved : c->sig_mask);
     c->sig_suspended = 0;
-    put64(f + MC_OFF, (sync && sig == SIGSEGV_N) ? addr : 0);
+    put64(f + MC_OFF, (sync && (sig == SIGSEGV_N || sig == SIGBUS_N)) ? addr : 0);
     for (int i = 0; i < 31; i++)
         put64(f + MC_REGS_OFF + 8 * i, c->x[i]);
     put64(f + MC_SP_OFF, c->sp);

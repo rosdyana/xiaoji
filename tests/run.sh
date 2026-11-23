@@ -31,6 +31,7 @@ args_for() {
     args) echo "alpha beta" ;;
     mountns) echo "$ROOT/build/tests/mountns-work" ;; # absolute: a guest process starts in "/"
     fmeta) echo "$ROOT/build/tests/fmeta-work" ;;
+    lazymap) echo "$ROOT/build/tests/lazymap-work" ;;
     *) echo "" ;;
     esac
 }

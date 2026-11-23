@@ -186,6 +186,9 @@ int main(int argc, char **argv)
     stats_on = stats || (stats_env && stats_env[0] == '1');
     const char *logcat_env = getenv("XIAOJI_LOGCAT");
     logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
+    const char *window_env = getenv("XIAOJI_LAZY_WINDOW");
+    if (window_env && window_env[0])
+        mem_set_lazy_window((size_t)strtoul(window_env, NULL, 0));
     const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
     sig_set_debug_faults(faults_env && faults_env[0] == '1');
     stats_t0 = host_monotonic_ns();
