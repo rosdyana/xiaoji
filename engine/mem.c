@@ -87,6 +87,8 @@ static size_t lazy_window = 65536;
 /* Set when a faulting access hit a lazy page past the end of its file: the fault is then
  * SIGBUS, not SIGSEGV. Holds vpn + 1 of that page; 0 when none. */
 static uint64_t bus_vpn1;
+static uint8_t *lazy_buf;
+static size_t lazy_buf_cap;
 
 /* A region with no file or memfd behind it. Only these merge with neighbours. */
 static int reg_anon(const region_t *r) { return !r->path && !r->shm && !r->lazy; }
@@ -559,9 +561,18 @@ static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
     if (we > r->end)
         we = r->end;
     size_t want_len = (size_t)(we - wa);
-    uint8_t *buf = malloc(want_len);
-    if (!buf)
-        die_oom();
+    /* One reusable buffer: a fill is not reentrant (host_pread does not call back), and a
+     * malloc and free per fault costs more than the copy. */
+    if (want_len > lazy_buf_cap) {
+        free(lazy_buf);
+        lazy_buf = malloc(want_len);
+        if (!lazy_buf) {
+            lazy_buf_cap = 0;
+            die_oom();
+        }
+        lazy_buf_cap = want_len;
+    }
+    uint8_t *buf = lazy_buf;
     size_t got = 0;
     while (got < want_len) {
         int64_t k = host_pread(hfd, buf + got, want_len - got, roff + (wa - rstart) + got);
@@ -593,7 +604,6 @@ static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
         if (pv == vpn)
             result = pg;
     }
-    free(buf);
     if (!result)
         bus_vpn1 = vpn + 1;
     return result;
@@ -852,7 +862,8 @@ int mem_map_lazy(uint64_t va, uint64_t len, unsigned prot, const char *path, mfi
 {
     if (!range_ok(va, len) || !f)
         return -1;
-    mem_unmap(va, len); /* a new file mapping starts with no pages of its own */
+    if (!mem_range_free(va, len))
+        mem_unmap(va, len); /* a new file mapping starts with no pages of its own */
     reg_set(va, va + len, path, off, NULL, f);
     uint64_t first = va >> 12;
     uint64_t n = len >> 12;

@@ -199,6 +199,16 @@ int main(int argc, char **argv)
     report("sigbus past eof, unhandled kills", ok);
     fails += !ok;
 
+    /* mremap grow with MAYMOVE: the moved private page keeps its write, and the new tail reads the
+     * file at its own offset. */
+    u8 *grow = (u8 *)(u64)sys_mmap(0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    grow[7] = 0x33;
+    u8 *moved = (u8 *)(u64)sc6(216, (i64)(u64)grow, PAGE, 2 * PAGE, 1, 0, 0);
+    ok = (i64)(u64)moved > 0 && moved[7] == 0x33 && moved[PAGE + 9] == pattern(PAGE + 9);
+    report("mremap grow keeps the page and reads the tail", ok);
+    fails += !ok;
+    sys_munmap((u64)(u64)moved, 2 * PAGE);
+
     ok = sys_munmap((u64)(u64)shr, PRIV_LEN) == 0;
     report("munmap shared", ok);
     fails += !ok;
