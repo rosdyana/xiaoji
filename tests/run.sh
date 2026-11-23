@@ -30,7 +30,17 @@ args_for() {
     case "$1" in
     args) echo "alpha beta" ;;
     mountns) echo "$ROOT/build/tests/mountns-work" ;; # absolute: a guest process starts in "/"
+    fmeta) echo "$ROOT/build/tests/fmeta-work" ;;
     *) echo "" ;;
+    esac
+}
+
+# The native oracle's scratch directory. fmeta runs its chown and chmod on the builder VM's own filesystem:
+# the repository is a Mac mount there, which does not keep owners the way Linux does.
+oracle_args_for() {
+    case "$1" in
+    fmeta) echo "/tmp/xiaoji-fmeta-work" ;;
+    *) args_for "$1" ;;
     esac
 }
 
@@ -87,7 +97,7 @@ make_oracle() {
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
     # oracles run as root (passwordless sudo in the builder VM).
     local runas=""
-    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | creds-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | creds-* | fmeta-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -161,7 +171,7 @@ run_case() {
         fail=$((fail + 1))
         return
     fi
-    if ! make_oracle "$name" "$bin" "$args"; then
+    if ! make_oracle "$name" "$bin" "$(oracle_args_for "${name%-O?}")"; then
         echo "FAIL  $name (could not create the native oracle; is the builder VM running?)"
         fail=$((fail + 1))
         return
@@ -558,6 +568,35 @@ for runner in engine node; do
     fi
 done
 
+# Guest metadata persistence (B8): an owner set in one engine run is read back by a second run from the
+# sidecar (<root>/.xiaoji-meta). The file is made, given an owner, read in two later runs, and removed; after
+# the removal the sidecar has no record of it. Engine and Node. The guest file is in /data of $RFS.
+META_F=/data/xiaoji-meta-persist
+if [ -f "$RFS/system/bin/toybox" ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --root "$RFS" -- /system/bin/sh -c "rm -f $META_F; touch $META_F && chown 1234:4321 $META_F" >/dev/null 2>&1
+            got=$("$ENGINE" --root "$RFS" -- /system/bin/toybox ls -ln $META_F 2>/dev/null | awk '{print $3" "$4}')
+            "$ENGINE" --root "$RFS" -- /system/bin/toybox rm -f $META_F >/dev/null 2>&1
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --root "$RFS" -- /system/bin/sh -c "rm -f $META_F; touch $META_F && chown 1234:4321 $META_F" >/dev/null 2>&1
+            got=$(node "$NODE_JS" --root "$RFS" -- /system/bin/toybox ls -ln $META_F 2>/dev/null | awk '{print $3" "$4}')
+            node "$NODE_JS" --root "$RFS" -- /system/bin/toybox rm -f $META_F >/dev/null 2>&1
+        else
+            continue
+        fi
+        left=0
+        [ -f "$RFS/.xiaoji-meta" ] && left=$(grep -c "^$META_F	" "$RFS/.xiaoji-meta")
+        if [ "$got" = "1234 4321" ] && [ "$left" = 0 ]; then
+            echo "PASS  metadata persistence: owner read back by a second run, record dropped after removal $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  metadata persistence $runner (read '$got', records left $left)"
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 # Zygote (B4a, B4b, B4c), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc. The log must show
 # the class preload ("...preloaded N classes"), the fork of system_server (zygote's own
 # "System server process N has been created", B4b milestone c), system_server's entry ("Entered
@@ -576,6 +615,8 @@ done
 # docs/boot.md B7), both HALs register, and BatteryService receives the health HAL's first update. These are
 # the furthest deterministic points (3 of 3 runs); system_server then dies in SettingsProvider (B7, next blocker).
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
+    # A boot starts from a cleared /data and no /data records (B8, tools/reset-data.py), so it is deterministic.
+    python3 -I tools/reset-data.py "$RFS" >/dev/null || { echo "FAIL  reset-data $RFS"; fail=$((fail + 1)); }
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&

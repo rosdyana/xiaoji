@@ -15,6 +15,7 @@
 
 #include "host.h"
 #include "linux.h"
+#include "meta.h"
 #include "mntns.h"
 #include "binder.h"
 #include "goldfish.h"
@@ -332,6 +333,9 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
 
         if (!mcov && host_path_of(cand, hp, sizeof hp) < 0)
             return -LE_NAMETOOLONG;
+        /* The metadata sidecar (meta.c) is not a guest file: it does not exist for the guest. */
+        if (meta_hidden_guest(cand))
+            return -LE_NOENT;
         host_stat st;
         int rc = host_stat_path(hp, 0, &st);
         if (rc == -LE_NOENT && !last &&
@@ -973,7 +977,15 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         hfd = host_open(r.host, LO_RDONLY, 0);
     } else {
         kind = VFS_FILE;
-        hfd = host_open(r.host, lflags, mode);
+        /* The host mode of a new file is fixed (the guest's mode is kept in meta.c, not on the host). */
+        hfd = host_open(r.host, lflags, 0644);
+        if (hfd >= 0 && (lflags & LO_CREAT) && !r.exists) {
+            rc = meta_new(r.host, 0, mode, proc_cur()->umask);
+            if (rc) {
+                host_close(hfd);
+                return rc;
+            }
+        }
     }
     if (hfd < 0 && kind != VFS_PATH)
         return hfd;
@@ -984,6 +996,14 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
     f->guest = xstrdup(r.guest);
     f->host = xstrdup(r.host);
+    if (kind == VFS_FILE) {
+        host_stat id;
+        if (host_stat_fd(hfd, &id) == 0) {
+            f->has_id = 1;
+            f->hdev = id.dev;
+            f->hino = id.ino;
+        }
+    }
     slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
     return slot;
 }
@@ -1156,6 +1176,8 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     }
     if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
         return -LE_BADF;
+    if (f->has_id)
+        meta_write_privs(f->hdev, f->hino); /* a write clears setuid and setgid (meta.c) */
     return host_write(f->hfd, buf, n);
 }
 
@@ -1320,6 +1342,8 @@ int64_t vfs_getdents(int fd, uint8_t *buf, size_t cap)
                 return -host_linux_errno(errno);
             break;
         }
+        if (!strcmp(f->guest, "/") && (!strcmp(de->d_name, ".xiaoji-meta") || !strcmp(de->d_name, ".xiaoji-meta.tmp")))
+            continue; /* the metadata sidecar (meta.c) is hidden from the guest's root */
         size_t nl = strlen(de->d_name);
         size_t reclen = (19 + nl + 1 + 7) & ~(size_t)7;
         if (w + reclen > cap) {
@@ -1422,8 +1446,12 @@ int vfs_stat_res(const vfs_res *r, host_stat *out)
     /* A path that bind made a socket node: the placeholder file reports as a socket. */
     if (r->syn == SYN_NONE && sock_is_fsnode(r->guest))
         out->mode = (out->mode & ~(uint32_t)0170000) | 0140000;
-    out->uid = 0; /* the root-run oracle reports uid and gid 0 */
-    out->gid = 0;
+    if (r->syn == SYN_NONE) {
+        meta_apply_stat(out); /* the owner and mode from the guest metadata (meta.c) */
+    } else {
+        out->uid = 0;
+        out->gid = 0;
+    }
     return 0;
 }
 
@@ -1479,8 +1507,12 @@ int vfs_stat_fd(int fd, host_stat *out)
     }
     if (rc)
         return rc;
-    out->uid = 0;
-    out->gid = 0;
+    if (f->kind == VFS_SYN) {
+        out->uid = 0;
+        out->gid = 0;
+    } else {
+        meta_apply_stat(out);
+    }
     return 0;
 }
 
@@ -1570,6 +1602,16 @@ const uint8_t *vfs_cmdline_bytes(const fdtab_t *t, size_t *len)
     return t && t->cmdline ? t->cmdline : none;
 }
 
+/* The host stat of a descriptor's file (its fd, else its host path), or -EPERM for an fd with no host file. */
+static int desc_host_stat(const vfs_fd *f, host_stat *out)
+{
+    if (f->hfd >= 0)
+        return host_stat_fd(f->hfd, out);
+    if (f->host)
+        return host_stat_path(f->host, 1, out);
+    return -LE_PERM;
+}
+
 int vfs_fchmod(int fd, uint32_t mode)
 {
     vfs_fd *f = vfs_get(fd);
@@ -1577,9 +1619,23 @@ int vfs_fchmod(int fd, uint32_t mode)
         return -LE_BADF;
     if (f->kind == VFS_PIPE || f->kind == VFS_MEMFD)
         return 0;
-    if (f->hfd >= 0)
-        return host_fchmod(f->hfd, mode);
-    if (f->host)
-        return host_chmod(f->host, mode);
-    return -LE_PERM;
+    host_stat st;
+    int rc = desc_host_stat(f, &st);
+    if (rc)
+        return rc;
+    return meta_chmod(&st, mode);
+}
+
+int vfs_fchown(int fd, uint32_t uid, uint32_t gid)
+{
+    vfs_fd *f = vfs_get(fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind == VFS_PIPE || f->kind == VFS_MEMFD)
+        return 0;
+    host_stat st;
+    int rc = desc_host_stat(f, &st);
+    if (rc)
+        return rc;
+    return meta_chown(&st, uid, gid);
 }

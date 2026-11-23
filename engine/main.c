@@ -20,6 +20,7 @@ EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); 
 #include "init.h"
 #include "linux.h"
 #include "logd.h"
+#include "meta.h"
 #include "loader.h"
 #include "mem.h"
 #include "proc.h"
@@ -166,6 +167,14 @@ int main(int argc, char **argv)
     if (vfs_init(g_root, path, gargc, gargv) < 0) {
         fprintf(stderr, "xiaoji: root path too long\n");
         return 2;
+    }
+    /* With --root, the guest metadata of the writable trees is kept in the root (meta.c): loaded now, written at exit. */
+    if (root_given) {
+        if (meta_persist_open(g_root) < 0) {
+            fprintf(stderr, "xiaoji: root path too long\n");
+            return 2;
+        }
+        atexit(meta_persist_save);
     }
     /* The system properties: the guest's build.prop files, the engine's values, then --prop. */
     if (props_init((const char *const *)props, nprop) < 0) {

@@ -47,6 +47,8 @@ typedef struct {
     void *binder;    /* VFS_BINDER: the binder proc (binder.h); released with the description */
     void *obj;       /* VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL: the object (fdobj.h, poll.h); VFS_GOLDFISH: the pipe (goldfish.h) */
     uint64_t ino;    /* VFS_PIPE, VFS_SOCK: the inode, numbered at creation (both pipe ends share it) */
+    int has_id;      /* VFS_FILE: hdev and hino are the host inode (meta.h), set at open */
+    uint64_t hdev, hino;
 } vfs_fd;
 
 /* A descriptor: a slot in a process's fd table. The close-on-exec flag is per slot;
@@ -143,6 +145,7 @@ int vfs_stat_fd(int fd, host_stat *out);
 int vfs_stat_props(host_stat *out);
 /* chmod of an open file (pipes and memfds accept and ignore it). */
 int vfs_fchmod(int fd, uint32_t mode);
+int vfs_fchown(int fd, uint32_t uid, uint32_t gid);
 int vfs_statfs_fd(int fd, host_statfs *out);
 
 /* Descriptions, for passing an fd to another process (binder). vfs_desc_hold takes a

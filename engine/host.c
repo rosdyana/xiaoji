@@ -211,6 +211,12 @@ int host_rename(const char *from, const char *to)
     return rename(from, to) == 0 ? 0 : neg_errno();
 }
 
+/* A hard link. The caller resolves from (sysfs.c sys_linkat), so a final symlink is linked as it is unless the caller follows it. */
+int host_link(const char *from, const char *to)
+{
+    return link(from, to) == 0 ? 0 : neg_errno();
+}
+
 int host_fsync(int fd)
 {
     return fsync(fd) == 0 ? 0 : neg_errno();

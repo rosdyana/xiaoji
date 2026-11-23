@@ -13,6 +13,7 @@
 #include "poll.h"
 #include "host.h"
 #include "linux.h"
+#include "meta.h"
 #include "mem.h"
 #include "mntns.h"
 #include "pipe.h"
@@ -536,7 +537,10 @@ static int64_t sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t mode)
         return -LE_EXIST;
     if (r.syn != SYN_NONE)
         return -LE_PERM;
-    return host_mkdir(r.host, (uint32_t)mode & ~proc_cur()->umask);
+    rc = host_mkdir(r.host, 0755); /* the host mode is fixed; the guest mode is recorded (meta.c) */
+    if (rc)
+        return rc;
+    return meta_new(r.host, 1, (uint32_t)mode, proc_cur()->umask);
 }
 
 static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
@@ -596,6 +600,41 @@ static int64_t sys_renameat(uint64_t odfd, uint64_t a1, uint64_t ndfd, uint64_t 
     return host_rename(rf.host, rt.host);
 }
 
+/* linkat (37): a hard link to a file that is not a directory. The new name must not exist. The record of the
+ * file (meta.c) is the same for every name, since it is keyed by the host inode. AT_SYMLINK_FOLLOW (0x400) follows
+ * a final symlink of the old name; without it the link itself is linked. */
+static int64_t sys_linkat(uint64_t odfd, uint64_t a1, uint64_t ndfd, uint64_t a3, uint64_t flags)
+{
+    static char from[VFS_PATH_MAX], to[VFS_PATH_MAX];
+    static vfs_res rf, rt;
+    if (flags & ~(uint64_t)0x400)
+        return -LE_INVAL;
+    int rc = get_path(a1, from, sizeof from);
+    if (rc)
+        return rc;
+    rc = get_path(a3, to, sizeof to);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(odfd), from, (flags & 0x400) != 0, &rf);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(ndfd), to, 0, &rt);
+    if (rc)
+        return rc;
+    if (!rf.exists && !rf.is_link)
+        return -LE_NOENT;
+    if (rt.exists || rt.is_link)
+        return -LE_EXIST;
+    if (rf.ro || rt.ro)
+        return -LE_ROFS;
+    if (rf.syn != SYN_NONE || rt.syn != SYN_NONE)
+        return -LE_PERM;
+    host_stat st;
+    if (host_stat_path(rf.host, 0, &st) == 0 && (st.mode & LS_IFMT) == LS_IFDIR)
+        return -LE_PERM;
+    return host_link(rf.host, rt.host);
+}
+
 /* fsync and fdatasync: a host file is synced; a memfd or a directory has nothing to sync (0); other
  * descriptors (pipes, sockets, eventfds, epoll) are EINVAL, as on Linux. */
 static int64_t sys_fsync(uint64_t fd)
@@ -610,9 +649,10 @@ static int64_t sys_fsync(uint64_t fd)
     return -LE_INVAL;
 }
 
-/* Ownership is not modelled. stat reports uid and gid 0 for every file, so a chown names an existing
- * file (or descriptor) and changes nothing. (capget and capset are in cred.c.) */
-static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t flags)
+/* fchownat (54): the owner and group go to the guest metadata (meta.c), with the Linux permission rules. -1 for an
+ * id changes nothing. AT_SYMLINK_NOFOLLOW (0x100) changes a final link itself. A synthetic file takes no record and
+ * the call is accepted. (capget and capset are in cred.c.) */
+static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t uid, uint64_t gid, uint64_t flags)
 {
     static char path[VFS_PATH_MAX];
     static vfs_res r;
@@ -622,7 +662,17 @@ static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t flags)
     rc = vfs_resolve(dirfd_of(a0), path, (flags & 0x100) == 0, &r);
     if (rc)
         return rc;
-    return r.exists || r.is_link ? 0 : -LE_NOENT;
+    if (!r.exists && !r.is_link)
+        return -LE_NOENT;
+    if (r.syn != SYN_NONE)
+        return 0;
+    if (r.ro)
+        return -LE_ROFS;
+    host_stat st;
+    rc = host_stat_path(r.host, 0, &st);
+    if (rc)
+        return rc;
+    return meta_chown(&st, (uint32_t)uid, (uint32_t)gid);
 }
 
 /* mount(source, target, type, flags, data) and umount2(target, flags), in the process's mount
@@ -777,7 +827,11 @@ static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
         return -LE_PERM;
     if (r.ro)
         return -LE_ROFS;
-    return host_chmod(r.host, (uint32_t)mode);
+    host_stat st;
+    rc = host_stat_path(r.host, 1, &st);
+    if (rc)
+        return rc;
+    return meta_chmod(&st, (uint32_t)mode);
 }
 
 /* Extended attributes (xattr.h, B7). A path form names the file by its resolved guest path; an fd form by the
@@ -1174,6 +1228,7 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_MKDIRAT: *ret = sys_mkdirat(a[0], a[1], a[2]); return 1;
     case SYS_UNLINKAT: *ret = sys_unlinkat(a[0], a[1], a[2]); return 1;
     case SYS_RENAMEAT: *ret = sys_renameat(a[0], a[1], a[2], a[3], 0); return 1;
+    case 37: /* linkat */ *ret = sys_linkat(a[0], a[1], a[2], a[3], a[4]); return 1;
     case SYS_RENAMEAT2: *ret = sys_renameat(a[0], a[1], a[2], a[3], a[4]); return 1;
     case SYS_FSYNC:
     case SYS_FDATASYNC: *ret = sys_fsync(a[0]); return 1;
@@ -1192,8 +1247,8 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case 14: /* removexattr */ *ret = xattr_path_call(a[0], 1, XA_REMOVE, a[1], 0, 0, 0); return 1;
     case 15: /* lremovexattr */ *ret = xattr_path_call(a[0], 0, XA_REMOVE, a[1], 0, 0, 0); return 1;
     case 16: /* fremovexattr */ *ret = xattr_fd_call(a[0], XA_REMOVE, a[1], 0, 0, 0); return 1;
-    case 54: /* fchownat */ *ret = sys_fchownat(a[0], a[1], a[4]); return 1;
-    case 55: /* fchown */ *ret = vfs_get((int)(int32_t)a[0]) ? 0 : -LE_BADF; return 1;
+    case 54: /* fchownat */ *ret = sys_fchownat(a[0], a[1], a[2], a[3], a[4]); return 1;
+    case 55: /* fchown */ *ret = vfs_fchown((int)(int32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]); return 1;
     case 40: /* mount */ *ret = sys_mount(a[0], a[1], a[2], a[3]); return 1;
     case 39: /* umount2 */ *ret = sys_umount2(a[0], a[1]); return 1;
     case 283: /* membarrier */ *ret = sys_membarrier(a[0], a[1]); return 1;

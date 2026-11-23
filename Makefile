@@ -26,7 +26,7 @@ GL_SPECS := $(wildcard third_party/gfxstream/*/*)
 build/gen/gen_report.txt: tools/gen-glproto.py $(GL_SPECS)
 	python3 -I tools/gen-glproto.py third_party/gfxstream build/gen
 
-.PHONY: all engine wasm wasm-node guest-tests test test-web serve image oracle clean help
+.PHONY: all engine wasm wasm-node guest-tests test test-web serve image oracle clean reset-data help
 
 all: engine     ## default: native engine
 
@@ -101,6 +101,9 @@ build/hello/classes.dex: tests/hello/Hello.java build/tools/r8.jar   ## test pro
 build/rootfs/data/hello.dex: build/hello/classes.dex   ## the test dex, where the guest's /data/hello.dex is read
 	@mkdir -p build/rootfs/data
 	cp $< $@
+
+reset-data:     ## clear the product tree's data/ and its metadata records (B8) -> build/rootfs-xiaoji
+	python3 -I tools/reset-data.py build/rootfs-xiaoji
 
 clean:          ## remove engine builds (keeps build/rootfs and build/image)
 	rm -rf build/xiaoji build/wasm build/wasm-node build/web build/tests build/hello
