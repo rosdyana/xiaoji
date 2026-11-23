@@ -175,8 +175,9 @@ $('boot').addEventListener('click', () => {
   };
   // ?trace records the boot's file access (web/trace.js) for docs/loading.md; off by default.
   const params = new URLSearchParams(location.search);
-  // ?boot=pack loads the chunk store and boot packs (web/chunks.js, docs/loading.md); the default is the manifest.
-  const mode = params.get('boot') === 'pack' ? 'pack' : 'manifest';
+  // The chunk store and boot packs (web/chunks.js, docs/loading.md) are the default. ?boot=manifest is the
+  // lazy-file manifest path, kept until the pack path has run for a while.
+  const mode = params.get('boot') === 'manifest' ? 'manifest' : 'pack';
   worker.postMessage({
     type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
     noPacks: params.has('nopack'),

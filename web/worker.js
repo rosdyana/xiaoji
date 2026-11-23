@@ -174,7 +174,6 @@ async function runBoot(base, opts) {
   const t0 = now();
   const traceOn = !!(opts && opts.trace);
   let trace = null;
-  let firstInsnWall = null;
   let firstLogWall = null;
   let packsWall = null;
   let tracePosted = false;
@@ -185,7 +184,6 @@ async function runBoot(base, opts) {
       when,
       wall: now() - t0,
       firstLogWall,
-      firstInsnWall,
       packsWall,
       sync: { ...sync },
       store: store ? store.stats : null,
@@ -198,7 +196,6 @@ async function runBoot(base, opts) {
       type: 'trace',
       when,
       wall: now() - t0,
-      firstInsnWall,
       firstLogWall,
       sync: { ...sync },
       access: trace.summary(),
@@ -257,9 +254,6 @@ async function runBoot(base, opts) {
   const Module = await createXiaoji({
     print: (line) => post({ type: 'out', text: line }),
     printErr: onLine,
-    onRunStart: () => {
-      if (firstInsnWall === null) firstInsnWall = now() - t0;
-    },
   });
   if (packsLoading) {
     await packsLoading;

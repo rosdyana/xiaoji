@@ -104,6 +104,11 @@ async function runBoot(chromium, baseUrl) {
       null,
       { timeout: BOOT_TIMEOUT_MS, polling: 500 },
     );
+    // The stats follow the milestone; wait for them, then read the state.
+    await page.waitForFunction(() => window.xb.stats !== undefined || window.xb.status === 'done', null, {
+      timeout: 60000,
+      polling: 100,
+    }).catch(() => {});
     // The worker is still running here if the log streamed: the milestone arrived before the engine stopped.
     const streaming = await page.evaluate(() => window.xb.status === 'running' || window.xb.status === 'loading');
     const xb = await page.evaluate(() => window.xb);
@@ -115,7 +120,10 @@ async function runBoot(chromium, baseUrl) {
       console.log(`    milestone ${ms.label}: wall ${(ms.wall / 1000).toFixed(2)} s, ${s}`);
     }
     if (xb.fetch) console.log(`    fetch: ${JSON.stringify(xb.fetch)}`);
+    const st = xb.stats ? xb.stats.store : null;
+    if (st) console.log(`    packs: ${st.packs} (${st.packDownloads} downloaded, ${st.packChunks} chunks), sync fetches: ${st.syncFetches}`);
     check(xb.milestones.phase100 !== undefined, 'boot: reaches "Starting phase 100"');
+    check(st !== null && st.packChunks > 0, 'boot: the chunk store served the boot from its boot packs');
     for (const id of BOOT_REQUIRED) {
       check(reached.includes(id), `boot: milestone ${id} reached`);
     }

@@ -42,7 +42,24 @@ function args(argv) {
 async function main() {
   const o = args(process.argv.slice(2));
   const { chromium } = await import(pathToFileURL(PW).href);
-  const srv = await startServer({ port: o.port, log: () => {}, throttle: { mbps: o.throttleMbps, rttMs: o.rttMs } });
+  // Every response the server sends is tallied from its log line (web/serve.mjs): bytes of GET bodies by
+  // kind (chunks, packs, other), GET and HEAD requests. Cache Storage hits never reach the server.
+  const wire = { bytes: 0, gets: 0, heads: 0, byKind: { chunks: 0, packs: 0, other: 0 } };
+  const log = (line) => {
+    const m = /^(\d{3}) (GET|HEAD) (\S+) (.*)$/.exec(line);
+    if (!m || m[1][0] !== '2') return;
+    if (m[2] === 'HEAD') {
+      wire.heads++;
+      return;
+    }
+    const n = m[1] === '206' ? Number(m[4].split('-')[1]) - Number(m[4].split('-')[0]) + 1 : Number(m[4]);
+    const kind = m[3].startsWith('/xj/chunks/') ? 'chunks' : m[3].startsWith('/xj/packs/') ? 'packs' : 'other';
+    if (process.env.XN_LOG_GETS) console.log(`    ${line}`);
+    wire.gets++;
+    wire.bytes += n;
+    wire.byKind[kind] += n;
+  };
+  const srv = await startServer({ port: o.port, log, throttle: { mbps: o.throttleMbps, rttMs: o.rttMs } });
   const profile = o.profile ?? mkdtempSync(join(tmpdir(), 'xj-bench-'));
   const t0 = Date.now();
   const browser = await chromium.launchPersistentContext(profile, { headless: true });
@@ -57,10 +74,12 @@ async function main() {
       null,
       { timeout: o.timeoutMs, polling: 250 },
     );
-    // The trace is posted from the worker at phase 100; give it a moment to arrive, then read the state.
-    await page.waitForFunction((wantTrace) => !wantTrace || window.xb.trace !== undefined || window.xb.status === 'done',
-      o.trace, { timeout: 60000, polling: 250 }).catch(() => {});
+    // The stats and the trace are posted from the worker at phase 100; give them a moment to arrive.
+    await page.waitForFunction((wantTrace) => (window.xb.stats !== undefined && (!wantTrace || window.xb.trace !== undefined))
+      || window.xb.status === 'done', o.trace, { timeout: 60000, polling: 250 }).catch(() => {});
     const xb = await page.evaluate(() => window.xb);
+    // The boot runs on after phase 100 until Stop. The numbers are taken here, at phase 100, like the stats.
+    const wireAt100 = JSON.parse(JSON.stringify(wire));
     await page.click('#stop').catch(() => {});
     const result = {
       query: o.query || (o.trace ? '?trace' : ''),
@@ -71,6 +90,7 @@ async function main() {
       milestones: xb.milestones,
       fetch: xb.fetch,
       stats: xb.stats ?? null,
+      wire: wireAt100,
       trace: xb.trace ?? null,
     };
     writeFileSync(o.out, JSON.stringify(result));
@@ -78,7 +98,7 @@ async function main() {
     console.log(
       `status ${xb.status}; phase100 wall ${p100 ? (p100.wall / 1000).toFixed(2) : 'n/a'} s, ` +
         `engine ${p100 && p100.stamp ? (p100.stamp.ms / 1000).toFixed(2) : 'n/a'} s; ` +
-        `fetch ${JSON.stringify(xb.fetch)}; stats ${xb.stats ? JSON.stringify({ sync: xb.stats.sync, store: xb.stats.store }) : 'n/a'}; -> ${o.out}`,
+        `wire ${JSON.stringify(wireAt100)}; stats ${xb.stats ? JSON.stringify({ sync: xb.stats.sync, store: xb.stats.store }) : 'n/a'}; -> ${o.out}`,
     );
   } finally {
     await browser.close();

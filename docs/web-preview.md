@@ -111,8 +111,9 @@ worker was still running). Then it presses **Stop**. Without `XIAOJI_WEB_BOOT=1`
 ## Known limits
 
 - **No screen.** Graphics use the null backend (`engine/gl_null.c`).
-- **Everything is fetched over localhost**, from `build/rootfs-xiaoji` through `web/serve.mjs`, with no caching
-  (`Cache-Control: no-store`).
+- **Everything is fetched over localhost**, from `build/rootfs-xiaoji` through `web/serve.mjs`. The default page
+  now loads the tree from a chunk store and boot packs, with a per-chunk cache (`docs/loading.md`); `?boot=manifest`
+  is the old lazy-file path, which has no caching (`Cache-Control: no-store`).
 - **State is lost on reload.** `/data`, `/cache`, `/metadata` and the rest of the writable state are in MEMFS, and
   the metadata sidecar is not kept. A new run always starts from an empty `/data`.
 - **No input.** The page sends nothing to the guest. It can start and stop a boot.

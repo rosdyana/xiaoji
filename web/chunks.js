@@ -9,7 +9,7 @@
 // and the packer are in tools/pack.py. Every pack chunk is hashed as it is decoded.
 import { inflateZlib } from './inflate.js';
 
-export const PACK_CACHE = 'xiaoji-packs-v1';
+export const CHUNK_CACHE = 'xiaoji-chunks-v1';
 const now = () => performance.now();
 
 async function sha256Id(bytes) {
@@ -27,6 +27,16 @@ async function inflateNative(bytes, rawLen) {
   return out;
 }
 
+// The cache is an optimization: when Cache Storage is missing or fails, the page fetches as if it were empty.
+async function openCache() {
+  if (typeof caches === 'undefined') return null;
+  try {
+    return await caches.open(CHUNK_CACHE);
+  } catch {
+    return null;
+  }
+}
+
 export class ChunkStore {
   // base: URL of the chunk store directory (ends in '/'); chunkSize: from the manifest.
   constructor(base, chunkSize) {
@@ -34,52 +44,77 @@ export class ChunkStore {
     this.chunkSize = chunkSize;
     this.mem = new Map(); // id -> raw Uint8Array
     this.stats = {
-      packs: 0, packBytes: 0, packNetBytes: 0, packCacheHits: 0, packChunks: 0, packMs: 0, packCpuMs: 0,
+      packs: 0, packDownloads: 0, packBytes: 0, packNetBytes: 0, packChunks: 0, packMs: 0, packCpuMs: 0,
+      chunkCacheHits: 0, chunkCachePuts: 0,
       syncFetches: 0, syncBytes: 0, syncFetchMs: 0, syncDecodeMs: 0,
     };
   }
 
-  // Async, before the engine runs: fetches the packs (in parallel, from Cache Storage when the pack
-  // was fetched before), verifies and decodes every chunk into memory.
+  chunkUrl(id) {
+    return this.base + 'chunks/' + id + '.z';
+  }
+
+  // Async, before the engine runs. Each chunk is cached under its own hash (the URL of chunks/<id>.z), so a
+  // pack is downloaded only when one of its chunks is not cached: when a build changes a chunk, the packs
+  // after it shift, but their chunks are still cached, and only the pack with the new chunk is downloaded.
   async loadPacks(packs) {
     const t0 = now();
-    const urls = packs.map((p) => this.base + p.file);
-    const cache = typeof caches !== 'undefined' ? await caches.open(PACK_CACHE) : null;
+    const cache = await openCache();
     if (cache) {
-      // Packs are named by their hash; the ones this build does not list are stale.
-      const keep = new Set(urls);
-      for (const req of await cache.keys()) if (!keep.has(req.url)) await cache.delete(req);
+      const keep = new Set();
+      for (const p of packs) for (const [id] of p.chunks) keep.add(this.chunkUrl(id));
+      try {
+        for (const req of await cache.keys()) if (!keep.has(req.url)) await cache.delete(req);
+      } catch {
+        // a stale entry is harmless
+      }
     }
     this.stats.packs = packs.length;
-    await Promise.all(packs.map((p, i) => this.loadPack(p, urls[i], cache)));
+    await Promise.all(packs.map((p) => this.loadPack(p, cache)));
     this.stats.packMs = now() - t0;
   }
 
-  async loadPack(pack, url, cache) {
-    let res = cache ? await cache.match(url) : undefined;
-    let net = 0;
-    if (res) {
-      this.stats.packCacheHits++;
-    } else {
-      res = await fetch(url);
+  async loadPack(pack, cache) {
+    const have = cache
+      ? await Promise.all(pack.chunks.map(([id]) => cache.match(this.chunkUrl(id)).catch(() => undefined)))
+      : null;
+    const cached = have ? have.filter(Boolean).length : 0;
+    this.stats.chunkCacheHits += cached;
+    let buf = null;
+    if (!have || cached < pack.chunks.length) {
+      const res = await fetch(this.base + pack.file);
       if (!res.ok) throw new Error(`pack ${pack.file}: HTTP ${res.status}`);
-      if (cache) await cache.put(url, res.clone());
-      net = 1;
+      buf = new Uint8Array(await res.arrayBuffer());
+      if (buf.length !== pack.bytes) {
+        throw new Error(`pack ${pack.file}: ${buf.length} bytes, the manifest says ${pack.bytes}`);
+      }
+      this.stats.packDownloads++;
+      this.stats.packBytes += buf.length;
+      this.stats.packNetBytes += buf.length;
     }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (buf.length !== pack.bytes) {
-      throw new Error(`pack ${pack.file}: ${buf.length} bytes, the manifest says ${pack.bytes}`);
-    }
-    this.stats.packBytes += buf.length;
-    if (net) this.stats.packNetBytes += buf.length;
+    const puts = [];
     const t0 = now();
-    for (const [id, off, len, raw] of pack.chunks) {
-      const data = await inflateNative(buf.subarray(off, off + len), raw);
+    for (let i = 0; i < pack.chunks.length; i++) {
+      const [id, off, len, raw] = pack.chunks[i];
+      let z;
+      if (buf) {
+        z = buf.subarray(off, off + len);
+        if (cache && !(have && have[i])) {
+          puts.push(cache.put(this.chunkUrl(id), new Response(z.slice())).then(
+            () => this.stats.chunkCachePuts++,
+            () => {},
+          ));
+        }
+      } else {
+        z = new Uint8Array(await have[i].arrayBuffer());
+      }
+      const data = await inflateNative(z, raw);
       if ((await sha256Id(data)) !== id) throw new Error(`pack ${pack.file}: chunk ${id} does not verify`);
       this.mem.set(id, data);
       this.stats.packChunks++;
     }
     this.stats.packCpuMs += now() - t0;
+    await Promise.all(puts); // the puts finish before the engine starts: it never yields
   }
 
   // Synchronous, from the engine's reads: the chunk from memory, else fetched and decoded now.
