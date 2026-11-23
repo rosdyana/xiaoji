@@ -7,8 +7,10 @@
 #include "cpu_a64.h"
 
 #define SIGILL_N 4
+#define SIGBUS_N 7
 #define SIGSEGV_N 11
 #define ILL_ILLOPC 1 /* si_code for SIGILL */
+#define BUS_ADRERR 2 /* si_code for SIGBUS: a file-backed page past the end of its file */
 
 /* Per-process handler tables. sig_tab_switch makes t the running table. */
 typedef struct sigtab sigtab_t;
@@ -61,6 +63,8 @@ int sig_debug_faults(void);
 
 /* The default SIGSEGV action: message and exit 139. */
 void sig_segv_fatal(uint64_t addr, uint64_t pc);
+/* The default SIGBUS action: message and death by SIGBUS. */
+void sig_bus_fatal(uint64_t addr, uint64_t pc);
 
 /* Timers (timers.c): a timer's signal to process p (tid 0) or to thread tid of p; 0, or -1 for no target.
  * sig_timer_pending says whether sig is already pending on that target. */

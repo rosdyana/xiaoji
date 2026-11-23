@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "filecache.h"
 #include "mem.h"
 #include "selinuxfs.h"
 #include "signals.h"
@@ -154,6 +155,7 @@ proc_t *proc_find(int pid)
 void proc_release(proc_t *p)
 {
     cgroupfs_proc_exit(p);
+    fc_flush_all(); /* a process's stores to shared file views reach the files when it exits */
     if (p->mm) {
         uint64_t rss = mem_mm_rss_kib(p->mm);
         if (rss > p->maxrss_kib)

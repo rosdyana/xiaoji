@@ -18,6 +18,7 @@
 /* Fault codes, the Linux si_code values for SIGSEGV. */
 #define MEM_FAULT_MAPERR 1 /* SEGV_MAPERR: no mapping at the address */
 #define MEM_FAULT_ACCERR 2 /* SEGV_ACCERR: mapped, but the access is not allowed */
+#define MEM_FAULT_BUS 3    /* SIGBUS BUS_ADRERR: a file-backed page wholly past the end of its file */
 /* The top byte of a guest address is an ignored tag; Linux reports addresses without it. */
 #define MEM_UNTAG_MASK 0x00FFFFFFFFFFFFFFull
 
@@ -49,6 +50,10 @@ int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint6
  * are m's own pages, so every view of the same memfd sees the same bytes. Any
  * existing mapping in the range is replaced. Returns 0 or -1. */
 int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_t off);
+/* Sets the size of a file cache memfd (filecache.c) in every address space: the pages of
+ * its views wholly past size stop being mapped (an access raises SIGBUS), and pages that
+ * come back into the size are mapped again. Called after the memfd's size changes. */
+void mem_shm_resize(memfd_t *m, uint64_t size);
 /* The memfd backing the region that contains va, or NULL. *start and *off are
  * the region start and its file offset at that start. */
 memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off);

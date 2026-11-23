@@ -24,6 +24,19 @@ uint64_t memfd_size(const memfd_t *m);
 /* Sets the size. Shrinking zeroes the discarded bytes. Returns 0 or -1 (out of memory). */
 int memfd_truncate(memfd_t *m, uint64_t size);
 
+/* Marks m as the cache of a host file (filecache.c). on_free runs when the last
+ * reference goes, before the pages are freed, so the file can be written back. */
+void memfd_set_file(memfd_t *m, void (*on_free)(memfd_t *m, void *ctx), void *ctx);
+int memfd_is_file(const memfd_t *m);
+int memfd_refs(const memfd_t *m);
+
+/* A file cache's pages are filled on first use (filecache.c): fill runs when a page is materialised (memfd_page,
+ * and so memfd_pread and memfd_pwrite on it), with the page zeroed; it writes the file's bytes into the page. The
+ * ctx is the one memfd_set_file was given. Without a fill, a page that was never materialised reads as zeros. */
+void memfd_set_fill(memfd_t *m, void (*fill)(memfd_t *m, uint64_t idx, uint8_t *page, void *ctx));
+/* Whether page idx has been materialised (a host page exists for it). */
+int memfd_materialized(const memfd_t *m, uint64_t idx);
+
 /* Host page for file page idx, allocated and zeroed if needed. The page stays
  * valid until the memfd is freed. NULL if out of memory. */
 uint8_t *memfd_page(memfd_t *m, uint64_t idx);

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "filecache.h"
 #include "host.h"
 #include "linux.h"
 #include "locks.h"
@@ -1055,6 +1056,8 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
             f->has_id = 1;
             f->hdev = id.dev;
             f->hino = id.ino;
+            if (lflags & LO_TRUNC)
+                fc_truncate(id.dev, id.ino, 0);
         }
     }
     slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
@@ -1119,6 +1122,20 @@ static int64_t syn_read(vfs_fd *f, void *buf, size_t n, uint64_t off, int use_of
     }
 }
 
+/* read and pread of a file with a live shared cache (filecache.c): the bytes come from the
+ * cache, which holds the views' stores that are not yet written back. The host fd's
+ * position is the file position, so it moves with the read. */
+static int64_t cached_read(vfs_fd *f, memfd_t *c, void *buf, size_t n)
+{
+    int64_t pos = host_lseek(f->hfd, 0, SEEK_CUR);
+    if (pos < 0)
+        return pos;
+    int64_t r = memfd_pread(c, buf, n, (uint64_t)pos);
+    if (r > 0)
+        host_lseek(f->hfd, pos + r, SEEK_SET);
+    return r;
+}
+
 int64_t vfs_read(int fd, void *buf, size_t n)
 {
     vfs_fd *f = vfs_get(fd);
@@ -1149,6 +1166,9 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
         return -LE_BADF;
+    memfd_t *c = f->has_id ? fc_lookup(f->hdev, f->hino) : NULL;
+    if (c)
+        return cached_read(f, c, buf, n);
     return host_read(f->hfd, buf, n);
 }
 
@@ -1174,6 +1194,9 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
         return -LE_BADF;
+    memfd_t *c = f->has_id ? fc_lookup(f->hdev, f->hino) : NULL;
+    if (c)
+        return memfd_pread(c, buf, n, off);
     return host_pread(f->hfd, buf, n, off);
 }
 
@@ -1239,7 +1262,13 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
         return -LE_BADF;
     if (f->has_id)
         meta_write_privs(f->hdev, f->hino); /* a write clears setuid and setgid (meta.c) */
-    return host_write(f->hfd, buf, n);
+    int64_t r = host_write(f->hfd, buf, n);
+    if (r > 0 && f->has_id && fc_lookup(f->hdev, f->hino)) {
+        int64_t end = host_lseek(f->hfd, 0, SEEK_CUR);
+        if (end >= r)
+            fc_patch(f->hdev, f->hino, buf, (size_t)r, (uint64_t)(end - r));
+    }
+    return r;
 }
 
 int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
@@ -1275,6 +1304,14 @@ int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
         return -LE_BADF;
     if (f->has_id)
         meta_write_privs(f->hdev, f->hino);
+    if (f->has_id && fc_lookup(f->hdev, f->hino)) {
+        /* O_APPEND writes at the end, as on the host: the cache's size is the host's. */
+        uint64_t at = (f->lflags & LO_APPEND) ? memfd_size(fc_lookup(f->hdev, f->hino)) : off;
+        int64_t r = host_pwrite(f->hfd, buf, n, off);
+        if (r > 0)
+            fc_patch(f->hdev, f->hino, buf, (size_t)r, at);
+        return r;
+    }
     return host_pwrite(f->hfd, buf, n, off);
 }
 

@@ -3729,3 +3729,239 @@ straddle that change, so the timing-dependent product boot check was run once; i
 - NETLINK_ROUTE (checkpoint 3): not started.
 - The `getOemNetd`, `clatd*`, and `ipSec*` methods are unsupported: their callers are IPv6-only networks, IPsec apps, and OEM
   code; none reached in the boot.
+
+## B13: the audio HAL (null sink), the shared page cache for MAP_SHARED, and the boot past System now ready (stops at the zygote's data mirror)
+
+Status: **partial.** Audio is up: the XiaoJi HAL registers, `audioserver` loads the primary module, `media.audio_policy`
+comes up, and `AudioService` completes (in B12 the watchdog killed system_server in it). The SQLite `-shm` failure is gone:
+`LockSettingsService` maps the file writable and starts (184 ms). In the product boot, `ActivityManager` reports
+**System now ready** (102 s). `sys.boot_completed=1` and the launcher are **not** reached: zygote's app specialization for
+`com.android.permissioncontroller` aborts on a data mirror mount, and the watchdog then kills system_server (next blocker,
+below).
+
+**Decision for the user: the page cache's memory (measured).** The first cache version loaded a host file's whole contents
+at its first `MAP_SHARED` mapping. Peak RSS of `hello-int` (ART, Google image, `build/rootfs`), one alternating pair: 132 MiB
+without the cache (`git HEAD`), 163 MiB with it. The cache now fills each page from the host file on first use. Three
+alternating pairs after that change: without the cache 159, 210 and 190 MiB; with it 156, 226 and 190 MiB. The same binary
+varies by about 70 MiB between runs, so the lazy version shows no regression I can measure, and the whole-file version cost
+about 30 MiB on that one pair. Not measured: the web snapshot (the 180 MB fetched by `make test-web` was not compared with a
+baseline build). Recommendation: keep the lazy fill. If the snapshot size matters, the choice is between this cache for
+every `MAP_SHARED` (the spec) and w1's lazy windows for read-only file views; that is the user's call.
+
+### The audio HAL (`device/xiaoji/audio`, mirrored in `aosp/device/xiaoji/audio`)
+
+The decision in B12 was a device-local HAL. What is in the tree:
+
+- **Sources.** The HIDL 7.0 implementation of `device/generic/goldfish/audio` (the ranchu HAL: entry, device factory,
+  primary device, streams, io thread, ring buffer, ports), copied as they are except the points below. The backend
+  `talsa.cpp`/`talsa.h` (tinyalsa over the goldfish device) is replaced by a null PCM with the same functions: a write is
+  paced to the sample rate (it sleeps for the frames' duration) and discarded; a read is paced and returns silence. The
+  HAL has no mixer. Writes to `/dev/xiaoji_audio` are **not** done: output is discarded (the plan allowed this).
+- **Device factory.** The ranchu factory dlopens the legacy ranchu library and asserts it (`Assertion failed: !mLegacyLib`,
+  the boot's first HAL abort). This product has one module, the primary one, so the legacy loader is removed; other modules
+  get `INVALID_ARGUMENTS`.
+- **Service** (`service/xiaoji_audio_hal.cpp`, binary `xiaoji_audio_hal`, `/vendor/bin/hw/xiaoji_audio_hal`). The stock
+  service main (`hardware/interfaces/audio/common/all-versions/default/service/service.cpp`) starts the vndbinder thread
+  pool before `ABinderProcess_setThreadPoolMaxThreadCount(1)`, and libbinder aborts on that order. This service has no
+  vndbinder (every HAL it serves is HIDL), so the path is not there. It registers, as the stock service does: Audio Core
+  `IDevicesFactory` 7.1 then 7.0 (7.0 is the one built), Audio Effect `IEffectsFactory` 7.0 (the product's passthrough
+  library), and the optional Soundtrigger family 2.3 to 2.0 (2.2 is the one present). The soundtrigger part is needed:
+  the framework's `SoundTriggerMiddlewareService` connects to `ISoundTriggerHw` on the main thread at boot with no timeout.
+- **Policy** (`audio_policy_configuration.xml`, copied to `/vendor/etc` in place of the goldfish file). One module,
+  `primary`: `Speaker` (output, `primary output`, 48 kHz stereo PCM 16) and `Built-In Mic` (input, `primary input`). The
+  goldfish configuration's a2dp, remote-submix, Bluetooth, telephony and FM ports are left out. The volume tables are the
+  framework's (`audio_policy_volumes.xml`, `default_volume_tables.xml`, as the goldfish configuration includes them).
+- **Product** (`aosp/device/xiaoji/xiaoji_vendor.mk`): `PRODUCT_PACKAGES` gets `xiaoji_audio_hal` and
+  `android.hardware.audio@7.0-impl.xiaoji` (a vintf fragment with the same HAL line as ranchu's). The ranchu audio HAL, its
+  legacy library and the stock `android.hardware.audio.service` are no longer in `PRODUCT_PACKAGES`, so the product does not
+  install them (checked in `build/rootfs-xiaoji`: no ranchu audio library, and `vendor/bin/hw` has only `xiaoji_audio_hal`).
+  The effects library and the goldfish soundtrigger library stay.
+- **rc** (`image/xiaoji.rc`): `service audioserver /system/bin/audioserver` (the stock block; the group `mediadrm` is
+  `media_drm` in `engine/ids_gen.h`) and `service vendor.audio-hal /vendor/bin/hw/xiaoji_audio_hal` (`class hal`, the stock
+  groups, with `interface` lines for the audio and effects factories, so hwservicemanager can map them to the service).
+
+**Checked in the rootfs and the boot:** `build/rootfs-xiaoji` has `vendor/bin/hw/xiaoji_audio_hal`,
+`vendor/lib64/hw/android.hardware.audio@7.0-impl.xiaoji.so`, `vendor/etc/audio_policy_configuration.xml` (ours), and no ranchu
+audio library. The remote product build (`tools/remote-build.sh`, `m -j20`, `xiaoji_arm64-userdebug`) exits 0; the
+rootfs was refreshed with `tools/fetch-remote-rootfs.sh` (defaults, linkerconfig regenerated) after the last source change.
+
+### Other framework blockers met on the way (each one a product or engine fix)
+
+| Blocker (seen in the boot) | Fix | Where |
+|---|---|---|
+| `Could not find ...IDevicesFactory/default for ctl.interface_start` (no lazy start) | `interface` lines in the HAL block | `image/xiaoji.rc` |
+| `F/android.hardware.audio@7.0-impl.xiaoji: Assertion failed: !mLegacyLib` | legacy loader removed | `device_factory.cpp` |
+| system_server killed: main thread in `SoundTriggerMiddlewareService` (ISoundTriggerHw 2.0, no instance) | soundtrigger passthrough family registered in the audio HAL service | `service/xiaoji_audio_hal.cpp` |
+| system_server killed: main thread in `HardwarePropertiesManagerService` (`IThermal` 1.0, no instance; the product has only the 2.0 mock) | `android.hardware.thermal@1.0-service` and `-impl` in the product, and the 1.0 rc block | `xiaoji_vendor.mk`, `image/xiaoji.rc` |
+| system_server killed: main thread in `LockSettingsService` (`IAuthSecret`, no instance; the binary is installed but has no rc block) | rc block | `image/xiaoji.rc` |
+| zygote: `Failed to mount tmpfs to /data/data: No such file or directory`, then `Failed to opendir /mnt/expand` | stock `mkdir` lines for `/data/data` and the `/mnt` tree | `image/xiaoji.rc` |
+| zygote: `Failed to create symlink /data/user/0 Function not implemented` | engine: `symlinkat` (syscall 36) was missing | `engine/sysfs.c` (`sys_symlinkat`), `engine/host.c` (`host_symlink`) |
+| zygote: `Failed to mount tmpfs to /data/data` is the mount point's absence; the `/data/data` directory is made here | see the layout note below | `image/xiaoji.rc` |
+
+The `symlinkat` engine gap is a real syscall gap, not a product workaround. An absolute link target is kept as written
+(`host_symlink`), and the engine's path walk resolves it inside the guest root, as it already does for the links of the
+tree. No owner record is kept for a new link (as `linkat` keeps none).
+
+### The user-0 data layout (decision for the user, not made)
+
+The product's rc makes `/data/user/0` as a directory (the B7 data root) and `/data/data` as a directory (the mount point
+of zygote's tmpfs; `/data/data` is missing without it). After the final boot, `build/rootfs-xiaoji` has:
+
+- `data/user/0`: empty.
+- `data/data`: 94 entries (one per package), and `data/user_de/0`: 94 entries.
+
+So installd and PackageManager create the app directories under `/data/data` and `/data/user_de/0`, while the framework
+resolves the credential-encrypted user-0 path, `/data/user/0`, which stays empty. The stock layout avoids the split with
+`mount none /data/data /data/user/0 bind rec` (init.rc, `on post-fs-data`), and this engine's init has only `mkdir` (no
+`symlink`, no `mount`). Options: (a) add a `symlink` builtin to `engine/init.c` (about ten lines, like its `mkdir`), and make
+`/data/user/0` a symlink to `/data/data` in the rc, which is the host-tree equivalent of the stock bind; (b) engine bind mounts
+for the rootfs view (`engine/mntns.c`); (c) keep the split, which the data mirror below does not tolerate. Recommendation:
+(a). Not done here: it needs a boot and a full verification round, and the boot's next blocker is the data mirror below.
+
+Zygote makes its own `/data/user` tmpfs and link inside its mount namespace, which is why the host tree shows no link of its
+own. The `symlinkat` the zygote calls (`Failed to create symlink /data/user/0 Function not implemented`, boot 8) is the one
+observed failure.
+
+### The shared page cache (`engine/filecache.c`, `engine/filecache.h`)
+
+Design, as in the plan (the plan's Decision 2):
+
+- **One cache per host file** (dev, ino): a memfd of the file's size, created at the first `MAP_SHARED` mapping (read-only
+  or writable). Each page is filled from the host file when it is first used: a view's fault, a `read`, or a `write`
+  (`memfd_set_fill`, `fc_fill`). Every `MAP_SHARED` view of the file, in every guest process, is a view of that memfd through
+  the existing `mem_map_shared`, so fork, futex keys and `mremap` work as they do for memfd views.
+- **read, pread, write, pwrite** go through the cache while it exists. A write goes to the host file first (the host fd
+  owns the position and `O_APPEND`), then the same bytes are patched into the cache (`fc_patch`). A read comes from the
+  cache, so it sees the views' stores that are not yet written back. A private mapping of the file is filled from the
+  cache too (`fill_from_cache`).
+- **Lifetime.** The cache holds no reference of its own. Its memfd's references are the views (one per region, across
+  every address space). `memfd.c` gained a file hook (`memfd_set_file`): when the last reference goes, the hook writes the
+  cache back and removes the entry, before the pages are freed. So the cache lives as long as a view does.
+- **Write-back** (`fc_write_back`): page by page (4 KiB), the cache's bytes are compared with the host file's, and only the
+  pages that differ are written; the host file is never written past the cache's size, and its size is set to the cache's.
+  Write-back runs on `msync` (`fc_sync_va`), `fsync` and `fdatasync` (`fc_flush_file`), the last unmapping (the hook),
+  a guest process's exit (`proc_release` calls `fc_flush_all`), and the engine's exit (`atexit`).
+- **Write fd.** A write-back needs a host fd open for writing: the cache keeps a `dup` of the first `O_RDWR` fd that maps
+  it. A read-only mapping (no write fd) has nothing to write back, since its views cannot store.
+- **ftruncate and O_TRUNC** call `fc_truncate`: the memfd is truncated (its tail zeroed), and the views are resized.
+- **SIGBUS past the end of the file.** `mem_shm_resize` walks every live address space (`mem.c` keeps a list of them now)
+  and clears `PTE_MAPPED` on the pages of the cache's views that lie wholly past its size; `mem_past_eof` turns the fault
+  into `MEM_FAULT_BUS`, and the CPU raises SIGBUS with `BUS_ADRERR`. Growing the file sets the bits back. `fork` copies
+  the unmapped shared entries too, so a child sees the same map. The SIGBUS plumbing (`MEM_FAULT_BUS`, `SIGBUS_N`,
+  `BUS_ADRERR`, `sig_bus_fatal`, the `setup_frame` address) is the w1 branch's (822c424), copied as it is.
+
+**Merge with `w1-browser-boot` (822c424 lazy file-backed mmap, not in main).** Both key a host file by (dev, ino). In w1,
+`mem_map_lazy` and `mfile_t` cover `MAP_PRIVATE` and read-only file windows; this cache covers every `MAP_SHARED` of a file.
+The SIGBUS hunks in `mem.h`, `signals.c`, `signals.h` and `cpu_a64.c` are copied from w1's text, so a three-way merge should take
+each of them once (not yet tried: w1 is not merged here). The
+other overlaps are real: `mem.c` (the region and PTE code, `mem_segv`), `syscall.c` (`sys_mmap` and `map_file`), and
+`memfd.c`. The recommended merge: keep w1's lazy path for `MAP_PRIVATE`, keep this cache for `MAP_SHARED`, and let the
+cache use w1's `mfile_t` for its (dev, ino) identity instead of its own table if the two are merged. Nothing here depends
+on w1's lazy windows.
+
+**Limits (B13).**
+- Memory: the pages touched (4 KiB each), not the file. The first version loaded whole files (the decision at the top).
+- A write-back compares the pages the cache has materialised (the others cannot differ from the host), and every `fsync`
+  does the same. Process exit writes back every cache, including caches of other processes still mapping them.
+- A host write that does not go through `vfs_write` or `vfs_pwrite` (`sendfile`, `copy_file_range`, or any other path
+  that writes a host file directly) does not patch the cache; a page already materialised then goes stale. Not checked
+  beyond the code.
+- A host-level read that does not go through the engine's read path (exec and the loader's whole-file reads,
+  `sendfile`, `copy_file_range`) sees the host bytes: stores through a view are visible there only after a write-back.
+- `/proc/<pid>/maps` names a cache view `/memfd:xiaoji-file (deleted)`, not the file's path.
+- An engine killed by a signal (not by `exit`) does not run `atexit`: unwritten view stores are lost. `msync` is the
+  guest's way to make them durable before that.
+
+### Tests
+
+- `tests/guest/shmmap.c` (freestanding; `argv[1]` is a scratch directory, `tests/run.sh` gives `build/tests/shmmap-work` to
+  the engine and `/tmp/xiaoji-shmmap-work` to the native oracle). Two processes map the same file shared; a store through
+  a view is read by `pread`; a `write` is read through the view; a child's store is seen by the parent, and the parent's
+  store by the child; `msync` and `munmap`; the contents read back after reopening; the SQLite WAL pattern (`wal.db-shm`
+  sized with `ftruncate`, mapped by two processes, a header and a counter); and SIGBUS for a page past the end after a
+  shrink, with zeros after the file grows again. Across address spaces: a child forked while the file is full blocks on a
+  pipe, the parent shrinks the file, and the child touches a page past the new end (SIGBUS, which needs the shrink to reach
+  the child's address space); a child forked while the file is short reads the pages the parent grows the file to (zeros).
+  The engine and the native oracle print the same 28 lines, for `-O0` and `-O2` (`cmp`).
+- `build/tests/msync-probe.c` (not a test case, under the gitignored `build/`): a store, `msync(MS_SYNC)`, then a 4 s sleep.
+  Read while the engine was alive, the host file already held `MSYNC-OK` (`od -c`): `msync` writes back, not only exit.
+- The product boot check (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) now also asserts the audio HAL registrations,
+  `Loaded primary audio interface`, `StartAudioService took to complete`, and `System now ready` (see the table below).
+
+### Milestones (product tree, final sources; guest time `[ms insn]`)
+
+Run: `./build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs-xiaoji --init-timeout 300` with `XIAOJI_STAMP=1`, after
+`python3 -I tools/reset-data.py build/rootfs-xiaoji`. Power: `pmset -g batt` shows `Now drawing from 'AC Power'`, and
+`pmset -g` shows `lowpowermode 0` (checked before the final run and after it).
+
+| Milestone | time | instructions |
+|---|---|---|
+| `xiaoji_audio_hal`: `Registered android.hardware.audio@7.0::IDevicesFactory/default` | 2.8 s | 0.33 G |
+| `Registered android.hardware.soundtrigger@2.2::ISoundTriggerHw/default` | 3.0 s | 0.35 G |
+| audioserver: `loadHwModule() Loaded primary audio interface` | 9.6 s | 1.02 G |
+| `InitBeforeStartServices took` 2479 ms | 46.1 s | 4.82 G |
+| `StartLockSettingsService took` 182 ms (no `SQLITE_IOERR_SHMMAP`, no `BOOT FAILURE`) | 76.9 s | 8.11 G |
+| `StartConnectivityService took` 807 ms | 82.1 s | 8.76 G |
+| `StartAudioService took` 10231 ms (B12: a watchdog kill here) | 92.7 s | 10.46 G |
+| `StartHardwarePropertiesManagerService took` 11 ms | 92.8 s | 10.47 G |
+| `ActivityManager: System now ready` | 99.9 s | 11.31 G |
+| zygote: `Failed to mount /data_mirror/data_de/null/0/com.android.permissioncontroller ...` (fatal) | 156.7 s | 19.13 G |
+| watchdog: main thread blocked; system_server killed | 176.8 s | 21.67 G |
+
+The table is the final product run (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh`, `build/tests/out/boot.err`).
+Times vary between runs on this host: in the earlier runs `System now ready` came at 98 to 102 s, and `StartAudioService`
+took 10.2 s each time. The instruction counts are the comparison.
+
+### Next blocker: zygote's data mirror (`/data_mirror`), then the watchdog
+
+After `System now ready`, `ActivityManager` starts `com.android.permissioncontroller`. Zygote specializes the process and
+aborts (the product's zygote, from the stock `zygote64` binary, `Zygote.cpp:792`):
+
+```
+[156687 ms 19129483699 insn] F/zygote64(1346): jni_internal.cc:825] JNI FatalError called: (com.android.permissioncontroller) frameworks/base/core/jni/com_android_internal_os_Zygote.cpp:792: Failed to mount /data_mirror/data_de/null/0/com.android.permissioncontroller to /data/user_de/0/com.android.permissioncontroller: No such file or directory
+[176792 ms 21671151631 insn] W/Watchdog(1068): *** WATCHDOG KILLING SYSTEM PROCESS: Blocked in handler on main thread (main)
+```
+
+The stock init creates `/data_mirror` as a tmpfs (`mount tmpfs tmpfs /data_mirror nodev noexec nosuid mode=0700,uid=0,gid=1000`)
+with its `data_ce`/`data_de` trees, and zygote bind-mounts each app's data from there (`/data_mirror/data_de/<vol>/<user>/<pkg>`)
+onto `/data/user_de/<user>/<pkg>`. The product's rc does not make that tree, and the engine's mount namespace (`engine/mntns.c`)
+has to make the bind. This is the next step: the `/data_mirror` tmpfs and its directories in the product rc, then the engine's
+bind-mount support for the zygote's per-app namespace (`mntns.c`). The watchdog kill follows because the system_server's main
+thread waits for the failed app start (the zygote's child dies with the fatal).
+
+Also seen, not blocking: `E/AudioFlinger`/`APM_AudioPolicyManager: invalid volume index range` (the cause is not determined; the
+minimal policy has no volume groups of its own), `Bluetooth service is null` (Bluetooth is not
+configured out), `W/StorageManagerService: storaged not found` (no storaged), `Failed to read /proc/zoneinfo`, `Failed to
+set SurfaceFlinger binder threadpool priority to SCHED_FIFO`, and dexopt children killed by signal 9 (`pidfd_open` is not
+implemented; installd's dex2oat for `ExtServices`).
+
+### Verification (B13, final sources)
+
+Power: `pmset -g batt` showed AC power and `pmset -g` showed `lowpowermode 0` before the first and the last boot of this round; the
+verification sequence ran in between, and its power state was not logged run by run.
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` | exit 0 (no warnings in the build log) |
+| `tests/run.sh` (default) | **224 passed, 0 failed, 0 xfail** |
+| `XIAOJI_JIT=0 tests/run.sh` | **224 passed, 0 failed, 0 xfail** |
+| `XIAOJI_BOOT=1 tests/run.sh` (Google image) | **225 passed, 0 failed, 0 xfail** |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (after `reset-data`, 300 s limit; the check now includes the audio and System-now-ready assertions) | **191 passed, 0 failed, 0 xfail** |
+| `make test-web` | **all web checks passed** (exit 0), with Playwright's Chromium from `~/Library/Caches/ms-playwright` |
+| `clang -std=c11 -Wall -Wextra -fsyntax-only` on the 10 changed engine files | 0 warnings, exit 0 each |
+| `emcc -std=c11 -Wall -Wextra -fsyntax-only` on the same files (`$HOME/emsdk`) | 0 warnings, exit 0 each |
+| remote product build (`tools/remote-build.sh`), with the audio sources touched so that all of them recompile (14 `clang++` steps) | exit 0; no warning from `device/xiaoji` in its log |
+| `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | empty (exit 1) |
+
+### Gaps (B13)
+
+- `/dev/xiaoji_audio` is not written: the HAL discards output. The engine has no sound device.
+- The audio HAL's volume curves: `invalid volume index range` messages from the policy manager (see above; the cause is not
+  determined).
+- The real-time pacing (a sleep per write and per read) is not exercised: no client wrote audio during a boot, so its
+  timing against AudioFlinger's mixer has not been checked.
+- The next blocker above (the data mirror and per-app bind mounts), then `sys.boot_completed` and the launcher. Nothing
+  about the launcher was reached.
+- Telephony, NFC, UWB and Bluetooth are not configured out. Bluetooth prints `Bluetooth service is null` and does not block.
+  Nothing else was turned off by property.
+- The page cache's limits (above), and the w1 merge, which is not done here.

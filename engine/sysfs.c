@@ -8,6 +8,7 @@
 
 #include "binder.h"
 #include "cgroupfs.h"
+#include "filecache.h"
 #include "cred.h"
 #include "inotify.h"
 #include "goldfish.h"
@@ -674,6 +675,31 @@ static int64_t sys_linkat(uint64_t odfd, uint64_t a1, uint64_t ndfd, uint64_t a3
     return host_link(rf.host, rt.host);
 }
 
+/* symlinkat(target, newdirfd, linkpath): a host symbolic link with the target as the guest wrote it. The engine
+ * resolves an absolute target inside the guest root when a path walks through the link. No owner record is kept
+ * for the link (sys_linkat keeps none either). */
+static int64_t sys_symlinkat(uint64_t a0, uint64_t ndfd, uint64_t a2)
+{
+    static char target[VFS_PATH_MAX], to[VFS_PATH_MAX];
+    static vfs_res rt;
+    int rc = get_path(a0, target, sizeof target);
+    if (rc)
+        return rc;
+    rc = get_path(a2, to, sizeof to);
+    if (rc)
+        return rc;
+    rc = vfs_resolve(dirfd_of(ndfd), to, 0, &rt);
+    if (rc)
+        return rc;
+    if (rt.exists || rt.is_link)
+        return -LE_EXIST;
+    if (rt.ro)
+        return -LE_ROFS;
+    if (rt.syn != SYN_NONE)
+        return -LE_PERM;
+    return host_symlink(target, rt.host);
+}
+
 /* fsync and fdatasync: a host file is synced; a memfd or a directory has nothing to sync (0); other
  * descriptors (pipes, sockets, eventfds, epoll) are EINVAL, as on Linux. */
 static int64_t sys_fsync(uint64_t fd)
@@ -681,8 +707,11 @@ static int64_t sys_fsync(uint64_t fd)
     vfs_fd *f = vfs_get((int)(int32_t)fd);
     if (!f)
         return -LE_BADF;
-    if (f->kind == VFS_FILE && f->hfd >= 0)
+    if (f->kind == VFS_FILE && f->hfd >= 0) {
+        if (f->has_id)
+            fc_flush_file(f->hdev, f->hino);
         return host_fsync(f->hfd);
+    }
     if (f->kind == VFS_MEMFD || f->kind == VFS_DIR)
         return 0;
     return -LE_INVAL;
@@ -1350,7 +1379,10 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t len)
     if (f->kind == VFS_FILE && f->hfd >= 0) {
         if ((f->lflags & LO_ACCMODE) == LO_RDONLY || len > (1ull << 40))
             return -LE_INVAL;
-        return host_ftruncate(f->hfd, len);
+        int64_t rc = host_ftruncate(f->hfd, len);
+        if (rc == 0 && f->has_id)
+            fc_truncate(f->hdev, f->hino, len);
+        return rc;
     }
     if (f->kind != VFS_MEMFD)
         return -LE_INVAL;
@@ -1576,6 +1608,7 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_UNLINKAT: *ret = sys_unlinkat(a[0], a[1], a[2]); return 1;
     case SYS_RENAMEAT: *ret = sys_renameat(a[0], a[1], a[2], a[3], 0); return 1;
     case 37: /* linkat */ *ret = sys_linkat(a[0], a[1], a[2], a[3], a[4]); return 1;
+    case 36: /* symlinkat */ *ret = sys_symlinkat(a[0], a[1], a[2]); return 1;
     case SYS_RENAMEAT2: *ret = sys_renameat(a[0], a[1], a[2], a[3], a[4]); return 1;
     case SYS_FSYNC:
     case SYS_FDATASYNC: *ret = sys_fsync(a[0]); return 1;
