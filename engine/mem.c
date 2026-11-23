@@ -84,6 +84,10 @@ static mfile_t *files;
 
 /* Bytes filled per lazy fault (a power of two, a whole aligned window). */
 static size_t lazy_window = 65536;
+/* 0 fills a file mapping at mmap time (mem_set_lazy_mmap). */
+static int lazy_map_on = 1;
+/* Counts of the file reads a lazy fill made (host_pread calls that returned data) and their bytes. */
+static uint64_t lazy_fill_calls, lazy_fill_bytes;
 /* Set when a faulting access hit a lazy page past the end of its file: the fault is then
  * SIGBUS, not SIGSEGV. Holds vpn + 1 of that page; 0 when none. */
 static uint64_t bus_vpn1;
@@ -580,6 +584,8 @@ static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
             break; /* end of file, or an error: the bytes read so far are the file */
         got += (size_t)k;
     }
+    lazy_fill_calls++;
+    lazy_fill_bytes += got;
     uint8_t *result = NULL;
     for (uint64_t pa = wa; pa < we; pa += MEM_PAGE_SIZE) {
         uint64_t pv = pa >> 12;
@@ -858,6 +864,17 @@ void mem_set_lazy_window(size_t bytes)
         lazy_window = bytes;
 }
 
+void mem_set_lazy_mmap(int on)
+{
+    lazy_map_on = on ? 1 : 0;
+}
+
+void mem_lazy_counts(uint64_t *calls, uint64_t *bytes)
+{
+    *calls = lazy_fill_calls;
+    *bytes = lazy_fill_bytes;
+}
+
 int mem_map_lazy(uint64_t va, uint64_t len, unsigned prot, const char *path, mfile_t *f, uint64_t off)
 {
     if (!range_ok(va, len) || !f)
@@ -872,6 +889,17 @@ int mem_map_lazy(uint64_t va, uint64_t len, unsigned prot, const char *path, mfi
         *slot = PTE_MAPPED | (prot & 7u); /* no host page: lazy_fill supplies it on first access */
     }
     tlb_flush();
+    if (!lazy_map_on) {
+        /* The eager baseline: every page is filled now, window by window, as the old mmap did. */
+        for (uint64_t pv = first; pv < first + n; pv++) {
+            uint64_t *ps = pte_slot(pv, 0);
+            if (!ps || (*ps & ~(uint64_t)PTE_FLAGS))
+                continue; /* already has a host page (filled with its window) */
+            int is_lazy;
+            lazy_fill(pv, &is_lazy);
+        }
+        bus_vpn1 = 0;
+    }
     return 0;
 }
 

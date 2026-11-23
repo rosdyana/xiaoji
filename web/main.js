@@ -219,6 +219,7 @@ $('boot').addEventListener('click', async () => {
       setBootStatus('running');
     } else if (m.type === 'bootline') {
       appendLog(m.text);
+      if (m.text.startsWith('xiaoji: Starting phase 100')) window.xb.statsAt = m.text; // ?statsat (A/B runs)
       if (RESTART.test(m.text)) {
         onRestart(scr);
         render();
@@ -264,9 +265,12 @@ $('boot').addEventListener('click', async () => {
   // The chunk store and boot packs (web/chunks.js, docs/loading.md) are the default. ?boot=manifest is the
   // lazy-file manifest path, kept until the pack path has run for a while.
   const mode = params.get('boot') === 'manifest' ? 'manifest' : 'pack';
+  // ?lazy=0 fills file mappings at mmap time (the A/B baseline, docs/loading.md L2); ?lazywin=BYTES sets the
+  // engine's lazy fill window (a power of two from 4096 to 1 MiB). Both are engine arguments.
   worker.postMessage({
     type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
-    noPacks: params.has('nopack'),
+    noPacks: params.has('nopack'), lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'),
+    statsAt: params.has('statsat'),
   });
 });
 

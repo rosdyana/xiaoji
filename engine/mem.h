@@ -63,6 +63,11 @@ void mem_file_unref(mfile_t *f);
 int mem_map_lazy(uint64_t va, uint64_t len, unsigned prot, const char *path, mfile_t *f, uint64_t off);
 /* The lazy fill window in bytes (a power of two between one page and 1 MiB). */
 void mem_set_lazy_window(size_t bytes);
+/* 0: mem_map_lazy fills the whole range at once, as the eager mmap did (the --no-lazy-mmap baseline for
+ * the A/B runs). The default is 1: pages are filled on first access. */
+void mem_set_lazy_mmap(int on);
+/* The file reads made by lazy fills so far (calls that returned data, and their bytes). */
+void mem_lazy_counts(uint64_t *calls, uint64_t *bytes);
 /* Maps len bytes at va as a MAP_SHARED view of m from file offset off. The pages
  * are m's own pages, so every view of the same memfd sees the same bytes. Any
  * existing mapping in the range is replaced. Returns 0 or -1. */

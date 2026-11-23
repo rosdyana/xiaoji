@@ -11,6 +11,8 @@
 
 /* Turns the stderr output on or off. Off by default. */
 void logd_set_print(int on);
+/* Called with each printed log message (main.c: XIAOJI_STATS_AT). */
+void stats_log_hook(const char *msg);
 
 /* The endpoint's operations (connect creates a connection; sock.c uses it). */
 const sock_ops *logd_ops(void);

@@ -41,6 +41,27 @@ static const char *g_root = NULL; /* NULL: the host root "/" */
 static int stats_on;
 static uint64_t stats_t0;
 
+/* XIAOJI_STATS_AT=TEXT: the first log line that contains TEXT prints the instruction count, time and lazy
+ * file reads at that point (the A/B runs read phase 100 this way, since the engine runs on after it). */
+static const char *stats_at;
+static int stats_at_done;
+static void stats_line(const char *tag, double secs, uint64_t icount)
+{
+    uint64_t lcalls, lbytes;
+    mem_lazy_counts(&lcalls, &lbytes);
+    fprintf(stderr, "xiaoji: %s: %llu instructions in %.3f s, lazy file reads %llu, %llu bytes\n", tag,
+            (unsigned long long)icount, secs, (unsigned long long)lcalls, (unsigned long long)lbytes);
+}
+
+void stats_log_hook(const char *msg)
+{
+    if (!stats_at || stats_at_done || !strstr(msg, stats_at))
+        return;
+    stats_at_done = 1;
+    fflush(stdout);
+    stats_line(stats_at, (double)(host_monotonic_ns() - stats_t0) / 1e9, sched_icount());
+}
+
 static void print_stats(void)
 {
     if (!stats_on)
@@ -52,6 +73,7 @@ static void print_stats(void)
     double rate = secs > 0 ? (double)icount / secs / 1e6 : 0.0;
     fprintf(stderr, "xiaoji: %llu instructions in %.3f s (%.2f M instructions/s)\n",
             (unsigned long long)icount, secs, rate);
+    stats_line("end", secs, icount);
 #ifdef __EMSCRIPTEN__
     jit_print_stats(icount);
 #endif
@@ -66,6 +88,9 @@ static int usage(FILE *out)
           "  --trace      print each syscall and its result to stderr\n"
           "  --stats      print the instruction count and rate on exit (as XIAOJI_STATS=1)\n"
           "  --logcat     print the guest's log messages (logd) to stderr (as XIAOJI_LOGCAT=1)\n"
+          "  --no-lazy-mmap  fill file mappings at mmap time (as XIAOJI_LAZY=0); the default fills on first access\n"
+          "  --lazy-window BYTES  the lazy fill window, a power of two from 4096 to 1 MiB (as XIAOJI_LAZY_WINDOW)\n"
+          "  --stats-at TEXT  print the instructions and lazy reads at the first log line containing TEXT (as XIAOJI_STATS_AT)\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
           out);
     return out == stdout ? 0 : 2;
@@ -76,6 +101,9 @@ int main(int argc, char **argv)
     char *envs[MAX_ENV];
     const char *props[MAX_PROP];
     int nenv = 0, nprop = 0, trace = 0, stats = 0, logcat = 0, root_given = 0;
+    int lazy_mmap = 1;
+    const char *lazy_window_arg = NULL;
+    const char *stats_at_arg = NULL;
     const char *init_config = NULL;
     uint64_t init_timeout = 0;
     int i = 1;
@@ -117,6 +145,22 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--stats")) {
             stats = 1;
+            continue;
+        }
+        if (!strcmp(a, "--stats-at")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            stats_at_arg = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--no-lazy-mmap")) {
+            lazy_mmap = 0;
+            continue;
+        }
+        if (!strcmp(a, "--lazy-window")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            lazy_window_arg = argv[++i];
             continue;
         }
         if (!strcmp(a, "--init")) {
@@ -186,12 +230,21 @@ int main(int argc, char **argv)
     stats_on = stats || (stats_env && stats_env[0] == '1');
     const char *logcat_env = getenv("XIAOJI_LOGCAT");
     logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
-    const char *window_env = getenv("XIAOJI_LAZY_WINDOW");
+    /* Lazy file mappings (docs/loading.md, L2): --no-lazy-mmap or XIAOJI_LAZY=0 fills them at mmap time (the
+     * A/B baseline). --lazy-window BYTES, or XIAOJI_LAZY_WINDOW, sets the fill window (a power of two). */
+    const char *lazy_env = getenv("XIAOJI_LAZY");
+    if (lazy_env && lazy_env[0] == '0')
+        lazy_mmap = 0;
+    mem_set_lazy_mmap(lazy_mmap);
+    const char *window_env = lazy_window_arg ? lazy_window_arg : getenv("XIAOJI_LAZY_WINDOW");
     if (window_env && window_env[0])
         mem_set_lazy_window((size_t)strtoul(window_env, NULL, 0));
     const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
     sig_set_debug_faults(faults_env && faults_env[0] == '1');
     stats_t0 = host_monotonic_ns();
+    stats_at = stats_at_arg ? stats_at_arg : getenv("XIAOJI_STATS_AT");
+    if (stats_at && !stats_at[0])
+        stats_at = NULL;
     if (stats_on)
         atexit(print_stats);
     prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit

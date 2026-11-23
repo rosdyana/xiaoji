@@ -282,6 +282,10 @@ async function runBoot(base, opts) {
   post({ type: 'boot-tree', files, wall: now() - t0, packsWall, store: store ? store.stats : null });
 
   const argv = ['--logcat', '--init', '/xiaoji.rc', '--root', '/rootfs', '--init-timeout', String(BOOT.timeoutS)];
+  if (opts && opts.lazy === false) argv.push('--no-lazy-mmap');
+  if (opts && opts.lazyWindow) argv.push('--lazy-window', String(Number(opts.lazyWindow)));
+  // ?statsat: the engine prints its instruction count and lazy reads at phase 100 (for the A/B runs).
+  if (opts && opts.statsAt) argv.push('--stats-at', 'Starting phase 100');
   let exitCode;
   try {
     exitCode = Module.callMain(argv);
@@ -303,7 +307,12 @@ self.onmessage = async (ev) => {
   if (!msg) return;
   try {
     if (msg.type === 'run') await run(msg.name, msg.base);
-    else if (msg.type === 'boot') await runBoot(msg.base, { trace: msg.trace, mode: msg.mode, noPacks: msg.noPacks });
+    else if (msg.type === 'boot') {
+      await runBoot(msg.base, {
+        trace: msg.trace, mode: msg.mode, noPacks: msg.noPacks, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
+        statsAt: !!msg.statsAt,
+      });
+    }
   } catch (e) {
     post({ type: 'error', text: String(e && e.stack ? e.stack : e) });
   }

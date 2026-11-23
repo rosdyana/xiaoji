@@ -22,11 +22,12 @@ const PW =
   '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
 
 function args(argv) {
-  const o = { out: null, trace: false, query: '', profile: null, timeoutMs: 900000, throttleMbps: 0, rttMs: 0, port: 0 };
+  const o = { out: null, trace: false, query: '', profile: null, timeoutMs: 900000, throttleMbps: 0, rttMs: 0, port: 0, coop: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out') o.out = argv[++i];
     else if (a === '--trace') o.trace = true;
+    else if (a === '--coop') o.coop = true; // COOP/COEP on the server (SharedArrayBuffer, docs/loading.md L2)
     else if (a === '--query') o.query = argv[++i];
     else if (a === '--profile') o.profile = argv[++i];
     else if (a === '--port') o.port = Number(argv[++i]);
@@ -59,10 +60,13 @@ async function main() {
     wire.bytes += n;
     wire.byKind[kind] += n;
   };
-  const srv = await startServer({ port: o.port, log, throttle: { mbps: o.throttleMbps, rttMs: o.rttMs } });
+  const srv = await startServer({ port: o.port, coop: o.coop, log, throttle: { mbps: o.throttleMbps, rttMs: o.rttMs } });
   const profile = o.profile ?? mkdtempSync(join(tmpdir(), 'xj-bench-'));
   const t0 = Date.now();
-  const browser = await chromium.launchPersistentContext(profile, { headless: true });
+  // XN_CHROME: a Chromium executable to use instead of Playwright's bundled one (for a machine without the bundle).
+  const launch = { headless: true };
+  if (process.env.XN_CHROME) launch.executablePath = process.env.XN_CHROME;
+  const browser = await chromium.launchPersistentContext(profile, launch);
   try {
     const page = await browser.newPage();
     const pageErrors = [];
@@ -84,6 +88,7 @@ async function main() {
     const result = {
       query: o.query || (o.trace ? '?trace' : ''),
       throttle: { mbps: o.throttleMbps, rttMs: o.rttMs },
+      coop: o.coop,
       status: xb.status,
       pageErrors,
       harnessWallS: (Date.now() - t0) / 1000,
@@ -92,6 +97,7 @@ async function main() {
       stats: xb.stats ?? null,
       wire: wireAt100,
       trace: xb.trace ?? null,
+      statsAt: xb.statsAt ?? null,
     };
     writeFileSync(o.out, JSON.stringify(result));
     const p100 = xb.milestones.phase100;

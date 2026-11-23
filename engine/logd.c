@@ -83,6 +83,7 @@ static void print_datagram(const uint8_t *buf, size_t n)
     fprintf(stderr, "%c/%.*s(%d): %.*s\n", prio_letter(prio), (int)(tag_end - (LOGD_HDR_LEN + 1)),
             (const char *)buf + LOGD_HDR_LEN + 1, p ? p->pid : 0, (int)(msg_end - msg_start),
             (const char *)buf + msg_start);
+    stats_log_hook((const char *)buf + msg_start);
 }
 
 static void *logd_connect(void)
