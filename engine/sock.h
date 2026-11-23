@@ -90,6 +90,10 @@ int sock_can_bind(const sock_t *s);
 int sock_passcred(const sock_t *s);
 /* SO_PASSCRED on a socket (init's socket line, seqpacket+passcred). */
 void sock_set_passcred(sock_t *s, int on);
+/* Netlink (B10, the uevent socket vold opens): 0 for other sockets, 1 for an unbound netlink socket, 2 once bound.
+ * A netlink socket never receives a message: the engine has no kernel to send uevents. */
+int sock_netlink(const sock_t *s);
+void sock_set_netlink(sock_t *s, int state);
 /* Records that a socket node exists at a guest path (bind created the file). */
 int sock_fsnode_add(const char *guest);
 /* 1 when guest is a socket node made by bind (stat reports S_IFSOCK). */

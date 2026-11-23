@@ -70,6 +70,7 @@ struct sock {
     size_t rcvbuf, sndbuf;
     uint64_t rcvtmo, sndtmo; /* ns, 0 for none */
     int passcred, shut_rd, shut_wr;
+    int netlink;          /* B10: 0, 1 (a NETLINK_KOBJECT_UEVENT socket, unbound) or 2 (bound) */
     const sock_ops *ops; /* an engine endpoint, or NULL */
     void *conn;
 };
@@ -458,6 +459,16 @@ int sock_passcred(const sock_t *s)
 void sock_set_passcred(sock_t *s, int on)
 {
     s->passcred = on != 0;
+}
+
+int sock_netlink(const sock_t *s)
+{
+    return s->netlink;
+}
+
+void sock_set_netlink(sock_t *s, int state)
+{
+    s->netlink = state;
 }
 
 int sock_listen(sock_t *s, int backlog)

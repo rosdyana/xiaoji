@@ -25,6 +25,8 @@
 #define SC_CTL_MAX 65536
 #define SC_SIGPIPE 13
 #define SC_AF_UNIX 1
+#define SC_AF_NETLINK 16
+#define SC_NETLINK_KOBJECT_UEVENT 15
 #define SC_SOL_SOCKET 1
 #define SC_SCM_RIGHTS 1
 #define SC_SCM_CREDENTIALS 2
@@ -419,8 +421,31 @@ static int64_t recv_ent(int fd, const uint64_t *ent, uint64_t cnt, int flags, so
 
 /* ---------- the syscalls ---------- */
 
+/* socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT) (B10): the uevent socket of vold's NetlinkManager. It is an
+ * unbound datagram that never receives, because the engine has no kernel to send uevents. Other netlink families
+ * and protocols are EPROTONOSUPPORT. */
+static int64_t sc_socket_netlink(uint64_t type, uint64_t proto)
+{
+    int kind = (int)(type & 0xF);
+    if (kind != SOCK_T_DGRAM || proto != SC_NETLINK_KOBJECT_UEVENT)
+        return -LE_PROTONOSUPPORT;
+    int64_t fd = vfs_socket((type & SC_SOCK_CLOEXEC) != 0, kind, (type & SC_SOCK_NONBLOCK) != 0);
+    if (fd < 0)
+        return fd;
+    int err = 0;
+    sock_t *s = sock_of((int)fd, &err);
+    if (!s) {
+        vfs_close((int)fd);
+        return err;
+    }
+    sock_set_netlink(s, 1);
+    return fd;
+}
+
 static int64_t sc_socket(uint64_t domain, uint64_t type, uint64_t proto)
 {
+    if (domain == SC_AF_NETLINK)
+        return sc_socket_netlink(type, proto);
     if (domain != SC_AF_UNIX)
         return -LE_AFNOSUPPORT;
     int kind = (int)(type & 0xF);
@@ -468,6 +493,20 @@ static int64_t sc_bind(uint64_t fd, uint64_t addr, uint64_t alen)
     sock_t *s = sock_of((int)(int32_t)fd, &err);
     if (!s)
         return err;
+    if (sock_netlink(s)) {
+        /* struct sockaddr_nl (B10): family AF_NETLINK, a 12-byte address. The pid and the groups are accepted as
+         * given; nothing is ever sent to the group. A second bind is accepted, as the kernel accepts a bind with
+         * the same pid. */
+        uint8_t nl[12];
+        if (alen < sizeof nl)
+            return -LE_INVAL;
+        if (mem_copy_out(nl, addr, sizeof nl) < 0)
+            return -LE_FAULT;
+        if (nl[0] != SC_AF_NETLINK || nl[1] != 0)
+            return -LE_INVAL;
+        sock_set_netlink(s, 2);
+        return 0;
+    }
     if (!sock_can_bind(s))
         return -LE_INVAL;
     sname_t n;

@@ -246,3 +246,23 @@ service vendor.vibrator-default /vendor/bin/hw/android.hardware.vibrator-service
     class hal
     user nobody
     group nobody
+
+# vold (B10): the real /system/bin/vold, the block of system/vold/vold.rc (class, ioprio and group as the engine reads
+# them; task_profiles, shutdown and reboot_on_failure are not modelled). The options are on one line, because the
+# engine's rc reader does not join lines with a backslash. Its binder service "vold" is what StorageManagerService
+# connects to (docs/boot.md, B10). Its uevent socket is the engine's netlink stub (engine/sockcall.c, sc_socket_netlink).
+service vold /system/bin/vold --blkid_context=u:r:blkid:s0 --blkid_untrusted_context=u:r:blkid_untrusted:s0 --fsck_context=u:r:fsck:s0 --fsck_untrusted_context=u:r:fsck_untrusted:s0
+    class core
+    ioprio be 2
+    group root reserved_disk
+
+# netd (B10): the Android 13 block of system/netd/server/netd.rc (class, capabilities, group and sockets as the engine
+# reads them). NetworkManagementService.create waits for it on the main thread of system_server.
+service netd /system/bin/netd
+    class main
+    capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID
+    group root net_admin
+    socket dnsproxyd stream 0660 root inet
+    socket mdns stream 0660 root system
+    socket fwmarkd stream 0660 root inet
+    onrestart restart zygote

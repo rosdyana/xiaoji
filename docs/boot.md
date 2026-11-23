@@ -3255,3 +3255,110 @@ Recommendation: (a), with the calls logged, so the next boot shows which ones th
   (`timers, sched, signals, syscall, exec, procfs, sock, init, fdobj, sysfs, vfs, poll, inotify, proc`): 0 each.
 - The first Node run of `timers` failed on the negative absolute time in the test (fixed, above). The first build of
   `inotify.c` failed under `-std=c11` on `strdup` (replaced with `malloc` and `memcpy`).
+
+## B10: the vold decision (the real vold), the netlink stub, and the boot past StorageManagerService (stops at netd)
+
+Status: **partial.** The real `/system/bin/vold` runs in the product boot. Its binder service is up, and
+StorageManagerService connects to it (`mDaemonConnected=true`). The fstrim NullPointerException of B9 is gone. The main
+thread of system_server now blocks in `NetworkManagementService.create`, which waits for netd. netd exits (status 1) because
+the engine has no cgroup v2 root and no NETLINK_ROUTE. `System now ready` and `sys.boot_completed=1` are not reached.
+Verification (the full B10 suite) has not been run; see "Not done".
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 1 | vold assessment and decision | Done (below). Decision: the real vold. |
+| 2 | vold running, IVold calls answered | Done for the boot path: the real vold answers them. The engine's stub is the netlink socket. |
+| 3 | Boot progress | Partial: stops at netd (next blocker). |
+
+### The vold assessment (evidence)
+
+Sources: remote `~/xiaoji-aosp/system/vold/` (read only) and the probe runs (scratchpad `vold-probe.err`, `vold-probe2.err`).
+The image already contains the real `system/bin/vold` (927 KB), so nothing new was built for it.
+
+- **Startup (`main.cpp`).** `process_config` reads the default fstab. `GetFstabPath` looks for `fstab.<suffix>` where the
+  suffix is `ro.boot.fstab_suffix`, `ro.boot.hardware` or `ro.boot.hardware.platform` (the engine sets `ro.hardware=xiaoji`).
+  No `fstab.xiaoji` exists in the image, so the probe logs `failed to find device default fstab` and `continuing anyways`.
+  **So device-mapper is not used at startup.** The logical-partition check (`PLOG(FATAL)`) and `defaultkey_precreate_dm_device`
+  (device-mapper, but non-fatal) are both behind the fstab, and never run. Consequence: the image's `/data` fileencryption
+  and keydirectory entries are not read by vold in this product, as long as the fstab is absent.
+- **`VolumeManager::start`.** `unmountAll`, `Loop::destroyAll`, and create an `EmulatedVolume("/data/media")`. No device-mapper,
+  no FUSE. It ran in the probe.
+- **`VoldNativeService::start`.** Binder publish, ran in the probe (`completed OK`).
+- **`NetlinkManager::start`.** `socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)`, then SO_RCVBUFFORCE (falls back to
+  SO_RCVBUF), SO_PASSCRED, bind. **The only fatal startup gap.** The engine had no AF_NETLINK
+  (`Unable to create uevent socket: Address family not supported by protocol`, exit 1, in the unmodified probe).
+- **Emulated storage.** `EmulatedVolume::doMount` opens `/dev/fuse` through `MountUserFuse` (and runs sdcardfs only when
+  `mUseSdcardFs`). The engine has no `/dev/fuse`. The framework's `mount(vol)` catches the exception and logs `Slog.wtf`.
+  This is not needed to start vold. Whether the boot can pass without a mounted `/storage/emulated` is not decided here; the
+  boot of this step got past the framework's mount path without a failure that stops it.
+- **Checkpoint.** `cp_needsCheckpoint` calls `IBootControl::getService()`. The image has no `android.hardware.boot` HAL. No
+  hang was seen in the probe runs.
+- **Repeated vold starts.** The probe's first rc block was broken (the rc reader does not join `\` lines; the stock block was
+  put on one line). That made vold abort on `sBlkidContext`. Fixed in the product rc.
+
+**Decision: the real vold, with the engine's netlink stub.** The fallback (a minimal `xiaoji_vold` binder service) was not
+built. The evidence says the real vold needs only the netlink stub to start, and its other gaps (FUSE, fscrypt keys) do not
+stop the boot path reached so far.
+
+### The netlink stub (`engine/sock.c`, `engine/sock.h`, `engine/sockcall.c`)
+
+- `socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)` (`sc_socket_netlink`) returns an unbound datagram socket with
+  `sock_set_netlink(s, 1)`. Other netlink families and protocols return EPROTONOSUPPORT. Because the engine has no kernel,
+  the socket never receives a message.
+- `bind` (`sc_bind`, netlink branch) accepts a 12-byte `sockaddr_nl` with family 16 and state 2. Any group or pid is accepted.
+  Gap: `getsockname` on a netlink socket is not AF_NETLINK (it reports the unbound AF_UNIX state).
+- The netlink state is the new field `struct sock.netlink` (0, 1, 2), with `sock_netlink` and `sock_set_netlink`.
+- Compile check: `clang -O2 -std=c11 -Wall -Wextra -c engine/sock.c` and `engine/sockcall.c`: 0 warnings. `make` rebuilt `build/xiaoji`.
+- No guest test was written for it yet (see "Not done").
+
+### The product rc (`image/xiaoji.rc`)
+
+- `service vold` (the stock `system/vold/vold.rc` block, class, ioprio and group; the command is on one line, since the rc reader
+  does not join `\` lines).
+- `service netd` (the stock `system/netd/server/netd.rc` block: class, capabilities, group, the three sockets, onrestart).
+- The storaged block is not added. Its absence logs `storaged not found; trying again` once a second on a background
+  thread, and it does not block the main thread.
+
+### Milestones (product tree, `build/rootfs-xiaoji`, `make reset-data` first)
+
+Run: `XIAOJI_STAMP=1 XIAOJI_DEBUG_FAULTS=1 ./build/xiaoji --logcat --init <rc> --root build/rootfs-xiaoji --init-timeout 150`,
+with the probe rc (`image/xiaoji.rc` plus the stock vold block, scratchpad `vold-probe.rc`), and the same run with the
+product rc. Times are guest time `[ms insn]`. Power: `pmset -g` shows `lowpowermode 0` and `Now drawing from 'AC Power'`.
+
+| Milestone | time | instructions |
+|---|---|---|
+| vold started, VoldNativeService start OK | 2.0 s | 0.24 G |
+| `Connection with lmkd established` | 56.6 s | 5.82 G |
+| `StartVibratorManagerService` | 62.95 s | 6.49 G |
+| StorageManagerService `Thinking about init, mDaemonConnected=true` | 64.98 s | 6.69 G |
+| main thread blocked in `NetworkManagementService.create` (netd missing) | 64.9 s to 145 s | to 17.1 G |
+| Watchdog: `WATCHDOG KILLING SYSTEM PROCESS: Blocked in handler on main thread` | 145.1 s | 17.15 G |
+
+### Next blocker: netd (the framework's main thread waits for it)
+
+`NetworkManagementService.create` calls `NetdService.get`, which sleeps until netd answers. The stock netd exits:
+
+```
+[2072 ms 239529120 insn] E/netd(1017): open() failed for /dev/cgroup_info/cgroup.rc: No such file or directory
+[2085 ms 240772666 insn] E/Netd(1017): Failed to find cgroup v2 root No such file or directory
+xiaoji: exit: pid 1017 (netd) status 1
+xiaoji: init: netd exited (status 1)
+```
+
+The same cgroup message appears for lmkd, surfaceflinger and netd. netd also needs NETLINK_ROUTE (interface and route
+control) and the netfilter tools. **Design decision for the user (not made here):** (a) give netd a real cgroup v2 root and
+a NETLINK_ROUTE socket with the link and address dumps it reads (a sizeable engine change); or (b) remove netd from the
+product's main-thread path, which needs a framework change or an overlay, and that is a product decision. Recommendation:
+(a) in steps, starting with the cgroup v2 root (the same file that lmkd and surfaceflinger need), then the netlink route
+dumps, logged per request, so the next netd run shows what it asks for.
+
+### Not done (B10)
+
+- The full verification suite (`make && make wasm-node && make wasm && tests/run.sh`, `XIAOJI_JIT=0`, `XIAOJI_BOOT=1`,
+  `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`, `make test-web`, the emcc build of the changed files). Not run in this step.
+- A guest test for the netlink stub, and the `XIAOJI_BOOT=1` extension to the furthest milestone.
+- `tools/remote-build.sh` and `tools/fetch-remote-rootfs.sh` were not used (no product change was needed). `build/rootfs-xiaoji`
+  was not refreshed; only its `data/` was cleared with `make reset-data`. The worktree `xiaoji-w1` was not touched.
+- The emulated storage plan (`/sdcard` needs FUSE in the engine, or sdcardfs-style bind mounts) is not built.
