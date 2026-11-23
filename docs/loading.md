@@ -300,11 +300,14 @@ excluded.
 - Page: `?lazy=0` (the eager arm), `?lazywin=BYTES`, `?statsat` (the engine's phase 100 line in `window.xb.statsAt`),
   and `?early=MB` (section 6.4).
 - Lazy mmap is on by default: `build/xiaoji` and the wasm build both have it.
+- The boot's packs (section 6.4) are needed by neither arm of the switch: the A/B changes only how the engine reads.
 
 ### 6.2 Does lazy mmap slow the engine?
 
-Interleaved A/B to phase 100. Each arm is 3 clean runs after one discarded warm-up run. A run is clean when no other
-engine or bench process was active during it (see 6.5). Power was AC with Low Power Mode off for every timed run.
+Interleaved A/B to phase 100, after one discarded warm-up run per platform. The native arms are 3 runs each, and a run
+that overlapped another engine run is excluded (the runs were checked during each run). The browser arms are 3 runs
+each, checked before each run only, so their overlap is unverified (see 6.5). Power was AC with Low Power Mode off for
+every timed run of both.
 
 | Platform | Lazy: engine to phase 100 (s) | Eager: engine to phase 100 (s) | Engine reads to phase 100, lazy | Engine reads, eager | Instructions (G) |
 |---|---|---|---|---|---|
@@ -368,57 +371,72 @@ pack downloads, and the download screen check (updated as above).
 
 Setup: `tools/webboot-bench.mjs` with headless Google Chrome 157 (`XN_CHROME`), a fresh profile for every cold run,
 and the warm run on the same port and profile as its cold run. "Before" is `main` at c4951f8, built in a
-`git archive` copy: its default page, the pack path with eager engine reads, the 7,366-entry order and 12 packs. "After"
-is this branch. Throttled rows use the model in `web/serve.mjs` (50 Mbit/s, one 20 ms RTT per response, one shared
-bandwidth bucket). `pmset -g` was recorded at the start and end of the batch (`lowpowermode 0`, sleep prevented by
-`powerd`); each timed run recorded `pmset -g batt` and `lowpowermode` at its start, and all of them show AC power and
-Low Power Mode off.
+`git archive` copy: its default page, the pack path with eager engine reads, the 7,366-entry order and 12 packs. It
+ran with `--no-coop`, which is the server it was built for. "After" is this branch, with COOP and COEP on (the
+default). Throttled rows use the model in `web/serve.mjs` (50 Mbit/s, one 20 ms RTT per response, one shared
+bandwidth bucket).
 
-The other agent's engine ran for much of the batch. A background sampler logged every engine and bench process whose
-working directory was not this worktree, every 2 s. A run that overlaps any sample is excluded. Of 40 boots, 16 are
-clean and 24 are excluded. The sampler started at 00:44, after the first boots; the other agent's first engine run
-that the logs show began at about 00:41, so those earlier boots are counted as clean from the logs, and they were not
-sampled directly. The clean runs per cell are: before, localhost, cold 2, warm 2; before,
-50 Mbit/s, cold 2, warm 1; after, localhost, cold 2, warm 2; after, 50 Mbit/s, cold 3, warm 2. The plan asked for 3
-per cell. The machine was not quiet enough to get them.
+Power. The `pmset -g` record at the start of the batch was taken on battery with Low Power Mode on (`lowpowermode 1`),
+and the end record was taken on AC with Low Power Mode off, so the per-run records are the evidence: each timed run
+wrote `pmset -g batt` and `lowpowermode` at its start, and every run that is used here shows AC power and Low Power
+Mode off.
 
-Clean runs only, medians with the ranges in brackets:
+Other load. The other agent's engine ran for much of the batch. A background sampler logged every engine and bench
+process whose working directory was not this worktree, every 2 s, from 00:44 on. A run whose window overlaps any sample
+is excluded. Boots before 00:44 were checked only before they started, not during. One boot (`after-thr-1-cold`) is
+also excluded: another engine run started just after it ended, and its engine time less its waits is an outlier.
+Of 40 boots, 15 are used and 25 are excluded. The used runs per cell are: before, localhost, cold 2 and warm 2;
+before, 50 Mbit/s, cold 2 and warm 1; after, localhost, cold 2 and warm 2; after, 50 Mbit/s, cold 2 and warm 2. The
+plan asked for 3 per cell; the machine was not quiet enough to get them.
 
-| Build | Network | Cache | n | Wall to phase 100 (s) | Engine to phase 100 (s) | First log line (s) | Wire to phase 100 (MB) | Requests | Before engine start (s) | Waits in run, packs and sync (s) | Pack GETs | Cache hits | Sync GETs |
+Used runs only, medians with the ranges in brackets:
+
+| Build | Network | Cache | n | Wall to phase 100 (s) | Engine to phase 100 (s) | First log line (s) | Wire to phase 100 (MB) | Requests | Before engine start (s) | Waits in run (s) | Pack GETs | Cache hits | Sync GETs |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| before | localhost | cold | 2 | 43.36 (41.72 to 44.99) | 39.04 (37.96 to 40.13) | 2.95 (2.45 to 3.45) | 190.4 | 92 | 2.83 | 0.15 | 12 | 0 | 65 |
-| before | localhost | warm | 2 | 42.31 (41.87 to 42.75) | 38.06 (37.69 to 38.42) | 2.99 (2.95 to 3.04) | 1.8 | 15 | 2.94 | 0.07 | 0 | 4,023 | 65 |
-| before | 50 Mbit/s, 20 ms | cold | 2 | 73.66 (73.16 to 74.15) | 39.76 (39.20 to 40.32) | 31.07 (31.03 to 31.11) | 190.4 | 92 | 31.00 | 1.64 | 12 | 0 | 65 |
-| before | 50 Mbit/s, 20 ms | warm | 1 | 43.13 | 38.70 | 3.17 | 1.8 | 16 | 3.13 | 0.06 | 0 | 4,023 | 65 |
-| after | localhost | cold | 2 | 40.70 (39.64 to 41.76) | 39.02 (37.97 to 40.07) | 0.45 (0.45 to 0.45) | 105.1 (104.6 to 105.7) | 37 (27 to 47) | 0.39 | 0.01 | 7 | 0 | 2 (1 to 3) |
-| after | localhost | warm | 2 | 44.16 (40.57 to 47.76) | 41.75 (38.14 to 45.37) | 1.17 (1.16 to 1.19) | 1.8 | 19 (18 to 20) | 1.11 | 0.01 | 0 | 2,709 | 1 (0 to 2) |
-| after | 50 Mbit/s, 20 ms | cold | 3 | 57.43 (51.71 to 59.59) | 52.59 (44.41 to 54.77) | 3.73 (3.72 to 4.12) | 104.6 | 28 (25 to 29) | 3.69 | 14.36 (1.62 to 15.73) | 7 | 0 | 0 (0 to 1) |
-| after | 50 Mbit/s, 20 ms | warm | 2 | 40.92 (40.71 to 41.13) | 38.33 (38.07 to 38.59) | 1.37 (1.36 to 1.38) | 1.9 | 21 | 1.32 | 0.04 | 0 | 2,709 | 2 (0 to 3) |
+| before | localhost | cold | 2 | 43.36 (41.72 to 44.99) | 39.04 (37.96 to 40.13) | 2.95 (2.45 to 3.45) | 190.4 (190.4 to 190.4) | 92 (92 to 93) | 2.83 (2.41 to 3.26) | 0.15 (0.12 to 0.18) | 12 (12 to 12) | 0 (0 to 0) | 65 (65 to 65) |
+| before | localhost | warm | 2 | 42.31 (41.87 to 42.75) | 38.06 (37.69 to 38.42) | 2.99 (2.95 to 3.04) | 1.8 (1.8 to 1.8) | 15 (15 to 15) | 2.94 (2.90 to 2.97) | 0.07 (0.06 to 0.08) | 0 (0 to 0) | 4023 (4023 to 4023) | 65 (65 to 65) |
+| before | 50 Mbit/s, 20 ms | cold | 2 | 73.66 (73.16 to 74.15) | 39.76 (39.20 to 40.32) | 31.07 (31.03 to 31.11) | 190.4 (190.4 to 190.4) | 92 (92 to 92) | 31.00 (30.97 to 31.03) | 1.64 (1.56 to 1.73) | 12 (12 to 12) | 0 (0 to 0) | 65 (65 to 65) |
+| before | 50 Mbit/s, 20 ms | warm | 1 | 43.13 (n=1) | 38.70 (n=1) | 3.17 (n=1) | 1.8 (n=1) | 16 (n=1) | 3.13 (n=1) | 0.06 (n=1) | 0 (n=1) | 4023 (n=1) | 65 (n=1) |
+| after | localhost | cold | 2 | 40.70 (39.64 to 41.76) | 39.02 (37.97 to 40.07) | 0.45 (0.45 to 0.45) | 105.1 (104.6 to 105.7) | 37 (27 to 47) | 0.39 (0.39 to 0.39) | 0.01 (0.00 to 0.01) | 7 (7 to 7) | 0 (0 to 0) | 2 (1 to 3) |
+| after | localhost | warm | 2 | 44.16 (40.57 to 47.76) | 41.75 (38.14 to 45.37) | 1.17 (1.16 to 1.19) | 1.8 (1.7 to 1.9) | 19 (18 to 20) | 1.11 (1.09 to 1.14) | 0.01 (0.00 to 0.01) | 0 (0 to 0) | 2709 (2709 to 2709) | 1 (0 to 2) |
+| after | 50 Mbit/s, 20 ms | cold | 2 | 58.51 (57.43 to 59.59) | 53.68 (52.59 to 54.77) | 3.72 (3.72 to 3.73) | 104.7 (104.6 to 104.7) | 28 (28 to 29) | 3.68 (3.67 to 3.69) | 15.05 (14.36 to 15.73) | 7 (7 to 7) | 0 (0 to 0) | 0 (0 to 1) |
+| after | 50 Mbit/s, 20 ms | warm | 2 | 40.92 (40.71 to 41.13) | 38.33 (38.07 to 38.59) | 1.37 (1.36 to 1.38) | 1.9 (1.9 to 1.9) | 21 (21 to 21) | 1.32 (1.32 to 1.33) | 0.04 (0.00 to 0.08) | 0 (0 to 0) | 2709 (2709 to 2709) | 2 (0 to 3) |
 
-What the clean runs show:
+What the used runs show:
 
-- **Bytes and requests.** Cold, the wire moved 190.4 MB (before) and 104.6 to 105.1 MB (after) to phase 100. The
+- **Bytes and requests.** Cold, the wire moved 190.4 MB (before) and 104.7 to 105.1 MB (after) to phase 100. The
   difference is the packs: 186.3 MB before and 102.7 MB after. Warm, both moved about 1.8 MB, most of it the 1.2 MB
   v2 manifest, which the dev server sends with `no-store`.
 - **First log line.** Cold on the throttled link it fell from 31.1 s to 3.7 s. On localhost it fell from 2.9 s to 0.45 s.
-- **Time to phase 100, wall.** Cold on the throttled link: 73.7 s before, 57.4 s after (a 22% cut). Localhost cold
-  is about the same (43.4 s, 40.7 s). Warm is about the same (42.3 s, 44.2 s, with one 47.8 s run after).
-- **Engine time.** On the throttled link the engine's own time rose, from 39.8 s to 52.6 s cold, because the engine now
-  waits for later packs inside its run (14.4 s in the median). The wall clock still falls, because the engine starts
+- **Time to phase 100, wall.** Cold on the throttled link: 73.7 s before, 58.5 s after (a 21% cut). Localhost cold is
+  about the same (43.4 s, 40.7 s). Warm is about the same (42.3 s, 44.2 s).
+- **Engine time.** On the throttled link the engine's own time rose, from 39.8 s to 53.7 s cold, because the engine now
+  waits for later packs inside its run (15.1 s in the median). The wall clock still falls, because the engine starts
   while the packs arrive. On localhost the cold engine time is the same (39.0 s on both), and the warm engine time is
   higher after (41.8 s against 38.1 s, with overlapping ranges and one 45.4 s run). I did not find the cause of the
   warm difference. The candidates are the copy from the shared buffer into the wasm heap (`TypedArray.set` from a
   `SharedArrayBuffer` view, which may take a slower path) and the 2,709 cache hits on each warm visit. Neither is
-  tested. With two clean warm runs per arm this is a lead, not a result.
+  tested. With two used warm runs per arm this is a lead, not a result.
 - **Blocked time.** The engine's blocked time is the time before its start (the module or the first pack, whichever
   is later) plus its waits (in-run waits on packs and synchronous requests). The cold throttled runs start the engine
-  at 3.7 s, and then wait 14.4 s in the median inside the run.
-- **Instructions.** Clean runs show 4.666 to 4.676 G to phase 100 in every cell except one before run at 4.765 G, so
+  at 3.7 s, and then wait 15.1 s in the median inside the run.
+- **Instructions.** Used runs show 4.666 to 4.676 G to phase 100 in every cell except one before run at 4.765 G, so
   the work is the same.
+- **Functional checks, not timed.** `?nopack` and `--no-coop` each reached phase 100 once, with the synchronous path:
+  2,698 synchronous GETs and no pack download, and 2,697 synchronous GETs with no pack store. On localhost the two
+  took 43.8 s to phase 100 each. Their cost on a throttled link is not measured. Before this change, a host without
+  cross-origin isolation still preloaded packs (main has no `SharedArrayBuffer` path), so such a host now reads every
+  chunk synchronously. That is a regression for it, and the page does not warn about the cost beyond one log line.
 
-Limits: 2 to 3 clean runs per cell; one Mac; headless Chrome 157 (the earlier sections used Playwright's headless
-shell, which was not on the machine for these runs, so section 4 and this section are not directly comparable); the
-throttle is a model. The warm engine difference is open.
+Limits: 2 to 3 used runs per cell; one Mac; headless Chrome 157 (the earlier sections used Playwright's headless
+shell, which was missing from the machine when these runs were made, so section 4 and this section are not directly
+comparable); the throttle is a model. The warm engine difference is open.
+
+Browser lazy/eager A/B (section 6.2). The table in 6.2 uses the batch made with the packs of main's order (the
+eager-trace packs), where both arms have the chunks they read. It ran with a busy check before each run and no
+sampler, so it is unverified for overlap. A later batch with the lazy-trace packs (this branch's order) is not a
+valid comparison: the eager arm reads chunks that those packs do not hold, so it makes about 1,400 synchronous GETs
+and its engine time includes them. That batch is reported only as a limit of the repack.
 
 ### 6.6 Open items
 
