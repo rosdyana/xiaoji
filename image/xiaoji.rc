@@ -60,6 +60,27 @@ on early-init
     mkdir /data/vendor_ce/0
     mkdir /data/vendor_de
     mkdir /data/vendor_de/0
+    # The cgroup subgroups that the stock init.rc makes (B11): task_profiles.json joins them, and a join needs the
+    # directory. The engine makes them in its cgroup namespace (engine/cgroupfs.c, cgroups.json's mounts); the
+    # "copy" lines of the stock file and the schedtune mount (not in cgroups.json for API 33) are left out.
+    mkdir /dev/cpuctl/foreground
+    mkdir /dev/cpuctl/background
+    mkdir /dev/cpuctl/top-app
+    mkdir /dev/cpuctl/rt
+    mkdir /dev/cpuctl/system
+    mkdir /dev/cpuctl/system-background
+    mkdir /dev/cpuctl/dex2oat
+    mkdir /dev/cpuctl/nnapi-hal
+    mkdir /dev/cpuctl/camera-daemon
+    mkdir /dev/cpuset/foreground
+    mkdir /dev/cpuset/background
+    mkdir /dev/cpuset/system-background
+    mkdir /dev/cpuset/restricted
+    mkdir /dev/cpuset/top-app
+    mkdir /dev/cpuset/camera-daemon
+    mkdir /dev/blkio/background
+    mkdir /dev/memcg/apps
+    mkdir /dev/memcg/system
 
 service servicemanager /system/bin/servicemanager
     class core animation

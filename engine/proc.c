@@ -99,6 +99,7 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     c->sid = parent->sid;
     c->umask = parent->umask;
     c->cred = parent->cred;
+    memcpy(c->cg, parent->cg, sizeof c->cg); /* a child starts in its parent's cgroups */
     memcpy(c->rlim, parent->rlim, sizeof c->rlim);
     memcpy(c->attr_current, parent->attr_current, sizeof c->attr_current);
     c->dumpable = parent->dumpable;
@@ -152,6 +153,7 @@ proc_t *proc_find(int pid)
 
 void proc_release(proc_t *p)
 {
+    cgroupfs_proc_exit(p);
     if (p->mm) {
         uint64_t rss = mem_mm_rss_kib(p->mm);
         if (rss > p->maxrss_kib)

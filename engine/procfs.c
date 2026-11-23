@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cgroupfs.h"
 #include "linux.h"
 #include "loader.h"
 #include "mem.h"
@@ -135,13 +136,13 @@ int procfs_known(const char *guest)
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
         is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
         !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo") || pressure_file(guest) ||
-        !strcmp(guest, "/proc/self/oom_score_adj"))
+        !strcmp(guest, "/proc/self/oom_score_adj") || !strcmp(guest, "/proc/self/cgroup"))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
         return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline") ||
                !strcmp(rest, "/attr/current") || !strcmp(rest, "/mounts") || !strcmp(rest, "/mountinfo") ||
-               !strcmp(rest, "/oom_score_adj");
+               !strcmp(rest, "/oom_score_adj") || !strcmp(rest, "/cgroup");
     return 0;
 }
 
@@ -378,6 +379,14 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
             sb_fmt(&b, "%s", target->attr_current);
         } else if (!strcmp(rest, "/oom_score_adj")) {
             sb_fmt(&b, "%d\n", target->oom_score_adj);
+        } else if (!strcmp(rest, "/cgroup")) {
+            /* The membership in each cgroup mount (cgroupfs.c, B11). */
+            uint8_t *t = NULL;
+            size_t tl = 0;
+            if (cgroupfs_proc_text(target->pid, &t, &tl) < 0)
+                return -1;
+            sb_add(&b, (const char *)t, tl);
+            free(t);
         } else {
             return -1;
         }
@@ -385,6 +394,13 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         build_stat(&b, proc_cur());
     } else if (!strcmp(guest, "/proc/self/status")) {
         build_status(&b, proc_cur());
+    } else if (!strcmp(guest, "/proc/self/cgroup")) {
+        uint8_t *t = NULL;
+        size_t tl = 0;
+        if (cgroupfs_proc_text(proc_cur()->pid, &t, &tl) < 0)
+            return -1;
+        sb_add(&b, (const char *)t, tl);
+        free(t);
     } else if (!strcmp(guest, "/proc/self/maps")) {
         build_maps(&b);
     } else if (!strcmp(guest, "/proc/filesystems")) {
