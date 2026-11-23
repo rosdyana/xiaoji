@@ -66,7 +66,7 @@ on early-init
     # The user 0 tree that vold prepares (system/vold/vold_prepare_subdirs.cpp, prepare_subdirs, and init.rc's
     # /data/user block). The engine has no vold, so the directories are made here, by path. installd and
     # SettingsProvider need them: ContextImpl and installd fail to create databases and app data under a
-    # missing parent (B7). The bind of /data/user/0 to /data/data is not made; /data/user/0 is the data root.
+    # missing parent (B7). The bind of /data/user/0 to /data/data is made below (B14), as the stock init.rc does.
     mkdir /data/user
     mkdir /data/user/0
     # /data/data (B13): the stock init.rc line. zygote's app specialization mounts a tmpfs on it (Zygote.cpp,
@@ -107,6 +107,29 @@ on early-init
     mkdir /dev/blkio/background
     mkdir /dev/memcg/apps
     mkdir /dev/memcg/system
+    # The storage views and the data mirror (B14): the stock init.rc lines, in its order (its "on post-fs" and
+    # "on post-fs-data" blocks), made by the engine's init as mount(2) in its own namespace, which the services inherit.
+    # The stock "mount rootfs rootfs / remount bind ro nodev" is not made (the engine's root has no flags to change), and
+    # the restorecon lines are not made (the engine keeps no labels). The stock "rm /data/user/0" is left out: /data/user/0
+    # is made as a directory above, never as the symlink that line removes.
+    mount none /mnt/user/0 /storage bind rec
+    mount none none /storage slave rec
+    symlink /storage/self/primary /mnt/sdcard
+    symlink /mnt/user/0/primary /mnt/runtime/default/self/primary
+    mkdir /mnt/runtime/full 0755 root root
+    mkdir /mnt/runtime/full/self 0755 root root
+    mount none /data/data /data/user/0 bind rec
+    mount tmpfs tmpfs /data_mirror nodev noexec nosuid mode=0700,uid=0,gid=1000
+    mkdir /data_mirror/data_ce 0700 root root
+    mkdir /data_mirror/data_de 0700 root root
+    mkdir /data_mirror/data_ce/null 0700 root root
+    mkdir /data_mirror/data_de/null 0700 root root
+    mount none /data/user /data_mirror/data_ce/null bind rec
+    mount none /data/user_de /data_mirror/data_de/null bind rec
+    mkdir /data_mirror/cur_profiles 0700 root root
+    mount none /data/misc/profiles/cur /data_mirror/cur_profiles bind rec
+    mkdir /data_mirror/ref_profiles 0700 root root
+    mount none /data/misc/profiles/ref /data_mirror/ref_profiles bind rec
 
 service servicemanager /system/bin/servicemanager
     class core animation

@@ -26,6 +26,7 @@
 #include "ids_gen.h"
 #include "linux.h"
 #include "loader.h"
+#include "mntns.h"
 #include "proc.h"
 #include "props.h"
 #include "sched.h"
@@ -120,10 +121,17 @@ static char *genv[INIT_MAX_GENV];
 static int ngenv;
 static char *bprop_k[INIT_MAX_BPROP], *bprop_v[INIT_MAX_BPROP];
 static int nbprop;
-/* The on-block mkdirs of the rc (B11: the product rc has more than 16; the old cap dropped the rest without a word). */
-#define INIT_MAX_DIR 128
-static char *boot_dir[INIT_MAX_DIR];
-static int nboot_dir;
+/* The on-block actions of the rc, in file order (B11: mkdirs; B14: mount and symlink, as the stock init's builtins).
+ * The product rc has more than 16 mkdirs; the old cap dropped the rest without a word. */
+#define INIT_MAX_DIR 256
+enum { BA_MKDIR, BA_MOUNT, BA_SYMLINK };
+typedef struct {
+    int kind;
+    char *a, *b, *c; /* mkdir: a = path; mount: a = type, b = source, c = target; symlink: a = target, b = path */
+    uint64_t flags;  /* mount: MNT_MS_* (mntns.h) */
+} boot_act_t;
+static boot_act_t boot_act[INIT_MAX_DIR];
+static int nboot_act;
 static ctl_req_t ctlq[INIT_CTLQ];
 static int ctl_n;
 static volatile sig_atomic_t stop_flag;
@@ -296,11 +304,53 @@ static int parse_config(char *text)
             if (!strcmp(tok[0], "export") && n >= 3)
                 genv_set(tok[1], tok[2]);
             else if (!strcmp(tok[0], "mkdir") && n >= 2) {
-                if (nboot_dir < INIT_MAX_DIR)
-                    boot_dir[nboot_dir++] = dupn(tok[1], strlen(tok[1]));
-                else
-                    fprintf(stderr, "xiaoji: init: more than %d mkdir actions; %s is not made\n", INIT_MAX_DIR, tok[1]);
+                if (nboot_act < INIT_MAX_DIR) {
+                    boot_act_t *ba = &boot_act[nboot_act++];
+                    memset(ba, 0, sizeof *ba);
+                    ba->kind = BA_MKDIR;
+                    ba->a = dupn(tok[1], strlen(tok[1]));
+                } else
+                    fprintf(stderr, "xiaoji: init: more than %d on-block actions; %s is not made\n", INIT_MAX_DIR, tok[1]);
             }
+            else if (!strcmp(tok[0], "mount") && n >= 4) {
+                /* mount <type> <source> <target> [flags...] [options]: flags are the stock init's names (the
+                 * last word, when it is no flag, is the options string: the engine ignores it, as the tmpfs mode). */
+                static const struct { const char *name; uint64_t flag; } mflags[] = {
+                    {"noatime", 0}, {"nodiratime", 0}, {"rw", 0}, {"defaults", 0}, {"wait", 0},
+                    {"ro", MNT_MS_RDONLY}, {"nosuid", MNT_MS_NOSUID}, {"nodev", MNT_MS_NODEV},
+                    {"noexec", MNT_MS_NOEXEC}, {"remount", MNT_MS_REMOUNT}, {"bind", MNT_MS_BIND},
+                    {"rec", MNT_MS_REC}, {"unbindable", 1ull << 17}, {"private", 1ull << 18},
+                    {"slave", 1ull << 19}, {"shared", 1ull << 20},
+                    {0, 0}};
+                uint64_t fl = 0;
+                for (int k = 4; k < n; k++)
+                    for (int m = 0; mflags[m].name; m++)
+                        if (!strcmp(tok[k], mflags[m].name)) {
+                            fl |= mflags[m].flag;
+                            break;
+                        }
+                if (nboot_act < INIT_MAX_DIR) {
+                    boot_act_t *ba = &boot_act[nboot_act++];
+                    memset(ba, 0, sizeof *ba);
+                    ba->kind = BA_MOUNT;
+                    ba->a = dupn(tok[1], strlen(tok[1]));
+                    ba->b = dupn(tok[2], strlen(tok[2]));
+                    ba->c = dupn(tok[3], strlen(tok[3]));
+                    ba->flags = fl;
+                } else
+                    fprintf(stderr, "xiaoji: init: more than %d on-block actions; mount %s is not made\n", INIT_MAX_DIR, tok[3]);
+            }
+            else if (!strcmp(tok[0], "symlink") && n >= 3) {
+                if (nboot_act < INIT_MAX_DIR) {
+                    boot_act_t *ba = &boot_act[nboot_act++];
+                    memset(ba, 0, sizeof *ba);
+                    ba->kind = BA_SYMLINK;
+                    ba->a = dupn(tok[1], strlen(tok[1]));
+                    ba->b = dupn(tok[2], strlen(tok[2]));
+                } else
+                    fprintf(stderr, "xiaoji: init: more than %d on-block actions; symlink %s is not made\n", INIT_MAX_DIR, tok[2]);
+            }
+            /* restorecon and the other labelling lines are not modelled: no label is kept, so they are not read. */
             else if (!strcmp(tok[0], "setprop") && n >= 3 && nbprop < INIT_MAX_BPROP) {
                 bprop_k[nbprop] = dupn(tok[1], strlen(tok[1]));
                 bprop_v[nbprop] = dupn(tok[2], strlen(tok[2]));
@@ -1060,6 +1110,48 @@ void init_prop_changed(const char *name, size_t nlen, const char *value, size_t 
         stop_flag = 1;
 }
 
+/* One on-block action (B14). mkdir: as before (B11; the mode and owner are the engine's). mount and symlink: the stock
+ * init's do_mount and do_symlink (system/core/init/builtins.cpp), made in the init's own mount namespace, which the
+ * services it forks inherit. A failed action is reported and skipped, as the stock init does. */
+static void boot_run(const boot_act_t *ba)
+{
+    vfs_res r;
+    if (ba->kind == BA_MKDIR) {
+        if (vfs_resolve(-100, ba->a, 1, &r) != 0)
+            return;
+        if (cgroupfs_under(r.guest)) {
+            int crc = cgroupfs_mkdir(r.guest);
+            if (crc && crc != -LE_EXIST)
+                fprintf(stderr, "xiaoji: init: mkdir %s failed (cgroup error %d)\n", ba->a, -crc);
+        } else if (r.syn == SYN_NONE && mkdir(r.host, 0771) < 0 && errno != EEXIST) {
+            fprintf(stderr, "xiaoji: init: mkdir %s failed (errno %d)\n", ba->a, errno);
+        }
+        return;
+    }
+    if (ba->kind == BA_MOUNT) {
+        /* "none" is the stock init's name for no source or no type (mount(2) takes NULL). */
+        const char *type = strcmp(ba->a, "none") ? ba->a : NULL;
+        const char *src = strcmp(ba->b, "none") ? ba->b : NULL;
+        int64_t mrc = mntns_mount(vfs_ns(), src, ba->c, type, ba->flags);
+        if (mrc)
+            fprintf(stderr, "xiaoji: init: mount %s %s on %s failed (error %d)\n", ba->a, ba->b, ba->c, (int)-mrc);
+        return;
+    }
+    /* BA_SYMLINK: the target is kept as given, and the resolver reads it as a guest path (vfs.c). */
+    int rc = vfs_resolve(-100, ba->b, 0, &r);
+    if (rc) {
+        fprintf(stderr, "xiaoji: init: symlink %s: cannot resolve (error %d)\n", ba->b, -rc);
+        return;
+    }
+    if (r.exists || r.is_link || r.syn != SYN_NONE) {
+        fprintf(stderr, "xiaoji: init: symlink %s: exists\n", ba->b);
+        return;
+    }
+    rc = host_symlink(ba->a, r.host);
+    if (rc)
+        fprintf(stderr, "xiaoji: init: symlink %s -> %s failed (error %d)\n", ba->b, ba->a, -rc);
+}
+
 int init_main(const char *config, uint64_t timeout_s)
 {
     uint8_t *buf = NULL;
@@ -1091,20 +1183,10 @@ int init_main(const char *config, uint64_t timeout_s)
     /* The cgroups of the system (B11): the mounts of /system/etc/cgroups.json and /dev/cgroup_info/cgroup.rc. Before the
      * mkdirs, which may make subgroups of them. */
     cgroupfs_init();
-    /* mkdir (an on-block action, in order): a directory of the root, made if missing. A cgroup directory is made in the
-     * cgroup namespace (cgroupfs.c). */
-    for (int i = 0; i < nboot_dir; i++) {
-        vfs_res r;
-        if (vfs_resolve(-100, boot_dir[i], 1, &r) != 0)
-            continue;
-        if (cgroupfs_under(r.guest)) {
-            int crc = cgroupfs_mkdir(r.guest);
-            if (crc && crc != -LE_EXIST)
-                fprintf(stderr, "xiaoji: init: mkdir %s failed (cgroup error %d)\n", boot_dir[i], -crc);
-        } else if (r.syn == SYN_NONE && mkdir(r.host, 0771) < 0 && errno != EEXIST) {
-            fprintf(stderr, "xiaoji: init: mkdir %s failed (errno %d)\n", boot_dir[i], errno);
-        }
-    }
+    /* The on-block actions, in file order (the mkdirs, mounts and symlinks of the rc; see boot_act_t). A failed action is
+     * reported and the next one runs, as the stock init does for its builtins. */
+    for (int i = 0; i < nboot_act; i++)
+        boot_run(&boot_act[i]);
     for (int i = 0; i < nbprop; i++)
         props_set(bprop_k[i], strlen(bprop_k[i]), bprop_v[i], strlen(bprop_v[i]));
     derive_classpath();

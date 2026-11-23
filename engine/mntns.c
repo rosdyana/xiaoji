@@ -2,11 +2,12 @@
  * The root (the host root that vfs.c maps "/" to) is not in the list: it is the namespace when the
  * list is empty, and every lookup with no covering mount uses it unchanged.
  *
- * A mount is live when no later mount has the same target (a newer mount on the same path hides
- * it) and its parent is live (a mount made under a hidden mount is hidden with it). The parent is
- * the live mount that covered the target when the mount was made, or 0 for the root. Lookup takes
- * the live mount with the longest target that is a path prefix (component-wise) of the guest path.
- * A detached mount (umount2 with MNT_DETACH) leaves its children unreachable: their parent is gone.
+ * A lookup walks the mount tree from the root, as Linux does: a prefix of the path that ends at a
+ * component is entered when a mount with that target and the current mount as its parent exists (the
+ * newest one, and a mount stacked on the same target in turn). So a mount is reached only through the
+ * mount that covers its target's parent path: a tmpfs mounted over a directory hides the mounts made
+ * below it before, and a mount made under a hidden mount is hidden with it. A detached mount (umount2
+ * with MNT_DETACH) leaves its children unreachable: their parent is gone.
  *
  * Bind mounts keep the host path of their source, taken at mount time, so a later change to the
  * namespace does not re-point them. tmpfs mounts own a host directory under /tmp, shared by copies of
@@ -156,35 +157,6 @@ static mnt_t *add_mount(mntns_t *ns)
     return slot;
 }
 
-/* The parent of mount i is visible from i's point of view: its own mount point is not covered by
- * another mount (a mount stacked on the parent, the newest one on the same target, is i itself or
- * a mount that hides the parent's tree), and its own parent is visible in turn. */
-static int parent_ok(const mntns_t *ns, int i)
-{
-    int pid = ns->m[i].parent;
-    if (pid == 0)
-        return 1;
-    for (int k = 0; k < ns->n; k++) {
-        if (ns->m[k].id != pid)
-            continue;
-        for (int j = k + 1; j < ns->n; j++)
-            if (j != i && !strcmp(ns->m[j].target, ns->m[k].target))
-                return 0;
-        return parent_ok(ns, k);
-    }
-    return 0; /* the parent was detached */
-}
-
-/* Mount i is live: no later mount has its target (a stacked mount hides it), and its parent is
- * visible (see parent_ok). */
-static int is_live(const mntns_t *ns, int i)
-{
-    for (int j = i + 1; j < ns->n; j++)
-        if (!strcmp(ns->m[j].target, ns->m[i].target))
-            return 0;
-    return parent_ok(ns, i);
-}
-
 /* The rest of guest below target (starting with "/" or empty), or NULL when guest is not under it. */
 static const char *under(const char *target, const char *guest)
 {
@@ -196,25 +168,30 @@ static const char *under(const char *target, const char *guest)
     return NULL;
 }
 
-/* The live mount with the longest target covering guest, or -1. */
+/* The walk of the mount tree (see the header). Returns the index of the last mount entered (-1 for the root) and sets
+ * *rem to the rest of guest below that mount's target. A mount is entered only as the child of the mount the walk is
+ * at, so a mount under a covered path is not reached. */
 static int cover_index(const mntns_t *ns, const char *guest, const char **rem)
 {
-    int best = -1;
-    size_t bl = 0;
-    for (int i = 0; i < ns->n; i++) {
-        const char *r = under(ns->m[i].target, guest);
-        if (!r)
+    int cur = -1, cur_id = 0;
+    size_t gl = strlen(guest), done = 0;
+    for (size_t L = 1; L <= gl; L++) {
+        if (L != gl && guest[L] != '/')
             continue;
-        size_t tl = strlen(ns->m[i].target);
-        if (best >= 0 && tl <= bl)
-            continue;
-        if (!is_live(ns, i))
-            continue;
-        best = i;
-        bl = tl;
-        *rem = r;
+        for (;;) {
+            int pick = -1;
+            for (int i = 0; i < ns->n; i++)
+                if (ns->m[i].parent == cur_id && strlen(ns->m[i].target) == L && !strncmp(ns->m[i].target, guest, L))
+                    pick = i; /* the newest of the children at this target (a stacked mount is newer) */
+            if (pick < 0)
+                break;
+            cur = pick;
+            cur_id = ns->m[pick].id;
+            done = L;
+        }
     }
-    return best;
+    *rem = guest + done;
+    return cur;
 }
 
 int mntns_map(mntns_t *ns, const char *guest, char *out, size_t cap, int *ro)
@@ -239,13 +216,18 @@ int mntns_map(mntns_t *ns, const char *guest, char *out, size_t cap, int *ro)
 /* Index of the live mount at exactly target, or -1. */
 static int live_at(const mntns_t *ns, const char *target)
 {
-    for (int i = 0; i < ns->n; i++)
-        if (!strcmp(ns->m[i].target, target) && is_live(ns, i))
-            return i;
-    return -1;
+    const char *rem = "";
+    int i = cover_index(ns, target, &rem);
+    return i >= 0 && rem[0] == 0 ? i : -1;
 }
 
-/* The id of the live mount that covers target (the new mount's parent), or 0 for the root. */
+/* A mount is live when the walk enters it at its own target (see cover_index). */
+static int is_live(const mntns_t *ns, int i)
+{
+    return live_at(ns, ns->m[i].target) == i;
+}
+
+/* The id of the mount that the walk reaches at target (the new mount's parent), or 0 for the root. */
 static int parent_of(const mntns_t *ns, const char *target)
 {
     const char *rem = "";
