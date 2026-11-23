@@ -14,7 +14,14 @@
 
 import { BOOT, CASES, ENGINE_ENV_ARGS } from './cases.js';
 import { openTrace } from './trace.js';
-import { ChunkStore, buildChunkTree } from './chunks.js';
+import { ChunkStore, buildChunkTree, earlyPackIndex } from './chunks.js';
+
+// The packs' layout from the downloader (web/packloader.js), relayed by the page: the manifest, the shared buffer and
+// the control words. The engine's module loads while it is on its way, so the boot waits for it here.
+let resolveLayout;
+const layoutReady = new Promise((r) => {
+  resolveLayout = r;
+});
 
 const now = () => performance.now();
 const post = (msg) => self.postMessage(msg);
@@ -207,13 +214,17 @@ async function runBoot(base, opts) {
   // mode 'pack' (?boot=pack): the chunk store and boot packs (web/chunks.js); 'manifest': the lazy-file
   // manifest (the page's default, until the pack mode is proven).
   const packMode = opts && opts.mode === 'pack';
-  const { manifest, size } = await fetchManifest(base, packMode ? 'xj/manifest-xiaoji-v2.json' : BOOT.manifest);
+  // Manifest mode fetches the manifest here. Pack mode gets it with the layout (see layoutReady above).
+  let manifest = null;
+  let size = 0;
+  if (!packMode) {
+    ({ manifest, size } = await fetchManifest(base, BOOT.manifest));
+    post({ type: 'boot-start', manifestBytes: size, files: manifest.count });
+  }
   const rc = await fetch(base + BOOT.rc, { cache: 'no-store' });
   if (!rc.ok) throw new Error(`${BOOT.rc}: HTTP ${rc.status}`);
   const rcText = await rc.text();
-  post({ type: 'boot-start', manifestBytes: size, files: manifest.count });
   let store = null;
-  let packsLoading = null;
 
   const seen = new Set();
   const fetchTick = { last: 0 };
@@ -247,36 +258,35 @@ async function runBoot(base, opts) {
     }
   };
 
-  // The download progress for the boot screen (web/bootscreen.js): throttled, and always sent at the end.
-  const dlTick = { last: 0 };
-  const postDownload = (p, force) => {
-    const t = now();
-    if (!force && t - dlTick.last < 100) return;
-    dlTick.last = t;
-    post({ type: 'download', loaded: p.loaded, total: p.total, fromCache: p.fromCache, cacheable: p.cacheable });
-  };
-  if (packMode) {
-    store = new ChunkStore(base + 'xj/', manifest.chunk_size, (url, n) => {
-      // The page's fetch counters count the packs too (one request per pack, the bytes of its body).
-      fetched.requests++;
-      fetched.bytes += n;
-      fetched.perUrl.set(url, n);
-      onFetch();
-    }, (p) => postDownload(p, false));
-    // The packs load while the engine module is imported and instantiated; the tree waits for them.
-    // ?nopack (a test of the fallback only): no packs, so every read is a synchronous chunk fetch.
-    packsLoading = opts.noPacks ? Promise.resolve() : store.loadPacks(manifest.packs);
-  }
   const { default: createXiaoji } = await import(base + 'xiaoji.mjs');
   const Module = await createXiaoji({
     print: (line) => post({ type: 'out', text: line }),
     printErr: onLine,
   });
-  if (packsLoading) {
-    await packsLoading;
+  let files;
+  if (packMode) {
+    // The packs come from the downloader while the module loads. The engine starts once the first pack (or the
+    // first opts.early MB) is in; its reads of a later pack wait for that pack. ?nopack, or no layout (the page
+    // could not start the downloader): every chunk is read synchronously, with the manifest fetched here.
+    const lay = await layoutReady;
+    if (lay.error) {
+      post({ type: 'pack-error', pack: -1, text: `no packs: ${lay.error}` });
+      ({ manifest, size } = await fetchManifest(base, 'xj/manifest-xiaoji-v2.json'));
+      store = new ChunkStore(base + 'xj/', manifest.chunk_size);
+    } else {
+      manifest = lay.manifest;
+      size = lay.manifestBytes;
+      store = new ChunkStore(base + 'xj/', manifest.chunk_size);
+      store.attachPacks(manifest.packs, lay.sab, lay.ctrl);
+    }
+    post({ type: 'boot-start', manifestBytes: size, files: manifest.count });
+    const earlyBytes = Math.max(0, Number(opts && opts.early ? opts.early : 0)) * 1048576;
+    await store.waitStart(manifest.packs ? earlyPackIndex(manifest.packs, earlyBytes) : 0);
     packsWall = now() - t0;
+    files = buildChunkTree(Module.FS, manifest, store);
+  } else {
+    files = buildTree(Module.FS, manifest, base, BOOT.tree);
   }
-  const files = packMode ? buildChunkTree(Module.FS, manifest, store) : buildTree(Module.FS, manifest, base, BOOT.tree);
   Module.FS.writeFile('/xiaoji.rc', rcText);
   if (traceOn) trace = openTrace(Module.FS, fileSizes(manifest));
   post({ type: 'boot-tree', files, wall: now() - t0, packsWall, store: store ? store.stats : null });
@@ -307,10 +317,11 @@ self.onmessage = async (ev) => {
   if (!msg) return;
   try {
     if (msg.type === 'run') await run(msg.name, msg.base);
+    else if (msg.type === 'layout') resolveLayout(msg);
     else if (msg.type === 'boot') {
       await runBoot(msg.base, {
-        trace: msg.trace, mode: msg.mode, noPacks: msg.noPacks, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
-        statsAt: !!msg.statsAt,
+        trace: msg.trace, mode: msg.mode, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
+        statsAt: !!msg.statsAt, early: msg.early,
       });
     }
   } catch (e) {

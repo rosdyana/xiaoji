@@ -56,7 +56,7 @@ async function runCase(chromium, baseUrl, name) {
   const expectOut = readFileSync(join(ROOT, CASES[name].expect), 'utf8');
   const expectRc = Number(readFileSync(join(ROOT, CASES[name].expect.replace(/\.out$/, '.rc')), 'utf8').trim());
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
   const page = await browser.newPage();
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -92,11 +92,12 @@ async function runCase(chromium, baseUrl, name) {
 const SHOTS = join(ROOT, 'build', 'web-shots');
 const VIEW = { width: 1100, height: 860 };
 
-// The download phase: the packs come over a slow link (40 Mbit/s), so the phase lasts long enough to
-// photograph. The run is stopped before the engine starts. Also checks that a reduced-motion user gets no spin.
+// The packs come over a slow link (40 Mbit/s). The engine starts after the first pack (docs/loading.md, L2), and the
+// rest keep downloading during the boot: the boot screen's detail line shows them. The run is stopped while packs
+// are still arriving. Also checks that a reduced-motion user gets no spin.
 async function runDownloadShot(chromium) {
   const slow = await startServer({ port: 0, log: () => {}, throttle: { mbps: 40, rttMs: 0 } });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
   const page = await browser.newPage({ viewport: VIEW });
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -108,12 +109,12 @@ async function runDownloadShot(chromium) {
     check(spin === 'none', 'boot screen: the arc does not spin with prefers-reduced-motion');
     await page.emulateMedia({ reducedMotion: 'no-preference' });
     await page.waitForFunction(
-      () => window.xb.screen && window.xb.screen.state === 'download' && window.xb.screen.fill >= 25 && window.xb.screen.fill <= 75,
+      () => window.xb.screen && /packs [\d.]+ of [\d.]+ MB/.test(window.xb.screen.detail || ''),
       null,
       { timeout: 120000, polling: 100 },
     );
     const s = await page.evaluate(() => window.xb.screen);
-    check(s.label === 'Downloading system' && /MB/.test(s.detail), `boot screen, download: "${s.label}", "${s.detail}", ${s.count}`);
+    check(/packs [\d.]+ of [\d.]+ MB/.test(s.detail), `boot screen, packs still downloading: "${s.label}", "${s.detail}", ${s.count}`);
     await page.screenshot({ path: join(SHOTS, 'boot-download.png') });
     console.log(`    screenshot: ${join(SHOTS, 'boot-download.png')}`);
     await page.click('#stop');
@@ -128,7 +129,7 @@ async function runDownloadShot(chromium) {
 // The Boot Android check (W1). Returns nothing; counts failures like the other checks.
 async function runBoot(chromium, baseUrl) {
   mkdirSync(SHOTS, { recursive: true });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
   const page = await browser.newPage({ viewport: VIEW });
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));

@@ -95,6 +95,7 @@ $('run').addEventListener('click', () => {
 const LOG_LINES = 20000;
 window.xb = { status: 'idle', lines: 0, milestones: {}, fetch: null, done: null, error: null, screen: null };
 let bootWorker = null;
+let bootPacker = null; // the pack downloader (web/packloader.js), pack mode
 let bootTimer = null;
 let scr = null; // the screen's state (bootscreen.js)
 let theme = DEFAULT_THEME;
@@ -186,6 +187,8 @@ function appendLog(text) {
 function stopBoot(status) {
   if (bootWorker) bootWorker.terminate();
   bootWorker = null;
+  if (bootPacker) bootPacker.terminate();
+  bootPacker = null;
   if (bootTimer) clearInterval(bootTimer);
   bootTimer = null;
   if (status) setBootStatus(status);
@@ -206,6 +209,41 @@ $('boot').addEventListener('click', async () => {
   bootWorker = worker;
   setControls();
   render();
+  // The packs (pack mode) come from a second worker, so the engine's worker can block on a pack while the rest
+  // download (web/packloader.js, docs/loading.md L2). Its messages are the packs' layout (relayed to the engine's
+  // worker, which needs it before the boot), the bytes of the packs (the boot screen), and the counters.
+  let packCtrl = null;
+  let packStats = null; // the downloader's counters, merged into the engine's store stats and the fetch line
+  let packNet = { requests: 0, bytes: 0 };
+  const failPacks = () => {
+    if (!packCtrl) return;
+    for (let j = 0; j < packCtrl.length; j++) {
+      if (Atomics.load(packCtrl, j) === 0) {
+        Atomics.store(packCtrl, j, 2); // failed: the engine reads those chunks synchronously
+        Atomics.notify(packCtrl, j);
+      }
+    }
+  };
+  const onPacker = (m) => {
+    if (m.type === 'layout') {
+      packCtrl = m.ctrl;
+      worker.postMessage({ type: 'layout', manifest: m.manifest, manifestBytes: m.manifestBytes, sab: m.sab, ctrl: m.ctrl });
+    } else if (m.type === 'layout-error') {
+      appendLog(`packs: ${m.text}`);
+      worker.postMessage({ type: 'layout', error: m.text });
+    } else if (m.type === 'download') {
+      onDownload(scr, m);
+    } else if (m.type === 'packstats') {
+      packStats = m.stats;
+      packNet = { requests: m.stats.packDownloads, bytes: m.stats.packNetBytes };
+      if (window.xb.stats && window.xb.stats.store) window.xb.stats.store = { ...window.xb.stats.store, ...packStats };
+    } else if (m.type === 'pack-error') {
+      appendLog(`pack ${m.pack}: ${m.text}`);
+    } else if (m.type === 'error') {
+      appendLog(`packs: ${m.text}`);
+      failPacks();
+    }
+  };
   worker.onmessage = (ev) => {
     const m = ev.data;
     const now = performance.now();
@@ -235,9 +273,12 @@ $('boot').addEventListener('click', async () => {
       onMilestone(scr, m.id, m.line, now);
       render();
     } else if (m.type === 'fetch') {
-      window.xb.fetch = { requests: m.requests, files: m.files, bytes: m.bytes };
-      $('bfetch').textContent = `${m.requests} requests, ${m.files} files, ${fmtBytes(m.bytes)}`;
+      const requests = m.requests + packNet.requests;
+      const bytes = m.bytes + packNet.bytes;
+      window.xb.fetch = { requests, files: m.files, bytes };
+      $('bfetch').textContent = `${requests} requests, ${m.files} files, ${fmtBytes(bytes)}`;
     } else if (m.type === 'stats') {
+      if (m.store && packStats) m.store = { ...m.store, ...packStats };
       window.xb.stats = m;
     } else if (m.type === 'trace') {
       window.xb.trace = m;
@@ -269,9 +310,27 @@ $('boot').addEventListener('click', async () => {
   // engine's lazy fill window (a power of two from 4096 to 1 MiB). Both are engine arguments.
   worker.postMessage({
     type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
-    noPacks: params.has('nopack'), lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'),
-    statsAt: params.has('statsat'),
+    lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'), statsAt: params.has('statsat'),
+    early: params.get('early'),
   });
+  if (mode === 'pack') {
+    // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).
+    if (self.crossOriginIsolated) {
+      const packer = new Worker(new URL('./packloader.js', location.href), { type: 'module' });
+      bootPacker = packer;
+      packer.onmessage = (ev) => onPacker(ev.data);
+      packer.onerror = (ev) => {
+        appendLog(`packs: ${ev.message || 'the downloader stopped'}`);
+        failPacks();
+        if (!packCtrl) worker.postMessage({ type: 'layout', error: 'the downloader stopped' });
+      };
+      packer.postMessage({ type: 'start', base: new URL('./', location.href).href, noPacks: params.has('nopack') });
+    } else {
+      // Without cross-origin isolation there is no SharedArrayBuffer: the engine reads every chunk synchronously.
+      appendLog('packs: the page is not cross-origin isolated (serve with COOP/COEP); reading synchronously');
+      worker.postMessage({ type: 'layout', error: 'not cross-origin isolated' });
+    }
+  }
 });
 
 $('stop').addEventListener('click', () => {

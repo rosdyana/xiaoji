@@ -22,12 +22,12 @@ const PW =
   '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
 
 function args(argv) {
-  const o = { out: null, trace: false, query: '', profile: null, timeoutMs: 900000, throttleMbps: 0, rttMs: 0, port: 0, coop: false };
+  const o = { out: null, trace: false, query: '', profile: null, timeoutMs: 900000, throttleMbps: 0, rttMs: 0, port: 0, coop: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out') o.out = argv[++i];
     else if (a === '--trace') o.trace = true;
-    else if (a === '--coop') o.coop = true; // COOP/COEP on the server (SharedArrayBuffer, docs/loading.md L2)
+    else if (a === '--no-coop') o.coop = false; // no COOP/COEP headers: the page is not isolated (docs/loading.md L2)
     else if (a === '--query') o.query = argv[++i];
     else if (a === '--profile') o.profile = argv[++i];
     else if (a === '--port') o.port = Number(argv[++i]);

@@ -1,26 +1,30 @@
-// Chunk store for the Boot Android page (docs/loading.md, tier 1). The page fetches the boot pack in
-// parallel while the engine module loads, and decodes it with DecompressionStream into memory before the
-// engine starts. The engine's reads then come from memory. A chunk that is not in a pack is fetched and
-// decoded synchronously when the engine reads it (the fallback), because the engine cannot wait.
+// Chunk store for the Boot Android page (docs/loading.md, tier 1 and L2). The boot packs are downloaded by a
+// second worker (web/packloader.js) into one SharedArrayBuffer, in the boot's first-read order. The engine's
+// worker starts once the first pack (or the first N MB) is in, and its reads of a chunk in a pack wait
+// (Atomics.wait) for that pack, not for a new request. A chunk in no pack, or in a pack that failed, is fetched
+// with a synchronous request and decoded when the engine reads it (the fallback).
 //
 // Names: chunks/<id>.z is a zlib stream of one raw chunk, <id> the first 32 hex digits of the SHA-256 of
 // the raw bytes. packs/<id>.bin concatenates the zlib streams of the boot's working set, in first-read
 // order; the manifest lists each chunk as [id, offset, length, rawLength] within its pack. The layout
-// and the packer are in tools/pack.py. Every pack chunk is hashed as it is decoded.
+// and the packer are in tools/pack.py.
 import { inflateZlib } from './inflate.js';
 
 export const CHUNK_CACHE = 'xiaoji-chunks-v1';
+export const PACK_PENDING = 0;
+export const PACK_READY = 1;
+export const PACK_FAILED = 2;
 const now = () => performance.now();
 
-async function sha256Id(bytes) {
+export async function sha256Id(bytes) {
   const d = await crypto.subtle.digest('SHA-256', bytes);
   let hex = '';
   for (const b of new Uint8Array(d).subarray(0, 16)) hex += b.toString(16).padStart(2, '0');
   return hex;
 }
 
-// Decodes one zlib stream with the browser's own decoder (async; used for the boot pack only).
-async function inflateNative(bytes, rawLen) {
+// Decodes one zlib stream with the browser's own decoder (async; used for the boot packs only).
+export async function inflateNative(bytes, rawLen) {
   const ds = new DecompressionStream('deflate');
   const out = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer());
   if (out.length !== rawLen) throw new Error(`chunk: ${out.length} bytes, want ${rawLen}`);
@@ -28,7 +32,7 @@ async function inflateNative(bytes, rawLen) {
 }
 
 // The cache is an optimization: when Cache Storage is missing or fails, the page fetches as if it were empty.
-async function openCache() {
+export async function openCache() {
   if (typeof caches === 'undefined') return null;
   try {
     return await caches.open(CHUNK_CACHE);
@@ -37,22 +41,44 @@ async function openCache() {
   }
 }
 
+// The place of every pack chunk in the shared buffer. Both workers compute it from the manifest's packs, so
+// neither needs a message to find a chunk: where.get(id) is { k (pack index), off (byte offset), raw }.
+export function layoutPacks(packs) {
+  const where = new Map();
+  let total = 0;
+  packs.forEach((p, k) => {
+    for (const [id, , , raw] of p.chunks) {
+      if (where.has(id)) throw new Error(`manifest: chunk ${id} is in two packs`);
+      where.set(id, { k, off: total, raw });
+      total += raw;
+    }
+  });
+  return { where, total };
+}
+
+// The first pack index that must be ready before the engine starts: the first pack whose end reaches
+// earlyBytes of pack data (0 means the first pack).
+export function earlyPackIndex(packs, earlyBytes) {
+  let cum = 0;
+  for (let k = 0; k < packs.length; k++) {
+    cum += packs[k].bytes;
+    if (cum >= earlyBytes) return k;
+  }
+  return Math.max(0, packs.length - 1);
+}
+
 export class ChunkStore {
-  // base: URL of the chunk store directory (ends in '/'); chunkSize: from the manifest; onNetwork(url, bytes)
-  // is called for each response body the page downloads (the worker's fetch counters use it).
-  // onProgress(p) is called as the boot packs download: p.loaded and p.total are bytes of the packs
-  // (the manifest's sizes), p.fromCache is true when every pack is in the cache, p.cacheable when the
-  // cache could be opened (so the next visit can use it).
-  constructor(base, chunkSize, onNetwork = () => {}, onProgress = () => {}) {
+  // base: URL of the chunk store directory (ends in '/'); chunkSize: from the manifest. The synchronous requests
+  // are counted by the worker's XHR hook, not here.
+  constructor(base, chunkSize) {
     this.base = base;
     this.chunkSize = chunkSize;
-    this.onNetwork = onNetwork;
-    this.onProgress = onProgress;
-    this.progress = { loaded: 0, total: 0, fromCache: false, cacheable: false };
-    this.mem = new Map(); // id -> raw Uint8Array
+    this.mem = new Map(); // id -> raw Uint8Array (a view of the shared buffer, or a decoded fallback chunk)
+    this.where = null; // id -> { k, off, raw } for the chunks of the packs (attachPacks)
+    this.sab = null;
+    this.ctrl = null;
     this.stats = {
-      packs: 0, packDownloads: 0, packBytes: 0, packNetBytes: 0, packChunks: 0, packMs: 0, packCpuMs: 0,
-      chunkCacheHits: 0, chunkCachePuts: 0,
+      packs: 0, packChunks: 0, packWaits: 0, packWaitMs: 0, packStartMs: 0, packFailedFallbacks: 0,
       syncFetches: 0, syncBytes: 0, syncFetchMs: 0, syncDecodeMs: 0,
     };
   }
@@ -61,114 +87,57 @@ export class ChunkStore {
     return this.base + 'chunks/' + id + '.z';
   }
 
-  emit() {
-    this.onProgress({ ...this.progress });
-  }
-
-  // Async, before the engine runs. Each chunk is cached under its own hash (the URL of chunks/<id>.z), so a
-  // pack is downloaded only when one of its chunks is not cached: when a build changes a chunk, the packs
-  // after it shift, but their chunks are still cached, and only the pack with the new chunk is downloaded.
-  async loadPacks(packs) {
-    const t0 = now();
-    const cache = await openCache();
-    if (cache) {
-      const keep = new Set();
-      for (const p of packs) for (const [id] of p.chunks) keep.add(this.chunkUrl(id));
-      try {
-        for (const req of await cache.keys()) if (!keep.has(req.url)) await cache.delete(req);
-      } catch {
-        // a stale entry is harmless
-      }
-    }
+  // The packs' shared buffer and control words (from the downloader). Packs not attached: every read is a fallback.
+  attachPacks(packs, sab, ctrl) {
+    this.where = layoutPacks(packs).where;
+    this.sab = sab;
+    this.ctrl = ctrl;
     this.stats.packs = packs.length;
-    // Probe every pack before the first download, so the progress denominator and the warm/cold decision are known.
-    const have = await Promise.all(packs.map((p) => this.probe(p, cache)));
-    this.progress = {
-      loaded: 0,
-      total: packs.reduce((n, p) => n + p.bytes, 0),
-      fromCache: !!cache && have.every((h) => h && h.every(Boolean)),
-      cacheable: !!cache,
-    };
-    this.emit();
-    await Promise.all(packs.map((p, i) => this.loadPack(p, cache, have[i])));
-    this.stats.packMs = now() - t0;
   }
 
-  // The cache entries of a pack's chunks, in order (undefined where missing), or null without a cache.
-  async probe(pack, cache) {
-    if (!cache) return null;
-    return Promise.all(pack.chunks.map(([id]) => cache.match(this.chunkUrl(id)).catch(() => undefined)));
-  }
-
-  // Streams one pack's bytes into memory, counting them into the progress as they arrive.
-  async download(pack) {
-    const url = this.base + pack.file;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`pack ${pack.file}: HTTP ${res.status}`);
-    const out = new Uint8Array(pack.bytes);
-    const reader = res.body.getReader();
-    let off = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (off + value.length > pack.bytes) {
-        throw new Error(`pack ${pack.file}: more than ${pack.bytes} bytes, the manifest says ${pack.bytes}`);
-      }
-      out.set(value, off);
-      off += value.length;
-      this.progress.loaded += value.length;
-      this.emit();
-    }
-    if (off !== pack.bytes) throw new Error(`pack ${pack.file}: ${off} bytes, the manifest says ${pack.bytes}`);
-    return out;
-  }
-
-  async loadPack(pack, cache, have) {
-    const cached = have ? have.filter(Boolean).length : 0;
-    this.stats.chunkCacheHits += cached;
-    let buf = null;
-    if (!have || cached < pack.chunks.length) {
-      buf = await this.download(pack);
-      this.stats.packDownloads++;
-      this.stats.packBytes += buf.length;
-      this.stats.packNetBytes += buf.length;
-      this.onNetwork(this.base + pack.file, buf.length);
-    } else {
-      this.progress.loaded += pack.bytes;
-      this.emit();
-    }
-    const puts = [];
+  // Async, before the engine starts: resolves when packs 0..upto are ready or failed. A failed pack is not an
+  // error here: its chunks fall back to synchronous reads.
+  async waitStart(upto) {
+    if (!this.ctrl) return;
     const t0 = now();
-    for (let i = 0; i < pack.chunks.length; i++) {
-      const [id, off, len, raw] = pack.chunks[i];
-      let z;
-      if (buf) {
-        z = buf.subarray(off, off + len);
-        if (cache && !(have && have[i])) {
-          puts.push(cache.put(this.chunkUrl(id), new Response(z.slice())).then(
-            () => this.stats.chunkCachePuts++,
-            () => {},
-          ));
-        }
-      } else {
-        z = new Uint8Array(await have[i].arrayBuffer());
+    for (let k = 0; k <= upto; k++) {
+      while (Atomics.load(this.ctrl, k) === PACK_PENDING) {
+        await Atomics.waitAsync(this.ctrl, k, PACK_PENDING).value;
       }
-      const data = await inflateNative(z, raw);
-      if ((await sha256Id(data)) !== id) throw new Error(`pack ${pack.file}: chunk ${id} does not verify`);
-      this.mem.set(id, data);
-      this.stats.packChunks++;
     }
-    this.stats.packCpuMs += now() - t0;
-    await Promise.all(puts); // the puts finish before the engine starts: it never yields
+    this.stats.packStartMs = now() - t0;
   }
 
-  // Synchronous, from the engine's reads: the chunk from memory, else fetched and decoded now.
+  // Synchronous, from the engine's reads: blocks until pack k is ready or failed. True if it is ready.
+  waitPack(k) {
+    let v = Atomics.load(this.ctrl, k);
+    if (v !== PACK_PENDING) return v === PACK_READY;
+    const t0 = now();
+    while ((v = Atomics.load(this.ctrl, k)) === PACK_PENDING) Atomics.wait(this.ctrl, k, PACK_PENDING);
+    this.stats.packWaits++;
+    this.stats.packWaitMs += now() - t0;
+    return v === PACK_READY;
+  }
+
+  // Synchronous, from the engine's reads: the chunk from memory, else from its pack (waiting for the pack), else
+  // fetched and decoded now (the fallback).
   get(id, rawLen) {
     const hit = this.mem.get(id);
     if (hit) return hit;
+    const w = this.where && this.where.get(id);
+    if (w) {
+      if (w.raw !== rawLen) throw new Error(`chunk ${id}: ${rawLen} bytes, the pack says ${w.raw}`);
+      if (this.waitPack(w.k)) {
+        const data = new Uint8Array(this.sab, w.off, w.raw);
+        this.mem.set(id, data);
+        this.stats.packChunks++;
+        return data;
+      }
+      this.stats.packFailedFallbacks++;
+    }
     const t0 = now();
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', this.base + 'chunks/' + id + '.z', false);
+    xhr.open('GET', this.chunkUrl(id), false);
     xhr.responseType = 'arraybuffer';
     xhr.send(null);
     if (xhr.status !== 200) throw new Error(`chunk ${id}: HTTP ${xhr.status}`);

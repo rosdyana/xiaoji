@@ -1,6 +1,6 @@
 // Dev server for the web page (M4). Node only, no dependencies.
 //
-//   node web/serve.mjs [--port N] [--host H] [--coop]
+//   node web/serve.mjs [--port N] [--host H] [--no-coop]
 //   throttle: { mbps, rttMs } (startServer / createHandler, for the boot benchmark). Every response waits
 //   rttMs before its headers, and all bodies share one bucket of mbps (0 = no limit), so the limit holds
 //   for the worker's requests too.
@@ -15,8 +15,9 @@
 //                           and packs are named by their hash, so they are served as immutable.
 //   /<name>                 web/<name>, else build/wasm/<name>
 //
-// --coop adds Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers. Off by
-// default: the engine does not use SharedArrayBuffer yet. Turn it on when threads land.
+// COOP and COEP headers (cross-origin isolation) are on by default: the boot's pack downloader shares its buffer
+// with the engine's worker through SharedArrayBuffer (docs/loading.md, L2). --no-coop turns them off; without
+// isolation the page reads every chunk synchronously.
 // Caching is off (Cache-Control: no-store) for development.
 
 import { createServer } from 'node:http';
@@ -129,7 +130,7 @@ async function pipeThrottled(src, res, bucket) {
   res.end();
 }
 
-export function createHandler({ coop = false, log = () => {}, throttle = null } = {}) {
+export function createHandler({ coop = true, log = () => {}, throttle = null } = {}) {
   const limited = throttle && (throttle.mbps > 0 || throttle.rttMs > 0);
   const bucket = { free: 0, bytesPerMs: throttle && throttle.mbps > 0 ? throttle.mbps * 125 : Infinity };
   return async (req, res) => {
@@ -191,7 +192,7 @@ export function createHandler({ coop = false, log = () => {}, throttle = null } 
 }
 
 // Starts the server and resolves to { server, port, url, close() }. Port 0 picks a free port.
-export function startServer({ port = 8080, host = '127.0.0.1', coop = false, log, throttle = null } = {}) {
+export function startServer({ port = 8080, host = '127.0.0.1', coop = true, log, throttle = null } = {}) {
   const handler = createHandler({ coop, log, throttle });
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
@@ -215,12 +216,12 @@ export function startServer({ port = 8080, host = '127.0.0.1', coop = false, log
 }
 
 function parseArgs(argv) {
-  const opts = { port: 8080, host: '127.0.0.1', coop: false };
+  const opts = { port: 8080, host: '127.0.0.1', coop: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port') opts.port = Number(argv[++i]);
     else if (a === '--host') opts.host = argv[++i];
-    else if (a === '--coop') opts.coop = true;
+    else if (a === '--no-coop') opts.coop = false;
     else throw new Error(`unknown argument: ${a}`);
   }
   return opts;

@@ -39,8 +39,10 @@ export function startRun(s) {
   });
 }
 
+// The packs keep downloading after the engine has started (web/packloader.js): the bytes are kept in the boot
+// phase too, and shown in its detail line.
 export function onDownload(s, p) {
-  if (s.phase !== 'download') return;
+  if (s.phase !== 'download' && s.phase !== 'boot') return;
   s.dl = { loaded: p.loaded, total: p.total, fromCache: !!p.fromCache, cacheable: !!p.cacheable };
 }
 
@@ -152,6 +154,7 @@ export function render(s, now) {
       const parts = [];
       if (s.classes !== null && s.stage === 1) parts.push(`${s.classes.toLocaleString('en-US')} classes`);
       parts.push(fmtSec((now - (s.bootAt ?? s.enteredAt)) / 1000) + ' booting');
+      if (s.dl.total && s.dl.loaded < s.dl.total) parts.push(`packs ${mb(s.dl.loaded)} of ${mb(s.dl.total)} MB`);
       detail = parts.join(' · ');
     }
   } else if (s.phase === 'stopped') {
