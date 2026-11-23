@@ -15,9 +15,12 @@
 #include "binder.h"
 #include "selinuxfs.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "host.h"
 #include "linux.h"
 #include "mem.h"
 #include "poll.h"
@@ -158,10 +161,14 @@ struct bwork {
 };
 
 struct btxn {
+    uint64_t id;     /* a number for the trace (XIAOJI_BINDER_TRACE) */
     bthread_t *from; /* the sending thread, while its call waits for the reply (NULL: none) */
     bthread_t *to;   /* the thread that took the request */
     balloc_t *buf;   /* the buffer in the receiving proc */
-    bnode_t *node;   /* the target node (for a oneway request) */
+    /* The target node's flags, taken at the send. A node is not kept by pointer: it can be freed
+     * between the send and the delivery, once nothing refers to it. */
+    int node_set;
+    uint32_t node_flags;
     uint64_t target, cookie;
     uint32_t code, flags;
     int32_t sender_pid;
@@ -226,6 +233,7 @@ typedef struct {
 
 struct bproc {
     bctx_t *ctx;
+    int pid;      /* the guest pid that opened the device (trace only) */
     memfd_t *mfd; /* the receive buffer (this proc holds one reference) */
     uint64_t map_va, map_size;
     int prepared, mapped, closing;
@@ -334,6 +342,122 @@ static void queue_proc(bproc_t *p, bwork_t *w)
     poll_notify();
 }
 
+/* ---------- trace: XIAOJI_BINDER_TRACE=1 (off by default) ----------
+ * One line per binder event on stderr: transactions (sender, target node, code, flags, the
+ * interface token and, for handle 0, the String16 argument), replies and failures, object
+ * translations, node and ref lifetimes, count traffic and acknowledgements. Off, each event is
+ * one test of a static flag. */
+
+static int bt_state = -1; /* -1: the variable is not read yet; 0: off; 1: on */
+
+static int bt_read(void)
+{
+    if (bt_state < 0) {
+        const char *e = getenv("XIAOJI_BINDER_TRACE");
+        bt_state = e && e[0] == '1';
+    }
+    return bt_state;
+}
+
+#define BT_ON (bt_state > 0 || (bt_state < 0 && bt_read()))
+#define BT(...)                \
+    do {                       \
+        if (BT_ON)             \
+            bt_log(__VA_ARGS__); \
+    } while (0)
+
+static uint64_t bt_seq;
+
+static void bt_log(const char *fmt, ...)
+{
+    static uint64_t t0;
+    if (!t0)
+        t0 = host_monotonic_ns() | 1;
+    proc_t *p = proc_cur();
+    fprintf(stderr, "[%llu ms %llu insn] binder pid=%d tid=%llu: ",
+            (unsigned long long)((host_monotonic_ns() - t0) / 1000000ull),
+            (unsigned long long)sched_icount(), p ? p->pid : 0, (unsigned long long)sched_tid());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static const char *bt_br(uint32_t br)
+{
+    switch (br) {
+    case BR_TRANSACTION: return "TRANSACTION";
+    case BR_REPLY: return "REPLY";
+    case BR_DEAD_REPLY: return "DEAD_REPLY";
+    case BR_FAILED_REPLY: return "FAILED_REPLY";
+    case BR_TRANSACTION_COMPLETE: return "TRANSACTION_COMPLETE";
+    case BR_INCREFS: return "INCREFS";
+    case BR_ACQUIRE: return "ACQUIRE";
+    case BR_RELEASE: return "RELEASE";
+    case BR_DECREFS: return "DECREFS";
+    default: return "other";
+    }
+}
+
+static const char *bt_obj(uint32_t t)
+{
+    switch (t) {
+    case OBJ_BINDER: return "BINDER";
+    case OBJ_WEAK_BINDER: return "WEAK_BINDER";
+    case OBJ_HANDLE: return "HANDLE";
+    case OBJ_WEAK_HANDLE: return "WEAK_HANDLE";
+    case OBJ_FD: return "FD";
+    case OBJ_FDA: return "FDA";
+    case OBJ_PTR: return "PTR";
+    default: return "?";
+    }
+}
+
+/* The String16 at data offset off (a length word, then UTF-16 units and a NUL): copies its ASCII
+ * text to out and returns the offset past it (4-byte aligned, as Parcel::writeString16 leaves it). */
+static uint64_t bt_str16(const uint8_t *d, uint64_t dsz, uint64_t off, char *out, size_t cap)
+{
+    size_t k = 0;
+    out[0] = 0;
+    if (off + 4 > dsz)
+        return dsz;
+    uint64_t n = ld32(d + off);
+    for (uint64_t i = 0; i < n && off + 4 + 2 * i + 2 <= dsz; i++) {
+        uint32_t c = d[off + 4 + 2 * i] | ((uint32_t)d[off + 5 + 2 * i] << 8);
+        if (k + 1 < cap)
+            out[k++] = (c >= 32 && c < 127) ? (char)c : '?';
+    }
+    out[k] = 0;
+    return off + 4 + ((2 * (n + 1) + 3) & ~(uint64_t)3);
+}
+
+/* Logs a sync or oneway request from a thread: the target handle and node, the code and flags,
+ * and the interface token (Parcel::writeInterfaceToken: strict mode, work source, 'SYST', then the
+ * String16). For handle 0 the String16 after the token is logged too (the service name). */
+static void bt_send(bproc_t *b, bthread_t *t, const btd_t *d, uint32_t h, bnode_t *node, uint64_t id)
+{
+    uint8_t head[256];
+    char tok[128] = "", arg[128] = "";
+    uint64_t n = d->data_size < sizeof head ? d->data_size : sizeof head;
+    if (n && mem_copy_out(head, d->buffer, (size_t)n) == 0 && n >= 16) {
+        uint64_t next = bt_str16(head, n, 12, tok, sizeof tok);
+        if (h == 0 && next < n)
+            bt_str16(head, n, next, arg, sizeof arg);
+    }
+    if (!node) {
+        BT("send txn=%llu from pid=%d handle=%u: NO REF (code=%u flags=%x) token=\"%s\"",
+           (unsigned long long)id, b->pid, h, d->code, d->flags, tok);
+        return;
+    }
+    BT("send txn=%llu from pid=%d tid=%llu handle=%u -> owner pid=%d ptr=%llx cookie=%llx "
+       "node-flags=%x code=%u flags=%x oneway=%d data=%llu offsets=%llu token=\"%s\"%s%s%s",
+       (unsigned long long)id, b->pid, (unsigned long long)t->tid, h, node->proc ? node->proc->pid : -1,
+       (unsigned long long)node->ptr, (unsigned long long)node->cookie, node->flags, d->code, d->flags,
+       (d->flags & TF_ONE_WAY) != 0, (unsigned long long)d->data_size, (unsigned long long)d->offsets_size,
+       tok, h == 0 ? " name=\"" : "", h == 0 ? arg : "", h == 0 ? "\"" : "");
+}
+
 /* The thread whose transaction is being translated, while it is (else NULL). A count the
  * transaction gives to its own sender's node (the sender owns the binder it sends) goes to
  * that thread: a thread waiting for its reply reads its own work, not the proc's, as the
@@ -348,6 +472,9 @@ static void node_notify_owner(bnode_t *n, uint32_t br)
     bwork_t *w = work_new(WK_OBJREF, br, n->ptr, n->cookie, NULL);
     if (!w)
         return;
+    BT("owner notify %s to pid=%d ptr=%llx cookie=%llx via %s", bt_br(br), n->proc->pid,
+       (unsigned long long)n->ptr, (unsigned long long)n->cookie,
+       xl_sender && xl_sender->proc == n->proc ? "sender thread" : "proc queue");
     if (xl_sender && xl_sender->proc == n->proc)
         queue_thread(xl_sender, w);
     else
@@ -408,15 +535,42 @@ static bnode_t *node_new(bproc_t *b, uint64_t ptr, uint64_t cookie, uint32_t fla
         n->flags = flags;
         n->next = b->nodes;
         b->nodes = n;
+        BT("node create owner pid=%d ptr=%llx cookie=%llx flags=%x", b->pid, (unsigned long long)ptr,
+           (unsigned long long)cookie, flags);
     }
     return n;
 }
 
-/* Frees a dead node with no refs left (its owner is gone, and its queue is empty). */
+static void node_unlink(bproc_t *b, bnode_t *n)
+{
+    for (bnode_t **pp = &b->nodes; *pp; pp = &(*pp)->next)
+        if (*pp == n) {
+            *pp = n->next;
+            return;
+        }
+}
+
+/* Frees a node once nothing needs it. A live owner's node goes when no ref holds it, the owner
+ * holds no count of it (none acknowledged, none pending) and no request is queued on it. This is
+ * the driver's rule (binder_dec_node_nilocked and BINDER_WORK_NODE, which erase the node). A later
+ * object at the same address then gets a new node with its own cookie. The context manager's node
+ * is kept while the manager lives. A dead owner's node goes when no ref is left. */
 static void node_maybe_free(bnode_t *n)
 {
-    if (!n->dead || n->nrefs || n->proc)
+    if (n->proc) {
+        bproc_t *o = n->proc;
+        if (n->nrefs || n->int_strong || n->int_weak || n->has_strong || n->has_weak || n->pend_strong ||
+            n->pend_weak || n->async || n->async_busy || o->ctx->mgr == n)
+            return;
+        BT("node free (owner alive) pid=%d ptr=%llx cookie=%llx", o->pid, (unsigned long long)n->ptr,
+           (unsigned long long)n->cookie);
+        node_unlink(o, n);
+        free(n);
         return;
+    }
+    if (!n->dead || n->nrefs)
+        return;
+    BT("node free ptr=%llx cookie=%llx", (unsigned long long)n->ptr, (unsigned long long)n->cookie);
     for (btxn_t *t = n->async; t;) {
         btxn_t *next = t->async_next;
         for (uint32_t i = 0; i < t->nfds; i++)
@@ -446,6 +600,8 @@ static bref_t *ref_new(bproc_t *b, bnode_t *n)
     r->next_node = n->refs;
     n->refs = r;
     n->nrefs++;
+    BT("ref create pid=%d handle=%u -> node owner=%d ptr=%llx cookie=%llx", b->pid, desc,
+       n->proc ? n->proc->pid : -1, (unsigned long long)n->ptr, (unsigned long long)n->cookie);
     return r;
 }
 
@@ -508,6 +664,8 @@ static void ref_free(bref_t *r)
 {
     bproc_t *b = r->proc;
     bnode_t *n = r->node;
+    BT("ref free pid=%d handle=%u -> node owner=%d ptr=%llx cookie=%llx", b->pid, r->desc,
+       n->proc ? n->proc->pid : -1, (unsigned long long)n->ptr, (unsigned long long)n->cookie);
     for (bref_t **pp = &b->refs; *pp; pp = &(*pp)->next_proc)
         if (*pp == r) {
             *pp = r->next_proc;
@@ -600,6 +758,8 @@ static void buf_release_refs(bproc_t *b, balloc_t *a)
         uint32_t type = ld32(obj);
         if (type == OBJ_HANDLE || type == OBJ_WEAK_HANDLE) {
             bref_t *r = ref_by_handle(b, ld32(obj + 8));
+            BT("buffer free pid=%d: release %s handle %u (%s)", b->pid, bt_obj(type), ld32(obj + 8),
+               r ? "ref" : "NO REF");
             if (r)
                 ref_dec(r, type == OBJ_HANDLE);
         }
@@ -613,9 +773,9 @@ static void buf_release_refs(bproc_t *b, balloc_t *a)
  * binder_transaction_priority). Only real-time policies are raised; oneway requests are not. */
 static void sched_raise(btxn_t *x, bthread_t *t)
 {
-    if (x->oneway || !x->node)
+    if (x->oneway || !x->node_set)
         return;
-    uint32_t f = x->node->flags;
+    uint32_t f = x->node_flags;
     int have = 0, pol = 0, pri = 0;
     int node_pol = (int)((f >> FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT) & 3);
     int node_pri = (int)(f & FLAT_BINDER_FLAG_PRIORITY_MASK);
@@ -668,6 +828,8 @@ static void sent_remove(bthread_t *from, btxn_t *t)
 static void fail_to_sender(btxn_t *t, uint32_t br)
 {
     bthread_t *s = t->from;
+    BT("fail txn=%llu to waiting tid=%llu: %s", (unsigned long long)t->id, s ? (unsigned long long)s->tid : 0ull,
+       bt_br(br));
     if (!s)
         return;
     sent_remove(s, t);
@@ -749,6 +911,9 @@ static int xl_binder(xlate_t *x, uint8_t *obj, int strong, bnode_t *n)
 {
     if (n->proc == x->dst) {
         /* The receiver owns the node: it gets its own binder back. */
+        BT("  translate %s: node owned by the receiver pid=%d, binder back ptr=%llx cookie=%llx",
+           strong ? "BINDER" : "WEAK_BINDER", x->dst->pid, (unsigned long long)n->ptr,
+           (unsigned long long)n->cookie);
         st32(obj, strong ? OBJ_BINDER : OBJ_WEAK_BINDER);
         st64(obj + 8, n->ptr);
         st64(obj + 16, n->cookie);
@@ -761,6 +926,9 @@ static int xl_binder(xlate_t *x, uint8_t *obj, int strong, bnode_t *n)
             return -LE_NOMEM;
     }
     ref_inc(r, strong);
+    BT("  translate %s: node owner pid=%d ptr=%llx cookie=%llx -> handle %llu in pid=%d",
+       strong ? "BINDER" : "WEAK_BINDER", n->proc ? n->proc->pid : -1, (unsigned long long)n->ptr,
+       (unsigned long long)n->cookie, (unsigned long long)r->desc, x->dst->pid);
     st32(obj, strong ? OBJ_HANDLE : OBJ_WEAK_HANDLE);
     st64(obj + 8, r->desc);
     st64(obj + 16, 0);
@@ -832,6 +1000,8 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
 {
     uint8_t *obj = x->data + off;
     uint32_t type = ld32(obj);
+    BT("  object %u at data offset %llu: type %s (from pid=%d to pid=%d)", idx, (unsigned long long)off,
+       bt_obj(type), x->src->pid, x->dst->pid);
     switch (type) {
     case OBJ_BINDER:
     case OBJ_WEAK_BINDER: {
@@ -843,6 +1013,13 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
             n = node_new(x->src, ptr, cookie, ld32(obj + 4));
             if (!n)
                 return -LE_NOMEM;
+        } else if (n->cookie != cookie) {
+            /* binder_translate_binder: a node is one object, so a different cookie at the same
+             * address is refused (the send fails). The stored cookie is kept. */
+            BT("  %s sent by pid=%d: node ptr=%llx has cookie %llx, sent %llx: REFUSED (cookie mismatch)",
+               bt_obj(type), x->src->pid, (unsigned long long)ptr, (unsigned long long)n->cookie,
+               (unsigned long long)cookie);
+            return -LE_INVAL;
         }
         return xl_binder(x, obj, type == OBJ_BINDER, n);
     }
@@ -851,8 +1028,13 @@ static int xl_object(xlate_t *x, uint32_t idx, uint64_t off)
         if (off + 24 > x->dsize)
             return -LE_INVAL;
         bref_t *r = ref_for_handle(x->src, ld32(obj + 8));
-        if (!r)
+        if (!r) {
+            BT("  %s handle %u in pid=%d: NO REF", bt_obj(type), ld32(obj + 8), x->src->pid);
             return -LE_INVAL;
+        }
+        BT("  %s handle %u in pid=%d -> node owner=%d ptr=%llx cookie=%llx strong=%d weak=%d",
+           bt_obj(type), r->desc, x->src->pid, r->node->proc ? r->node->proc->pid : -1,
+           (unsigned long long)r->node->ptr, (unsigned long long)r->node->cookie, r->strong, r->weak);
         /* A weak-only ref cannot be sent as a strong one (the driver's need_strong_ref). */
         if (type == OBJ_HANDLE && r->strong == 0)
             return -LE_INVAL;
@@ -1154,6 +1336,7 @@ static void queue_txn_complete(bthread_t *t)
 
 static void queue_failed(bthread_t *t, uint32_t br)
 {
+    BT("fail to tid=%llu: %s", (unsigned long long)t->tid, bt_br(br));
     bwork_t *w = work_new(WK_FAILED, br, 0, 0, NULL);
     if (w)
         queue_thread(t, w);
@@ -1260,6 +1443,9 @@ static int emit(bproc_t *b, bthread_t *t, bwork_t *w, uint64_t va)
         txn_install_fds(b, x);
         if (w->kind == WK_TXN) {
             x->to = t;
+            BT("deliver request txn=%llu code=%u to pid=%d tid=%llu: node ptr=%llx cookie=%llx sender pid=%d",
+               (unsigned long long)x->id, x->code, b->pid, (unsigned long long)t->tid,
+               (unsigned long long)x->target, (unsigned long long)x->cookie, x->sender_pid);
             sched_raise(x, t);
             if (!x->oneway) {
                 x->recv_next = t->recv;
@@ -1440,6 +1626,9 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
         t->recv = orig->recv_next;
         bthread_t *s = orig->from;
         orig->from = NULL;
+        BT("reply to txn=%llu: waiting tid=%llu (pid=%d), replied by pid=%d tid=%llu",
+           (unsigned long long)orig->id, s ? (unsigned long long)s->tid : 0ull,
+           s ? s->proc->pid : -1, b->pid, (unsigned long long)t->tid);
         if (s)
             sent_remove(s, orig);
         int err = 0;
@@ -1454,6 +1643,10 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
                 rep->reply = 1;
                 rep->flags = d->flags;
                 rep->to = s;
+                rep->id = ++bt_seq;
+                BT("reply txn=%llu built as txn=%llu for tid=%llu: flags=%x data=%llu",
+                   (unsigned long long)orig->id, (unsigned long long)rep->id, (unsigned long long)s->tid,
+                   d->flags, (unsigned long long)d->data_size);
                 rep->sender_pid = proc_cur()->pid;
                 bwork_t *w = work_new(WK_REPLY, BR_REPLY, 0, 0, rep);
                 if (w)
@@ -1472,6 +1665,9 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     uint32_t h = (uint32_t)d->target;
     bref_t *r = ref_for_handle(b, h);
     bnode_t *node = r ? r->node : NULL;
+    uint64_t txid = ++bt_seq;
+    if (BT_ON)
+        bt_send(b, t, d, h, node, txid);
     if (!node) {
         queue_failed(t, h == 0 ? BR_DEAD_REPLY : BR_FAILED_REPLY);
         return;
@@ -1498,10 +1694,12 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     }
     x->code = d->code;
     x->flags = d->flags;
+    x->id = txid;
     x->sender_pid = proc_cur()->pid;
     x->target = node->ptr;
     x->cookie = node->cookie;
-    x->node = node;
+    x->node_set = 1;
+    x->node_flags = node->flags;
     x->oneway = oneway;
     queue_txn_complete(t);
     if (oneway) {
@@ -1572,6 +1770,8 @@ static int bcmd(bproc_t *b, bthread_t *t, uint32_t cmd, const uint8_t *arg)
     case BC_INCREFS:
     case BC_ACQUIRE: {
         bref_t *r = ref_for_handle(b, ld32(arg));
+        BT("count %s pid=%d handle=%u: %s", cmd == BC_ACQUIRE ? "ACQUIRE" : "INCREFS", b->pid, ld32(arg),
+           r ? "ref" : "NO REF");
         if (r)
             ref_inc(r, cmd == BC_ACQUIRE);
         return 0;
@@ -1579,6 +1779,8 @@ static int bcmd(bproc_t *b, bthread_t *t, uint32_t cmd, const uint8_t *arg)
     case BC_RELEASE:
     case BC_DECREFS: {
         bref_t *r = ref_by_handle(b, ld32(arg));
+        BT("count %s pid=%d handle=%u: %s", cmd == BC_RELEASE ? "RELEASE" : "DECREFS", b->pid, ld32(arg),
+           r ? "ref" : "NO REF");
         if (r)
             ref_dec(r, cmd == BC_RELEASE);
         return 0;
@@ -1587,6 +1789,8 @@ static int bcmd(bproc_t *b, bthread_t *t, uint32_t cmd, const uint8_t *arg)
     case BC_ACQUIRE_DONE: {
         bnode_t *n = node_by_ptr(b, ld64(arg));
         int strong = cmd == BC_ACQUIRE_DONE;
+        BT("ack %s pid=%d ptr=%llx: %s", strong ? "ACQUIRE_DONE" : "INCREFS_DONE", b->pid,
+           (unsigned long long)ld64(arg), n ? "node" : "NO NODE");
         if (!n)
             return 0;
         if (strong ? n->pend_strong : n->pend_weak) {
@@ -1606,6 +1810,7 @@ static int bcmd(bproc_t *b, bthread_t *t, uint32_t cmd, const uint8_t *arg)
                 }
             }
         }
+        node_maybe_free(n);
         return 0;
     }
     case BC_REQUEST_DEATH_NOTIFICATION: {
@@ -1801,8 +2006,11 @@ binder_proc_t *binder_open(int which)
     if (which < 0 || which >= NDEV)
         return NULL;
     bproc_t *b = calloc(1, sizeof *b);
-    if (b)
+    if (b) {
         b->ctx = &contexts[which];
+        proc_t *p = proc_cur();
+        b->pid = p ? p->pid : 0;
+    }
     return b;
 }
 

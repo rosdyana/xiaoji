@@ -82,7 +82,7 @@ make_oracle() {
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
     # oracles run as root (passwordless sudo in the builder VM).
     local runas=""
-    case "$name" in mountns-* | binder-sg-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -504,8 +504,9 @@ done
 # "System server process N has been created", B4b milestone c), system_server's entry ("Entered
 # the Android system server!", B4c milestone d1) and the furthest deterministic point of
 # startBootstrapServices, "InitPowerManagement" (B4d: the last bootstrap step before the
-# PowerManager NullPointerException, see docs/boot.md B4d). About 57 s natively.
-# Not in the default run, which is kept short; the boot is stopped by --init-timeout.
+# PowerManager NullPointerException, which is intermittent after B4e: see docs/boot.md B4e). It is
+# the furthest point reached in every run, so it is the furthest deterministic one. About 57 s
+# natively. Not in the default run, which is kept short; the boot is stopped by --init-timeout.
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"

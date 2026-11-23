@@ -1994,3 +1994,151 @@ java.lang.NullPointerException: Attempt to invoke virtual method 'android.os.Pow
 - The deadlock check is a diagnostic in init mode. It does not stop a hang; the run ends at `--init-timeout`.
 - The "nothing can wake" test treats any service-restart deadline as a wake-up, and a host-side event (a control socket
   message) as not a wake-up. A hang that only a host event could end would be reported, and that is the intent.
+
+## B4e: binder node reuse, the binder trace, and the thermalservice fault (not fully fixed)
+
+Status: **partly done.** The stale-node defect is found with evidence, fixed, and covered by a regression test that
+is red before the fix and green after it. The B4d blocker is **not** resolved: `thermalservice` lookups still return
+"not found" in most boots (4 of 5 after the fix), so `InitPowerManagement` throws the NullPointerException there. A
+boot that gets the lookup right then stops at a SIGILL in system_server during `StartDisplayManager`.
+
+### The binder trace (`XIAOJI_BINDER_TRACE=1`, `engine/binder.c`)
+
+Off by default. With the variable off, each event is one test of a static flag (`BT_ON`), and the arguments are not
+evaluated. On, each binder event is one line on stderr with the guest pid and tid and an instruction stamp
+(`insn`, the same counter as the logcat stamp; the millisecond origin is the trace's own, so compare by `insn`).
+Events: a send (the target handle and its node's owner, ptr, cookie, node flags, code, flags, the interface token,
+and for handle 0 the String16 name), a delivery to a thread, a reply and its build, failures (`BR_FAILED_REPLY`,
+`BR_DEAD_REPLY`), each object of a transaction and how it was translated (with the node and ref), node and ref
+create and free, owner notifications (BR_ACQUIRE, BR_INCREFS, BR_RELEASE, BR_DECREFS), acknowledgements, buffer
+releases, and a node that a new object finds with a different cookie.
+
+Command: `XIAOJI_BINDER_TRACE=1 XIAOJI_STAMP=1 ./build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs
+--init-timeout 75`. Power: battery, Low Power Mode on, for the pre-fix run; battery, LPM off, for the later runs
+(`build/tests/boot/b4e-trace.pmset.txt`, `b4e-fixed.pmset.txt`). The Mac was on battery for every run here, not AC, so
+no run is a benchmark.
+
+### The evidence
+
+- **The stale node (pre-fix trace).** A node of system_server (pid 1014) was created at 57.994 s with ptr
+  `6ffd65f52430` and cookie `...efb8` (a callback object of servicemanager's `IServiceCallback`). servicemanager's
+  ref was released at 58.126 s, and the owner was sent RELEASE and DECREFS. The engine never freed the node,
+  because it freed a node only when its owner was dead (`node_maybe_free` checked `n->dead`). At 58.128 s
+  system_server sent a new BINDER object with the same ptr and a new cookie `...ea30` (a new Java object at a reused
+  weakref address). The engine attached it to the old node and kept the old cookie, and logged
+  `** COOKIE MISMATCH **`. A call through the handle then reaches the old cookie, the address of a freed object.
+  system_server took SIGSEGV at fault address 0x4 at 58.43 s, which was not analysed further.
+- **The kernel's rules** (6.12 source, `drivers/android/binder.c`, in the builder VM at
+  `/home/rosdyanakusuma/xbuild/linux-6.12.117`). `binder_translate_binder` returns `-EINVAL` when
+  `fp->cookie != node->cookie` (the send then fails with `BR_FAILED_REPLY`). `binder_dec_node_nilocked` and the
+  `BINDER_WORK_NODE` case erase a live owner's node once it has no refs, no owner-held strong or weak count, and no
+  tmp refs. The running kernel is 7.2 (OrbStack); the 6.12 source was used for the rules, and the test ran on the 7.2
+  kernel.
+- **The `activity` lookup (pre-fix trace; the log was later overwritten).** In that run the lookup of `activity` (txn
+  159, made before `setSystemProcess` registers it) was answered by servicemanager with handle 20, which is the thermal
+  node (owner 1014, ptr `6ffd69c95ce0`). That run logged no `SecurityException`, so this is not shown to be the B4d
+  symptom (an `IActivityManager` call reaching the thermal stub). Why servicemanager named handle 20 for `activity` is
+  **not established**. It is an anomaly to explain next, and it may be the same fault as the thermal lookup.
+- **The thermal lookup (post-fix).** `ThermalManagerService` adds `thermalservice` (txn 147, `ADD_SERVICE`). The reply
+  is `data=4`, a success status. servicemanager takes its own strong and weak counts on the ref (`count ACQUIRE` and
+  `count INCREFS`, handle 20) before it frees the request buffer, so the thermal node is kept (confirmed in the trace).
+  The `checkService` for `thermalservice` (txn 157) is then answered with no object at all, so servicemanager's
+  `tryGetService` returned null. Three branches of `tryGetService` (`frameworks/native/cmds/servicemanager/
+  ServiceManager.cpp`, remote tree) return null: the name is not in `mNameToService`, the stored binder is null, or
+  `mAccess->canFind` is false. **Which one is not established.** The SELinux emulation is allow-all, so `canFind` is the
+  least likely, but it is not ruled out.
+
+### The fix (engine/binder.c)
+
+- `node_maybe_free` frees a live owner's node under the kernel's rule: no ref holds it, the owner holds no count
+  (`has_strong`, `has_weak`) and none is pending, no request is queued on it (`async`, `async_busy`), and it is not the
+  context manager's node. It unlinks the node from the owner's list. It is called from `ref_free` and after the
+  owner's `BC_ACQUIRE_DONE` and `BC_INCREFS_DONE`.
+- A translated BINDER whose ptr names an existing node with a different cookie is refused (`-LE_INVAL`), as the
+  kernel does. The stored cookie is not overwritten.
+- A sync request keeps the node's flags (`node_set`, `node_flags`), not a pointer to the node, because the node can
+  be freed between the send and the delivery (`sched_raise` reads the flags at delivery).
+
+### The regression test (tests/guest/binder-node-reuse.c)
+
+A freestanding guest test, like `binder-sg`. The parent is the owner, and a forked child is the context manager (the
+kernel refuses a sync transaction between two binder fds of one process, which the first version found). Steps:
+
+1. The owner gives the object (ptr P, cookie 1). The server takes it, frees its buffer and replies.
+2. The owner gives the object at the same P with cookie 2. The server keeps the object.
+3. The server calls back through its handle (oneway). The owner's request carries the node's cookie.
+4. The owner gives P with cookie 3 while the server still holds cookie 2. The driver refuses it.
+5. The server frees the step-2 object. The owner is told to release it.
+
+Kernel oracle (builder VM, `sudo -n`, `build/tests/boot/binder-node-reuse-kernel.txt`):
+
+```
+step 1: txn-complete 1 reply 1
+step 2: txn-complete 1 reply 1
+step 3: callback code 9 requests 1 cookie 0xc002
+step 4: failed 1 reply 0
+step 5: release 1 decref 1
+```
+
+- **Green** (the fixed engine): identical to the kernel output (`cmp`).
+- **Red** (`build/tests/boot/xiaoji-red`, the engine with the lifetime and cookie-check hunks reverted, the trace and
+  the test kept): `step 3: ... cookie 0xc001` (the stale cookie), and `step 4: failed 0 reply 0` (the send was
+  accepted). `cmp` reports the difference.
+- The test's output does not print the owner's ACQUIRE and INCREFS counts for steps 1 and 2. The engine sends
+  BR_ACQUIRE and BR_INCREFS for a node's first translation, and the kernel's first translation gets none (its step 1
+  shows `acquire 0 incref 0`). The count protocol of a first translation differs, and it is not part of this fix. It is
+  a gap (below). The rest of the output is the kernel's.
+- `make test` runs the case in the engine and in Node (`binder-node-reuse-O0` and `-O2`, 4 PASS lines).
+
+### Milestones (this step, the post-fix boots that were run)
+
+Guest time (the logcat stamp), with the instruction count of the first system_server cycle. The Mac was on battery,
+Low Power Mode off, for these. Host load changes the time a lot (the same instruction count came at 33 s and at 57 s),
+so the instruction count is the figure to compare. Each boot is one system_server cycle unless it has a second one.
+
+| Boot (log) | Thermal lookup (first cycle) | InitPowerManagement (first cycle) | StartDisplayManager (first cycle, pid 1014) | SIGILL (first cycle) | Second cycle |
+|---|---|---|---|---|---|
+| trace, `b4e-fixed.err` | found (no "No service" line) | 56.78 s, 3.59 G | 56.96 s, 3.60 G | 56.98 s, 3.60 G | StartDisplayManager 114.72 s, SIGILL 114.74 s |
+| no trace, `build/tests/out/boot.err` (make test) | not found at 40.48 s: NPE | 40.48 s, 3.59 G | not reached | not reached | StartDisplayManager 76.62 s, SIGILL 76.63 s |
+| no trace, `b4e-notrace.err` | not found at 36.68 s: NPE | 36.67 s, 3.59 G | not reached | not reached | StartDisplayManager 74.44 s, SIGILL 74.45 s |
+| trace, `b4e-obj-1.err` | not found at 33.70 s: NPE | 33.69 s, 3.59 G | not reached | not reached | StartDisplayManager 68.00 s, SIGILL 68.01 s |
+| trace, `b4e-trace.err` (last trace-run) | not found: NPE | reached | not reached | not reached | not reached |
+
+Four of the five post-fix boots lost the thermal lookup. The pre-fix B4d run and the first pre-fix traced run are not
+compared (too few pre-fix runs of this step to give a rate).
+
+### The next blocker, with the log
+
+Two stops, depending on the run:
+
+```
+[36675 ms 3591718802 insn] E/SystemServiceRegistry(1014): No service published for: thermalservice     (the NPE of B4d)
+[56976 ms 3599716735 insn] F/libc(1014): Fatal signal 4 (SIGILL), code 1 (ILL_ILLOPC), fault addr 0x71697ee4 in tid 1014 (system_server), pid 1014
+```
+
+The SIGILL is in system_server after `Starting com.android.server.display.DisplayManagerService`. The faulting code is
+not identified (the address is in a mapping the engine does not name). It is a decode or an unimplemented instruction
+in the guest, to be found with the mapping of `0x71697ee4` (which the engine does not print).
+
+### Tests (this step)
+
+- `make test`: **168 passed, 0 failed, 0 xfail** (164 before: the four `binder-node-reuse` lines).
+- `XIAOJI_JIT=0 make test`: **168 passed, 0 failed, 0 xfail.**
+- `XIAOJI_BOOT=1 make test`: **169 passed, 0 failed, 0 xfail.** The check is unchanged: the class preload, the fork,
+  the d1 entry, `StartPowerManager` and `InitPowerManagement`. `StartDisplayManager` was tried as the new milestone and
+  removed: it is reached only when the thermal lookup succeeds, so it is not deterministic. `InitPowerManagement` is
+  the furthest point reached in every run of this step.
+- `make test-web`: all web checks passed.
+- `make` and `make wasm-node`: built. `clang` and `emcc` with `-O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -c` on
+  `engine/binder.c`: 0 warnings. The guest test with `gcc -Wall -Wextra -Wno-unused-parameter`: 0 warnings.
+- `pmset -g` before the runs is in `build/tests/boot/*.pmset.txt`.
+
+### Gaps (B4e)
+
+- **The thermalservice lookup returns null** (above). Not fixed. The branch of `tryGetService` is not established.
+- **`activity` was answered with the thermal node** in one pre-fix run. Not explained.
+- The owner's count protocol for a node's first translation differs from the kernel (BR_ACQUIRE and BR_INCREFS are sent
+  by the engine, not by the kernel, in step 1 of the test). Not changed.
+- The SIGILL in `DisplayManagerService`, at `0x71697ee4` (above). Not identified.
+- `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` contexts are still `u:r:kernel:s0` for every sender (B4c gap, unchanged).
+- The trace's millisecond stamp has its own origin (use `insn` to join it with logcat).
