@@ -247,11 +247,6 @@ void meta_write_privs(uint64_t dev, uint64_t ino)
 #define META_TMP ".xiaoji-meta.tmp"
 #define META_HEADER "xiaoji-meta 1"
 
-static char persist_root[4096];
-static int persist_on;
-static const char *const tree_names[] = {"/data", "/cache", "/metadata"};
-#define NTREES ((int)(sizeof tree_names / sizeof tree_names[0]))
-
 int meta_hidden_guest(const char *guest)
 {
     return !strcmp(guest, "/" META_FILE) || !strcmp(guest, "/" META_TMP);
@@ -267,6 +262,24 @@ int meta_recorded(const host_stat *st, meta_t *out)
     out->mode = r->mode;
     return 1;
 }
+
+#ifdef XIAOJI_WEB
+/* The browser build (W1) keeps the records in memory only: nothing is read from or written to the page's file
+ * system at start or exit, and the guest's /data does not outlive the page. */
+int meta_persist_open(const char *root)
+{
+    (void)root;
+    return 0;
+}
+
+void meta_persist_save(void)
+{
+}
+#else
+static char persist_root[4096];
+static int persist_on;
+static const char *const tree_names[] = {"/data", "/cache", "/metadata"};
+#define NTREES ((int)(sizeof tree_names / sizeof tree_names[0]))
 
 /* Writes the records under host (guest is its guest path) as sidecar lines, then recurses into directories. */
 static void write_tree(FILE *out, const char *host, const char *guest, int depth)
@@ -426,3 +439,4 @@ void meta_persist_save(void)
     if (rename(tmp, fin) != 0)
         fputs("xiaoji: cannot replace the guest metadata sidecar\n", stderr);
 }
+#endif /* XIAOJI_WEB */

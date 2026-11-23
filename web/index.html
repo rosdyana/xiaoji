@@ -9,6 +9,8 @@
   table { border-collapse: collapse; }
   td { padding: 0.15em 1em 0.15em 0; }
   td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  #blog { height: 24em; overflow-y: auto; font: 12px/1.3 ui-monospace, Menlo, monospace; }
+  #bms td { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -29,6 +31,22 @@
 <pre id="err"></pre>
 <h3>Timings</h3>
 <table id="timing"></table>
+
+<h2>Boot Android</h2>
+<p>
+  The native product boot (docs/boot.md, B7) in the browser: the same engine, the product tree, and
+  <code>--logcat --init image/xiaoji.rc</code>. It runs until the engine's init timeout, or until Stop.
+  No screen yet (null graphics). See docs/web-preview.md.
+</p>
+<p>
+  <button id="boot">Boot Android</button>
+  <button id="stop" disabled>Stop</button>
+  <span id="bstatus">idle</span>
+</p>
+<p>Fetched: <span id="bfetch">0 requests, 0 files, 0 bytes</span></p>
+<table id="bms"></table>
+<h3>logcat</h3>
+<pre id="blog"></pre>
 <script type="module" src="./main.js"></script>
 </body>
 </html>

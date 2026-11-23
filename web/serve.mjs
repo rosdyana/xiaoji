@@ -5,6 +5,9 @@
 // URL layout:
 //   /manifest.json          build/web/manifest.json (make build/web/manifest.json)
 //   /rootfs/<guest path>    build/rootfs/<guest path> (lazy files, Range requests)
+//   /manifest-xiaoji.json   build/web/manifest-xiaoji.json (make build/web/manifest-xiaoji.json)
+//   /rootfs-xiaoji/<path>   build/rootfs-xiaoji/<path>: the product tree, for "Boot Android" (W1)
+//   /xiaoji.rc              image/xiaoji.rc, the boot config the page passes to --init (W1)
 //   /<name>                 web/<name>, else build/wasm/<name>
 //
 // --coop adds Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers. Off by
@@ -24,6 +27,9 @@ export const DIRS = {
   wasm: join(REPO, 'build', 'wasm'),
   manifest: join(REPO, 'build', 'web', 'manifest.json'),
   rootfs: join(REPO, 'build', 'rootfs'),
+  manifestXiaoji: join(REPO, 'build', 'web', 'manifest-xiaoji.json'),
+  rootfsXiaoji: join(REPO, 'build', 'rootfs-xiaoji'),
+  image: join(REPO, 'image'),
 };
 
 const TYPES = {
@@ -50,7 +56,10 @@ async function locate(urlPath) {
     return null;
   }
   if (p === '/manifest.json') return { file: DIRS.manifest, root: DIRS.manifest };
+  if (p === '/manifest-xiaoji.json') return { file: DIRS.manifestXiaoji, root: DIRS.manifestXiaoji };
+  if (p === '/xiaoji.rc') return within(DIRS.image, '/xiaoji.rc');
   if (p.startsWith('/rootfs/')) return within(DIRS.rootfs, p.slice('/rootfs'.length));
+  if (p.startsWith('/rootfs-xiaoji/')) return within(DIRS.rootfsXiaoji, p.slice('/rootfs-xiaoji'.length));
   if (p === '/') p = '/index.html';
   const name = p.slice(1);
   if (!name || name.includes('/')) return null;

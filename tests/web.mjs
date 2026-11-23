@@ -3,6 +3,14 @@
 // (build/oracle/<case>.{out,rc}, the native run in the builder VM).
 //
 //   node tests/web.mjs [case ...]        (default: hello-jit)
+//   node tests/web.mjs --boot-only       the Boot Android check alone (W1)
+//   XIAOJI_WEB_BOOT=1 node tests/web.mjs ... also runs the Boot Android check
+//
+// The Boot Android check (W1) clicks "Boot Android" on the page and waits for the milestone
+// "Starting phase 100" (the furthest point the native boot reaches reliably at commit 054b086). It
+// then checks that every earlier milestone was reached, and that the log was still streaming (the
+// worker was still running when the milestone arrived). It stops the boot with the page's Stop
+// button. XN_BOOT_TIMEOUT_MS bounds the wait (default 900000).
 //
 // Playwright comes from XN_PLAYWRIGHT (the playwright-core ESM entry), defaulting to the
 // copy in the xiaonux bench. Each case gets a new browser process, so each run has a fresh
@@ -21,6 +29,9 @@ const PW =
   process.env.XN_PLAYWRIGHT ??
   '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
 const TIMEOUT_MS = Number(process.env.XN_WEB_TIMEOUT_MS ?? 600000);
+const BOOT_TIMEOUT_MS = Number(process.env.XN_BOOT_TIMEOUT_MS ?? 900000);
+// The milestones that come before phase 100 in the native boot (any order).
+const BOOT_REQUIRED = ['art', 'preload', 'sensors', 'health', 'sf', 'forked', 'entry', 'phase100'];
 
 let failures = 0;
 function check(ok, what) {
@@ -77,15 +88,66 @@ async function runCase(chromium, baseUrl, name) {
   }
 }
 
+// The Boot Android check (W1). Returns nothing; counts failures like the other checks.
+async function runBoot(chromium, baseUrl) {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  try {
+    await page.goto(baseUrl, { waitUntil: 'load' });
+    const t0 = Date.now();
+    await page.click('#boot');
+    await page.waitForFunction(
+      () => window.xb && (window.xb.milestones.phase100 || ['done', 'error', 'stopped'].includes(window.xb.status)),
+      null,
+      { timeout: BOOT_TIMEOUT_MS, polling: 500 },
+    );
+    // The worker is still running here if the log streamed: the milestone arrived before the engine stopped.
+    const streaming = await page.evaluate(() => window.xb.status === 'running' || window.xb.status === 'loading');
+    const xb = await page.evaluate(() => window.xb);
+    const reached = Object.keys(xb.milestones);
+    console.log(`--- boot: status "${xb.status}", ${xb.lines} log lines, ${Math.round((Date.now() - t0) / 1000)} s wall`);
+    if (xb.error) console.log(`    error: ${xb.error.split('\n')[0]}`);
+    for (const ms of Object.values(xb.milestones)) {
+      const s = ms.stamp ? `engine ${ms.stamp.ms} ms, ${ms.stamp.insn} insn` : 'no stamp';
+      console.log(`    milestone ${ms.label}: wall ${(ms.wall / 1000).toFixed(2)} s, ${s}`);
+    }
+    if (xb.fetch) console.log(`    fetch: ${JSON.stringify(xb.fetch)}`);
+    check(xb.milestones.phase100 !== undefined, 'boot: reaches "Starting phase 100"');
+    for (const id of BOOT_REQUIRED) {
+      check(reached.includes(id), `boot: milestone ${id} reached`);
+    }
+    check(streaming, 'boot: logcat streams while the engine runs (milestone arrived before the engine stopped)');
+    check(pageErrors.length === 0, `boot: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
+    // Stop the worker (the page's Stop button), so the run does not hold the browser.
+    await page.click('#stop');
+    await page.waitForFunction(() => window.xb.status !== 'running' && window.xb.status !== 'loading', null, {
+      timeout: 30000,
+      polling: 100,
+    });
+  } finally {
+    await browser.close();
+  }
+}
+
 async function main() {
-  const names = process.argv.slice(2).length ? process.argv.slice(2) : ['hello-jit'];
+  const argv = process.argv.slice(2);
+  const bootOnly = argv.includes('--boot-only');
+  const bootToo = process.env.XIAOJI_WEB_BOOT === '1';
+  const names = argv.filter((a) => !a.startsWith('--')).length
+    ? argv.filter((a) => !a.startsWith('--'))
+    : bootOnly ? [] : ['hello-jit'];
   for (const n of names) {
     if (!CASES[n]) {
       console.error(`unknown case ${n}; known: ${Object.keys(CASES).join(' ')}`);
       process.exit(2);
     }
   }
-  for (const f of ['build/wasm/xiaoji.mjs', 'build/web/manifest.json', 'build/rootfs/data/hello.dex']) {
+  const needed = ['build/wasm/xiaoji.mjs'];
+  if (names.length) needed.push('build/web/manifest.json', 'build/rootfs/data/hello.dex');
+  if (bootOnly || bootToo) needed.push('build/web/manifest-xiaoji.json', 'build/rootfs-xiaoji/system/bin/init');
+  for (const f of needed) {
     if (!existsSync(join(ROOT, f))) {
       console.error(`missing ${f}; run make test-web (it builds the prerequisites)`);
       process.exit(2);
@@ -99,6 +161,7 @@ async function main() {
     for (const n of names) {
       await runCase(chromium, srv.url, n);
     }
+    if (bootOnly || bootToo) await runBoot(chromium, srv.url);
   } finally {
     await srv.close();
   }

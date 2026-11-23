@@ -45,7 +45,7 @@ wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 # filesystem built by the worker in MEMFS (createLazyFile over HTTP).
 build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	$(EMENV) emcc -O3 -std=c11 -DXIAOJI_WEB=1 $(GEN_INC) -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
 	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
 	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
@@ -76,10 +76,19 @@ build/web/manifest.json: tools/mkmanifest.py build/rootfs/data/hello.dex
 	@mkdir -p build/web
 	tools/mkmanifest.py build/rootfs $@
 
-test-web: wasm build/web/manifest.json   ## run the web build in headless Chromium (tests/web.mjs)
+# The product tree for "Boot Android" (W1): writable trees listed empty, everything else lazy. Built from
+# build/rootfs-xiaoji, which is not built here (it comes from the image, docs/boot.md B4d). Delete the manifest to
+# regenerate it after the tree changes.
+build/web/manifest-xiaoji.json: tools/mkmanifest.py
+	@mkdir -p build/web
+	tools/mkmanifest.py --product build/rootfs-xiaoji $@
+
+test-web: wasm build/web/manifest.json   ## run the web build in headless Chromium (tests/web.mjs); XIAOJI_WEB_BOOT=1 adds the boot check
+	@if [ "$(XIAOJI_WEB_BOOT)" = 1 ]; then $(MAKE) build/web/manifest-xiaoji.json; fi
 	node tests/web.mjs hello-jit hello-int
 
 serve: wasm build/web/manifest.json   ## dev server for the web page (web/serve.mjs), port 8080
+	@if [ -d build/rootfs-xiaoji ]; then $(MAKE) build/web/manifest-xiaoji.json; else echo "serve: no build/rootfs-xiaoji, Boot Android is off"; fi
 	node web/serve.mjs --port 8080
 
 image:          ## download + extract the Android 13 arm64 guest -> build/rootfs

@@ -68,8 +68,13 @@ static void print_datagram(const uint8_t *buf, size_t n)
     static int stamp = -1;
     static uint64_t t0;
     if (stamp < 0) {
+#ifdef XIAOJI_WEB
+        /* The browser build always stamps: the page's milestone strip reads the counts (W1). */
+        stamp = 1;
+#else
         const char *e = getenv("XIAOJI_STAMP");
         stamp = e && e[0] == '1';
+#endif
         t0 = host_monotonic_ns();
     }
     if (stamp)

@@ -1,5 +1,8 @@
 // Page side of the web build (M4): starts one worker per run and shows its output.
-// window.xn holds the state of the last run, for tests/web.mjs.
+// window.xn holds the state of the last run, for tests/web.mjs. The Boot Android panel (W1) starts
+// a worker for the product boot; window.xb holds its state.
+
+import { BOOT } from './cases.js';
 
 const $ = (id) => document.getElementById(id);
 const base = new URL('./', location.href).href;
@@ -77,4 +80,98 @@ $('run').addEventListener('click', () => {
     finish();
   };
   worker.postMessage({ type: 'run', name, base });
+});
+
+// Boot Android (W1). window.xb is the machine-readable state, for tests/web.mjs: status is 'idle',
+// 'loading', 'running', 'stopped', 'done' or 'error'; milestones maps each reached id to its
+// wall time (s, from the worker's start), engine ms and instruction count.
+const LOG_LINES = 20000;
+window.xb = { status: 'idle', lines: 0, milestones: {}, fetch: null, done: null, error: null };
+let bootWorker = null;
+
+function setBootStatus(s) {
+  window.xb.status = s;
+  $('bstatus').textContent = s;
+}
+
+function fmtBytes(n) {
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B';
+}
+
+function renderMilestoneRows() {
+  $('bms').innerHTML = '<tr><th>Milestone</th><th>Wall</th><th>Engine time</th><th>Instructions</th></tr>' +
+    BOOT.milestones.map((ms) =>
+    `<tr id="ms-${ms.id}"><td>${ms.label}</td><td class="n" data-k="wall">-</td>` +
+    `<td class="n" data-k="ms">-</td><td class="n" data-k="insn">-</td></tr>`).join('');
+}
+
+function appendLog(text) {
+  const log = $('blog');
+  log.append(document.createTextNode(text + '\n'));
+  while (log.childNodes.length > LOG_LINES) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+  window.xb.lines++;
+}
+
+function stopBoot(status) {
+  if (bootWorker) bootWorker.terminate();
+  bootWorker = null;
+  $('boot').disabled = false;
+  $('stop').disabled = true;
+  if (status) setBootStatus(status);
+}
+
+$('boot').addEventListener('click', () => {
+  $('blog').textContent = '';
+  $('bfetch').textContent = '0 requests, 0 files, 0 bytes';
+  renderMilestoneRows();
+  window.xb = { status: 'loading', lines: 0, milestones: {}, fetch: null, done: null, error: null };
+  setBootStatus('loading');
+  $('boot').disabled = true;
+  $('stop').disabled = false;
+
+  const worker = new Worker(new URL('./worker.js', location.href), { type: 'module' });
+  bootWorker = worker;
+  worker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === 'boot-start') {
+      // The machine status stays 'loading' (Stop depends on it); only the display text changes.
+      $('bstatus').textContent = `loading ${m.files} entries`;
+    } else if (m.type === 'boot-tree') {
+      setBootStatus('running');
+    } else if (m.type === 'bootline') {
+      appendLog(m.text);
+    } else if (m.type === 'milestone') {
+      const row = $('ms-' + m.id);
+      if (row && m.stamp) {
+        row.querySelector('[data-k="wall"]').textContent = (m.wall / 1000).toFixed(2) + ' s';
+        row.querySelector('[data-k="ms"]').textContent = (m.stamp.ms / 1000).toFixed(2) + ' s';
+        row.querySelector('[data-k="insn"]').textContent = (m.stamp.insn / 1e9).toFixed(3) + ' G';
+      }
+      window.xb.milestones[m.id] = { label: m.label, wall: m.wall, stamp: m.stamp, line: m.line };
+    } else if (m.type === 'fetch') {
+      window.xb.fetch = { requests: m.requests, files: m.files, bytes: m.bytes };
+      $('bfetch').textContent = `${m.requests} requests, ${m.files} files, ${fmtBytes(m.bytes)}`;
+    } else if (m.type === 'done') {
+      window.xb.done = m;
+      stopBoot(`exit ${m.exitCode}`);
+      window.xb.status = 'done';
+    } else if (m.type === 'error') {
+      window.xb.error = m.text;
+      appendLog(m.text);
+      stopBoot('error');
+    } else if (m.type === 'out') {
+      appendLog(m.text);
+    }
+  };
+  worker.onerror = (ev) => {
+    window.xb.error = ev.message || 'worker error';
+    appendLog(window.xb.error);
+    stopBoot('error');
+  };
+  worker.postMessage({ type: 'boot', base: new URL('./', location.href).href });
+});
+
+$('stop').addEventListener('click', () => {
+  if (window.xb.status === 'loading' || window.xb.status === 'running') stopBoot('stopped');
 });
