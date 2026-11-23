@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cred.h"
 #include "fdobj.h"
+#include "linux.h"
 #include "logd.h"
 #include "poll.h"
 #include "proc.h"
@@ -88,6 +90,28 @@ typedef struct {
     int active;
 } tmo_t;
 static tmo_t tmos[SCHED_MAX_THREADS];
+
+/* The credentials SCM_CREDENTIALS carries when the sender gives none: the real ids (net/core/scm.c,
+ * scm_set_cred with current_uid and current_gid). SO_PEERCRED is cur_cred (the effective ids). */
+static sock_cred_t cur_scm_cred(void)
+{
+    proc_t *p = proc_cur();
+    sock_cred_t c = {p ? p->pid : 0, p ? p->cred.ruid : 0, p ? p->cred.rgid : 0};
+    return c;
+}
+
+int sock_scm_check(const sock_cred_t *c)
+{
+    proc_t *p = proc_cur();
+    if (c->uid == 0xFFFFFFFFu || c->gid == 0xFFFFFFFFu)
+        return -LE_INVAL;
+    int pid_ok = c->pid == p->pid || cred_has_cap(p, LCAP_SYS_ADMIN);
+    int uid_ok = c->uid == p->cred.ruid || c->uid == p->cred.euid || c->uid == p->cred.suid ||
+                 cred_has_cap(p, LCAP_SETUID);
+    int gid_ok = c->gid == p->cred.rgid || c->gid == p->cred.egid || c->gid == p->cred.sgid ||
+                 cred_has_cap(p, LCAP_SETGID);
+    return pid_ok && uid_ok && gid_ok ? 0 : -LE_PERM;
+}
 
 static sock_cred_t cur_cred(void)
 {
@@ -634,7 +658,7 @@ static void enqueue(sock_t *t, msg_t *m)
     wake(t);
 }
 
-int64_t sock_send(sock_t *s, const uint8_t *buf, size_t n, void **fds, int nfds, sock_t *to)
+int64_t sock_send(sock_t *s, const uint8_t *buf, size_t n, void **fds, int nfds, sock_t *to, const sock_cred_t *scm)
 {
     if (s->ops) {
         if (nfds)
@@ -672,7 +696,7 @@ int64_t sock_send(sock_t *s, const uint8_t *buf, size_t n, void **fds, int nfds,
     for (int i = 0; i < nfds; i++)
         m->fds[i] = fds[i];
     m->nfds = nfds;
-    m->cred = cur_cred();
+    m->cred = scm ? *scm : cur_scm_cred();
     enqueue(t, m);
     tmo_drop();
     return (int64_t)k;
@@ -811,7 +835,7 @@ int64_t sock_read(sock_t *s, void *buf, size_t n)
 
 int64_t sock_write(sock_t *s, const void *buf, size_t n)
 {
-    return sock_send(s, (const uint8_t *)buf, n, NULL, 0, NULL);
+    return sock_send(s, (const uint8_t *)buf, n, NULL, 0, NULL, NULL);
 }
 
 /* ---------- readiness and options ---------- */

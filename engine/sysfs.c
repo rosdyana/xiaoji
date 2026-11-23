@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "binder.h"
+#include "cred.h"
 #include "goldfish.h"
 #include "fdobj.h"
 #include "poll.h"
@@ -607,9 +608,8 @@ static int64_t sys_fsync(uint64_t fd)
     return -LE_INVAL;
 }
 
-/* Ownership and capabilities are not modelled. stat reports uid and gid 0 for every file, so a
- * chown names an existing file (or descriptor) and changes nothing. A process is root, so
- * capget reports the full set (the version-3 layout); capset is accepted and ignored. */
+/* Ownership is not modelled. stat reports uid and gid 0 for every file, so a chown names an existing
+ * file (or descriptor) and changes nothing. (capget and capset are in cred.c.) */
 static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t flags)
 {
     static char path[VFS_PATH_MAX];
@@ -637,7 +637,7 @@ static int mount_str(uint64_t va, char *buf, size_t cap, int *present)
 static int64_t sys_mount(uint64_t src_va, uint64_t tgt_va, uint64_t type_va, uint64_t flags)
 {
     static char src[VFS_PATH_MAX], tgt[VFS_PATH_MAX], type[64];
-    if (proc_cur()->cred.euid != 0)
+    if (!cred_has_cap(proc_cur(), LCAP_SYS_ADMIN))
         return -LE_PERM;
     int hsrc, htype, rc;
     rc = mount_str(src_va, src, sizeof src, &hsrc);
@@ -657,7 +657,7 @@ static int64_t sys_mount(uint64_t src_va, uint64_t tgt_va, uint64_t type_va, uin
 static int64_t sys_umount2(uint64_t tgt_va, uint64_t flags)
 {
     static char tgt[VFS_PATH_MAX];
-    if (proc_cur()->cred.euid != 0)
+    if (!cred_has_cap(proc_cur(), LCAP_SYS_ADMIN))
         return -LE_PERM;
     int rc = get_path(tgt_va, tgt, sizeof tgt);
     if (rc)
@@ -753,31 +753,10 @@ static int64_t sys_unshare(uint64_t flags)
         return -LE_INVAL;
     if (!(flags & CLONE_NEWNS_FLAG))
         return 0;
-    if (proc_cur()->cred.euid != 0)
+    if (!cred_has_cap(proc_cur(), LCAP_SYS_ADMIN))
         return -LE_PERM;
     vfs_fdtab_copy_ns(proc_cur()->fds);
     return 0;
-}
-
-static int64_t sys_capget(uint64_t hdr_va, uint64_t data_va)
-{
-    uint8_t h[8];
-    if (mem_copy_out(h, hdr_va, sizeof h) < 0)
-        return -LE_FAULT;
-    const uint32_t cap_v3 = 0x20080522u;
-    uint32_t version = (uint32_t)h[0] | (uint32_t)h[1] << 8 | (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
-    if (version != cap_v3) {
-        for (int i = 0; i < 4; i++)
-            h[i] = (uint8_t)(cap_v3 >> (8 * i));
-        mem_copy_in(hdr_va, h, 4);
-        return data_va ? -LE_INVAL : 0;
-    }
-    if (!data_va)
-        return 0;
-    uint8_t d[24];
-    for (int i = 0; i < 24; i++)
-        d[i] = (i % 12) < 8 ? 0xff : 0; /* effective and permitted full, inheritable empty */
-    return mem_copy_in(data_va, d, sizeof d) < 0 ? -LE_FAULT : 0;
 }
 
 static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
@@ -1117,8 +1096,6 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case 283: /* membarrier */ *ret = sys_membarrier(a[0], a[1]); return 1;
     case 97: /* unshare */ *ret = sys_unshare(a[0]); return 1;
     case 270: /* process_vm_readv */ *ret = sys_process_vm_readv(a[0], a[1], a[2], a[3], a[4], a[5]); return 1;
-    case 90: /* capget */ *ret = sys_capget(a[0], a[1]); return 1;
-    case 91: /* capset */ *ret = 0; return 1;
     case SYS_FACCESSAT2: *ret = sys_faccessat(a[0], a[1], a[2], a[3]); return 1;
     case SYS_GETDENTS64: *ret = sys_getdents64(a[0], a[1], a[2]); return 1;
     case SYS_FSTATFS: *ret = sys_fstatfs(a[0], a[1]); return 1;

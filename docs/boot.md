@@ -2424,3 +2424,188 @@ critical path, not the stop.
   `glTexImage2D`, `glUniformMatrix4fv`, `glUseProgram`, `rcCreateDisplayById`, `rcOpenColorBuffer2`,
   `rcSetDisplayPoseDpi`, `rcSetPuid`, `rcSetWindowColorBuffer`. None of them stops the boot so far.
 - **`XIAOJI_GF_TRACE=1`** (goldfish) and **`XIAOJI_BINDER_TRACE=1`** (binder) are the two traces used here.
+
+## B6: the credentials model, init's ids, and the boot past idmap2d (stops at the sensors HAL)
+
+Status: **the credentials model is built and checked against the native root oracle. init applies `user`, `group` and
+`capabilities`. idmap2d passes (it was never refused for uid 0; see the correction below). system_server now reaches
+`Starting phase 100` and `StartDisplayManager`, and waits for the `health` and `sensors` HALs, which the image's init does
+not start. `System now ready` is not reached. The next blocker is the sensors HAL, which needs the goldfish `qemud`
+service (`pipe:qemud:sensors`), not in the engine.**
+
+### Correction to B5
+
+B5 said `idmap2d` refused its caller because every service ran as uid 0. That was wrong. The log line is
+`will not write ... calling uid 0 lacks write accesss`, and `UidHasWriteAccessToPath` (frameworks/base/cmds/idmap2/libidmap2/
+FileUtils.cpp) returns true for root. It returns false only when `Realpath(dirname(path))` fails. The directory
+`/data/resource-cache` did not exist: the engine's `image/xiaoji.rc` does not run the stock `init.rc` line
+`mkdir /data/resource-cache 0771 system system`. Adding the `mkdir` (in the early-init block) was the fix that made idmap2d
+pass. The uid model is still needed, because idmap2d now runs as `system` as the image's rc says, and its checks compare
+against the real uid.
+
+### The credentials model (engine/cred.c, engine/proc.h)
+
+- **State:** real, effective, saved and fs uids and gids; the supplementary groups (up to 32, `CRED_MAX_GROUPS`);
+  permitted, effective, inheritable and ambient sets (`proc_cred_t.cap_*`); the bounding set (`proc_t.capbset`); keep-caps
+  (`proc_t.keepcaps`). A fork copies all of it. The first process is root with the full effective and permitted sets and
+  an empty inheritable and ambient set, as in the oracle VM (`CapBnd 1ffffffffff`, `CapEff` and `CapPrm` full).
+- **Rules, from the 6.12 sources in the builder VM** (`kernel/sys.c`, `kernel/groups.c`, `kernel/capability.c`,
+  `security/commoncap.c`): a privileged check is the effective set holding `CAP_SETUID`, `CAP_SETGID` or `CAP_SETPCAP`
+  (`ns_capable`), not `euid == 0`. The set*id calls, setgroups, setfsuid and setfsgid follow `kernel/sys.c`.
+  `cap_emulate_setxuid` runs for setreuid, setuid and setresuid (a uid change from or to root clears or restores the
+  sets, keep-caps keeps them, and the ambient set is cleared when all ids become non-root). `cap_task_fix_setuid` for
+  setfsuid moves `CAP_FS_SET` with fsuid 0.
+- **capget and capset** (`kernel/capability.c`, `cap_capset`): the version selects 1 or 2 structs; an unknown version is
+  answered with v3 and EINVAL (NULL data is a probe that returns 0). capget of another pid reads that process (ESRCH if
+  none). capset checks the inheritable set against the old inheritable and bounding sets, and against the old permitted
+  set without CAP_SETPCAP. The ambient set is masked to permitted and inheritable.
+- **prctl:** PR_CAPBSET_READ and PR_CAPBSET_DROP (CAP_SETPCAP), PR_SET_KEEPCAPS, PR_CAP_AMBIENT (IS_SET, RAISE, LOWER,
+  CLEAR_ALL, with the argument checks of `cap_task_prctl`).
+- **exec** (`cred_exec`, called from `exec_run` and from init's service start, after the image is in place): keep-caps is
+  cleared, and the sets are recomputed as `cap_bprm_creds_from_file` does for a program with no file capabilities and no
+  set-id bits: a root process (real or effective uid 0) gets permitted = bounding | inheritable and effective when the
+  effective uid is 0; a non-root process gets permitted = ambient and effective = ambient.
+- **Not modelled:** file capabilities (`security.capability`), set-uid and set-gid bits (the rootfs has no owner metadata,
+  see the DAC decision), the securebits lock (SECBIT_KEEP_CAPS_LOCKED is not kept, so keep-caps can be set again after
+  exec), SECURE_NOROOT and the other securebits, the 65536-group limit (32 here; setgroups above 32 is EINVAL), and
+  user namespaces.
+- **Uses that now check capabilities instead of euid:** mount, umount2 and unshare(CLONE_NEWNS) (CAP_SYS_ADMIN),
+  setrlimit raising a hard limit (CAP_SYS_RESOURCE), PR_SET_SECUREBITS (CAP_SETPCAP).
+- **/proc/<pid>/status** shows the real Uid and Gid lines, Groups, and CapInh, CapPrm, CapEff, CapBnd, CapAmb.
+  `/proc/self/status` was not served before; it now is (the same text as the current process's).
+
+### init: user, group, capabilities (engine/init.c, engine/ids_gen.h)
+
+- `user NAME` and `group NAME [SUPP...]`: AID names from bionic's table (`system/core/libcutils/include/private/
+  android_filesystem_config.h`, 142 entries), or a number. Not /etc/passwd. `capabilities NAME...`: the names init's
+  `capabilities.cpp` accepts (41 entries), with the numbers from bionic's `linux/capability.h`. Unknown names fail the
+  config. `tools/fetch-remote-ids.sh` copies the three AOSP files from the remote tree and runs `tools/gen-ids.py`, which
+  writes `engine/ids_gen.h`.
+- The service's process applies init's `SetProcessAttributesAndCaps` (`system/core/init/service.cpp`,
+  `service_utils.cpp`, `capabilities.cpp`) before its program loads (`cred_apply_service`): keep-caps when there are
+  capabilities and the uid is not 0; then setgid (when the gid is not 0), setgroups, setuid (when the uid is not 0). With
+  capabilities: capset with the set and SETPCAP, drop the bounding set outside the set, capset with the set only, and raise
+  the ambient set. Without capabilities, a non-root service clears its inheritable set. Then the program loads and the exec
+  transform runs.
+- `image/xiaoji.rc`: the image's own user, group and capability lines for `lmkd` (`user lmkd`, `group lmkd system readproc`,
+  `capabilities DAC_OVERRIDE KILL IPC_LOCK SYS_NICE SYS_RESOURCE`), `idmap2d` (`user system`, `group system`) and
+  `surfaceflinger` (`capabilities SYS_NICE`). The other blocks already had them.
+
+### Binder and sockets
+
+- **Binder:** the sender's euid is the sender's effective uid at send time (`btxn_t.sender_euid`, set in
+  `engine/binder.c` for requests and replies). It was a constant 0. The guest's own value in its transaction data is
+  ignored, as the driver does.
+- **SO_PEERCRED** is the peer's effective uid and gid (`cur_cred`), as `net/core/sock.c` `cred_to_ucred` does.
+- **SCM_CREDENTIALS, implicit** (when the receiver has SO_PASSCRED): the sender's real uid and gid (`cur_scm_cred`), as
+  `scm_set_cred` with `current_uid()` and `current_gid()` does.
+- **SCM_CREDENTIALS, explicit** (a sendmsg cmsg): `sock_scm_check` is `scm_check_creds`: the pid must be the sender's
+  (or CAP_SYS_ADMIN), the uid one of its real, effective or saved uids (or CAP_SETUID), the gid likewise (or CAP_SETGID),
+  otherwise EPERM; -1 is EINVAL. The last one in the message wins.
+
+### DAC: not enforced (decision)
+
+Permission checks on file mode bits are **not** enforced in this step. The evidence:
+
+- The rootfs is extracted with `debugfs rdump` (`tools/extract-rootfs.sh`, `tools/fetch-remote-rootfs.sh`). On the host,
+  every file and directory of `build/rootfs-xiaoji` is owned by the Mac user and group `staff`, and the files have mode
+  `775`. Android's system binaries are `0755` and owned by root or by their service user. So the extraction does not
+  keep owner or mode (`stat -f '%Sp %Su %Sg'`, `ls -ln`). The `rdump` run is probably not root, which would make its
+  `fchown` a no-op, and the mode `775` matches a process default (umask 002 on `0777`), not the ext4 mode. This is inferred
+  from the output, not checked against the tool's source.
+- The canonical owner and mode table (AOSP's `fs_config`) is not in the places searched on the remote tree
+  (`system/core/libcutils`, `build/make/tools`, `build/make/target/product`, `system/core/rootdir`). The record is therefore
+  the extraction result, not an fs_config comparison.
+- Enforcing DAC on `/data` and `/system` would deny services that the stock images run correctly (for example writes
+  to `/data/misc` by the stock services under the wrong mode). With no owner and mode data, enforcement would be a guess.
+- Guest `stat` keeps reporting uid and gid 0 for rootfs files. Bionic's property-area checks depend on it.
+
+**Gap:** the rootfs needs owner, mode, file capability and set-id metadata (from the image's ext4 metadata, read with
+`debugfs stat` on the system image, or fs_config) before DAC can be enforced. setuid and file capabilities are not used
+by the boot path yet.
+
+### Milestones (product tree, `build/rootfs-xiaoji`, `--logcat --init-timeout 90`, the boot check's command)
+
+Times and instruction counts are guest time (`[ms insn]` in the log):
+
+| Milestone | Time | Instructions |
+|---|---|---|
+| `Started idmap2d` (init) | 1.34 s | 0.157 G |
+| `Entered the Android system server!` | 36.74 s | 3.817 G |
+| `StartDisplayManager` (SystemServerTiming) | 40.40 s | 4.160 G |
+| `Starting phase 100` | 40.42 s | 4.161 G |
+| idmap2d `failed to parse idmap header` warnings (no refusal) | 48.8 s | 4.87 G |
+| end of the 90 s run (init timeout) | 89 s | 5.10 G |
+
+Wall clock of that run: 1:30.06, 48.98 s user, 0.67 s system (55% CPU). Power: `pmset -g` before the run showed `lowpowermode 0` on AC power
+(the scratchpad copy is `pmset-before2.txt`).
+
+A 400 s run (`--init-timeout 400`, no health or sensors blocks, the state of this step) reached the same phase 100 at
+39.3 s (4.161 G). The first system_server (pid 1042) then waited on the HAL lookups, and a later system_server (pid 1517)
+was waiting in the same place at 398 s (15.18 G).
+
+### The next blocker (logcat)
+
+`system_server` waits for HIDL services that init does not start. hwservicemanager tries to start them as lazy HALs, and
+init reports that it cannot find them:
+
+```
+W/HidlServiceManagement(1042): Waited one second for android.hardware.health@2.0::IHealth/default
+I/hwservicemanager(1002): Since android.hardware.health@2.0::IHealth/default is not registered, trying to start it as a lazy HAL.
+xiaoji: init: Control message: Could not find 'android.hardware.sensors@2.1::ISensors/default' for ctl.interface_start
+E/ActivityManager(1042): Connection failed: java.io.IOException: Connection refused
+W/ActivityManager(1042): Failed to connect to lowmemorykiller, retry later
+```
+
+The image has both HALs: `vendor/bin/hw/android.hardware.health@2.1-service` and
+`android.hardware.sensors@2.1-service.multihal`, with their rc blocks in `vendor/etc/init/`. Both were added to
+`image/xiaoji.rc` (class hal, user, group and capabilities, as their rc files say; the `task_profiles`, `rlimit` and `file`
+lines are not modelled) and run in a 400 s boot. The sensors HAL then aborts at once:
+
+```
+E/android.hardware.sensors@2.1-service.multihal(1014): qemu_pipe_open_ns:159: Could not connect to the 'pipe:qemud:sensors' service: Invalid argument
+E/android.hardware.sensors@2.1-impl.ranchu(1014): MultihalSensors:39: m_qemuSensorsFd is not opened
+xiaoji: killed by signal 6
+F/crash_dump64(1027): failed to open /proc/1023: No such file or directory
+```
+
+The engine has no `qemud` service (the goldfish pipe services `opengles`, `GLProcessPipe` and `refcount` only, `engine/goldfish.c`).
+The sensors HAL restarts in a loop and does not make its interface available. The two HAL blocks were **reverted** from
+`image/xiaoji.rc` after this run, so the committed config does not start them. The health HAL's result alone was not
+separated out in that run.
+
+### Checkpoints (this step)
+
+1. Creds syscalls and the guest test: done (`tests/guest/creds.c`, oracle as root, identical output in the engine at O0
+   and O2, and in Node).
+2. init user, group and capabilities, and the id test: done (`tests/init/ids.rc`, `tests/expect/init-ids.out`:
+   `uid=1000(system) gid=1000(system) groups=1000(system),3003(inet)`). A scratch check with `capabilities NET_RAW SYS_NICE`
+   gave Inh, Prm, Eff, Bnd and Amb all `0000000000802000`.
+3. idmap2d passes: done (the `resource-cache` directory; no refusal in the 90 s run; idmap2d runs as `system`).
+4. Boot progress: partial. Past idmap2d to `Starting phase 100` and `StartDisplayManager`; stopped at the sensors HAL.
+
+### Tests (this step)
+
+- `make` and `make wasm-node`: exit 0. `make test`: 194 passed, 0 failed (188 before, plus the creds cases (engine and
+  Node, O0 and O2) and the init id case (engine and Node)).
+- `XIAOJI_JIT=0 make test`: 194 passed, 0 failed.
+- `XIAOJI_BOOT=1 make test`: 195 passed, 0 failed (the boot check now also requires `Starting phase 100` and no
+  `lacks write` line on the product tree only).
+- `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh`: 161 passed, 0 failed.
+- `make test-web`: exit 0.
+- `clang -std=c11 -Wall -Wextra` on the changed engine files: no warnings. `emcc -std=c11 -Wall -Wextra` per file (cred, init,
+  sock, sockcall, binder, simd, procfs, syscall, sysfs, exec, proc): no warnings.
+- Guest tests `creds-O0` and `creds-O2` (engine and Node) compare with the native root oracle.
+
+### Gaps (B6)
+
+- **Sensors HAL:** the `qemud` pipe service is needed (`pipe:qemud:sensors`). Without it the HAL aborts. Either the engine
+  serves that pipe, or the sensors HAL is left out and SensorService's wait is handled by config. This is the next decision.
+- **Health HAL:** its result was not separated from the sensors abort (see above).
+- **lmkd** exits at once (no PSI, no cgroup memory), and ActivityManager retries (B5). The `lmkd` block now runs as `lmkd`.
+- **Binder:** no guest test that checks `sender_euid` against the kernel (the B5 gap for the reply routing is still open).
+  The socket credentials are tested (`tests/guest/creds.c`).
+- **DAC and metadata:** not enforced (see the decision). setuid, set-gid bits and file capabilities are not modelled.
+- **securebits lock** and the other securebits are not modelled (see above).
+- `/data/resource-cache` is created with the engine's mkdir, which ignores the mode and owner (`0771 system system` in the
+  stock rc).

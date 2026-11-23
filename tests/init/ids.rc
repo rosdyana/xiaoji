@@ -1,0 +1,9 @@
+# Init ids (B6): a service's user, group and supplementary groups (user system, group system inet), and the ids
+# its process has when toybox runs. The services' stdio is /dev/null, so the report goes to a file. Its shell
+# then stops init.
+export ANDROID_ROOT /system
+
+service ids /system/bin/sh -c "/system/bin/toybox id >/data/local/tmp/ids-init.txt; /system/bin/toybox id -u >>/data/local/tmp/ids-init.txt; /system/bin/toybox id -G >>/data/local/tmp/ids-init.txt; /system/bin/setprop xiaoji.exit 1"
+    user system
+    group system inet
+    oneshot

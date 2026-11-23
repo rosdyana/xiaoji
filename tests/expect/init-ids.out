@@ -1,0 +1,3 @@
+uid=1000(system) gid=1000(system) groups=1000(system),3003(inet) context=u:r:kernel:s0
+1000
+1000 3003

@@ -144,6 +144,21 @@
 #define LCLOCK_MONOTONIC 1
 #define LTIMER_ABSTIME 1
 
+/* Capability numbers (include/uapi/linux/capability.h). */
+#define LCAP_CHOWN 0
+#define LCAP_DAC_OVERRIDE 1
+#define LCAP_DAC_READ_SEARCH 2
+#define LCAP_FOWNER 3
+#define LCAP_FSETID 4
+#define LCAP_SETGID 6
+#define LCAP_SETUID 7
+#define LCAP_SETPCAP 8
+#define LCAP_LINUX_IMMUTABLE 9
+#define LCAP_SYS_ADMIN 21
+#define LCAP_SYS_RESOURCE 24
+#define LCAP_MKNOD 27
+#define LCAP_MAC_OVERRIDE 32
+
 /* prctl(2) options. */
 #define LPR_SET_PDEATHSIG 1
 #define LPR_GET_PDEATHSIG 2
@@ -156,6 +171,11 @@
 #define LPR_CAPBSET_READ 23
 #define LPR_CAPBSET_DROP 24
 #define LPR_GET_SECUREBITS 27
+#define LPR_CAP_AMBIENT 47
+#define LPR_CAP_AMBIENT_IS_SET 1
+#define LPR_CAP_AMBIENT_RAISE 2
+#define LPR_CAP_AMBIENT_LOWER 3
+#define LPR_CAP_AMBIENT_CLEAR_ALL 4
 #define LPR_SET_SECUREBITS 28
 #define LPR_SET_TIMERSLACK 29
 #define LPR_GET_TIMERSLACK 30

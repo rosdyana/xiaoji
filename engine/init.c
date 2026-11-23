@@ -20,7 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cred.h"
 #include "host.h"
+#include "ids_gen.h"
 #include "linux.h"
 #include "loader.h"
 #include "proc.h"
@@ -52,6 +54,9 @@ enum { CP_BOOT = 1, CP_SYSTEMSERVER = 2, CP_DEX2OAT = 3, CP_STANDALONE = 4 };
 enum { CTL_START = 1, CTL_STOP = 2, CTL_RESTART = 3 };
 enum { ST_STOPPED, ST_RUNNING, ST_RESTARTING };
 
+static int aid_lookup(const char *name, uint32_t *out);
+static int cap_lookup(const char *name, uint32_t *out);
+
 typedef struct {
     char name[32];
     int type; /* SOCK_T_* (sock.h) */
@@ -73,6 +78,13 @@ typedef struct {
     int niface;
     int oneshot, disabled;
     uint64_t restart_delay_ns;
+    /* user, group (the primary gid, then the supplementary groups) and capabilities: applied to the
+     * service's process before its program loads (cred_apply_service). */
+    uint32_t uid, gid;
+    uint32_t supp[CRED_MAX_GROUPS];
+    int nsupp;
+    int has_caps;
+    uint64_t caps;
     /* runtime */
     int state;
     int pid;
@@ -320,12 +332,71 @@ static int parse_config(char *text)
                 return -1;
             }
             snprintf(cur->iface[cur->niface++], INIT_IFACE_MAX, "%s", full);
+        } else if (!strcmp(tok[0], "user") && n >= 2) {
+            if (aid_lookup(tok[1], &cur->uid) < 0) {
+                fprintf(stderr, "xiaoji: init: line %d: unknown user %s\n", lineno, tok[1]);
+                return -1;
+            }
+        } else if (!strcmp(tok[0], "group") && n >= 2) {
+            if (aid_lookup(tok[1], &cur->gid) < 0) {
+                fprintf(stderr, "xiaoji: init: line %d: unknown group %s\n", lineno, tok[1]);
+                return -1;
+            }
+            cur->nsupp = 0;
+            for (int i = 2; i < n; i++) {
+                if (cur->nsupp == CRED_MAX_GROUPS || aid_lookup(tok[i], &cur->supp[cur->nsupp]) < 0) {
+                    fprintf(stderr, "xiaoji: init: line %d: bad group %s\n", lineno, tok[i]);
+                    return -1;
+                }
+                cur->nsupp++;
+            }
+        } else if (!strcmp(tok[0], "capabilities")) {
+            cur->has_caps = 1;
+            cur->caps = 0;
+            for (int i = 1; i < n; i++) {
+                uint32_t cap = 0;
+                if (cap_lookup(tok[i], &cap) < 0 || cap > 63) {
+                    fprintf(stderr, "xiaoji: init: line %d: unknown capability %s\n", lineno, tok[i]);
+                    return -1;
+                }
+                cur->caps |= 1ull << cap;
+            }
         } else if (!strcmp(tok[0], "restart_delay_ms") && n >= 2) {
             cur->restart_delay_ns = strtoull(tok[1], NULL, 10) * 1000000ull;
         }
         /* Other options (class, user, group, critical, onrestart, ...) are not modelled. */
     }
     return 0;
+}
+
+/* ---------- user, group and capabilities (ids_gen.h, from the AOSP sources) ---------- */
+
+/* An Android name from the AID table (init's DecodeUid: the name, or a number). */
+static int aid_lookup(const char *name, uint32_t *out)
+{
+    if (name[0] >= '0' && name[0] <= '9') {
+        *out = (uint32_t)strtoul(name, NULL, 10);
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof ids_aid / sizeof ids_aid[0]; i++) {
+        if (!strcmp(ids_aid[i].name, name)) {
+            *out = ids_aid[i].id;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* A capability name, as init's LookupCap takes it (BLOCK_SUSPEND, ...). */
+static int cap_lookup(const char *name, uint32_t *out)
+{
+    for (size_t i = 0; i < sizeof ids_cap / sizeof ids_cap[0]; i++) {
+        if (!strcmp(ids_cap[i].name, name)) {
+            *out = ids_cap[i].id;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 /* ---------- classpaths (derive_classpath.cpp) ---------- */
@@ -709,10 +780,14 @@ static int svc_start(svc_t *s)
     int rc = 0;
     if (!stdio_host && svc_stdio_null() < 0) {
         rc = -LE_NOENT; /* reported below, with the same release as a failed load */
+    } else if ((rc = cred_apply_service(child, s->uid, s->gid, s->supp, s->nsupp, s->has_caps, s->caps)) < 0) {
+        fprintf(stderr, "xiaoji: init: %s: cannot set its ids or capabilities (%d)\n", s->name, rc);
     } else {
         vfs_set_prog(canon);
         vfs_set_argv(s->argc, s->argv);
         rc = loader_load(img, len, s->path, s->argc, s->argv, ne, envp, &entry, &sp);
+        if (rc >= 0)
+            cred_exec(child); /* the program's execve: the ids and sets it starts with (cred.c) */
     }
     free(img);
     proc_switch(self);

@@ -116,7 +116,11 @@ int sock_connected(const sock_t *s);
 /* Data. Each returns the byte count, or a negative LE_* error. -LE_AGAIN means the call
  * would block (the caller decides with sock_block). On success the fds in fds are taken; on
  * failure they stay the caller's. */
-int64_t sock_send(sock_t *s, const uint8_t *buf, size_t n, void **fds, int nfds, sock_t *to);
+/* scm is the SCM_CREDENTIALS the sender gave (checked with sock_scm_check), or NULL for the sender's own real ids. */
+int64_t sock_send(sock_t *s, const uint8_t *buf, size_t n, void **fds, int nfds, sock_t *to, const sock_cred_t *scm);
+/* scm_check_creds (net/core/scm.c): 0 if the sender may send these credentials, else -LE_*: the pid must be its own
+ * (or CAP_SYS_ADMIN), the uid one of its real, effective or saved uids (or CAP_SETUID), the gid likewise. */
+int sock_scm_check(const sock_cred_t *c);
 int64_t sock_recv(sock_t *s, sock_recv_t *r);
 /* read and write on a socket (no ancillary data): a stream read drops the fds it finds. */
 int64_t sock_read(sock_t *s, void *buf, size_t n);

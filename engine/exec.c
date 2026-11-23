@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cred.h"
 #include "host.h"
 #include "linux.h"
 #include "loader.h"
@@ -356,6 +357,7 @@ int64_t exec_run(cpu_t *c, int dirfd, uint64_t pathva, uint64_t argvva, uint64_t
     p->mm = nm;
     mem_mm_unref(old);
     vfs_close_cloexec();
+    cred_exec(p); /* the ids and capability sets of the new program (cred.c) */
     sig_exec_reset(c);
     sched_exec_threads(c); /* the other threads of the process are gone */
     vfs_set_prog(r->guest);

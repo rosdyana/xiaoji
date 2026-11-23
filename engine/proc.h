@@ -13,12 +13,14 @@
  * its address space and fd table are released at once (pipes see end of file). */
 #define CRED_MAX_GROUPS 32
 
-/* A process's credentials (cred.c): the real, effective, saved and filesystem ids. A fork copies
- * them. A new process (init or the initial one) is root. */
+/* A process's credentials (cred.c): the real, effective, saved and filesystem ids, the supplementary
+ * groups, and the capability sets (bit n is capability n; the bounding set is proc_t.capbset). A
+ * fork copies them. A new process (init or the initial one) is root with the full sets. */
 typedef struct {
     uint32_t ruid, euid, suid, fsuid, rgid, egid, sgid, fsgid;
     uint32_t groups[CRED_MAX_GROUPS];
     int ngroups;
+    uint64_t cap_eff, cap_perm, cap_inh, cap_amb; /* effective, permitted, inheritable, ambient */
 } proc_cred_t;
 
 #define PROC_CAP_LAST 40 /* CAP_LAST_CAP of the oracle kernel (CAP_CHECKPOINT_RESTORE) */

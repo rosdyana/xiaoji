@@ -224,7 +224,8 @@ static int64_t iov_read(uint64_t iov, uint64_t cnt, uint64_t **out, uint64_t *to
 
 /* Sends the guest segments ent (va, len pairs). The descriptions in fds are taken by a send
  * that succeeds and dropped otherwise. Blocking follows sock.c's rules. */
-static int64_t send_ent(int fd, const uint64_t *ent, uint64_t cnt, int flags, void **fds, int nfds, sock_t *to)
+static int64_t send_ent(int fd, const uint64_t *ent, uint64_t cnt, int flags, void **fds, int nfds, sock_t *to,
+                        const sock_cred_t *scm)
 {
     vfs_fd *f = vfs_get(fd);
     if (!f || f->kind != VFS_SOCK) {
@@ -259,7 +260,7 @@ static int64_t send_ent(int fd, const uint64_t *ent, uint64_t cnt, int flags, vo
             }
             off += len;
         }
-        int64_t w = sock_send(s, msg, (size_t)total, fds, nfds, to);
+        int64_t w = sock_send(s, msg, (size_t)total, fds, nfds, to, scm);
         free(msg);
         if (w == -LE_AGAIN) {
             drop_fds(fds, nfds);
@@ -302,7 +303,7 @@ static int64_t send_ent(int fd, const uint64_t *ent, uint64_t cnt, int flags, vo
         /* Descriptions go with the first send only (pos is 0 there, and not after a restart). */
         void **fa = pos == 0 ? fds : NULL;
         int na = pos == 0 ? nfds : 0;
-        int64_t w = sock_send(s, sc_iobuf, chunk, fa, na, to);
+        int64_t w = sock_send(s, sc_iobuf, chunk, fa, na, to, scm);
         if (w == -LE_AGAIN) {
             drop_fds(fa ? fa : NULL, na);
             if (sock_block(sock_send_target(s, to), sock_timeo(s, 1), nb)) {
@@ -325,8 +326,9 @@ static int64_t send_ent(int fd, const uint64_t *ent, uint64_t cnt, int flags, vo
     return (int64_t)pos;
 }
 
-/* Reads the SCM_RIGHTS descriptions of a control buffer (each is held). */
-static int64_t parse_rights(uint64_t ctlp, uint64_t ctln, void **fds, int *nfds)
+/* Reads the SCM_RIGHTS descriptions of a control buffer (each is held), and the SCM_CREDENTIALS: the last one
+ * wins, and each is checked as the kernel checks it (sock_scm_check). *have is set when there is one. */
+static int64_t parse_rights(uint64_t ctlp, uint64_t ctln, void **fds, int *nfds, sock_cred_t *scm, int *have)
 {
     uint64_t off = 0;
     while (off + SC_CMSG_HDR <= ctln) {
@@ -350,6 +352,16 @@ static int64_t parse_rights(uint64_t ctlp, uint64_t ctln, void **fds, int *nfds)
                     return -LE_BADF;
                 fds[(*nfds)++] = d;
             }
+        } else if (level == SC_SOL_SOCKET && type == SC_SCM_CREDENTIALS) {
+            uint8_t cb[12];
+            if (cl < SC_CMSG_HDR + sizeof cb || mem_copy_out(cb, ctlp + off + SC_CMSG_HDR, sizeof cb) < 0)
+                return cl < SC_CMSG_HDR + sizeof cb ? -LE_INVAL : -LE_FAULT;
+            sock_cred_t c = {(int32_t)get32(cb), get32(cb + 4), get32(cb + 8)};
+            int rc = sock_scm_check(&c);
+            if (rc)
+                return rc;
+            *scm = c;
+            *have = 1;
         }
         off += (cl + 7) & ~(uint64_t)7;
     }
@@ -576,7 +588,7 @@ static int64_t sc_sendto(uint64_t fd, uint64_t buf, uint64_t n, uint64_t flags, 
             return nm.fsnode && !nm.exists ? -LE_NOENT : -LE_CONNREFUSED;
     }
     uint64_t ent[2] = {buf, n};
-    return send_ent((int)(int32_t)fd, ent, 1, (int)flags, NULL, 0, to);
+    return send_ent((int)(int32_t)fd, ent, 1, (int)flags, NULL, 0, to, NULL);
 }
 
 static int64_t sc_recvfrom(uint64_t fd, uint64_t buf, uint64_t n, uint64_t flags, uint64_t addr, uint64_t alen)
@@ -699,16 +711,18 @@ static int64_t sc_sendmsg(uint64_t fd, uint64_t msg, uint64_t flags)
     }
     void *fds[SOCK_MAX_FDS];
     int nfds = 0;
+    sock_cred_t scm = {0, 0, 0};
+    int have_scm = 0;
     /* A restart after progress (io_done) already sent the descriptions. */
     if (sched_cur_cpu()->io_done == 0 && ctln && ctlp) {
-        rc = parse_rights(ctlp, ctln, fds, &nfds);
+        rc = parse_rights(ctlp, ctln, fds, &nfds, &scm, &have_scm);
         if (rc) {
             drop_fds(fds, nfds);
             free(ent);
             return rc;
         }
     }
-    int64_t res = send_ent((int)(int32_t)fd, ent, iovn, (int)flags, fds, nfds, to);
+    int64_t res = send_ent((int)(int32_t)fd, ent, iovn, (int)flags, fds, nfds, to, have_scm ? &scm : NULL);
     free(ent);
     return res;
 }
@@ -892,7 +906,7 @@ int64_t sockcall_readv(int fd, uint64_t iov, uint64_t cnt)
 int64_t sockcall_write(int fd, uint64_t buf, uint64_t n)
 {
     uint64_t ent[2] = {buf, n};
-    return send_ent(fd, ent, 1, 0, NULL, 0, NULL);
+    return send_ent(fd, ent, 1, 0, NULL, 0, NULL, NULL);
 }
 
 int64_t sockcall_writev(int fd, uint64_t iov, uint64_t cnt)
@@ -901,7 +915,7 @@ int64_t sockcall_writev(int fd, uint64_t iov, uint64_t cnt)
     int64_t rc = iov_read(iov, cnt, &ent, &total);
     if (rc)
         return rc;
-    int64_t sent = send_ent(fd, ent, cnt, 0, NULL, 0, NULL);
+    int64_t sent = send_ent(fd, ent, cnt, 0, NULL, 0, NULL, NULL);
     free(ent);
     return sent;
 }

@@ -1917,6 +1917,17 @@ static int by_element(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* Scalar shift by immediate (01 U 111110 immh immb opcode 1 Rn Rd): the 64-bit element, which is the
+ * vector form with Q=0 (the upper half of the register is zeroed). Only SSHR and USHR (opcode 00000),
+ * and SHL (opcode 01010, U=0) are allocated here; immh must select the 64-bit element (1xxx). */
+static int scalar_shift_imm(cpu_t *c, uint32_t insn)
+{
+    unsigned immh = (insn >> 19) & 0xF, opc = (insn >> 11) & 0x1F, u = (insn >> 29) & 1;
+    if (!((insn >> 10) & 1) || !(immh & 8) || !(opc == 0x00 || (opc == 0x0A && !u)))
+        return -1;
+    return shift_imm(c, insn & ~(1u << 30));
+}
+
 int simd_exec(cpu_t *c, uint32_t insn)
 {
     unsigned top = (insn >> 24) & 0x1F; /* bits 28..24 */
@@ -1953,6 +1964,8 @@ int simd_exec(cpu_t *c, uint32_t insn)
             return fp_cmp(c, insn);
         return -1;
     }
+    if (top == 0x1F && !(insn >> 31) && ((insn >> 30) & 1)) /* scalar shift by immediate: 01 U 111110 */
+        return scalar_shift_imm(c, insn);
     if (top == 0x1F) { /* FP 3-source: FMADD and relatives, bit 31 and bits 30:29 zero */
         if ((insn >> 31) || ((insn >> 29) & 3))
             return -1;

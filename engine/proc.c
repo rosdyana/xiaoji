@@ -40,6 +40,7 @@ proc_t *proc_init(void)
     p->rlim[3][0] = 8ull << 20; /* RLIMIT_STACK: the soft limit is 8 MiB, as before */
     strcpy(p->attr_current, SELINUX_CTX);
     p->capbset = PROC_CAPS_ALL;
+    p->cred.cap_eff = p->cred.cap_perm = PROC_CAPS_ALL; /* root: full effective and permitted sets */
     p->mm = mem_mm_new();
     p->fds = vfs_fdtab_new();
     p->sig = calloc(1, sig_tab_size());

@@ -622,7 +622,7 @@ static int64_t sys_prlimit64(uint64_t resource, uint64_t newv, uint64_t old)
         }
         if (nl[0] > nl[1])
             return -LE_INVAL;
-        if (nl[1] > p->rlim[resource][1] && p->cred.euid != 0)
+        if (nl[1] > p->rlim[resource][1] && !cred_has_cap(p, LCAP_SYS_RESOURCE))
             return -LE_PERM;
         p->rlim[resource][0] = nl[0];
         p->rlim[resource][1] = nl[1];
@@ -892,20 +892,15 @@ static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t
         me->keepcaps = (int)arg2;
         return 0;
     case LPR_CAPBSET_READ:
-        if (arg2 > PROC_CAP_LAST)
-            return -LE_INVAL;
-        return (int64_t)((me->capbset >> arg2) & 1);
+        return cred_capbset_read(me, arg2);
     case LPR_CAPBSET_DROP:
-        if (arg2 > PROC_CAP_LAST)
-            return -LE_INVAL;
-        if (me->cred.euid != 0) /* needs CAP_SETPCAP, which only uid 0 has here */
-            return -LE_PERM;
-        me->capbset &= ~(1ull << arg2);
-        return 0;
+        return cred_capbset_drop(me, arg2);
+    case LPR_CAP_AMBIENT:
+        return cred_ambient(me, arg2, arg3, arg4, arg5);
     case LPR_GET_SECUREBITS:
         return me->securebits;
     case LPR_SET_SECUREBITS:
-        if (me->cred.euid != 0)
+        if (!cred_has_cap(me, LCAP_SETPCAP))
             return -LE_PERM;
         me->securebits = (int)(uint32_t)arg2;
         return 0;
@@ -1255,6 +1250,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_CLOCK_NANOSLEEP:
         *ret = sys_clock_nanosleep(a[0], a[1], a[2]);
         return;
+    case 90: case 91:
     case 143: case 144: case 145: case 146: case 147: case 148: case 149: case 150: case 151:
     case 152: case 158: case 159:
     case SYS_GETUID:

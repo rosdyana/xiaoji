@@ -2,7 +2,8 @@
 #   xiaoji --init image/xiaoji.rc --root build/rootfs
 # The global environment is init.environ.rc's early-init block (its imports are not followed).
 # The servicemanager and zygote blocks are the Android 13 rc files, copied verbatim: options the
-# engine does not model (class, user, onrestart, critical, task_profiles, ...) are ignored.
+# engine does not model (class, onrestart, critical, task_profiles, ...) are ignored. user, group and
+# capabilities are applied (engine/init.c, cred_apply_service).
 # BOOTCLASSPATH and the other classpath variables are derived by the engine (engine/init.c).
 on early-init
     export ANDROID_BOOTLOGO 1
@@ -26,6 +27,9 @@ on early-init
     mkdir /data/misc
     mkdir /data/misc/user
     mkdir /data/misc/installd
+    # idmap2d (B6): IdmapDaemon writes under /data/resource-cache; idmap2d refuses any caller when the directory
+    # is missing (UidHasWriteAccessToPath fails on Realpath). init.rc creates it 0771 system system.
+    mkdir /data/resource-cache 0771
 
 service servicemanager /system/bin/servicemanager
     class core animation
@@ -75,7 +79,7 @@ service zygote /system/bin/app_process64 -Xzygote /system/bin --zygote --start-s
     critical window=${zygote.critical_window.minute:-off} target=zygote-fatal
 
 # The system suspend HAL (B4c part 2): the real daemon, with the Android 13 block of its rc, verbatim
-# ("capabilities" is ignored). The engine has no /sys/power, so the daemon keeps running (it handles wake
+# (the capabilities are applied, see engine/init.c). The engine has no /sys/power, so the daemon keeps running (it handles wake
 # locks and collects stats) and does not suspend the device: its own main.cpp describes this for hosts
 # without platform suspend. system_server's PowerManager waits for it (ISystemSuspend/default).
 service system_suspend /system/bin/hw/android.system.suspend@1.0-service
@@ -142,6 +146,7 @@ service surfaceflinger /system/bin/surfaceflinger
     class core
     user system
     group graphics drmrpc readproc
+    capabilities SYS_NICE
 
 # vendor.hwcomposer-2-4: /vendor/etc/init/android.hardware.graphics.composer@2.4-service.rc
 service vendor.hwcomposer-2-4 /vendor/bin/hw/android.hardware.graphics.composer@2.4-service
@@ -164,14 +169,20 @@ service vndservicemanager /vendor/bin/vndservicemanager /dev/vndbinder
     group system readproc
 
 # lmkd (G1): the low-memory killer. ActivityManager connects to its socket and retries once a second without it.
-# system/memory/lmkd/lmkd.rc, class and socket as the engine reads them. The engine does not model user, group or
-# capabilities (init.c), and it has no passcred socket type, so the socket is plain seqpacket.
+# The block of system/memory/lmkd/lmkd.rc: class, user, group, capabilities and socket. The engine has no passcred
+# socket type, so the socket is plain seqpacket.
 service lmkd /system/bin/lmkd
     class core
+    user lmkd
+    group lmkd system readproc
+    capabilities DAC_OVERRIDE KILL IPC_LOCK SYS_NICE SYS_RESOURCE
     critical
     socket lmkd seqpacket 0660 system system
 
 # idmap2d (G1): the overlay idmap daemon. OverlayManagerService connects to it (IdmapDaemon) and blocks in
-# getIdmapService without it. frameworks/base/cmds/idmap2 (system/etc/init/idmap2d.rc), class as the engine reads it.
+# getIdmapService without it. frameworks/base/cmds/idmap2 (system/etc/init/idmap2d.rc), class, user and group as
+# the engine reads them.
 service idmap2d /system/bin/idmap2d
     class main
+    user system
+    group system

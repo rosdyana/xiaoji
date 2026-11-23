@@ -172,6 +172,7 @@ struct btxn {
     uint64_t target, cookie;
     uint32_t code, flags;
     int32_t sender_pid;
+    uint32_t sender_euid; /* the sender's effective uid, when the request was sent (the driver's sender_euid) */
     int oneway, reply, secctx;
     uint64_t secctx_at;
     /* A sync request raised its receiving thread's priority: restored when the request ends. */
@@ -1435,7 +1436,7 @@ static int emit(bproc_t *b, bthread_t *t, bwork_t *w, uint64_t va)
         st32(out + 20, x->code);
         st32(out + 24, x->flags);
         st32(out + 28, (uint32_t)x->sender_pid);
-        st32(out + 32, 0); /* the sender's euid: root */
+        st32(out + 32, x->sender_euid);
         st64(out + 36, dsize);
         st64(out + 44, x->buf->offs_size);
         st64(out + 52, base);
@@ -1657,6 +1658,7 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
                    (unsigned long long)orig->id, (unsigned long long)rep->id, (unsigned long long)s->tid,
                    d->flags, (unsigned long long)d->data_size);
                 rep->sender_pid = proc_cur()->pid;
+                rep->sender_euid = proc_cur()->cred.euid;
                 bwork_t *w = work_new(WK_REPLY, BR_REPLY, 0, 0, rep);
                 if (w)
                     queue_thread(s, w);
@@ -1705,6 +1707,7 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     x->flags = d->flags;
     x->id = txid;
     x->sender_pid = proc_cur()->pid;
+    x->sender_euid = proc_cur()->cred.euid;
     x->target = node->ptr;
     x->cookie = node->cookie;
     x->node_set = 1;

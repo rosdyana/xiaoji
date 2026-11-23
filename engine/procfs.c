@@ -106,7 +106,7 @@ static int is_self_attr(const char *guest)
 
 int procfs_known(const char *guest)
 {
-    if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/maps") ||
+    if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/status") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
         is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
         !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo"))
@@ -197,9 +197,16 @@ static const char *prog_base(const proc_t *p)
 /* /proc/<pid>/status: the few fields a caller reads. */
 static void build_status(sbuf *b, const proc_t *p)
 {
+    const proc_cred_t *c = &p->cred;
     sb_fmt(b, "Name:\t%s\nState:\tS (sleeping)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n"
-              "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
-           prog_base(p), p->pid, p->pid, p->ppid);
+              "Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\nGroups:\t",
+           prog_base(p), p->pid, p->pid, p->ppid, c->ruid, c->euid, c->suid, c->fsuid, c->rgid, c->egid,
+           c->sgid, c->fsgid);
+    for (int i = 0; i < c->ngroups; i++)
+        sb_fmt(b, "%u ", c->groups[i]);
+    sb_fmt(b, "\nCapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\nCapBnd:\t%016llx\nCapAmb:\t%016llx\n",
+           (unsigned long long)c->cap_inh, (unsigned long long)c->cap_perm, (unsigned long long)c->cap_eff,
+           (unsigned long long)p->capbset, (unsigned long long)c->cap_amb);
 }
 
 /* /proc/self/stat: the 52 fields of proc(5). f[k] is field k+4 (fields 1 to 3 are
@@ -292,6 +299,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         }
     } else if (!strcmp(guest, "/proc/self/stat")) {
         build_stat(&b, proc_cur());
+    } else if (!strcmp(guest, "/proc/self/status")) {
+        build_status(&b, proc_cur());
     } else if (!strcmp(guest, "/proc/self/maps")) {
         build_maps(&b);
     } else if (!strcmp(guest, "/proc/filesystems")) {

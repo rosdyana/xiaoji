@@ -87,7 +87,7 @@ make_oracle() {
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
     # oracles run as root (passwordless sudo in the builder VM).
     local runas=""
-    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | creds-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -417,6 +417,30 @@ if [ -d build/rootfs/system/bin ]; then
     done
 fi
 
+# Init ids (B6): a service's user, group and supplementary groups (user system, group system inet), and the ids its
+# process has when toybox id runs (tests/init/ids.rc). The report must equal tests/expect/init-ids.out. Engine and Node.
+if [ -f "$RFS/system/bin/toybox" ]; then
+    mkdir -p "$RFS/data/local/tmp"
+    for runner in engine node; do
+        rm -f "$RFS"/data/local/tmp/ids-init.txt
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/ids.rc --root "$RFS" --init-timeout 60 >"$OUT/init-ids.$runner.out" 2>"$OUT/init-ids.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/ids.rc --root "$RFS" --init-timeout 60 >"$OUT/init-ids.$runner.out" 2>"$OUT/init-ids.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$RFS"/data/local/tmp/ids-init.txt tests/expect/init-ids.out; then
+            echo "PASS  init-ids $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-ids $runner (exit $rc; see $OUT/init-ids.$runner.err)"
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 # Init stdio (B4b): with the default --init-stdio null, a service's stdin, stdout and stderr are
 # /dev/null, so the probe writes its report to a file. The report (fdnames, tests/guest/fdnames.c)
 # must equal tests/expect/init-stdio.out. Engine and Node.
@@ -550,7 +574,9 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
         ! grep -q 'is not decoded' "$OUT/boot.err" &&
         { [ ! -f "$RFS/vendor/bin/vndservicemanager" ] ||
           { grep -q 'StartDisplayManager took to complete' "$OUT/boot.err" &&
-            ! grep -q "Since 'SurfaceFlinger' could not be found" "$OUT/boot.err"; }; }; then
+            ! grep -q "Since 'SurfaceFlinger' could not be found" "$OUT/boot.err" &&
+            grep -q 'SystemServiceManager([0-9]*): Starting phase 100' "$OUT/boot.err" &&
+            ! grep -q 'lacks write' "$OUT/boot.err"; }; }; then
         echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1)"
         pass=$((pass + 1))
     else
