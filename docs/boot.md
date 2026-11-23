@@ -1822,3 +1822,175 @@ raised and the detector is not changed here.
 | Watchdog | real | fires after the main thread is blocked | consequence of the stop |
 | cgroups, boot_id, userfaultfd | missing or ENOSYS | non-fatal | not decided |
 | Other HALs, lmkd, statsd, storaged, netd, vold; telephony, NFC, Bluetooth | not decided | not reached | after d2 |
+
+## B4d: the VNDK linker path, the deadlock check, and the power and light HALs (d2 done, stop at d2's end)
+
+Status: **the linker decision (A) is implemented and verified statically and by the test suite. The power HAL and the
+light HAL link and run (IPower and ILights register through the lazy start). The deadlock check no longer fires during
+the 1-second waits. system_server now gets through `startBootstrapServices` to `InitPowerManagement` (d2's last step),
+where `PowerManager` cannot be built: `thermalservice` is not visible to servicemanager, although ThermalManagerService
+started and published it. The Java side then throws a NullPointerException, and the zygote restarts system_server (the
+cycle repeats). d3, d4 and d5 are not reached. The blocker is below, with its log.**
+
+### Files
+
+- `tools/gen-ldconfig.py`: appends `/apex/com.android.vndk.<name>/${LIB}` to the flat default namespace, last (after
+  `/system`, the APEXes, `/system_ext`, `/product` and `/vendor`). The VNDK APEX directory is found, not hardcoded.
+  Docstring updated. Both rootfs trees regenerated (`build/rootfs`, `build/rootfs-xiaoji`).
+- `engine/sched.c`: the idle streak is reset when a thread runs, the wakeable-deadline count is separate, and the two
+  diagnostics are split (see "The deadlock check").
+- `engine/init.c`: `init_deadline` returns only service-restart times. The `--init-timeout` end is not a wake-up.
+- `image/xiaoji.rc`: `vendor.light-default` (new), a disabled lazy service like `vendor.power-default`.
+- `tests/guest/futex-hang.c` (new), `tests/init/idle-sleep.rc` and `tests/init/idle-hang.rc` (new), and
+  `tests/expect/init-idle-sleep.out` and `init-idle-hang.out` (new). `tests/run.sh`: the two deadlock cases, the oracle
+  skip for `futex-hang-*`, and the `XIAOJI_BOOT` check now also requires `InitPowerManagement`.
+
+### The linker path (decision A)
+
+- The search path of the flat `default` namespace is now `/apex/com.android.art`, `i18n`, `runtime`, `/system`, the other
+  APEXes, `/system_ext`, `/product`, `/vendor`, and then `/apex/com.android.vndk.current/${LIB}`. The APEX directory is
+  `com.android.vndk.current` on both rootfs trees (checked with `ls`).
+- Static check, before any boot. The old and new `ld.config.txt` differ in exactly one path, the appended one, in both
+  trees (a script compared the path lists: the old list is a prefix of the new one).
+- The VNDK-only sonames (in the VNDK `lib64`, in no earlier directory): 38 in `build/rootfs`, 39 in `build/rootfs-xiaoji`.
+  `android.hardware.power-V3-ndk.so` and `android.hardware.light-V2-ndk.so` are VNDK-only. `libbinder.so`, `libbinder_ndk.so`
+  and `libhidlbase.so` are in `/system` (earlier), so they still resolve to `/system`. The overlap between the VNDK
+  `lib64` and `/vendor/lib64` is 0, so the placement at the end of the list does not change any vendor resolution.
+- `DT_NEEDED` (from `readelf -d` in the builder VM): the power HAL needs `libbase`, `libbinder_ndk`, `power-V3-ndk`,
+  `libc++`, `libc`, `libm`, `libdl`. The light HAL needs the same with `light-V2-ndk`. Every one except the two NDK
+  libraries is in `/system` or the runtime APEXes (`libc.so` is in `/system/lib64`).
+- Test results with this change: `make test` 164 passed, 0 failed (`XIAOJI_JIT=0`: 164, 0 failed). `make test-web`
+  passed. `build/web/manifest.json` packs `build/rootfs` (including `linkerconfig`), and its make rule does not depend on
+  that directory, so the file was deleted and rebuilt before the run.
+- Runtime: `IPower` is found in the device VINTF manifest at 56.65 s (lazy start), and `Power isModeSupported` answers at
+  56.93 s. `StartPowerManager took to complete: 337ms` (run1). The B4c part 2 experiment (run9) took 46 ms; its power
+  state was not recorded, so the two are not compared. In the second system_server cycle, `StartPowerManager` took 77 ms.
+
+### The deadlock check
+
+- The cause (B4c part 2): `idle_since` was set at the first idle moment and never cleared, so the 5 s measured wall time,
+  and any thread that had run in between counted.
+- The fix (`engine/sched.c`, `run_loop`, init mode only): `idle_since` is reset whenever `pick()` returns a thread. The
+  "none can wake" report needs a continuous idle streak of more than 5 s, no guest thread with a deadline, and no
+  service-restart deadline in init. It prints `xiaoji: deadlock: every thread is blocked with no deadline, and none can
+  wake` and the thread list, once per streak. A second diagnostic, `xiaoji: init: nothing has run for 60 s, with deadlines
+  pending`, covers a long continuous idle with a deadline pending (it is a diagnostic, the run continues). The non-init
+  path (a process run without `--init`) is unchanged: it still ends with exit 134 when no thread has a deadline.
+- `engine/init.c`: `init_deadline` no longer returns the `--init-timeout` end. Before, the timeout made every init run look
+  like it had a pending wake-up, so a hang could never be reported. The timeout is still checked on every pass of
+  `init_tick`, and the idle sleep is at most 10 ms, so the run still ends on time.
+- Tests (engine and Node): `init-idle-sleep` (seven one-second sleeps with output between them; stdout must match, and
+  stderr must have no deadlock or "nothing has run" line). `init-idle-hang` (`tests/guest/futex-hang.c`, one thread on a
+  futex with no timeout; stderr must have the deadlock line; the run ends at `--init-timeout 9`). The first version of
+  `init-idle-hang` failed for the reason above (the timeout made init look busy), which is how the fix was found.
+- The boot (run1): no `deadlock` or `nothing has run` line in 3,357 log lines over 240 s. The old lines appeared in
+  every run before this change (B4c part 2).
+- Red check of `init-idle-sleep` against the pre-fix `sched.c`: not run. The test is expected to fail there (seven
+  one-second idle moments exceed the 5 s of the old wall-clock check), but that is not shown here.
+
+### Milestones (B4d)
+
+Run1, the committed rc with the two HAL changes. The power state was **battery, Low Power Mode on** (`pmset -g` in
+`build/tests/boot/b4d-run1.pmset.txt`: `lowpowermode 1`, "Now drawing from 'Battery Power'"). The benchmark rule (AC, LPM off)
+was not met, because the machine was not on AC. These timings are a single run, not a benchmark, and are not comparable
+with the B4c part 2 AC figures.
+
+| Milestone | Logcat line | Time, insn (run1, battery, LPM on) |
+|---|---|---|
+| (b) classes preloaded | `I/Zygote: ...preloaded 16252 classes` | 38.4 s, 2.37 G |
+| (c) system_server forked | `I/Zygote: System server process 1014 has been created` | 50.6 s, 3.22 G |
+| (d1) system_server starts | `I/SystemServer: Entered the Android system server!` | 51.5 s, 3.27 G |
+| (d2) startBootstrapServices begins | `D/SystemServerTiming: startBootstrapServices` | 55.4 s, 3.50 G |
+| (d2) IPower registers (lazy start) | `I/servicemanager: Found android.hardware.power.IPower/default` | 56.65 s |
+| (d2) StartPowerManager done | `V/SystemServerTiming: StartPowerManager took to complete: 337ms` | 56.9 s, 3.59 G |
+| (d2) InitPowerManagement (the furthest point, XIAOJI_BOOT check) | `D/SystemServerTiming: InitPowerManagement` | 56.96 s, 3.59 G |
+| (d2) startBootstrapServices done | not reached: `PowerManager` is null (blocker) | |
+| (d3), (d4), (d5) | not reached | |
+
+- The second cycle (run1): the zygote forks system_server 1062 at 108.2 s; its `StartPowerManager` takes 77 ms and it reaches
+  `LightsService` at 114.2 s. Lights: `servicemanager: Found android.hardware.light.ILights/default` (lazy start at 114.19 s,
+  `Lights reporting supported lights` at 114.45 s). It then fails at the same `thermalservice` point (the cycle repeats:
+  the zygote restarts system_server at 166.9 s and 227.4 s).
+- The `XIAOJI_BOOT=1` check (`tests/run.sh`) now requires the preload, the fork, the d1 entry, `StartPowerManager` and
+  `InitPowerManagement`. It is run with `--init-timeout 90`, and the furthest line is reached at about 57 s natively. It passed.
+
+### The blocker (d2 end): `thermalservice` is not published
+
+`PowerManager`'s service fetcher (`frameworks/base/core/java/android/app/SystemServiceRegistry.java:590`) calls
+`ServiceManager.getServiceOrThrow(Context.THERMAL_SERVICE)`. ThermalManagerService publishes `thermalservice` in its
+`onStart` (`frameworks/base/services/core/java/com/android/server/power/ThermalManagerService.java:125-126`), and
+`StartThermalManager` ran (10 ms, with `Starting ...ThermalManagerService`). The lookup then fails. The servicemanager log
+has no line about the add (no error), and no other server reports one. Logcat, run1 (`build/tests/boot/b4d-run1.err`):
+
+```
+[56936 ms 3589547725 insn] D/SystemServerTiming(1014): StartThermalManager
+[56936 ms 3589557563 insn] I/SystemServiceManager(1014): Starting com.android.server.power.ThermalManagerService
+[56946 ms 3590128995 insn] V/SystemServerTiming(1014): StartThermalManager took to complete: 10ms
+[56964 ms 3590998362 insn] D/SystemServerTiming(1014): InitPowerManagement
+[56977 ms 3591821663 insn] E/SystemServiceRegistry(1014): No service published for: thermalservice
+android.os.ServiceManager$ServiceNotFoundException: No service published for: thermalservice
+	at android.os.ServiceManager.getServiceOrThrow(ServiceManager.java:166)
+	at android.app.SystemServiceRegistry$38.createService(SystemServiceRegistry.java:601)
+	at android.app.ActivityTaskSupervisor.initPowerManagement(ActivityTaskSupervisor.java:505)
+	...
+[56980 ms 3591960182 insn] W/Parcel(1014): **** enforceInterface() expected 'android.os.IThermalService' but read 'android.app.IActivityManager'
+[56989 ms 3592519342 insn] E/AndroidRuntime(1014): Error reporting WTF
+java.lang.SecurityException: Binder invocation to an incorrect interface
+[57025 ms 3594587492 insn] E/AndroidRuntime(1014): *** FATAL EXCEPTION IN SYSTEM PROCESS: main
+java.lang.NullPointerException: Attempt to invoke virtual method 'android.os.PowerManager$WakeLock android.os.PowerManager.newWakeLock(int, java.lang.String)' on a null object reference
+	at com.android.server.wm.ActivityTaskSupervisor.initPowerManagement(ActivityTaskSupervisor.java:507)
+[57151 ms 3594994450 insn] E/Zygote(1003): Exit zygote because system server (pid 1014) has terminated
+```
+
+- The `SecurityException` is a second symptom of the same fault. `RuntimeInit.wtf` reports the fatal error through
+  `ActivityManager`'s proxy, and that transaction arrives at the `IThermalService` stub of the same process. A transaction
+  for one local Binder object reaches another object's stub. The likely place is the engine's binder node table
+  (`engine/binder.c`: nodes are looked up by `ptr`, and a local node's `cookie` decides which Java object answers), but this
+  is a hypothesis; it is not established by a trace.
+- Not decided yet: whether the add is lost in the transaction (the flat object for the thermal service is translated by
+  `xl_object`), or whether servicemanager stores it and loses it later. The next step is a binder trace of the `ADD_SERVICE`
+  transaction for `thermalservice` (the engine has none; one would be added for this run only), then the fix.
+- This is a binder bug in the engine, not a missing HAL, so it is not handled with a component choice (the thermal HAL
+  itself is not reached: ThermalManagerService connects to it later, in `onBootPhase`).
+
+### Component table (B4d)
+
+| Component | Choice | State | Why |
+|---|---|---|---|
+| `vendor.power-default` (IPower) | real example HAL, lazy | **runs** (after the linker path) | the B4c part 2 linker decision (A) |
+| `vendor.light-default` (ILights) | real example HAL, lazy, new in this step | **runs** (`Lights reporting supported lights`) | same decision; `light-V2-ndk` is VNDK-only |
+| `vendor.power.stats-hal-1-0-mock` | real mock HAL | runs | as B4c part 2 |
+| `system_suspend`, `installd` | real daemons | run | as B4c part 2 |
+| ThermalManagerService (`thermalservice`) | real system service, started | **blocker**: the add is not visible to lookups | binder fault (above) |
+| HintManagerService | real system service, started | starts (`StartHintManager took 14ms`) | |
+| BluetoothAdapter | real | `E/BluetoothAdapter: Bluetooth service is null` (logged, not fatal here) | Bluetooth decision pending (docs/features.md: never) |
+| Telephony, NFC, UWB, cell broadcast | not reached | not decided in this step | features.md: never in base. The planned mechanism is configuration (`config_voice_capable`, `ro.radio.noril=yes`), not emulation; not applied yet |
+| `/proc/uid_time_in_state`, `/sys/devices/system/cpu/cpu0/cpufreq` | missing | non-fatal (`Cannot obtain CPU frequency count`) | no kernel stats in the engine |
+| `/d/wakeup_sources`, `/proc/wakelocks` | missing | non-fatal (`KernelWakelockReader`) | no wakelock stats |
+
+### Other observations (run1)
+
+- `Could not find 'aidl/android.system.suspend.ISystemSuspend/default' for ctl.interface_start` (twice): the request
+  servicemanager makes for an AIDL name that system_suspend does not provide (it is HIDL). Non-fatal, not fixed.
+- `Could not find android.hardware.power.stats.IPowerStats/default in the VINTF manifest` (servicemanager, once per
+  boot cycle): the lookup uses the AIDL form, and the stats mock is a HIDL service. Non-fatal, not fixed.
+- The Watchdog did not fire in run1 (system_server died before the 60 s half-timeout could matter).
+
+### Tests
+
+- `make test`: 164 passed, 0 failed, 0 xfail (before the boot check; the baseline was 160). The four new lines are
+  `init-idle-sleep` and `init-idle-hang`, engine and Node.
+- `XIAOJI_JIT=0 make test`: 164 passed, 0 failed, 0 xfail.
+- `XIAOJI_BOOT=1 make test`: 165 passed, 0 failed, 0 xfail (the boot check is the 165th).
+- `make test-web`: all checks passed (run after the manifest was regenerated).
+- Warnings: `clang -std=c11 -Wall -Wextra -Wno-unused-parameter -O2` and `emcc` (same flags, one file at a time) are clean
+  for `engine/sched.c` and `engine/init.c`. `tools/gen-ldconfig.py` compiles (`py_compile`).
+- No engine or guest process is left running (checked with `ps` on the host and `pgrep` in the builder VM).
+
+### Gaps (B4d)
+
+- The thermal fault above (the blocker). The d3, d4 and d5 milestones are not reached.
+- The battery and Low Power Mode state of run1: no AC run was made.
+- The deadlock check is a diagnostic in init mode. It does not stop a hang; the run ends at `--init-timeout`.
+- The "nothing can wake" test treats any service-restart deadline as a wake-up, and a host-side event (a control socket
+  message) as not a wake-up. A hang that only a host event could end would be reported, and that is the intent.

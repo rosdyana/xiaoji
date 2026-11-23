@@ -1,0 +1,5 @@
+# B4d: the deadlock check must not fire while a thread keeps running between its sleeps. The driver sleeps one
+# second seven times (seven idle moments, more than the 5 s the check waits for) and prints after each one. The
+# run must print no "deadlock" and no "nothing has run" line on stderr; tests/run.sh checks that.
+service driver /system/bin/sh -c "i=0; while [ $i -lt 7 ]; do /system/bin/toybox sleep 1; i=$((i+1)); echo tick $i; done; /system/bin/setprop xiaoji.exit 1"
+    oneshot

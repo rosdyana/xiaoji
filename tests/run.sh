@@ -185,8 +185,9 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     stretch=0
     case "$name" in glibc_hello*) stretch=1 ;; esac
     # prop-* programs need the engine's property service, which the native run lacks:
-    # they are expectation cases (PROP_CASES below), not oracle cases.
-    case "$name" in prop-*|initsock-*) continue ;; esac
+    # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
+    # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
+    case "$name" in prop-*|initsock-*|futex-hang-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -454,11 +455,56 @@ for case_name in init-sockets init-ctl init-interface; do
     done
 done
 
+# Deadlock check (B4d). idle-sleep: a thread sleeps one second at a time, seven times (the check waits 5 s
+# of continuous idleness, and that is not idleness here), so stderr must have no deadlock line. idle-hang: a
+# real hang (tests/guest/futex-hang.c, no deadline anywhere) must be reported on stderr; the run ends at
+# --init-timeout, so its exit status is not checked. Engine and Node.
+if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/futex-hang-O0 ]; then
+    mkdir -p build/rootfs/data/local/tmp
+    cp build/tests/guest/futex-hang-O0 build/rootfs/data/local/tmp/futex-hang
+fi
+for runner in engine node; do
+    if [ "$runner" = engine ]; then
+        "$ENGINE" --init tests/init/idle-sleep.rc --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
+    elif [ -f "$NODE_JS" ]; then
+        node "$NODE_JS" --init tests/init/idle-sleep.rc --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
+    else
+        continue
+    fi
+    rc=$?
+    if [ "$rc" = 0 ] && cmp -s "$OUT/init-idle-sleep.$runner.out" tests/expect/init-idle-sleep.out &&
+        ! grep -q "deadlock\|nothing has run" "$OUT/init-idle-sleep.$runner.err"; then
+        echo "PASS  init-idle-sleep $runner"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  init-idle-sleep $runner (exit $rc)"
+        grep "deadlock\|nothing has run" "$OUT/init-idle-sleep.$runner.err" | head -n 3 | sed 's/^/        /'
+        fail=$((fail + 1))
+    fi
+    if [ "$runner" = engine ]; then
+        "$ENGINE" --init tests/init/idle-hang.rc --root build/rootfs --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
+    elif [ -f "$NODE_JS" ]; then
+        node "$NODE_JS" --init tests/init/idle-hang.rc --root build/rootfs --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
+    else
+        continue
+    fi
+    if cmp -s "$OUT/init-idle-hang.$runner.out" tests/expect/init-idle-hang.out &&
+        grep -q "deadlock: every thread is blocked with no deadline" "$OUT/init-idle-hang.$runner.err"; then
+        echo "PASS  init-idle-hang $runner"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  init-idle-hang $runner"
+        head -n 6 "$OUT/init-idle-hang.$runner.err" | sed 's/^/        /'
+        fail=$((fail + 1))
+    fi
+done
+
 # Zygote (B4a, B4b, B4c), opt-in: XIAOJI_BOOT=1 boots the zygote of image/xiaoji.rc. The log must show
 # the class preload ("...preloaded N classes"), the fork of system_server (zygote's own
 # "System server process N has been created", B4b milestone c), system_server's entry ("Entered
 # the Android system server!", B4c milestone d1) and the furthest deterministic point of
-# startBootstrapServices, "StartPowerManager" (B4c part 2, milestone d2 begun). About 56 s natively.
+# startBootstrapServices, "InitPowerManagement" (B4d: the last bootstrap step before the
+# PowerManager NullPointerException, see docs/boot.md B4d). About 57 s natively.
 # Not in the default run, which is kept short; the boot is stopped by --init-timeout.
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
@@ -466,11 +512,12 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
         grep -q 'Entered the Android system server!' "$OUT/boot.err" &&
-        grep -q 'SystemServerTiming([0-9]*): StartPowerManager' "$OUT/boot.err"; then
-        echo "PASS  zygote preload, system_server fork, its entry and StartPowerManager (XIAOJI_BOOT, B4c part 2 d2)"
+        grep -q 'SystemServerTiming([0-9]*): StartPowerManager' "$OUT/boot.err" &&
+        grep -q 'SystemServerTiming([0-9]*): InitPowerManagement' "$OUT/boot.err"; then
+        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager and InitPowerManagement (XIAOJI_BOOT, B4d d2)"
         pass=$((pass + 1))
     else
-        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry or StartPowerManager line is missing in $OUT/boot.err"
+        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager or InitPowerManagement line is missing in $OUT/boot.err"
         fail=$((fail + 1))
     fi
 fi

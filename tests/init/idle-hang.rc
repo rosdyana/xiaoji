@@ -1,0 +1,5 @@
+# B4d: a real hang. The one service blocks on a futex with no timeout (tests/guest/futex-hang.c), so no thread
+# has a deadline and init has no timer. The engine must report it on stderr after 5 s; the run then ends at
+# --init-timeout, which tests/run.sh sets.
+service hang /data/local/tmp/futex-hang
+    oneshot

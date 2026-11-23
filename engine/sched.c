@@ -389,10 +389,23 @@ static int wait_for_timers(void)
     return 1;
 }
 
-static void report_deadlock(void)
+/* The threads with a deadline: returns how many, and the earliest deadline in *earliest. */
+static int pending_deadlines(uint64_t *earliest)
 {
-    fflush(stdout);
-    fprintf(stderr, "xiaoji: deadlock: every thread is blocked and none can wake\n");
+    int n = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->state == TS_RUNNABLE || !t->has_deadline)
+            continue;
+        if (!n || t->deadline < *earliest)
+            *earliest = t->deadline;
+        n++;
+    }
+    return n;
+}
+
+static void report_threads(void)
+{
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_t *t = threads[i];
         if (!t)
@@ -407,6 +420,13 @@ static void report_deadlock(void)
                                           : "runnable",
                 (unsigned long long)t->cpu.pc);
     }
+}
+
+static void report_deadlock(void)
+{
+    fflush(stdout);
+    fprintf(stderr, "xiaoji: deadlock: every thread is blocked and none can wake\n");
+    report_threads();
 }
 
 /* A process has ended (its last thread is gone, or exit_group or a fatal signal): its
@@ -450,11 +470,14 @@ static void idle_wait(uint64_t (*deadline)(void))
 
 /* The scheduler loop. main_cpu starts the initial process's main thread. In init mode
  * (main_cpu NULL) the initial process has no thread: tick runs between slices and whenever
- * nothing is runnable, and deadline gives the host time of init's next timer (0 for none). */
+ * nothing is runnable, and deadline gives the host time of init's next timer that can wake a
+ * thread (0 for none). The deadlock check reads it: a timer that only stops the run does not count. */
 static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(void))
 {
+    /* Init mode only: idle_since is the start of the current idle streak. A thread that
+     * runs ends the streak, so only continuous idleness counts (see the idle branch below). */
     uint64_t idle_since = 0;
-    int idle_reported = 0;
+    int idle_reported = 0, idle_long_reported = 0;
     if (main_cpu) {
         thread_t *m = add_thread(main_cpu, TID_MAIN, proc_cur());
         if (!m) {
@@ -477,16 +500,32 @@ static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(vo
                 break;
         }
         thread_t *t = pick();
+        if (t && tick) {
+            idle_since = 0; /* a thread ran: the idle streak is over */
+            idle_reported = idle_long_reported = 0;
+        }
         if (!t) {
             if (tick) {
-                /* Nothing runnable: after 5 s, print the threads once (a hang, not slow work). */
                 uint64_t now = host_monotonic_ns();
+                uint64_t earliest = 0;
+                int pending = pending_deadlines(&earliest);
+                int init_pending = deadline && deadline() != 0;
                 if (!idle_since)
                     idle_since = now;
-                if (!idle_reported && now - idle_since > 5000000000ull) {
+                uint64_t idle = now - idle_since;
+                /* A hang: every thread is blocked with no deadline, and init has no timer. Nothing in
+                 * the guest can wake it. Printed once per idle streak, after 5 s of continuous idleness. */
+                if (!idle_reported && idle > 5000000000ull && !pending && !init_pending) {
                     idle_reported = 1;
-                    fprintf(stderr, "xiaoji: init: nothing has been runnable for 5 s\n");
-                    report_deadlock();
+                    fprintf(stderr, "xiaoji: deadlock: every thread is blocked with no deadline, and none can wake\n");
+                    report_threads();
+                }
+                /* Deadlines pending but nothing has run for a long continuous time: the timers are not
+                 * firing (a diagnostic; the run continues). */
+                if (!idle_long_reported && idle > 60000000000ull && (pending || init_pending)) {
+                    idle_long_reported = 1;
+                    fprintf(stderr, "xiaoji: init: nothing has run for 60 s, with deadlines pending\n");
+                    report_threads();
                 }
                 idle_wait(deadline);
                 continue;

@@ -873,17 +873,15 @@ static void init_tick(void)
     }
 }
 
+/* The host time of init's next timer that can wake a thread (a service restart). The --init-timeout
+ * end is not one: it only stops the run, and init_tick checks it on every pass. Reporting it here
+ * would make a hang look like a pending wake-up to the deadlock check (sched.c). */
 static uint64_t init_deadline(void)
 {
     uint64_t dl = 0;
     for (int i = 0; i < nsvc; i++) {
         if (svcs[i].state == ST_RESTARTING && (!dl || svcs[i].restart_at < dl))
             dl = svcs[i].restart_at;
-    }
-    if (timeout_ns) {
-        uint64_t end = start_ns + timeout_ns;
-        if (!dl || end < dl)
-            dl = end;
     }
     return dl;
 }

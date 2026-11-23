@@ -112,6 +112,17 @@ service vendor.power-default /vendor/bin/hw/android.hardware.power-service.examp
     user nobody
     group system
 
+# The light HAL (B4d): the example implementation (AOSP's lights-default.rc block, class and user as the engine
+# reads them). It serves ILights/default, which system_server's LightsService waits for (VintfHalCache). Its
+# android.hardware.light-V2-ndk.so is in the VNDK APEX, found through the flat search path (tools/gen-ldconfig.py).
+# Lazy, like the power HAL: the interface line lets servicemanager start it on demand.
+service vendor.light-default /vendor/bin/hw/android.hardware.lights-service.example
+    interface aidl android.hardware.light.ILights/default
+    disabled
+    class hal
+    user nobody
+    group system
+
 # init derives ro.product.cpu.abilist* from ro.<partition>.product.cpu.abilist* (property_service.cpp,
 # property_initialize_ro_cpu_abilist). The engine does not derive them yet: these are the values that
 # derivation gives this image (system: abilist64 arm64-v8a, abilist32 empty).
