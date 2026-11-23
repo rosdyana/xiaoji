@@ -300,7 +300,6 @@ excluded.
 - Page: `?lazy=0` (the eager arm), `?lazywin=BYTES`, `?statsat` (the engine's phase 100 line in `window.xb.statsAt`),
   and `?early=MB` (section 6.4).
 - Lazy mmap is on by default: `build/xiaoji` and the wasm build both have it.
-- The boot's packs (section 6.4) are needed by neither arm of the switch: the A/B changes only how the engine reads.
 
 ### 6.2 Does lazy mmap slow the engine?
 
