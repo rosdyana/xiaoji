@@ -52,6 +52,24 @@ static const u64 fsets_d[NFSETS][10] __attribute__((aligned(16))) = {
 
 static u8 mbuf[64] __attribute__((aligned(16)));
 
+/* Narrowing inputs (SQXTN, UQXTN, SQXTUN): v0 is a fixed pattern (kept by the "2" forms), v1 holds eight 16-bit lanes,
+ * v2 four 32-bit lanes and v3 two 64-bit lanes, at and around the bounds of the narrow element (0x7f/0x80, 0x7fff/0x8000,
+ * 0xffff, 0x7fffffff/0x80000000, 0xffffffff, 0x100000000, and the negative sources of the signed forms). */
+#define NQSETS 2
+static const uint16_t qh[NQSETS][8] = {
+    {0x0000, 0x007f, 0x0080, 0x00ff, 0x0100, 0x7fff, 0x8000, 0xffff},
+    {0x8000, 0x7f80, 0xff7f, 0x0001, 0x8001, 0x00ff, 0xff00, 0x7f00},
+};
+static const u32 qs[NQSETS][4] = {
+    {0x00000000, 0x00007fff, 0x00010000, 0x7fffffff},
+    {0xffffffff, 0x80000000, 0x00008000, 0x0000ffff},
+};
+static const u64 qd[NQSETS][2] = {
+    {0x0000000080000000ull, 0xffffffffffffffffull},
+    {0x7fffffffffffffffull, 0x0000000100000000ull},
+};
+static u64 qsets[NQSETS][10] __attribute__((aligned(16)));
+
 #define LOADV "ldp q0, q1, [%[in]]\n ldp q2, q3, [%[in], #32]\n"
 #define LOADG "ldr x5, [%[in], #64]\n ldr x6, [%[in], #72]\n"
 #define STOREV "stp q0, q1, [%[out]]\n stp q2, q3, [%[out], #32]\n str x5, [%[out], #64]\n str x6, [%[out], #72]\n"
@@ -293,6 +311,35 @@ int main(int argc, char **argv)
     CASE("xtn2-8h", "xtn2 v0.8h, v1.4s");
     CASE("xtn-2s", "xtn v0.2s, v1.2d");
     CASE("xtn2-4s", "xtn2 v0.4s, v1.2d");
+
+    /* Saturating narrows: SQXTN (signed), UQXTN (unsigned), SQXTUN (signed to unsigned); the "2" forms keep v0's low half.
+     * The inputs are qsets (built here: v0 fixed, v1 8 x 16-bit, v2 4 x 32-bit, v3 2 x 64-bit). */
+    for (int s = 0; s < NQSETS; s++) {
+        memset(qsets[s], 0, sizeof qsets[s]);
+        qsets[s][0] = 0x1122334455667788ull;
+        qsets[s][1] = 0x99aabbccddeeff00ull;
+        memcpy(&qsets[s][2], qh[s], sizeof qh[s]);
+        memcpy(&qsets[s][4], qs[s], sizeof qs[s]);
+        memcpy(&qsets[s][6], qd[s], sizeof qd[s]);
+    }
+    CASE_N("sqxtn-8b", "sqxtn v0.8b, v1.8h", qsets, NQSETS);
+    CASE_N("sqxtn2-16b", "sqxtn2 v0.16b, v1.8h", qsets, NQSETS);
+    CASE_N("uqxtn-8b", "uqxtn v0.8b, v1.8h", qsets, NQSETS);
+    CASE_N("uqxtn2-16b", "uqxtn2 v0.16b, v1.8h", qsets, NQSETS);
+    CASE_N("sqxtun-8b", "sqxtun v0.8b, v1.8h", qsets, NQSETS);
+    CASE_N("sqxtun2-16b", "sqxtun2 v0.16b, v1.8h", qsets, NQSETS);
+    CASE_N("sqxtn-4h", "sqxtn v0.4h, v2.4s", qsets, NQSETS);
+    CASE_N("sqxtn2-8h", "sqxtn2 v0.8h, v2.4s", qsets, NQSETS);
+    CASE_N("uqxtn-4h", "uqxtn v0.4h, v2.4s", qsets, NQSETS);
+    CASE_N("uqxtn2-8h", "uqxtn2 v0.8h, v2.4s", qsets, NQSETS);
+    CASE_N("sqxtun-4h", "sqxtun v0.4h, v2.4s", qsets, NQSETS);
+    CASE_N("sqxtun2-8h", "sqxtun2 v0.8h, v2.4s", qsets, NQSETS);
+    CASE_N("sqxtn-2s", "sqxtn v0.2s, v3.2d", qsets, NQSETS);
+    CASE_N("sqxtn2-4s", "sqxtn2 v0.4s, v3.2d", qsets, NQSETS);
+    CASE_N("uqxtn-2s", "uqxtn v0.2s, v3.2d", qsets, NQSETS);
+    CASE_N("uqxtn2-4s", "uqxtn2 v0.4s, v3.2d", qsets, NQSETS);
+    CASE_N("sqxtun-2s", "sqxtun v0.2s, v3.2d", qsets, NQSETS);
+    CASE_N("sqxtun2-4s", "sqxtun2 v0.4s, v3.2d", qsets, NQSETS);
 
     /* Permutes. */
     CASE("uzp1-16b", "uzp1 v0.16b, v1.16b, v2.16b");

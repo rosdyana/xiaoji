@@ -3965,3 +3965,197 @@ verification sequence ran in between, and its power state was not logged run by 
 - Telephony, NFC, UWB and Bluetooth are not configured out. Bluetooth prints `Bluetooth service is null` and does not block.
   Nothing else was turned off by property.
 - The page cache's limits (above), and the w1 merge, which is not done here.
+
+## B14: the data layout and the mount walk (part 1), the thermal 2.0 HAL, the saturating narrows, the accepted socket name, the mountinfo listing, and the boot past System now ready (stops at a bpf map open in libmeminfo)
+
+Part 1 (commit a15d9d1) made the stock post-fs and post-fs-data data layout and the Linux-style mount walk. Part 2 (this section) is the
+boot's next run: the thermal HAL, four engine gaps (the saturating narrowing SIMD ops, the name of an accepted socket, the mountinfo listing,
+and a debug mapping of fatal signals), the product rc lines the boot needed, and the guest tests for the mount walk. The product boot reaches
+`ActivityManager: System now ready` at about 98 s. Its next blocker is an abort in system_server at about 122 s: libmeminfo's GPU memory
+read opens a pinned BPF map, the engine answers `bpf(2)` with ENOSYS, and libmeminfo aborts. The decision on that is below.
+`sys.boot_completed` is not reached, and the launcher was not started.
+
+### Part 1: the data layout and the mount walk (a15d9d1)
+
+- Init actions, in the stock order (`image/xiaoji.rc`, `post-fs` and `post-fs-data`): `/storage` (a recursive bind of `/mnt/user/0`, then
+  slave), the `/mnt/sdcard` and `/mnt/runtime/default/self/primary` symlinks, `/mnt/runtime/full/self`, `/data/user/0` as a recursive bind
+  of `/data/data` (stock `init.rc` line 919: `mount none /data/data /data/user/0 bind rec`, after its `mkdir /data/user/0`), a `/data_mirror`
+  tmpfs (`mode=0700,uid=0,gid=1000`) with `data_ce/null` and `data_de/null` bound from `/data/user` and `/data/user_de`, and the profile binds
+  (`cur_profiles`, `ref_profiles`).
+- Not made: the stock `mount rootfs rootfs / remount bind ro` (the engine's root has no flags to change), the restorecon lines (the engine
+  keeps no labels), and the stock `rm /data/user/0` (the engine keeps `/data/user/0` as a directory, never a symlink).
+- The mount walk (`engine/mntns.c`): a lookup enters a mount only as the child of the mount the walk is at, as Linux does. A tmpfs mounted
+  over a path therefore hides the binds made below it before, and a mount made under a hidden mount is hidden with it.
+
+### Thermal HAL: the 2.0 mock replaces the 1.0 service (`image/xiaoji.rc`)
+
+- The product rc now carries the stock block of `/vendor/etc/init/android.hardware.thermal@2.0-service.rc`
+  (`vendor.thermal-hal-2-0-mock`, both `interface` lines). It replaces the 1.0 block of B13, because both would register
+  `@1.0::IThermal/default`.
+- The mock registers `android.hardware.thermal@2.0::IThermal/default` (`HidlServiceManagement`, 2.5 s). HardwarePropertiesManagerService's
+  1.0 lookup then completes (`StartHardwarePropertiesManagerService took to complete: 10ms`), so the 2.0 mock serves the 1.0 call, as its rc
+  says.
+- `tests/run.sh` (the XIAOJI_BOOT check) asserts the 2.0 registration and that StartHardwarePropertiesManagerService completes, in place of the
+  1.0 registration.
+
+### Engine and rc changes in this section
+
+- `engine/simd.c`: the saturating narrows were missing. SQXTUN (U=1, opcode 0x12, and its `2` form) and SQXTN (U=0) and UQXTN (U=1) at
+  opcode 0x14 are implemented. libhwui.so (system_server's binder thread) hit SQXTUN (`0x2e612800`) and then UQXTN (`0x2e214800`). QC is not
+  kept (as the file's note says for the doubling forms).
+- `engine/sock.c`: an accepted socket reports its listener's bound name from getsockname (Linux copies the address in unix_stream_connect).
+  Without it, zygote's webview socket aborted with `Unsupported AF_UNIX socket (fd=45) with empty path`.
+- `engine/mntns.c`: mountinfo (and /proc/mounts) lists every mount of the namespace in the order they were made, the covered ones too. It
+  listed only the live mounts, so a bind hidden under a tmpfs was missing. The table holds only attached mounts (umount compacts it, and
+  MNT_DETACH takes the subtree), so no further filter is needed.
+- `engine/sched.c`: under `XIAOJI_DEBUG_FAULTS=1`, a fatal signal also prints the file and the offset of the pc, of x30, and of up to 12
+  frame-pointer return addresses (`debug_region`). This is what identified the blocker below.
+- `image/xiaoji.rc`: (1) `symlink /apex/com.android.vndk.current /apex/com.android.vndk.v33`. nativeloader reads
+  `/apex/com.android.vndk.v<ro.vndk.version>/etc/llndk.libraries.<version>.txt` (vendor/build.prop: `ro.vndk.version=33`), and the image
+  carries only `com.android.vndk.current`, which has that file. Without the name, the WebView relro process aborted in
+  `ClassLoaderFactory.createClassloaderNamespace`. (2) `mkdir /data/misc/shared_relro` (stock: `mkdir /data/misc/shared_relro 0771
+  shared_relro shared_relro`; the engine's mkdir takes the path only). The WebView relro file is still not created with this directory; the
+  WebView process proceeds without it (see the blocker section).
+- The VNDK link is written into the rootfs by the boot, in `build/rootfs-xiaoji/apex/` and in `build/rootfs/apex/` (by the Google-image
+  XIAOJI_BOOT run). Its target is absolute and resolves only inside the guest, so it is dangling on the Mac. `tools/gen-ldconfig.py` still
+  finds one VNDK directory in both trees (`com.android.vndk.current`), because it tests `isdir` on each entry, and the link does not resolve on
+  the Mac (checked read-only after the link existed in both trees).
+
+### Tests in this section
+
+- `tests/guest/simd.c`: 18 narrowing cases, each over two input sets (36 output lines): SQXTN, UQXTN and SQXTUN, with and without the `2`
+  form, from 16-, 32- and 64-bit sources. The inputs sit at the bounds (0x7f/0x80, 0x7fff/0x8000, 0xffff, 0x7fffffff/0x80000000,
+  0xffffffff, 0x100000000), and v0 is a fixed pattern that the `2` forms keep.
+- `tests/guest/unixsock.c`: `accepted getsockname path` (the accepted socket reports the listener's path).
+- `tests/guest/mountns.c`, three sections added to the existing test:
+  - the mount walk: a tmpfs over a path hides an earlier bind below it; the bind is back after the umount; a bind made below the tmpfs is
+    visible; the mountinfo lines show the covered bind;
+  - zygote's per-app isolation: a clone child (`clone(SIGCHLD)`) runs `unshare(CLONE_NEWNS)`, a private remount of `/`, a tmpfs over
+    `zd/user`, and a bind of the app's directory from a mirror under it. The child sees the app file and not the parent's file; the parent
+    sees neither the tmpfs nor the bind. The child and the parent each print their mountinfo;
+  - a snapshot while an rbind and its submount copy are mounted (`rbind src2 mnt5`), before the MNT_DETACH.
+  The recursive bind with a submount is also the existing `rbind src2 mnt3` case.
+- The XIAOJI_BOOT product check (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) also asserts that no `Unsupported AF_UNIX socket` and no
+  `Failed to mount /data_mirror` line appears.
+
+### Milestones (product tree, final sources; guest time `[ms insn]`)
+
+Run: `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (after `reset-data`, which the check does itself), so the table is the
+`build/tests/out/boot.err` of that run, as in B13. Its power state is below. Times vary between runs (the boot11 run of the same sources
+reached System now ready at 95.8 s).
+
+| Milestone | time | instructions |
+|---|---|---|
+| `Registered android.hardware.thermal@2.0::IThermal/default` | 2.5 s | 0.30 G |
+| `InitBeforeStartServices took to complete: 2466ms` | 45.4 s | 4.81 G |
+| `StartLockSettingsService took to complete: 204ms` | 77.1 s | 8.17 G |
+| `StartConnectivityService took to complete: 389ms` | 81.8 s | 8.74 G |
+| `StartAudioService took to complete: 10395ms` | 92.6 s | 10.36 G |
+| `StartHardwarePropertiesManagerService took to complete: 10ms` | 92.7 s | 10.37 G |
+| `ActivityManager: System now ready` | 98.1 s | 10.99 G |
+| `WebViewLibraryLoader: failed to create relro file` (not fatal) | 122.1 s | 13.72 G |
+| system_server `Thread-10`: SIGABRT (the blocker below) | 122.3 s | 13.73 G |
+
+### The next blocker: system_server's abort in libmeminfo's GPU memory read (a pinned BPF map)
+
+After `System now ready`, ActivityManager reports memory. When a process dies, system_server's Thread-10 reads the GPU memory of the
+processes through `libmeminfo.so`, and the read aborts. Final product run (`build/tests/out/boot.err`):
+
+```
+[122072 ms 13715964248 insn] E/WebViewLibraryLoader(1310): failed to create relro file
+[122104 ms 13718792797 insn] I/ActivityManager(1068): Process WebViewLoader-arm64-v8a (pid 1310) has died: psvc PER
+[122252 ms 13733401906 insn] F/libc(1068): Fatal signal 6 (SIGABRT), code -1 (SI_QUEUE) in tid 1331 (Thread-10), pid 1068 (<unknown>)
+[122737 ms 13772939664 insn] W/webviewchromiumloader(1332): Failed to open relro file /data/misc/shared_relro/libwebviewchromium64.relro: No such file or directory
+[122738 ms 13772944602 insn] W/WebViewLibraryLoader(1332): failed to load with relro file, proceeding without
+```
+
+The relro line is not fatal: the WebView process proceeds without the relro file. The abort is. The engine's `XIAOJI_DEBUG_FAULTS=1` mapping of the
+same kind of abort (boot11, at 119.4 s) gives the frames: `libc.so` at file offset 0x8a914 (abort), a return address into `libmeminfo.so`
+at 0x117c4, and then `libmeminfo.so` at 0xfa1c, which is inside `android::meminfo::ReadProcessGpuUsageKb` (its exported symbol is at 0xf9d4).
+Disassembling `libmeminfo.so` (`llvm-objdump -d`, the emsdk copy) shows the function that aborts:
+
+- at 0x1160c it calls `syscall(280, 7, ...)`. On arm64 280 is `bpf(2)` and 7 is `BPF_OBJ_GET`: it opens a pinned BPF map by path. The
+  path is in `strings libmeminfo.so`: `/sys/fs/bpf/map_gpu_mem_gpu_mem_total_map`.
+- the result is tested for the sign bit (`tbnz w8, #0x1f` at 0x11698), and a negative fd branches to `bl abort` at 0x117c0. The return
+  address of that call is 0x117c4, which is the frame in the log.
+
+So the abort is a fatal check of a failed `bpf(2)`. The engine answers `bpf(2)` with ENOSYS: the final log has `xiaoji: unimplemented
+syscall 280` (`engine/syscall.c` returns `-LE_NOSYS` for an unimplemented number), and the same boot logs `nativeBpfFdGet failed: ENOSYS`
+from `BpfInterfaceMapUpdater` and `NetworkStats`. The trigger, as far as the logs show, is ActivityManager's memory report after a
+process death: the abort follows a process death by 0.2 to 0.4 s in each run (boot10: SystemUI, pid 1230, dies at 98.7 s and the abort is at
+99.1 s; boot11: WebView, pid 1311, dies at 119.2 s and the abort at 119.4 s; the final run: pid 1310 at 122.1 s and 122.3 s). So the abort
+time is not a fixed milestone: it follows the first process death after `System now ready`.
+
+**Decision needed (not built).** B11 and B12 decided that the engine does not implement `bpf(2)`, that the real netd is replaced by
+`xiaoji_netd`, and that the BPF-dependent framework calls must be checked for fatal failures (docs/boot.md, B11 "The BPF gate", and B12).
+This call is fatal in libmeminfo, so the B11 policy does not cover it. The options:
+
+1. **Recommended.** Answer `bpf(BPF_OBJ_GET)` for the one pinned path above with the fd of an empty map the engine keeps (a hash map whose
+   lookups return ENOENT). This adds a narrow `bpf(2)` surface (map create for that type, object get by path, lookup), and it keeps the B11
+   decision for everything else: no programs, no attach, no iptables. ActivityManager then gets no GPU memory, which the framework handles
+   when the driver reports none. A guest test would check the error paths against the native oracle; a successful open has no oracle
+   counterpart, because the native kernel has no such pinned map.
+2. Keep the BPF gate as it is, and turn the GPU memory report off. The read is native and inside ActivityManager's memory report, and no
+   property or rc line is known to disable it. Not checked further.
+3. Implement `bpf(2)` for the framework's maps. That reverses the B11 decision, and it is the largest of the three.
+
+Option 1 is my recommendation. It is a design decision, so nothing was built for it. After the decision: the engine's `bpf` case and the
+test.
+
+### SystemUI's first crash (not GL)
+
+The first SystemUI process death (boot10, 98.7 s, pid 1230) is a Java NullPointerException in `SystemUIFactory.createFromConfig`
+(`SystemUIFactory.java:82`, reached from `KeyguardSliceProvider`): `Attempt to invoke interface method 'void
+android.content.pm.ILauncherApps.addOnAppsChangedListener(...)' on a null object reference`. The stack has no EGL, GLES or renderControl
+frame, so the null GL backend is not the cause and was not changed. Why `ILauncherApps` is null is not determined (in boot11,
+`StartLauncherAppsService` ran at 90.9 s). SystemUI's later deaths (pid 1503 in the final run at 213 s) were not analysed.
+
+### Not reached, and not checked
+
+- `sys.boot_completed=1`, the launcher, and the HOME intent: not reached. Launcher3QuickStep is in `/system_ext/priv-app` and is parsed
+  (`Parse times for '/system_ext/priv-app/Launcher3QuickStep'`), but no HOME resolution is logged before the abort.
+- Telephony, NFC, Bluetooth and UWB: not configured out in this section. No trace shows them blocking before the abort.
+- The later restart cycles of system_server (`System now ready` again at 205 s and 281 s in boot11) are not analysed. The run ends at the
+  init timeout (300 s).
+- The relro file: the `shared_relro` directory exists, but WebView still does not create the file (the reason is not checked).
+
+### Power and the host
+
+`pmset -g batt` showed `Now drawing from 'AC Power'` and `pmset -g` showed `lowpowermode 0` before the first boot of this section and again
+at the end of the verification (06:36). The power state was not logged run by run.
+
+A Maintenance Sleep on AC (`pmset -g log`: 05:35:46 to 05:50:40) paused the first full `tests/run.sh` of this section, which is the run that
+reported the four mountns failures. Those failures are the mountinfo difference fixed below, not a sleep effect; the suite was run again
+after the fix (see the verification table). Earlier, boot5 (03:31 to 03:48) was paused the same way and is not counted. From then on every engine run
+and every verification run is wrapped in `caffeinate -dims`.
+
+### Verification (B14, final sources)
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` (final chain) | exit 0; no warning in the log |
+| `tests/run.sh` (default), final sources | **228 passed, 0 failed, 0 xfail** (the mountns checks, O0 and O2, engine and node, pass against the native oracle) |
+| `XIAOJI_JIT=0 tests/run.sh`, final sources | **228 passed, 0 failed, 0 xfail** |
+| `XIAOJI_BOOT=1 tests/run.sh` (Google image; its boot creates the VNDK link in `build/rootfs/apex`) | **229 passed, 0 failed, 0 xfail** (run before the zygote section of `mountns.c` was reworked; the check does not use that test) |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (reset-data first) | **195 passed, 0 failed, 0 xfail** (before the `mountns.c` rework; the engine and rc are unchanged since) |
+| `make test-web` | all web checks passed, exit 0 (before the `mountns.c` rework; not affected by it) |
+| `clang -std=c11 -Wall -Wextra -fsyntax-only` and `emcc` on `engine/simd.c`, `sock.c`, `sched.c`, `mntns.c` | 0 warnings each |
+| `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | empty |
+
+Two runs of the final default suite before the repeat: the first (after the mountinfo fix, before the zygote rework) reported 228 passed
+with the mountns checks failing; after the rework, one default run reported `FAIL init-ctl engine` (exit 0: its output lacked the last line,
+`crasher stopped`). That case passed in three standalone runs, in the no-JIT run, and in the clean repeat (the last row of the final
+default run); the cause of the intermittent failure is not determined.
+
+The mountns mismatch found by the first default run: the engine's mountinfo left out the bind that a tmpfs covers
+(`/wk/a/x rw bind`, the first bind), and the oracle lists it. The fix (`engine/mntns.c`, `mntns_text`) lists every mount of the
+namespace in creation order, covered ones included. The zygote section and the rbind snapshot were then added to the test as the plan lists
+them, and the engine output matched the oracle again (gcc builds, O0 and O2).
+
+### Gaps (B14)
+
+- The boot stops at the libmeminfo bpf abort (above). `System now ready` is reached; `sys.boot_completed` is not. The bpf decision is open.
+- The VNDK link and the `shared_relro` directory are created by the boot in the rootfs (`build/rootfs-xiaoji`, and `build/rootfs` by its
+  XIAOJI_BOOT run), not by the image build. The rootfs builder does not know about them yet.
+- The mountinfo fields the test prints are the target, the options and the fs type. The device numbers and the `shared:` peer groups are not
+  compared with Linux.

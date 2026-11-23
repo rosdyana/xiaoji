@@ -675,6 +675,8 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'ActivityManager([0-9]*): Connection with lmkd established' "$OUT/boot.err" &&
             grep -q 'SystemServerTiming([0-9]*): StartVibratorManagerService took to complete' "$OUT/boot.err" &&
             ! grep -q "Could not find 'aidl/android.hardware.vibrator" "$OUT/boot.err" &&
+            ! grep -q 'Unsupported AF_UNIX socket' "$OUT/boot.err" &&
+            ! grep -q 'Failed to mount /data_mirror' "$OUT/boot.err" &&
             ! grep -q 'Failed to find cgroup v2 root' "$OUT/boot.err" &&
             ! grep -q 'cgroup_info/cgroup.rc: No such file' "$OUT/boot.err" &&
             ! grep -q 'Failed to open /dev/cpuset/' "$OUT/boot.err" &&
@@ -688,7 +690,8 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'Registered android.hardware.audio.effect@7.0::IEffectsFactory/default' "$OUT/boot.err" &&
             grep -q 'AudioFlinger([0-9]*): loadHwModule() Loaded primary audio interface' "$OUT/boot.err" &&
             grep -q 'SystemServerTiming([0-9]*): StartAudioService took to complete' "$OUT/boot.err" &&
-            grep -q 'Registered android.hardware.thermal@1.0::IThermal/default' "$OUT/boot.err" &&
+            grep -q 'Registered android.hardware.thermal@2.0::IThermal/default' "$OUT/boot.err" &&
+            grep -q 'SystemServerTiming([0-9]*): StartHardwarePropertiesManagerService took to complete' "$OUT/boot.err" &&
             grep -q 'Registered android.hardware.authsecret@1.0::IAuthSecret/default' "$OUT/boot.err" &&
             grep -q 'ActivityManager([0-9]*): System now ready' "$OUT/boot.err"; }; }; then
         echo "PASS  cgroups (B11) and xiaoji_netd (B12): no cgroup.rc or cgroup v2 root error, no cpuset open error, xiaoji_netd registers netd and dnsresolver, no null INetd, StartNetworkManagementService and StartConnectivityService complete, no netd exit; the audio HAL (device/xiaoji/audio) registers, audioserver loads the primary module, StartAudioService completes, and ActivityManager reports System now ready (B13); zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"

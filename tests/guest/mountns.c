@@ -290,6 +290,7 @@ int main(int argc, char **argv)
     /* A rbind again, then a lazy (MNT_DETACH) unmount of the parent: the child goes with it. */
     putl("rbind src2 mnt5", do_mount("src2", "mnt5", NULL, MS_BIND | MS_REC));
     show_file("mnt5/sub/t (rbind again)", "mnt5/sub/t");
+    show_mountinfo("mountinfo with rbind and submount copy");
     putl("umount mnt5 MNT_DETACH", do_umount("mnt5", MNT_DETACH));
     show_file("mnt5/sub/t after detach", "mnt5/sub/t");
     show_mountinfo("mountinfo after detach");
@@ -358,7 +359,70 @@ int main(int argc, char **argv)
     putl("parent sees iso/x", open_rc("iso/x"));
     show_mountinfo("mountinfo at end");
 
+    /* B14, the mount walk: a tmpfs mounted over a path hides a bind made below it before, and the bind is back when
+     * the tmpfs is unmounted. A later bind below the tmpfs is visible. */
+    do_mkdir("wk");
+    do_mkdir("wk/a");
+    do_mkdir("wk/a/x");
+    do_mkdir("wk/src");
+    putl("write wk/src/marker", write_file("wk/src/marker", "under-bind"));
+    putl("bind wk/src over wk/a/x", do_mount("wk/src", "wk/a/x", NULL, MS_BIND));
+    show_file("wk/a/x/marker (bind)", "wk/a/x/marker");
+    putl("tmpfs over wk/a", do_mount("tmpfs", "wk/a", "tmpfs", 0));
+    show_file("wk/a/x/marker under tmpfs", "wk/a/x/marker");
+    putl("mkdir wk/a/x on tmpfs", do_mkdir("wk/a/x"));
+    putl("bind wk/src over wk/a/x (on tmpfs)", do_mount("wk/src", "wk/a/x", NULL, MS_BIND));
+    show_file("wk/a/x/marker (bind on tmpfs)", "wk/a/x/marker");
+    show_mountinfo("mountinfo in walk (tmpfs over bind)");
+    putl("umount wk/a/x (bind on tmpfs)", do_umount("wk/a/x", 0));
+    putl("umount wk/a (tmpfs)", do_umount("wk/a", 0));
+    show_file("wk/a/x/marker after umount", "wk/a/x/marker");
+    show_mountinfo("mountinfo after walk");
+
+    /* B14, zygote's per-app isolation: a clone child (its own copy of the namespace) mounts a tmpfs over data/user and
+     * binds the app's directory from the mirror under it. The child sees the bind and not the parent's files; the
+     * parent sees neither the tmpfs nor the bind. */
+    do_mkdir("zd");
+    do_mkdir("zd/user");
+    do_mkdir("zm");
+    do_mkdir("zm/0");
+    do_mkdir("zm/0/pkg");
+    putl("write zd/user/parent.txt", write_file("zd/user/parent.txt", "parent-view"));
+    putl("write zm/0/pkg/app.txt", write_file("zm/0/pkg/app.txt", "per-app"));
+    i64 zpid = sc6(SYS_CLONE, SIGCHLD, 0, 0, 0, 0, 0);
+    if (zpid == 0) {
+        putl("zygote child unshare newns", sc6(SYS_UNSHARE, CLONE_NEWNS, 0, 0, 0, 0, 0));
+        putl("zygote child make / private", do_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE));
+        putl("zygote child tmpfs over zd/user", do_mount("tmpfs", "zd/user", "tmpfs", 0));
+        putl("zygote child mkdir zd/user/0", do_mkdir("zd/user/0"));
+        putl("zygote child mkdir zd/user/0/pkg", do_mkdir("zd/user/0/pkg"));
+        putl("zygote child bind zm/0/pkg", do_mount("zm/0/pkg", "zd/user/0/pkg", NULL, MS_BIND));
+        show_file("zygote child zd/user/0/pkg/app.txt", "zd/user/0/pkg/app.txt");
+        show_file("zygote child zd/user/parent.txt (hidden)", "zd/user/parent.txt");
+        show_mountinfo("mountinfo in zygote child");
+        sc6(SYS_EXIT, 0, 0, 0, 0, 0, 0);
+    }
+    i64 zstatus = 0;
+    sc6(SYS_WAIT4, zpid, pth((char *)&zstatus), 0, 0, 0, 0);
+    putl("zygote child exit status", (zstatus >> 8) & 0xff);
+    show_file("parent zd/user/parent.txt", "zd/user/parent.txt");
+    show_file("parent zd/user/0/pkg/app.txt (no bind)", "zd/user/0/pkg/app.txt");
+    show_mountinfo("mountinfo after zygote pattern");
+
     /* Cleanup: the files and directories this run made. */
+    putl("umount wk/a/x (first bind)", do_umount("wk/a/x", 0));
+    do_unlink("zm/0/pkg/app.txt", 0);
+    do_unlink("zd/user/parent.txt", 0);
+    do_unlink("wk/src/marker", 0);
+    do_unlink("zm/0/pkg", AT_REMOVEDIR);
+    do_unlink("zm/0", AT_REMOVEDIR);
+    do_unlink("zm", AT_REMOVEDIR);
+    do_unlink("zd/user", AT_REMOVEDIR);
+    do_unlink("zd", AT_REMOVEDIR);
+    do_unlink("wk/src", AT_REMOVEDIR);
+    do_unlink("wk/a/x", AT_REMOVEDIR);
+    do_unlink("wk/a", AT_REMOVEDIR);
+    do_unlink("wk", AT_REMOVEDIR);
     do_unlink("src/q", 0);
     do_unlink("src/hello", 0);
     do_unlink("src2/sub/t", 0);

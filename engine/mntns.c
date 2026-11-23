@@ -500,10 +500,10 @@ int mntns_text(mntns_t *ns, int info, uint8_t **data, size_t *len)
     } else {
         tb_add(&b, "rootfs / rootfs rw 0 0\n");
     }
+    /* Every mount of the namespace is listed, in the order they were made, the covered ones too (as Linux lists them):
+     * the table holds only attached mounts (umount compacts it, and MNT_DETACH takes the subtree). */
     for (int i = 0; ns && i < ns->n; i++) {
         const mnt_t *m = &ns->m[i];
-        if (!is_live(ns, i))
-            continue;
         char opts[64];
         snprintf(opts, sizeof opts, "%s%s%s%s", m->ro ? "ro" : "rw", m->nosuid ? ",nosuid" : "",
                  m->nodev ? ",nodev" : "", m->noexec ? ",noexec" : "");

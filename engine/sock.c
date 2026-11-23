@@ -56,6 +56,9 @@ struct sock {
     uint8_t *disp;        /* the name as bound (what getsockname reports) */
     size_t dlen;
     int fsnode;
+    uint8_t *aname;       /* an accepted socket: its listener's name as bound (Linux copies the address), else NULL */
+    size_t alen;
+    int afsnode;
     int bound;
     struct sock *bnext;   /* the list of live bound sockets */
     int listening, backlog;
@@ -249,6 +252,7 @@ static void sock_free(sock_t *s)
         s->ops->close(s->conn);
     free(s->name);
     free(s->disp);
+    free(s->aname);
     free(s->acc);
     free(s);
 }
@@ -502,6 +506,11 @@ size_t sock_addr(const sock_t *s, int peer, uint8_t *sa, size_t cap)
         len = 2 + t->dlen;
         if (t->fsnode)
             tmp[len++] = 0;
+    } else if (t && !peer && t->aname) {
+        memcpy(tmp + 2, t->aname, t->alen);
+        len = 2 + t->alen;
+        if (t->afsnode)
+            tmp[len++] = 0;
     }
     memcpy(sa, tmp, len < cap ? len : cap);
     return len;
@@ -585,6 +594,16 @@ int sock_connect(sock_t *s, const uint8_t *name, size_t nlen, int fsnode, int ex
         }
         l->acc = a;
         l->acccap = cap;
+    }
+    if (l->disp) { /* getsockname of the accepted socket reports the listener's bound name, as Linux does */
+        c->aname = malloc(l->dlen ? l->dlen : 1);
+        if (!c->aname) {
+            free(c);
+            return -LE_NOMEM;
+        }
+        memcpy(c->aname, l->disp, l->dlen);
+        c->alen = l->dlen;
+        c->afsnode = l->fsnode;
     }
     c->hold = 1; /* the accept queue's reference */
     c->connected = 1;

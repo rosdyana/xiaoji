@@ -1285,15 +1285,53 @@ static int two_misc(cpu_t *c, uint32_t insn)
             putel(r, esz, i, t ? emask(esz) : 0);
         }
         break;
-    case 0x12: { /* XTN (u=0), XTN2 when q: narrow the source's low elements */
-        if (u || size == 3)
+    case 0x12: { /* XTN (u=0), XTN2 when q: narrow the source's low elements; SQXTUN (u=1), SQXTUN2 when q: the
+                  * signed source saturated to the unsigned range of the narrow element (QC is not kept, see below) */
+        if (size == 3)
             return -1;
         unsigned src_esz = 2u << size; /* H, S or D source */
         unsigned src_lanes = 16 / src_esz;
         uint8_t half[8];
         memset(half, 0, sizeof half);
-        for (unsigned i = 0; i < src_lanes; i++)
-            putel(half, esz, i, getel(n, src_esz, i) & emask(esz));
+        for (unsigned i = 0; i < src_lanes; i++) {
+            if (!u) {
+                putel(half, esz, i, getel(n, src_esz, i) & emask(esz));
+            } else {
+                int64_t s = sext_el(getel(n, src_esz, i), src_esz);
+                uint64_t v = s < 0 ? 0 : (uint64_t)s > emask(esz) ? emask(esz) : (uint64_t)s;
+                putel(half, esz, i, v);
+            }
+        }
+        if (q) {
+            rd_v(c, rd, d);
+            memcpy(r, d, 8);
+            memcpy(r + 8, half, 8);
+            wr_v(c, rd, r, 16);
+        } else {
+            memcpy(r, half, 8);
+            wr_v(c, rd, r, 8);
+        }
+        return 0;
+    }
+    case 0x14: { /* SQXTN (u=0), UQXTN (u=1), SQXTN2/UQXTN2 when q: the source saturated to the range of the narrow
+                  * element (QC is not kept, see below) */
+        if (size == 3)
+            return -1;
+        unsigned src_esz = 2u << size;
+        unsigned src_lanes = 16 / src_esz;
+        uint8_t half[8];
+        memset(half, 0, sizeof half);
+        for (unsigned i = 0; i < src_lanes; i++) {
+            uint64_t raw = getel(n, src_esz, i), v;
+            if (u) {
+                v = raw > emask(esz) ? emask(esz) : raw;
+            } else {
+                int64_t s = sext_el(raw, src_esz);
+                int64_t smax = (int64_t)(emask(esz) >> 1), smin = -smax - 1;
+                v = (uint64_t)(s > smax ? smax : s < smin ? smin : s) & emask(esz);
+            }
+            putel(half, esz, i, v);
+        }
         if (q) {
             rd_v(c, rd, d);
             memcpy(r, d, 8);

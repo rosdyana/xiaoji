@@ -63,6 +63,9 @@ on early-init
     # idmap2d (B6): IdmapDaemon writes under /data/resource-cache; idmap2d refuses any caller when the directory
     # is missing (UidHasWriteAccessToPath fails on Realpath). init.rc creates it 0771 system system.
     mkdir /data/resource-cache 0771
+    # WebView's relro file (B14): WebViewLibraryLoader writes libwebviewchromium64.relro under it (init.rc's post-fs-data
+    # line is "mkdir /data/misc/shared_relro 0771 shared_relro shared_relro"; the engine's mkdir takes the path only).
+    mkdir /data/misc/shared_relro
     # The user 0 tree that vold prepares (system/vold/vold_prepare_subdirs.cpp, prepare_subdirs, and init.rc's
     # /data/user block). The engine has no vold, so the directories are made here, by path. installd and
     # SettingsProvider need them: ContextImpl and installd fail to create databases and app data under a
@@ -116,6 +119,10 @@ on early-init
     mount none none /storage slave rec
     symlink /storage/self/primary /mnt/sdcard
     symlink /mnt/user/0/primary /mnt/runtime/default/self/primary
+    # The VNDK APEX under its versioned name (B14): nativeloader reads /apex/com.android.vndk.v<ro.vndk.version>/etc/
+    # llndk.libraries.<version>.txt (vendor/build.prop: 33), and the image carries only com.android.vndk.current, which has
+    # that file. Without the name, the WebView relro process aborts in ClassLoaderFactory.createClassloaderNamespace.
+    symlink /apex/com.android.vndk.current /apex/com.android.vndk.v33
     mkdir /mnt/runtime/full 0755 root root
     mkdir /mnt/runtime/full/self 0755 root root
     mount none /data/data /data/user/0 bind rec
@@ -357,10 +364,12 @@ service vendor.audio-hal /vendor/bin/hw/xiaoji_audio_hal
     capabilities BLOCK_SUSPEND
     onrestart restart audioserver
 
-# Thermal HAL 1.0 (B13): the default service of hardware/interfaces/thermal/1.0/default, the block of its rc. The
-# system_server's HardwarePropertiesManagerService takes IThermal 1.0 on its main thread, with no timeout.
-service vendor.thermal-hal-1-0 /vendor/bin/hw/android.hardware.thermal@1.0-service
+# Thermal HAL (B14): the stock block of /vendor/etc/init/android.hardware.thermal@2.0-service.rc, the 2.0 mock. It serves
+# both IThermal 2.0 (ThermalManagerService) and IThermal 1.0 (HardwarePropertiesManagerService, which takes 1.0 on the
+# system_server's main thread, with no timeout). It replaces the 1.0 service of B13: both would register @1.0::IThermal/default.
+service vendor.thermal-hal-2-0-mock /vendor/bin/hw/android.hardware.thermal@2.0-service.mock
     interface android.hardware.thermal@1.0::IThermal default
+    interface android.hardware.thermal@2.0::IThermal default
     class hal
     user system
     group system

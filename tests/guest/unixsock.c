@@ -422,6 +422,12 @@ int main(int argc, char **argv)
     int a1 = (int)r_accept4(srv, 0, 0, 0);
     int a2 = (int)r_accept4(srv, 0, 0, 0);
     line("accept queued", a1 >= 0 && a2 >= 0);
+    /* An accepted socket reports its listener's bound path (Linux copies the address in unix_stream_connect). zygote's
+     * webview socket checks this and aborts with "Unsupported AF_UNIX socket ... with empty path" otherwise (B14). */
+    u8 asa[110];
+    u32 anl = 110;
+    r_getsockname(a1, asa, &anl);
+    line("accepted getsockname path", anl == salen && streq((char *)asa + 2, SOCK_PATH));
     r_close(c1);
     r_close(c2);
     r_close(c3);

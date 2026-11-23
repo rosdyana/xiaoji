@@ -672,12 +672,37 @@ void sched_exit_process(uint64_t code)
     }
 }
 
+/* XIAOJI_DEBUG_FAULTS: a line on stderr with the mapping of a guest address (the file and the offset in it). */
+static void debug_region(const char *what, uint64_t va)
+{
+    uint64_t rs = 0, re = 0, roff = 0;
+    const char *rpath = NULL;
+    if (mem_region_next(va, &rs, &re, &rpath, &roff) && rs <= va && va < re)
+        fprintf(stderr, "xiaoji:   %s 0x%llx: %s off 0x%llx, file offset 0x%llx\n", what, (unsigned long long)va,
+                rpath ? rpath : "(anon)", (unsigned long long)roff, (unsigned long long)(roff + va - rs));
+    else
+        fprintf(stderr, "xiaoji:   %s 0x%llx: not mapped\n", what, (unsigned long long)va);
+}
+
 void sched_exit_signal(int sig)
 {
     proc_t *p = cur() ? cur()->proc : proc_cur();
-    if (sig_debug_faults() && cur())
+    if (sig_debug_faults() && cur()) {
         fprintf(stderr, "xiaoji: fatal signal %d in pid %d (%s) at pc 0x%llx\n", sig, p->pid,
                 cur()->comm, (unsigned long long)cur()->cpu.pc);
+        /* The place of the signal, and the return addresses of the frame-pointer chain (x29 -> [x29] and [x29 + 8]). */
+        debug_region("pc", cur()->cpu.pc);
+        debug_region("x30", cur()->cpu.x[30]);
+        uint64_t fp = cur()->cpu.x[29];
+        for (int i = 0; i < 12 && fp && (fp & 7) == 0; i++) {
+            uint64_t rs = 0, re = 0, roff = 0;
+            const char *rpath = NULL;
+            if (!mem_region_next(fp, &rs, &re, &rpath, &roff) || rs > fp || fp + 16 > re)
+                break;
+            debug_region("frame lr", mem_read64(fp + 8));
+            fp = mem_read64(fp);
+        }
+    }
     if (!p->exited) {
         p->exited = 1;
         p->exit_code = (128 + sig) & 0xFF; /* the engine's status for a fatal signal */
