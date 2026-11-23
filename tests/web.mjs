@@ -95,7 +95,7 @@ async function runBoot(chromium, baseUrl) {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   try {
-    // The chunk store and boot packs (?boot=pack, docs/loading.md); the manifest path is the page's default.
+    // The chunk store and boot packs are the page's default (docs/loading.md); ?boot=pack says so explicitly.
     await page.goto(baseUrl + '?boot=pack', { waitUntil: 'load' });
     const t0 = Date.now();
     await page.click('#boot');

@@ -11,10 +11,11 @@ delivery layer, and reports what tier 1 gains. Tier 2 is design only.
 - Product tree `build/rootfs-xiaoji`: 3,510 files, 1,327.2 MiB (1.39 GB). Boot: `xiaoji.rc`, `--logcat`, phase 100.
 - Headless Chromium through `tools/webboot-bench.mjs` (Playwright from the xiaonux bench), a fresh profile per
   cold run, the same machine for every row.
-- Power: the first two trace runs were on battery with Low Power Mode on (116 s engine, the same as
-  `docs/web-preview.md`). Later the machine was on AC with Low Power Mode off; every timing in section 4 is from
-  that state, recorded by `pmset -g` at the start and end of the batch. The two states differ by almost 2x, so no
-  number here is compared with a run from the other state.
+- Power: a first trace run on battery with Low Power Mode on took 116 s of engine time, the same as
+  `docs/web-preview.md`; its trace file was overwritten by the next run. The working set below is from a second
+  trace run, on AC with Low Power Mode off (66 s engine). Every timing in section 4 is from that state, recorded by
+  `pmset -g` at the start and end of the batches. The battery run took 116 s against 66 s on AC, so no number here is
+  compared with a run from the other state.
 - Access trace: `?trace` (`web/trace.js`) wraps `FS.read`. Every engine read reaches it: `read`, `pread` and
   the mmap fill (`engine/syscall.c` `map_file` -> `fill_from_fd` -> `host_pread` -> libc `pread` -> `FS.read`).
   The trace records 4 KiB pages, 64 KiB chunks, the first-read order of the chunks, and the time spent in
@@ -145,7 +146,10 @@ starts, and a miss falls back to a synchronous request.
 ### Tier 2 (design only)
 
 **Post-boot snapshot.** A returning visitor could skip the boot if the engine state at phase 100 were saved and
-restored. xiaonux saves the whole VM (RAM, CPU, devices) in `emu/wasm/xsnap*`. For xiaoji the state is larger
+restored. xiaonux saves the whole VM in `emu/tinyemu/xsnap.h`: a symmetric serializer (the same code saves and
+loads, fixed-width little-endian fields, magic `XNXSNAP1`). `docs/phase-2.md` describes what it holds: CPU and CSRs,
+the interrupt controllers, the virtio queues, and RAM with zero pages skipped and compressed (a 256 MB guest gave a
+16.2 MB snapshot, 68.5 MB raw, in `docs/benchmarks.md`). For xiaoji the state is larger
 and spread over more objects: guest RAM as memfd-backed views (`engine/mem.c`, `engine/memfd.c`), the process
 table and per-thread CPU state (`engine/proc.c`, `engine/sched.c`, `engine/cpu_a64.c`), the descriptor table
 (`engine/vfs.c`, `engine/fdobj.c`), binder and its proc state (`engine/binder.c`), the property area, the
@@ -182,63 +186,77 @@ packer prints them):
 
 ## 4. Results
 
-Commit `w1-browser-boot`. Headless Chromium on the M2 MacBook, AC power with Low Power Mode off (`pmset -g`
-before and after the batch). Each cold run has a fresh profile. The warm runs reuse the profile of one cold run,
-on the same port, because Cache Storage is per origin. Localhost rows are the median of three runs, and each
-row's spread is given below. Throttled rows are one run each, with the model in section 5. Every run is taken
-at phase 100 (the wire tally and the stats are read there, not at the Stop click, since the boot runs on).
+Headless Chromium on the M2 MacBook, AC power with Low Power Mode off (`pmset -g` before and after the batches).
+Each cold run has a fresh profile. Warm runs reuse the profile of one cold run on the same port, because Cache
+Storage is per origin. Every number is taken at phase 100: the wire tally and the stats are read there, since the
+boot runs on until Stop. Medians are over the runs listed in the `n` column; the ranges show the spread. The
+throttled rows use the model in section 5.
 
-| Config | Wall to phase 100 (s) | Engine (s) | First log line (s) | Wire to phase 100 (MB) | Requests | Packs before engine (s) | Blocked on fetch (s) | Chunk cache hits |
-|---|---|---|---|---|---|---|---|---|
-| manifest (before), localhost, median of 3 | 81.8 | 75.8 | 0.20 | 452.9 | 1,300 sync GETs, 1,027 HEADs | 0.0 | 7.4 | n/a |
-| pack (after), localhost, cold, median of 3 | 41.8 | 38.3 | 2.65 | 188.1 | 12 pack GETs, 0 sync GETs | 2.6 | 2.6 | 0 of 4,023 |
-| pack (after), localhost, warm, median of 3 | 49.6 | 45.6 | 2.85 | 1.7 | 0 pack GETs, 0 sync GETs | 2.8 | 2.8 | 4,023 of 4,023 |
-| manifest (before), 50 Mbit/s, 20 ms RTT | 201.2 | 174.8 | 2.31 | 452.9 | 1,300 sync GETs, 1,027 HEADs | 0.0 | 122.3 | n/a |
-| pack (after), 50 Mbit/s, 20 ms, cold | 113.7 | 77.4 | 33.73 | 188.1 | 12 pack GETs, 0 sync GETs | 33.2 | 33.2 | 0 of 4,023 |
-| pack (after), 50 Mbit/s, 20 ms, warm | 44.0 | 39.7 | 3.35 | 1.7 | 0 pack GETs, 0 sync GETs | 3.1 | 3.1 | 4,023 of 4,023 |
+| Config | n | Wall to phase 100, median (s) | Engine, median (s) | Engine range (s) | First log line, median (s) | Wire to phase 100 (MB) | Requests | Packs before engine, median (s) | Blocked, median (s) | Chunk cache hits |
+|---|---|---|---|---|---|---|---|---|---|---|
+| manifest (before), localhost | 6 | 74.1 | 67.9 | 63.1 to 87.4 | 0.19 | 452.9 | 1,300 sync GETs, 1,027 HEADs | 0.0 | 3.5 | n/a |
+| pack (after), localhost, cold | 9 | 41.0 | 37.4 | 36.9 to 38.8 | 2.74 | 188.1 | 12 pack GETs, 0 sync GETs | 2.7 | 2.7 | 0 of 4,023 |
+| pack (after), localhost, warm | 8 | 42.0 | 38.6 | 36.4 to 46.1 | 2.26 | 1.7 | 0 pack GETs, 0 sync GETs | 2.2 | 2.2 | 4,023 of 4,023 |
+| manifest (before), 50 Mbit/s, 20 ms RTT | 3 | 200.4 | 172.7 | 171.6 to 174.8 | 2.37 | 452.9 | 1,300 sync GETs, 1,027 HEADs | 0.0 | 124.1 | n/a |
+| pack (after), 50 Mbit/s, 20 ms, cold | 3 | 72.2 | 40.1 | 36.3 to 77.4 | 31.19 | 188.1 | 12 pack GETs, 0 sync GETs | 30.9 | 30.9 | 0 of 4,023 |
+| pack (after), 50 Mbit/s, 20 ms, warm | 1 | 44.0 | 39.7 | 39.7 | 3.35 | 1.7 | 0 pack GETs, 0 sync GETs | 3.1 | 3.1 | 4,023 of 4,023 |
 
-Spread of the localhost engine times: manifest 69.7 to 87.4 s (three runs); pack cold 37.4 to 38.8 s; pack warm
-39.9 to 45.6 s. Medians are the rows above. The first line of the manifest run's stamp (0.20 s) is the first
-logcat line, not the first instruction: `onRunStart` is not an emscripten hook in this SDK (it is not in
-`emsdk/upstream/emscripten/src`), so the first-instruction stamp is not measured. The first log line is the nearest
-point. "Blocked on fetch" is the
-time before the engine starts plus the time in synchronous requests; for the manifest it is the synchronous
-requests alone.
+The localhost manifest runs are three from the first session and three from the batch that also has the byte
+tally, so the baseline's spread is wide (63 to 87 s engine). The pack rows pool the runs of both sessions; the
+warm row includes one run of a shifted-pack check (below). "Blocked" is the time before the engine starts plus the
+time in synchronous requests. "First log line" is the first logcat line, which is the nearest point this build
+gives: `onRunStart` is not an emscripten hook in this SDK (it is not in `emsdk/upstream/emscripten/src`), so the
+first-instruction stamp is not measured.
 
 What the rows show:
 
-- **Bytes.** The manifest path moved 452.9 MB to phase 100: 1,312 GETs (1,300 for the engine's files and 12 for
-  the page), and 1,027 HEADs that carry no body. The pack path moved 188.1 MB cold: 186.3 MB of boot packs and
-  1.7 MB of page, JavaScript, wasm and the v2 manifest. Warm, it moved 1.7 MB. The v2 manifest is 1.2 MB, sent on
-  every visit by the dev server (`no-store`); a deployed site can cache it by content, which would leave the warm
-  visit near zero.
-- **Where the local engine gain comes from.** The engine ran 75.8 s before and 38.3 s after, with about the same
-  work (4.61 to 4.72 G instructions in the pack runs, 4.62 to 4.75 G in the manifest runs). A trace run of each path
-  shows the time inside `FS.read`: 30.5 s for the manifest path (the trace run of section 1), 2.3 s for the pack
-  path (the trace run of this batch), with the same number of calls (19,976). That is about 28 s of the 37.5 s gain.
-  The rest is the synchronous waits (3 to 7 s in the manifest runs) and run-to-run spread. So most of the localhost
-  gain is the read path, not the prefetch. The cost was emscripten's per-byte copy in the lazy-file read, and the
-  chunk store copies whole chunks.
-- **The cost of waiting for packs.** The engine starts after the packs. On localhost that is 2.6 s; on
-  50 Mbit/s it is 33.7 s, against 2.3 s for the manifest path, which starts at once and then waits on each file. The
-  manifest path still ends later on the throttled link (201.2 s against 113.7 s wall), because its 1,027 HEADs and
-  1,300 GETs each wait a round trip and the 452 MB shares the same link as the packs' 186 MB.
-- **Warm.** On localhost a warm visit is not faster than a cold one (45.6 s engine against 38.3 s, the same
-  instruction count). The pack is decoded and hashed again on each visit, and the cache saves only the network.
-  The cache's value is on a slow link: 44.0 s wall warm against 113.7 s cold at 50 Mbit/s. I did not find the cause
-  of the local warm engine time; it is not explained by the work done.
-- **Unexplained: the throttled cold engine time.** The throttled cold run's engine time (77.4 s) is about twice
-  its local counterpart, with the same instruction count (4.623 G in both), and the throttled warm run's engine time
-  (39.7 s) is normal. The network is idle while the engine runs, so the slowdown is not a request in flight. The
-  candidates are guest timeouts that run on host time, and host contention; I did not isolate either.
-- **Fallback.** With `?nopack`, no pack is loaded and every chunk is read synchronously: 4,023 GETs, 10.6 s blocked
-  (7.3 s of that is the JavaScript inflater), phase 100 at 76.7 s wall. The fallback works, and it is slower than
+- **Bytes.** The manifest path moved 452.9 MB to phase 100: 1,300 GETs for the engine's files and 12 for the page,
+  and 1,027 HEADs that carry no body. The pack path moved 188.1 MB cold: 186.3 MB of boot packs and 1.7 MB of page,
+  JavaScript, wasm and the v2 manifest. Warm, it moved 1.7 MB. The v2 manifest is 1.2 MB and the dev server sends
+  it on every visit (`no-store`), so it is most of the warm figure. A deployed site can cache it by content.
+- **Where the local engine gain comes from.** The engine ran 67.9 s before and 37.4 s after (medians), with about
+  the same work: 4.61 to 4.72 G instructions in the pack runs, 4.62 to 4.76 G in the manifest runs. A trace run of
+  each path shows the time inside `FS.read`: 30.5 s for the manifest path (the trace run of section 1), 2.3 s for
+  the pack path (a trace run of this batch), with the same number of calls (19,976). That is about 28 s of the
+  30 s gain. The rest is the synchronous waits and run-to-run spread. So most of the localhost gain is the read path,
+  not the prefetch. The cost was emscripten's per-byte copy in the lazy-file read; the chunk store copies whole
+  chunks.
+- **The cost of waiting for packs.** The engine starts after the packs. On localhost that is 2.7 s. At 50 Mbit/s it is
+  31 s (median), against 2.4 s for the manifest path, which starts at once and then waits on each file. The manifest
+  path still ends later on the throttled link (200.4 s against 72.2 s wall, medians), because its 1,027 HEADs and
+  1,300 GETs each wait a round trip and the 452 MB shares the link with the packs' 186 MB.
+- **Warm.** On localhost a warm visit is not faster in the engine (38.6 s median, against 37.4 s cold; the ranges
+  overlap). The packs are decoded and hashed again on each visit, and the cache saves the network. The cache's value
+  is on a slow link: 44.0 s wall warm against 72.2 s cold at 50 Mbit/s (one warm run). I did not find a warm engine
+  gain, and the eight warm runs do not show one.
+- **The throttled cold outlier.** One throttled cold run (`run2/thr-pack-cold`) took 77.4 s of engine time; two
+  more runs took 40.1 s and 36.3 s. Its milestones have the same instruction counts as a local run
+  (4.623 G in both), and every interval took about twice as long as the local one, from the first log line on. The
+  network is idle while the engine runs, so a uniform slowdown at fixed work points to the host, not to a guest wait.
+  Another process was running on the same Mac during that batch: a native engine test run from the main checkout,
+  which I saw in `ps` at the end of the work. I did not start it, and I did not check whether it overlapped that run.
+  The median of three is the number to use.
+- **Fallback.** With `?nopack`, no pack is loaded and every chunk is read synchronously: 4,023 GETs, 10.6 s blocked,
+  of which 7.3 s is the JavaScript inflater, and phase 100 at 76.7 s wall. The fallback works, and it is slower than
   the packs, which is why the packs are loaded first.
+- **Shifted packs.** The packer was run with 8 MiB packs instead of 16 MiB, so all 23 packs had new boundaries and
+  new names, with the same 10,978 chunks. A warm run on the profile that held the 16 MiB packs' chunks downloaded
+  no packs (`packDownloads: 0`), served all 4,023 chunks from the cache, made no synchronous fetch, and moved 1.7 MB.
+  The per-chunk cache therefore survives a change of pack boundaries, which is the case a changed chunk causes.
+  The packs were then rebuilt at 16 MiB.
+- **Order file.** The committed `image/boot-order.json` was first written by a one-line extraction from the trace.
+  `tools/workingset.py --order-out` was then run on the same trace, and its output is identical to the committed
+  file (7,366 entries).
 
 **Tests.** `make test-web` (the ART cases) passes. `XIAOJI_WEB_BOOT=1 make test-web` passes: the chunk check (all
 10,978 chunks hash, all 3,510 files reassemble), the ART cases, and the boot to phase 100 in pack mode with 12 packs
 and 0 synchronous fetches. `node tests/chunks.mjs` on a copy with one corrupted chunk fails with the chunk's name
 and the file that depends on it.
+
+**Where the data is.** The raw run JSON, the trace and the working-set report are not committed. They are in the
+session scratch directory `/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-projects-xiaonux/02218bd1-8168-4b28-a0fa-30c789f8f133/scratchpad/loading/`
+(`before-trace.json`, `workingset.json`, `run2/`, `run3/`), which a reboot can clear. The timing tool is
+`tools/webboot-bench.mjs`, not `tests/web.mjs`.
 
 ## 5. Known limits
 

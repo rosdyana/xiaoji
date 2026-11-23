@@ -38,10 +38,12 @@ async function openCache() {
 }
 
 export class ChunkStore {
-  // base: URL of the chunk store directory (ends in '/'); chunkSize: from the manifest.
-  constructor(base, chunkSize) {
+  // base: URL of the chunk store directory (ends in '/'); chunkSize: from the manifest; onNetwork(url, bytes)
+  // is called for each response body the page downloads (the worker's fetch counters use it).
+  constructor(base, chunkSize, onNetwork = () => {}) {
     this.base = base;
     this.chunkSize = chunkSize;
+    this.onNetwork = onNetwork;
     this.mem = new Map(); // id -> raw Uint8Array
     this.stats = {
       packs: 0, packDownloads: 0, packBytes: 0, packNetBytes: 0, packChunks: 0, packMs: 0, packCpuMs: 0,
@@ -91,6 +93,7 @@ export class ChunkStore {
       this.stats.packDownloads++;
       this.stats.packBytes += buf.length;
       this.stats.packNetBytes += buf.length;
+      this.onNetwork(this.base + pack.file, buf.length);
     }
     const puts = [];
     const t0 = now();

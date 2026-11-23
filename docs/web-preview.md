@@ -33,7 +33,9 @@ manifest has 4,888 entries (3,510 files, 723 symbolic links) and is 453 KB. Dele
   system_server, its entry, `Starting phase 100`, the BatteryService health update, and the first fatal
   exception of system_server (the B7 blocker; the Node run logged it, the 90 s native runs did not). Each row has the page's wall time
   (from the start of the worker), the engine's time, and the instruction count.
-- **Fetched**: the requests, the lazy files and the bytes that have come over the wire so far.
+- **Fetched**: the requests, the files and the bytes that have come over the wire so far. In the default boot
+  these are the boot packs (one request each) and any synchronous chunk fallbacks; with `?boot=manifest`, the lazy
+  files.
 
 ## Timings
 

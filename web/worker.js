@@ -1,9 +1,11 @@
 // Runs one xiaoji ART case, or the Android boot, in a Web Worker (M4, W1).
 //
-// The guest root is /rootfs in MEMFS. It is built from a manifest (build/web/manifest.json for
-// the cases, build/web/manifest-xiaoji.json for the boot): directories with FS.mkdir, symlinks with
-// FS.symlink, and regular files as lazy files that fetch their bytes from <tree>/<path> on first use
-// (emscripten's createLazyFile, synchronous XHR with Range requests, which is allowed in workers).
+// The guest root is /rootfs in MEMFS. It is built from a manifest: directories with FS.mkdir, symlinks
+// with FS.symlink, and regular files. The ART cases use build/web/manifest.json, whose files are lazy files
+// fetched from <tree>/<path> on first use (emscripten's createLazyFile, synchronous XHR with Range requests,
+// allowed in workers). The Boot Android page uses the chunk store (web/chunks.js, docs/loading.md) by default:
+// boot packs are fetched before the engine starts, and each file's bytes come from them. ?boot=manifest uses
+// build/web/manifest-xiaoji.json with lazy files instead.
 // Each run uses a fresh module instance.
 //
 // The engine runs synchronously and never yields, so the boot cannot use timers here. Its log
@@ -179,6 +181,7 @@ async function runBoot(base, opts) {
   let tracePosted = false;
   // The run's counters, at phase 100 and at the end (the page keeps the last one; tests/bench reads it).
   const postStats = (when) => {
+    postFetch(true); // the page's fetch line is rate-limited; this makes it current at phase 100
     post({
       type: 'stats',
       when,
@@ -245,7 +248,13 @@ async function runBoot(base, opts) {
   };
 
   if (packMode) {
-    store = new ChunkStore(base + 'xj/', manifest.chunk_size);
+    store = new ChunkStore(base + 'xj/', manifest.chunk_size, (url, n) => {
+      // The page's fetch counters count the packs too (one request per pack, the bytes of its body).
+      fetched.requests++;
+      fetched.bytes += n;
+      fetched.perUrl.set(url, n);
+      onFetch();
+    });
     // The packs load while the engine module is imported and instantiated; the tree waits for them.
     // ?nopack (a test of the fallback only): no packs, so every read is a synchronous chunk fetch.
     packsLoading = opts.noPacks ? Promise.resolve() : store.loadPacks(manifest.packs);
