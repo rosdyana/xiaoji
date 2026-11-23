@@ -506,19 +506,31 @@ static int fp_csel(cpu_t *c, uint32_t insn)
  * imm8<5:4> (b = imm8<6>), fraction imm8<3:0>:Zeros(19). Double: exponent
  * NOT(b):Replicate(b,8):imm8<5:4>, fraction imm8<3:0>:Zeros(48). Type 2 is
  * unallocated; type 3 is half precision (FEAT_FP16), not implemented. */
+/* VFPExpandImm: the single (32-bit) and double (64-bit) values of an 8-bit FP immediate. */
+static uint32_t vfp_expand32(uint32_t imm8)
+{
+    uint32_t sign = (imm8 >> 7) & 1, b = (imm8 >> 6) & 1, lo = (imm8 >> 4) & 3, frac = imm8 & 0xF;
+    uint32_t e = ((b ^ 1) << 7) | (b ? 0x1Fu << 2 : 0) | lo;
+    return (sign << 31) | (e << 23) | (frac << 19);
+}
+
+static uint64_t vfp_expand64(uint32_t imm8)
+{
+    uint64_t sign = (imm8 >> 7) & 1, b = (imm8 >> 6) & 1, lo = (imm8 >> 4) & 3, frac = imm8 & 0xF;
+    uint64_t e = ((b ^ 1) << 10) | (b ? 0xFFull << 2 : 0) | lo;
+    return (sign << 63) | (e << 52) | (frac << 48);
+}
+
 static int fmov_imm(cpu_t *c, uint32_t insn)
 {
     unsigned type = (insn >> 22) & 3, rd = insn & 31;
     uint32_t imm8 = (insn >> 13) & 0xFF;
-    uint32_t sign = (imm8 >> 7) & 1, b = (imm8 >> 6) & 1, lo = (imm8 >> 4) & 3, frac = imm8 & 0xF;
     if (type == 0) {
-        uint32_t e = ((b ^ 1) << 7) | (b ? 0x1Fu << 2 : 0) | lo;
-        put_fs(c, rd, (sign << 31) | (e << 23) | (frac << 19));
+        put_fs(c, rd, vfp_expand32(imm8));
         return 0;
     }
     if (type == 1) {
-        uint64_t e = ((uint64_t)(b ^ 1) << 10) | (b ? 0xFFull << 2 : 0) | lo;
-        put_fd(c, rd, ((uint64_t)sign << 63) | (e << 52) | ((uint64_t)frac << 48));
+        put_fd(c, rd, vfp_expand64(imm8));
         return 0;
     }
     return -1;
@@ -539,8 +551,18 @@ static int modified_imm(cpu_t *c, uint32_t insn)
     uint64_t val = 0;
     int invert = 0, logic = 0; /* logic: ORR (op 0) / BIC (op 1) applied to Vd */
     unsigned esz = 4;          /* element size of the replicated immediate */
-    if (cmode == 0xF)
-        return -1; /* FMOV (vector, immediate) is not in M1 */
+    if (cmode == 0xF) {
+        /* FMOV (vector, immediate): op 0 is single precision (2S or 4S), op 1 is double (2D, Q 1
+         * only). o2 1 is half precision (FEAT_FP16), not implemented. The value is replicated into
+         * every element of the register. */
+        if (((insn >> 11) & 1) || (op && !q))
+            return -1;
+        uint64_t w = op ? vfp_expand64(imm8) : (uint64_t)vfp_expand32(imm8) * 0x0000000100000001ull;
+        memcpy(r, &w, 8);
+        memcpy(r + 8, &w, 8);
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
     if (cmode < 8) { /* 32-bit shifted immediate */
         unsigned sh = (cmode >> 1) & 3;
         val = (uint64_t)imm8 << (8 * sh);

@@ -2135,10 +2135,179 @@ in the guest, to be found with the mapping of `0x71697ee4` (which the engine doe
 
 ### Gaps (B4e)
 
-- **The thermalservice lookup returns null** (above). Not fixed. The branch of `tryGetService` is not established.
+- **The thermalservice lookup returns null** (above). Resolved in B4f: the cause was the engine's reply routing, not a `tryGetService` branch (see B4f).
 - **`activity` was answered with the thermal node** in one pre-fix run. Not explained.
 - The owner's count protocol for a node's first translation differs from the kernel (BR_ACQUIRE and BR_INCREFS are sent
   by the engine, not by the kernel, in step 1 of the test). Not changed.
 - The SIGILL in `DisplayManagerService`, at `0x71697ee4` (above). Not identified.
 - `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` contexts are still `u:r:kernel:s0` for every sender (B4c gap, unchanged).
 - The trace's millisecond stamp has its own origin (use `insn` to join it with logcat).
+
+## B4f: one request per binder read (the thermal lookup), the FMOV SIGILL, and the display stop
+
+Status: **the thermal lookup is fixed (5 of 5 boots), and the SIGILL is fixed (checkpoint 2). The boot now stops at the
+display stack, which needs a design decision (SurfaceFlinger, below). `startOtherServices` is not reached.**
+
+### The null lookup: the cause (binder reply routing)
+
+The B4e list named four hypotheses. The trace settles this one, and none of the four is the cause:
+
+- **The two lookups were delivered in one read.** The engine's `bread` (`engine/binder.c`) kept emitting work after a
+  transaction, so servicemanager's read returned two BR_TRANSACTIONs. With the B4f trace (the deliver line now shows the
+  buffer offset, and a `buffer alloc` line is added), txn 157 (`checkService "thermalservice"`, from tid 1014) is at
+  buffer offset 0 and txn 158 (`checkService "activity"`, from tid 1045) at offset 128, both at the same instant
+  (`build/tests/boot/b4f-r2.err`). The buffers are distinct, so the allocator is not the fault.
+- **The replies crossed.** servicemanager reads the first request (157) and replies with the thermal handle, which is
+  correct. The engine routed that reply to the head of the thread's receive list (`t->recv`, the LIFO stack of requests
+  being served), which was 158, so tid 1045 got the thermal handle for `activity`. The second reply ("no object") went to
+  157's sender, tid 1014, which is the `No service published for: thermalservice` of the NPE. This explains the B4e
+  anomaly (`activity` answered with handle 20) as well.
+- **servicemanager did find the service.** Its first reply carried handle 20, the thermal node (strong=1, weak=1 at the
+  lookup). So the null branch of `ServiceManager::tryGetService` that B4e could not name is not reached for
+  `thermalservice`. The answer was right and reached the wrong caller.
+- **The four hypotheses, checked against the trace.** (1) Lifetime: the node was live at the lookup. Its RELEASE (insn
+  3594652342) and DECREFS (3594707983) came after system_server (pid 1014) was killed (`Sending signal`, insn
+  3594615979, in `b4f-r1.err`), so they are not the cause. (2)
+  Handle reuse: handle 20 was valid and held at the lookup. (3) The security context: the reply to the
+  `thermalservice` request carried handle 20, so `canFind` passed for that request. The null was the crossed reply, not a
+  rejection. (4) BR_ACQUIRE and BR_INCREFS: they are not part of the crossed replies. The kernel's
+  `binder_inc_node_nilocked` and node-work rules were not compared line by line in this step (open, below).
+- **The kernel's rule** (6.12 source in the builder VM, `drivers/android/binder.c`): the read loop of
+  `binder_thread_read` ends after a transaction or a reply (the `break` at line 5090, after the BINDER_WORK_TRANSACTION
+  case, inside the loop that starts at line 4717), so one read returns at most one request. BC_REPLY takes
+  `thread->transaction_stack` (line 3054). The engine did not end the read, so its LIFO list paired the replies wrongly.
+
+### The fix (engine/binder.c)
+
+- `bread`: after emitting a `WK_TXN` (sync or oneway) or a `WK_REPLY`, the read ends. Other work (BR_TRANSACTION_COMPLETE,
+  the refcount returns, BR_SPAWN_LOOPER) keeps batching, as in the kernel. `cmd_send` and the LIFO `t->recv` are unchanged;
+  LIFO is the kernel's transaction stack, and a FIFO would break nested calls.
+- Wake-ups (checked): `sched_wake_key` wakes every thread on the key, and `queue_proc` wakes on every queued item. A
+  request left in `b->todo` by a read is taken by the next free looper's read (`proc_has_work`), and `binder_readable`
+  reports the queue state at poll time.
+
+### The regression test (tests/guest/binder-read-pair.c)
+
+A single-threaded context manager (forked), and two forked clients (codes 11 and 12). The parent queues the two requests
+before the server reads (pipe sequencing), so both wait in the proc queue together. The server prints the requests per
+read; each client exits 0 if its reply carries its own code. The oracle is the builder VM's kernel (`sudo -n`, as
+`binder-node-reuse`). Red and green were recorded by hand (the wired case compares the engine with the oracle):
+
+| Run | Output |
+|---|---|
+| kernel (`build/tests/boot/binder-read-pair-kernel-O0.txt`) | `server read: requests 1 codes 11`, `server read: requests 1 codes 12`, `client 1 (code 11): reply ok`, `client 2 (code 12): reply ok` |
+| red: the engine before this fix (`build/tests/boot/xiaoji-red-b4f`) | `server read: requests 2 codes 11 12`, `client 1 (code 11): reply wrong`, `client 2 (code 12): reply wrong` (differs, `cmp`) |
+| green: the fixed engine (`build/xiaoji`) | identical to the kernel output (`cmp`, O0 and O2) |
+
+`make test` runs it in the engine and in Node (`binder-read-pair-O0` and `-O2`, 4 PASS lines).
+
+### Milestones (B4f)
+
+Five boots, **before the SIMD fix** (so each ends at the SIGILL), with the exact B4f command (`XIAOJI_STAMP=1 ./build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs
+--init-timeout 240`, no trace), run one after another. The final binary (with the SIMD fix) was checked by `b4f-next.err` and by the `XIAOJI_BOOT=1` run (`build/tests/boot/b4f-fix-1..5.err`). Power for every boot: AC,
+Low Power Mode off (`build/tests/boot/b4f-fix-*.pmset.txt`).
+
+| Boot | system_server cycles entered | `No service published` | NPE | cycles reaching StartDisplayManager | cycles with the SIGILL |
+|---|---|---|---|---|---|
+| 1 | 7 | 0 | 0 | 7 | 7 |
+| 2 | 7 | 0 | 0 | 6 | 6 |
+| 3 | 7 | 0 | 0 | 6 | 6 |
+| 4 | 7 | 0 | 0 | 6 | 6 |
+| 5 | 7 | 0 | 0 | 6 | 6 |
+
+Every cycle that reached `ThermalManagerService` found `thermalservice`. The `deadlock` and `nothing has run` lines are 0 in
+all five boots. In boots 2 to 5 the seventh cycle starts but does not reach `StartDisplayManager` before the 240 s limit;
+its log was not examined further.
+
+First cycle, boot 1 (guest time, instruction count):
+
+| Milestone | Time, insn |
+|---|---|
+| InitPowerManagement | 33.01 s, 3.590 G |
+| StartDisplayManager (pid 1014) | 33.12 s, 3.599 G |
+| SIGILL (pre-fix, `0x4f03f400`) | 33.13 s, 3.600 G |
+| StartDisplayManager, after the SIMD fix (`b4f-next.err`, run with `XIAOJI_DEBUG_FAULTS=1`) | 33.42 s, 3.599 G |
+| watchdog kill, after the SIMD fix (same run) | 103.05 s, 3.703 G |
+
+### The SIGILL (checkpoint 2)
+
+- **The faulting word.** `XIAOJI_DEBUG_FAULTS=1` now prints the region of the faulting PC (path and file offset; a debug
+  line only, `engine/cpu_a64.c`). It printed `unimplemented A64 instruction 0x4f03f400 at pc 0x7297cee4`, and
+  `region 72479000-72b9d000 .../boot-framework.oat off 0x1b2000: pc is file offset 0x6b5ee4`. The file's bytes at
+  0x6b5ee4 are `00 f4 03 4f`, the same word. Decode (`objdump -D -b binary -m aarch64` in the builder VM):
+  `fmov v0.4s, #5.0e-01`. It is the Advanced SIMD FMOV (vector, immediate), single precision, Q=1.
+- **The symbol.** `oatdump --addr2instr=0x503ee4` names the method `android.util.Spline$MonotoneCubicSpline.<init>(float[], float[])`
+  (dex_method_idx 36831): its compiled code block is at code_offset 0x6b4d50, size 1160, and oatdump's own listing shows
+  `0x006b4ee4: 4f03f400  fmov v0.4s, #0x60 (0.5000)`. oatdump's addresses are the file offset minus 0x1000 (its listing
+  line `0x006b5ee4: b940021f` is the file's bytes at 0x6b6ee4), so the input is the file offset 0x6b5ee4 minus the
+  executable offset 0x1b1000 minus 0x1000. The method is a spline constructor with a float constant, which fits.
+- **The fix (engine/simd.c).** `modified_imm` implemented cmode 1111: op 0 is FMOV into 2S or 4S (single), op 1 with Q 1
+  is FMOV into 2D (double), and each value is replicated to every element with the high half cleared for Q 0. o2 1 (FP16,
+  FEAT_FP16) and op 1 with Q 0 stay unimplemented (SIGILL). `vfp_expand32` and `vfp_expand64` are shared with the scalar
+  `fmov_imm`. The translator reaches the same code through `tr_simd` and `simd_exec`, so the Node JIT path is the same
+  code (checked in `engine/jit.c`).
+- **The guest test (tests/guest/fmov-vec-imm.c).** Thirteen cases (4S, 2S with the high half cleared, 2D), each printing
+  the register's two halves. Native run (the oracle) and the engine's output are identical (`build/tests/boot/fmov-oracle.txt`,
+  `fmov-engine.txt`, and the interpreter `fmov-engine-int.txt`). The red run (the pre-fix binary) exits 132 with
+  `unimplemented A64 instruction 0x4f03f400` (`fmov-red.err`).
+
+### The next blocker: the display stack (the stop)
+
+With the SIGILL gone, system_server reaches `DisplayManagerService` and blocks in its constructor. The watchdog kills it
+60 s later. These lines are copied by grep from `build/tests/boot/b4f-next.err` (that run had `XIAOJI_DEBUG_FAULTS=1`):
+
+```
+[33420 ms 3599037562 insn] D/SystemServerTiming(1014): StartDisplayManager
+[33428 ms 3599723671 insn] I/servicemanager(1001): Since 'SurfaceFlinger' could not be found, trying to start it as a lazy AIDL service
+xiaoji: init: Control message: Could not find 'aidl/SurfaceFlinger' for ctl.interface_start
+[103050 ms 3703462200 insn] W/Watchdog(1014): *** WATCHDOG KILLING SYSTEM PROCESS: Blocked in handler on main thread (main)
+[103055 ms 3703690319 insn] W/Watchdog(1014):     at android.view.SurfaceControl.nativeGetCompositionDataspaces(Native Method)
+[103056 ms 3703757025 insn] W/Watchdog(1014):     at com.android.server.display.DisplayManagerService.<init>(DisplayManagerService.java:501)
+[103062 ms 3704111965 insn] I/Process(1014): Sending signal. PID: 1014 SIG: 9
+```
+
+**The probe (one boot; `build/tests/boot/b4f-sf.rc` is `image/xiaoji.rc` plus three service blocks copied from the image's
+own rc files; log `b4f-sf.err`).** The image does not start SurfaceFlinger or the graphics HALs. With them started, the
+first failures are:
+
+```
+[1587 ms 189543094 insn] E/libEGL(1007): load_driver(/vendor/lib64/egl/libEGL_angle.so): dlopen failed: library "libGLESv2_angle.so" not found: needed by /vendor/lib64/egl/libEGL_angle.so in namespace (default)
+[1587 ms 189546675 insn] F/libEGL(1007): couldn't find an OpenGL ES implementation, make sure you set ro.hardware.egl or ro.board.platform
+[1587 ms 189551291 insn] F/libc(1007): Fatal signal 6 (SIGABRT), code -1 (SI_QUEUE) in tid 1016 (surfaceflinger), pid 1007 (<unknown>)
+[588 ms 94536430 insn] E/android.hardware.graphics.composer@2.4-service(1008): failed to open framebuffer device: No such file or directory
+[799 ms 115944198 insn] E/android.hardware.graphics.allocator@3.0-service(1009): open_verbose_path:50: Could not open '/dev/goldfish_pipe': No such file or directory
+```
+
+The composer (`android.hardware.graphics.composer@2.4-service`, in `vendor/bin/hw`, with its VINTF fragment) exits at its
+framebuffer open. The allocator registers `IAllocator/default` after its `/dev/goldfish_pipe` error. The image itself says
+that the engine has no OpenGL ES driver (`image/xiaoji.rc`: ZygoteInit's GL preload is disabled for that reason).
+
+**Why this is a design question, not a fix.** A real SurfaceFlinger needs three things the engine does not have: an OpenGL
+ES implementation (the image has `libEGL_angle.so` but not the `libGLESv2_angle.so` it needs), a framebuffer device for the
+composer, and the goldfish pipe to a host renderer for the allocator. Two directions are open, and neither is chosen here:
+(1) a software GLES, a framebuffer, and a composer, so the real SurfaceFlinger runs (a large component, and slow in the
+interpreter); or (2) a boot without SurfaceFlinger, which changes the framework's display path (outside "prefer real
+components"). I did not try a stub, and I did not change the rc beyond the probe copy.
+
+### Tests (this step)
+
+- `make && make wasm-node && make test`: **176 passed, 0 failed, 0 xfail** (168 before; +4 `binder-read-pair` and +4
+  `fmov-vec-imm`, engine and Node, O0 and O2).
+- `XIAOJI_JIT=0 make test`: **176 passed, 0 failed, 0 xfail.**
+- `XIAOJI_BOOT=1 make test`: **177 passed, 0 failed, 0 xfail.** The check now also requires `StartDisplayManager`, which is
+  reached in every boot of this step (the thermal lookup is 5 of 5). The comment in `tests/run.sh` is updated.
+- `make test-web`: all web checks passed.
+- Warnings: `clang -std=c11 -Wall -Wextra -Wno-unused-parameter -O2 -c` on `engine/binder.c`, `engine/cpu_a64.c` and
+  `engine/simd.c`: 0. The same with `emcc`, one file at a time: 0. `gcc -Wall -Wextra` on the two new guest tests (and
+  `binder-node-reuse.c`): 0.
+- Power: `build/tests/boot/b4f-fix-*.pmset.txt` and `b4f-verify.pmset.txt` (AC Power, `lowpowermode 0`). The runs
+  `b4f-r1` and `b4f-r2` overlapped in time, so no timing is taken from them.
+
+### Gaps (B4f)
+
+- **The display stack** (the next blocker, above): an OpenGL ES implementation, a framebuffer and the goldfish pipe are
+  missing. The `startOtherServices` steps and the d3 to d5 milestones are not reached. Telephony, NFC, Bluetooth and UWB
+  are not configured yet (the planned properties were not applied, since the boot does not get past the display).
+- **The first-translation count protocol** (BR_ACQUIRE and BR_INCREFS, B4e) differs from the kernel. Not changed.
+- **FP16 vector immediate** (`o2` 1) is not implemented. Not needed yet.
+- **`FLAT_BINDER_FLAG_TXN_SECURITY_CTX`** contexts are still `u:r:kernel:s0` for every sender (B4c gap, unchanged).

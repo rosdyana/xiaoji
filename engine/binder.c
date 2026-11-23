@@ -1278,6 +1278,8 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
      * at their buffer offsets. */
     a->next = dst->allocs;
     dst->allocs = a;
+    BT("buffer alloc pid=%d off=%llu size=%llu data=%llu from pid=%d", dst->pid, (unsigned long long)a->off,
+       (unsigned long long)a->size, (unsigned long long)a->data_size, src->pid);
     t->buf = a;
     t->secctx = secctx;
     t->secctx_at = secctx_at;
@@ -1443,9 +1445,10 @@ static int emit(bproc_t *b, bthread_t *t, bwork_t *w, uint64_t va)
         txn_install_fds(b, x);
         if (w->kind == WK_TXN) {
             x->to = t;
-            BT("deliver request txn=%llu code=%u to pid=%d tid=%llu: node ptr=%llx cookie=%llx sender pid=%d",
+            BT("deliver request txn=%llu code=%u to pid=%d tid=%llu: node ptr=%llx cookie=%llx sender pid=%d buf=%llu va=%llx",
                (unsigned long long)x->id, x->code, b->pid, (unsigned long long)t->tid,
-               (unsigned long long)x->target, (unsigned long long)x->cookie, x->sender_pid);
+               (unsigned long long)x->target, (unsigned long long)x->cookie, x->sender_pid,
+               (unsigned long long)x->buf->off, (unsigned long long)base);
             sched_raise(x, t);
             if (!x->oneway) {
                 x->recv_next = t->recv;
@@ -1510,12 +1513,18 @@ static int64_t bread(bproc_t *b, bthread_t *t, uint64_t buf, uint64_t size, uint
             break;
         }
         q_pop(q);
+        /* A transaction or a reply ends the read (the driver's binder_thread_read breaks out of
+         * its loop there), so one request is delivered per read and each BC_REPLY pairs with the
+         * request the thread is serving. Other work keeps batching. */
+        int ends = w->kind == WK_TXN || w->kind == WK_REPLY;
         int rc = emit(b, t, w, buf + cur);
         free(w);
         if (rc)
             return rc;
         cur += need;
         items++;
+        if (ends)
+            break;
     }
     if (items == 0 && start == 0) {
         if (nonblock)

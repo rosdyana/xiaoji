@@ -82,7 +82,7 @@ make_oracle() {
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
     # oracles run as root (passwordless sudo in the builder VM).
     local runas=""
-    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -503,10 +503,10 @@ done
 # the class preload ("...preloaded N classes"), the fork of system_server (zygote's own
 # "System server process N has been created", B4b milestone c), system_server's entry ("Entered
 # the Android system server!", B4c milestone d1) and the furthest deterministic point of
-# startBootstrapServices, "InitPowerManagement" (B4d: the last bootstrap step before the
-# PowerManager NullPointerException, which is intermittent after B4e: see docs/boot.md B4e). It is
-# the furthest point reached in every run, so it is the furthest deterministic one. About 57 s
-# natively. Not in the default run, which is kept short; the boot is stopped by --init-timeout.
+# startBootstrapServices, "InitPowerManagement" (B4d), and StartDisplayManager (B4f: the thermal
+# lookup now succeeds, so the boot goes on to DisplayManagerService; it is reached in every cycle
+# of every B4f boot, and the thermal NullPointerException is gone). About 34 s natively. Not in the
+# default run, which is kept short; the boot is stopped by --init-timeout.
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
     XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
@@ -514,11 +514,12 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
         grep -q 'Entered the Android system server!' "$OUT/boot.err" &&
         grep -q 'SystemServerTiming([0-9]*): StartPowerManager' "$OUT/boot.err" &&
-        grep -q 'SystemServerTiming([0-9]*): InitPowerManagement' "$OUT/boot.err"; then
-        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager and InitPowerManagement (XIAOJI_BOOT, B4d d2)"
+        grep -q 'SystemServerTiming([0-9]*): InitPowerManagement' "$OUT/boot.err" &&
+        grep -q 'SystemServerTiming([0-9]*): StartDisplayManager' "$OUT/boot.err"; then
+        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement and StartDisplayManager (XIAOJI_BOOT, B4f)"
         pass=$((pass + 1))
     else
-        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager or InitPowerManagement line is missing in $OUT/boot.err"
+        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement or StartDisplayManager line is missing in $OUT/boot.err"
         fail=$((fail + 1))
     fi
 fi

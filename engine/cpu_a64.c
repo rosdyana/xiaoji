@@ -999,9 +999,17 @@ static int exec(cpu_t *c, uint32_t insn, uint64_t pc)
 static void unimplemented(cpu_t *c, uint32_t insn, uint64_t pc)
 {
     c->pc = pc;
-    if (sig_debug_faults() && sig_catchable(c, SIGILL_N))
+    if (sig_debug_faults() && sig_catchable(c, SIGILL_N)) {
         fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,
                 (unsigned long long)pc);
+        /* The mapping of pc: the file and the offset of pc in it (B4f, the SIGILL in system_server). */
+        uint64_t rs = 0, re = 0, roff = 0;
+        const char *rpath = NULL;
+        if (mem_region_next(pc, &rs, &re, &rpath, &roff) && rs <= pc && pc < re)
+            fprintf(stderr, "xiaoji:   region %llx-%llx %s off 0x%llx: pc is file offset 0x%llx\n",
+                    (unsigned long long)rs, (unsigned long long)re, rpath ? rpath : "(anon)",
+                    (unsigned long long)roff, (unsigned long long)(roff + pc - rs));
+    }
     if (sig_fault(c, SIGILL_N, ILL_ILLOPC, pc))
         return;
     fprintf(stderr, "xiaoji: unimplemented A64 instruction 0x%08x at pc 0x%llx\n", insn,
