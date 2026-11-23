@@ -190,17 +190,24 @@ PRODUCT_PACKAGES += \
     android.hardware.camera.provider@2.7-impl-google
 endif
 
-ifneq ($(EMULATOR_VENDOR_NO_SOUND),true)
+# Thermal HAL 1.0: HardwarePropertiesManagerService (system_server's main thread at boot) takes IThermal 1.0 with no
+# timeout, and the product has only the 2.0 mock (docs/boot.md, B13). The 1.0 default is the real service of the tree.
 PRODUCT_PACKAGES += \
-    android.hardware.audio.service \
-    android.hardware.audio@7.0-impl.ranchu \
+    android.hardware.thermal@1.0-service \
+    android.hardware.thermal@1.0-impl
+
+ifneq ($(EMULATOR_VENDOR_NO_SOUND),true)
+# XiaoJi audio: the null-sink HAL (device/xiaoji/audio) replaces the ranchu HAL and its service.
+PRODUCT_PACKAGES += \
+    xiaoji_audio_hal \
+    android.hardware.audio@7.0-impl.xiaoji \
     android.hardware.soundtrigger@2.2-impl.ranchu \
     android.hardware.audio.effect@7.0-impl \
 
 DEVICE_MANIFEST_FILE += device/generic/goldfish/audio/android.hardware.audio.effects@7.0.xml
 
 PRODUCT_COPY_FILES += \
-    device/generic/goldfish/audio/policy/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
+    device/xiaoji/audio/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
     device/generic/goldfish/audio/policy/primary_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/primary_audio_policy_configuration.xml \
     frameworks/av/services/audiopolicy/config/a2dp_in_audio_policy_configuration_7_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/a2dp_in_audio_policy_configuration_7_0.xml \
     frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration_7_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/bluetooth_audio_policy_configuration_7_0.xml \

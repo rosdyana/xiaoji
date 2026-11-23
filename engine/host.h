@@ -60,6 +60,7 @@ int host_unlink(const char *path);
 int host_rmdir(const char *path);
 int host_rename(const char *from, const char *to);
 int host_link(const char *from, const char *to);
+int host_symlink(const char *target, const char *path);
 int host_fsync(int fd);
 /* ftruncate of a host file (len is the new size). Returns 0 or -errno. */
 int host_ftruncate(int fd, uint64_t len);

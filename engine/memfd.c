@@ -16,7 +16,28 @@ struct memfd {
     uint8_t **pages; /* host page per file page; NULL until materialized */
     size_t cap;      /* slots in pages */
     char name[64];
+    int is_file;     /* the cache of a host file (memfd_set_file) */
+    void (*on_free)(memfd_t *m, void *ctx);
+    void (*fill)(memfd_t *m, uint64_t idx, uint8_t *page, void *ctx);
+    void *ctx;
 };
+
+void memfd_set_fill(memfd_t *m, void (*fill)(memfd_t *m, uint64_t idx, uint8_t *page, void *ctx))
+{
+    m->fill = fill;
+}
+
+int memfd_materialized(const memfd_t *m, uint64_t idx) { return idx < m->cap && m->pages[idx] != NULL; }
+
+void memfd_set_file(memfd_t *m, void (*on_free)(memfd_t *m, void *ctx), void *ctx)
+{
+    m->is_file = 1;
+    m->on_free = on_free;
+    m->ctx = ctx;
+}
+
+int memfd_is_file(const memfd_t *m) { return m->is_file; }
+int memfd_refs(const memfd_t *m) { return m->refs; }
 
 memfd_t *memfd_new(const char *name)
 {
@@ -38,6 +59,8 @@ void memfd_unref(memfd_t *m)
 {
     if (!m || --m->refs > 0)
         return;
+    if (m->on_free)
+        m->on_free(m, m->ctx);
     for (size_t i = 0; i < m->cap; i++) {
 #ifdef __EMSCRIPTEN__
         if (m->pages[i])
@@ -78,6 +101,8 @@ uint8_t *memfd_page(memfd_t *m, uint64_t idx)
             return NULL;
         memset(p, 0, MFD_PAGE);
         m->pages[idx] = p;
+        if (m->fill)
+            m->fill(m, idx, p, m->ctx);
     }
     return m->pages[idx];
 }
@@ -122,6 +147,8 @@ int64_t memfd_pread(memfd_t *m, void *buf, size_t n, uint64_t off)
             chunk = n - done;
         if (idx < m->cap && m->pages[idx])
             memcpy(d + done, m->pages[idx] + in, chunk);
+        else if (m->fill && memfd_page(m, idx))
+            memcpy(d + done, m->pages[idx] + in, chunk); /* a file cache fills the page on first use */
         else
             memset(d + done, 0, chunk);
         done += chunk;

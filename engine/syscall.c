@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "binder.h"
+#include "filecache.h"
 #include "goldfish.h"
 #include "exec.h"
 #include "host.h"
@@ -248,9 +249,19 @@ static int map_file(uint64_t base, uint64_t len, unsigned prot, const char *path
     mfile_t *f = mem_file_get(hfd, st.dev, st.ino);
     if (!f)
         return -1;
+    /* A file with a shared cache (filecache.c) is filled from the cache by lazy_fill (mem.c). */
     int rc = mem_map_lazy(base, len, prot, path, f, off);
     mem_file_unref(f);
     return rc;
+}
+
+/* Maps len bytes of file hfd as a MAP_SHARED view of its cache (filecache.c). */
+static int map_shared_file(uint64_t base, uint64_t len, unsigned prot, uint64_t off, int hfd, int can_write)
+{
+    host_stat st;
+    if (host_stat_fd(hfd, &st) != 0)
+        return -1;
+    return fc_map_shared(base, len, prot, off, &st, hfd, can_write);
 }
 
 /* Maps a tail of len bytes after a mapping whose last page is last, with the
@@ -323,6 +334,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
 
     int file = !(flags & LMAP_ANONYMOUS);
     int hfd = -1;
+    int can_write = 0;
     const char *path = NULL;
     if (file) {
         if (off & PAGE_MASK)
@@ -360,11 +372,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
             return mmap_memfd(addr, len, p, type, flags, f, off);
         if (f->kind == VFS_DIR || f->kind == VFS_SYN || !f->host)
             return -LE_NODEV;
-        if (type == LMAP_SHARED && (prot & LPROT_WRITE))
-            return -LE_ACCES; /* only read-only MAP_SHARED is supported */
+        if (type == LMAP_SHARED && (prot & LPROT_WRITE) && (f->lflags & LO_ACCMODE) != LO_RDWR)
+            return -LE_ACCES; /* a writable shared view needs the file open read-write */
         if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
             return -LE_ACCES;
         hfd = f->hfd;
+        can_write = (f->lflags & LO_ACCMODE) == LO_RDWR;
         path = f->host;
     }
 
@@ -382,7 +395,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
             return -LE_NOMEM;
     }
     if (file) {
-        if (map_file(base, len, p, path, hfd, off) < 0) {
+        int rc = type == LMAP_SHARED ? map_shared_file(base, len, p, off, hfd, can_write)
+                                     : map_file(base, len, p, path, hfd, off);
+        if (rc < 0) {
             mem_unmap(base, len);
             return -LE_NOMEM;
         }
@@ -1200,6 +1215,13 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sys_madvise(a[0], a[1], a[2]);
         return;
     case SYS_MSYNC:
+        if (a[0] & PAGE_MASK) {
+            *ret = -LE_INVAL;
+            return;
+        }
+        fc_sync_va(a[0]); /* write-back of the file's cache, if it is mapped (filecache.c) */
+        *ret = 0;
+        return;
     case SYS_MLOCK:
     case SYS_MUNLOCK:
         *ret = 0;

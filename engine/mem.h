@@ -76,6 +76,10 @@ int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_
  * the region start and its file offset at that start. The file is borrowed: take a
  * reference (mem_map_lazy does) to keep it. */
 mfile_t *mem_region_file(uint64_t va, uint64_t *start, uint64_t *off);
+/* Sets the size of a file cache memfd (filecache.c) in every address space: the pages of
+ * its views wholly past size stop being mapped (an access raises SIGBUS), and pages that
+ * come back into the size are mapped again. Called after the memfd's size changes. */
+void mem_shm_resize(memfd_t *m, uint64_t size);
 /* The memfd backing the region that contains va, or NULL. *start and *off are
  * the region start and its file offset at that start. */
 memfd_t *mem_region_memfd(uint64_t va, uint64_t *start, uint64_t *off);

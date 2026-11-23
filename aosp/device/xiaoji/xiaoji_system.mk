@@ -124,6 +124,9 @@ PRODUCT_SYSTEM_MANUFACTURER := Android
 PRODUCT_SYSTEM_MODEL := mainline
 PRODUCT_SYSTEM_DEVICE := generic
 
+# xiaoji_netd (docs/boot.md, B12) registers the "netd" binder service in place of the stock netd.
+PRODUCT_PACKAGES += xiaoji_netd
+
 _base_mk_allowed_list :=
 
 _my_allowed_list := $(_base_mk_allowed_list)

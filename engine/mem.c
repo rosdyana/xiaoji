@@ -20,6 +20,8 @@
  */
 #include "mem.h"
 #include "host.h"
+#include "filecache.h"
+#include "memfd.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -105,9 +107,11 @@ struct mm {
     region_t *regs;
     size_t nregs, cregs;
     int refs; /* processes using this address space (vfork shares one) */
+    struct mm *next, *prev; /* every live address space (mem_shm_resize walks them) */
 };
 
 static mm_t *cur_mm;
+static mm_t *all_mm;
 static tlb_ent tlb_rd[TLB_SIZE];
 static tlb_ent tlb_wr[TLB_SIZE];
 static uint64_t fetch_tag;
@@ -119,8 +123,13 @@ static void tlb_flush(void);
 mm_t *mem_mm_new(void)
 {
     mm_t *m = calloc(1, sizeof(mm_t));
-    if (m)
+    if (m) {
         m->refs = 1;
+        m->next = all_mm;
+        if (all_mm)
+            all_mm->prev = m;
+        all_mm = m;
+    }
     return m;
 }
 
@@ -154,18 +163,18 @@ static void tlb_flush(void)
 #endif
 }
 
-static uint64_t *pte_slot(uint64_t vpn, int create)
+static uint64_t *pte_slot_in(mm_t *mm, uint64_t vpn, int create)
 {
     if (vpn >= VPN_LIMIT)
         return NULL;
-    if (!cur_mm->l1) {
+    if (!mm->l1) {
         if (!create)
             return NULL;
-        cur_mm->l1 = calloc(L1_COUNT, sizeof *cur_mm->l1);
-        if (!cur_mm->l1)
+        mm->l1 = calloc(L1_COUNT, sizeof *mm->l1);
+        if (!mm->l1)
             die_oom();
     }
-    uint64_t **l2 = &cur_mm->l1[vpn >> 18];
+    uint64_t **l2 = &mm->l1[vpn >> 18];
     if (!*l2) {
         if (!create)
             return NULL;
@@ -175,6 +184,8 @@ static uint64_t *pte_slot(uint64_t vpn, int create)
     }
     return &(*l2)[vpn & (L2_COUNT - 1)];
 }
+
+static uint64_t *pte_slot(uint64_t vpn, int create) { return pte_slot_in(cur_mm, vpn, create); }
 
 static jmp_buf *fault_jb;
 static uint64_t fault_va;
@@ -207,6 +218,9 @@ uint64_t mem_futex_key(uint64_t va, uint64_t *obj)
     return a;
 }
 
+/* True if va is in a file cache view and its page lies wholly past the end of the file. */
+static int mem_past_eof(uint64_t va);
+
 /* A guest access failed. The CPU loop gets the fault (and the faulting pc) by
  * longjmp, so it can deliver SIGSEGV; without a loop, the process exits. */
 static void mem_segv(uint64_t va) __attribute__((noreturn));
@@ -228,6 +242,8 @@ static void mem_segv(uint64_t va)
     }
     fault_va = va;
     fault_code = bus ? MEM_FAULT_BUS : mem_is_mapped(va & VA_MASK, 1) ? MEM_FAULT_ACCERR : MEM_FAULT_MAPERR;
+    if (mem_past_eof(va & VA_MASK))
+        fault_code = MEM_FAULT_BUS;
     longjmp(*fault_jb, 1);
 }
 
@@ -578,7 +594,13 @@ static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
     }
     uint8_t *buf = lazy_buf;
     size_t got = 0;
-    while (got < want_len) {
+    /* A file with a shared cache (filecache.c) has its current bytes there, ahead of the host file. */
+    memfd_t *fc = fc_lookup(r->lazy->dev, r->lazy->ino);
+    if (fc) {
+        int64_t k = memfd_pread(fc, buf, want_len, roff + (wa - rstart));
+        got = k > 0 ? (size_t)k : 0;
+    }
+    while (!fc && got < want_len) {
         int64_t k = host_pread(hfd, buf + got, want_len - got, roff + (wa - rstart) + got);
         if (k <= 0)
             break; /* end of file, or an error: the bytes read so far are the file */
@@ -922,6 +944,40 @@ int mem_map_shared(uint64_t va, uint64_t len, unsigned prot, memfd_t *m, uint64_
     return 0;
 }
 
+static int mem_past_eof(uint64_t va)
+{
+    uint64_t start, off;
+    memfd_t *m = mem_region_memfd(va, &start, &off);
+    if (!m || !memfd_is_file(m))
+        return 0;
+    uint64_t pos = off + ((va & ~(uint64_t)(MEM_PAGE_SIZE - 1)) - start);
+    return pos >= memfd_size(m);
+}
+
+/* The PTEs of a shared view keep their protection; only PTE_MAPPED changes. A page past
+ * the new size loses it (an access faults, see mem_past_eof), and a page that is back in
+ * the size gets it again. The host pages stay with the memfd. */
+void mem_shm_resize(memfd_t *m, uint64_t size)
+{
+    for (mm_t *mm = all_mm; mm; mm = mm->next) {
+        for (size_t i = 0; i < mm->nregs; i++) {
+            region_t *r = &mm->regs[i];
+            if (r->shm != m)
+                continue;
+            for (uint64_t va = r->start; va < r->end; va += MEM_PAGE_SIZE) {
+                uint64_t *slot = pte_slot_in(mm, va >> 12, 0);
+                if (!slot || !(*slot & PTE_SHARED))
+                    continue;
+                if (r->off + (va - r->start) < size)
+                    *slot |= PTE_MAPPED;
+                else
+                    *slot &= ~(uint64_t)PTE_MAPPED;
+            }
+        }
+    }
+    tlb_flush();
+}
+
 void mem_unmap(uint64_t va, uint64_t len)
 {
     if (!len)
@@ -967,8 +1023,11 @@ int mem_protect(uint64_t va, uint64_t len, unsigned prot)
     uint64_t n = len >> 12;
     for (uint64_t i = 0; i < n; i++) {
         uint64_t *slot = pte_slot(first + i, 0);
-        host_page_changed((uint8_t *)(uintptr_t)(*slot & ~(uint64_t)PTE_FLAGS));
-        *slot = (*slot & ~(uint64_t)PTE_FLAGS) | (*slot & (PTE_SHARED | PTE_COW)) | PTE_MAPPED | (prot & 7u);
+        uint64_t e = *slot;
+        host_page_changed((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
+        /* A shared view page past the end of its file stays unmapped (mem_shm_resize): mprotect does not map it. */
+        uint64_t mapped = ((e & PTE_SHARED) && !(e & PTE_MAPPED)) ? 0 : PTE_MAPPED;
+        *slot = (e & ~(uint64_t)PTE_FLAGS) | (e & (PTE_SHARED | PTE_COW)) | mapped | (prot & 7u);
     }
     tlb_flush();
     return 0;
@@ -1201,7 +1260,9 @@ mm_t *mem_mm_fork(mm_t *src)
             dst->l1[i] = d2;
             for (uint32_t j = 0; j < L2_COUNT; j++) {
                 uint64_t e = s2[j];
-                if (!(e & PTE_MAPPED))
+                /* A shared view past the end of its file is unmapped but keeps its slot
+                 * (mem_shm_resize), so the child keeps it too. */
+                if (!(e & (PTE_MAPPED | PTE_SHARED)))
                     continue;
                 if (!(e & PTE_SHARED) && (e & ~(uint64_t)PTE_FLAGS)) {
                     share_add((uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
@@ -1242,6 +1303,12 @@ void mem_mm_unref(mm_t *m)
 {
     if (!m || --m->refs > 0)
         return;
+    if (m->prev)
+        m->prev->next = m->next;
+    else if (all_mm == m)
+        all_mm = m->next;
+    if (m->next)
+        m->next->prev = m->prev;
     if (m->l1) {
         for (uint32_t i = 0; i < L1_COUNT; i++) {
             uint64_t *l2 = m->l1[i];

@@ -26,6 +26,29 @@ on early-init
     # these). zygote's bind mounts (/storage) are made in its own mount namespace (engine/mntns.c, B4c).
     mkdir /mnt/user 0755
     mkdir /mnt/user/0 0755
+    # The rest of the stock init.rc /mnt tree (B13), which zygote's specialization and the storage views open:
+    mkdir /mnt/secure
+    mkdir /mnt/secure/asec
+    mkdir /mnt/asec
+    mkdir /mnt/obb
+    mkdir /mnt/media_rw
+    mkdir /mnt/user/0/self
+    mkdir /mnt/user/0/emulated
+    mkdir /mnt/user/0/emulated/0
+    mkdir /mnt/pass_through
+    mkdir /mnt/pass_through/0
+    mkdir /mnt/pass_through/0/self
+    mkdir /mnt/pass_through/0/emulated
+    mkdir /mnt/pass_through/0/emulated/0
+    mkdir /mnt/expand
+    mkdir /mnt/appfuse
+    mkdir /mnt/runtime
+    mkdir /mnt/runtime/default
+    mkdir /mnt/runtime/default/self
+    mkdir /mnt/runtime/read
+    mkdir /mnt/runtime/read/self
+    mkdir /mnt/runtime/write
+    mkdir /mnt/runtime/write/self
     # installd's directories (init.rc's on-init block makes these). The engine's mkdir takes the path only:
     # the mode is 0771 and the owner is the engine's, whatever the rc says.
     mkdir /data/misc
@@ -46,6 +69,9 @@ on early-init
     # missing parent (B7). The bind of /data/user/0 to /data/data is not made; /data/user/0 is the data root.
     mkdir /data/user
     mkdir /data/user/0
+    # /data/data (B13): the stock init.rc line. zygote's app specialization mounts a tmpfs on it (Zygote.cpp,
+    # "MountAppDataTmpFs"), in its own mount namespace, so it must exist as a directory.
+    mkdir /data/data 0771 system system encryption=None
     mkdir /data/user_de
     mkdir /data/user_de/0
     mkdir /data/system_ce
@@ -277,13 +303,50 @@ service vold /system/bin/vold --blkid_context=u:r:blkid:s0 --blkid_untrusted_con
     ioprio be 2
     group root reserved_disk
 
-# netd (B10): the Android 13 block of system/netd/server/netd.rc (class, capabilities, group and sockets as the engine
-# reads them). NetworkManagementService.create waits for it on the main thread of system_server.
-service netd /system/bin/netd
+# netd (B12): xiaoji_netd (device/xiaoji/xiaoji_netd), not the stock netd, which needs bpf(2) and NETLINK_ROUTE. The
+# stock capabilities and group, and the same "netd" binder service. The stock sockets (dnsproxyd, fwmarkd, mdns) are
+# left out: nothing listens on them yet. NetworkManagementService.create waits for this service.
+service netd /system/bin/xiaoji_netd
     class main
     capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID
     group root net_admin
-    socket dnsproxyd stream 0660 root inet
-    socket mdns stream 0660 root system
-    socket fwmarkd stream 0660 root inet
     onrestart restart zygote
+
+# Audio (B13, docs/boot.md): audioserver, the Android 13 block (frameworks/av/media/audioserver/audioserver.rc),
+# with the group mediadrm written as media_drm (the name in engine/ids_gen.h). The restarts of the HALs that are not in
+# this product are left out. It registers media.audio_policy, which system_server's AudioService waits for.
+service audioserver /system/bin/audioserver
+    class core
+    user audioserver
+    group audio camera drmrpc media media_drm net_bt net_bt_admin net_bw_acct wakelock
+    capabilities BLOCK_SUSPEND
+    onrestart restart vendor.audio-hal
+
+# The XiaoJi audio HAL (device/xiaoji/audio): the null sink, as the HIDL passthrough service. The block of the stock
+# hardware/interfaces/audio service (vendor.audio-hal), with /vendor/bin/hw/xiaoji_audio_hal in place of the stock
+# binary, whose main aborts in this tree (docs/boot.md, B12).
+service vendor.audio-hal /vendor/bin/hw/xiaoji_audio_hal
+    interface android.hardware.audio@7.0::IDevicesFactory default
+    interface android.hardware.audio.effect@7.0::IEffectsFactory default
+    class hal
+    user audioserver
+    group audio camera drmrpc inet media media_drm net_bt net_bt_admin net_bw_acct wakelock context_hub
+    capabilities BLOCK_SUSPEND
+    onrestart restart audioserver
+
+# Thermal HAL 1.0 (B13): the default service of hardware/interfaces/thermal/1.0/default, the block of its rc. The
+# system_server's HardwarePropertiesManagerService takes IThermal 1.0 on its main thread, with no timeout.
+service vendor.thermal-hal-1-0 /vendor/bin/hw/android.hardware.thermal@1.0-service
+    interface android.hardware.thermal@1.0::IThermal default
+    class hal
+    user system
+    group system
+
+# Authsecret HAL 1.0 (B13): the default service of hardware/interfaces/authsecret/1.0/default (installed by the product,
+# from the goldfish vendor packages), with the block of its rc. LockSettingsService takes IAuthSecret at boot, on the
+# system_server's main thread, with no timeout.
+service vendor.authsecret-1-0 /vendor/bin/hw/android.hardware.authsecret@1.0-service
+    interface android.hardware.authsecret@1.0::IAuthSecret default
+    class hal
+    user system
+    group system

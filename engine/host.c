@@ -236,6 +236,12 @@ int host_link(const char *from, const char *to)
     return link(from, to) == 0 ? 0 : neg_errno();
 }
 
+/* A symbolic link whose target is kept as given (the engine resolves it when a path walks through it). */
+int host_symlink(const char *target, const char *path)
+{
+    return symlink(target, path) == 0 ? 0 : neg_errno();
+}
+
 int host_ftruncate(int fd, uint64_t len)
 {
     return ftruncate(fd, (off_t)len) == 0 ? 0 : neg_errno();
