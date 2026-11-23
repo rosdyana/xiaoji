@@ -23,7 +23,7 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/media_product.mk)
 
 # vendor: the arm64 emulator's vendor side, unchanged for now.
 $(call inherit-product, device/generic/goldfish/arm64-vendor.mk)
-$(call inherit-product, device/generic/goldfish/64bitonly/product/emulator64_vendor.mk)
+$(call inherit-product, device/xiaoji/xiaoji_emulator64_vendor.mk)
 $(call inherit-product, device/generic/goldfish/emulator64_arm64/device.mk)
 
 PRODUCT_PROPERTY_OVERRIDES += \
@@ -31,6 +31,10 @@ PRODUCT_PROPERTY_OVERRIDES += \
     debug.sf.nobootanimation=1 \
     dalvik.vm.heapgrowthlimit=128m \
     dalvik.vm.heapsize=256m
+
+# vndservicemanager: the vendor binder's context manager (/dev/vndbinder). The composer and the other vendor
+# HALs look services up there. base_vendor.mk (which lists it) is not inherited by this product.
+PRODUCT_PACKAGES += vndservicemanager
 
 PRODUCT_BRAND := Android
 PRODUCT_NAME := xiaoji_arm64

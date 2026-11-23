@@ -1734,9 +1734,14 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     x->from = t;
     x->sent_next = t->sent;
     t->sent = x;
-    /* Prefer the thread that this thread's calls are already being served by, if it is
-     * in the target proc (a nested call), as the driver does. Otherwise any looper. */
+    /* A nested call (the driver's rule, binder_transaction: the thread's transaction_stack, from its top): the
+     * target is the thread that sent the request this thread is serving, if that thread is in the target proc.
+     * Here t->recv is the LIFO of requests being served (its head is the most recent). The sent calls of this
+     * thread are the fallback, as they were before. Otherwise any looper. */
     bthread_t *tt = NULL;
+    for (btxn_t *r = t->recv; r && !tt; r = r->recv_next)
+        if (r->from && r->from->proc == dst)
+            tt = r->from;
     for (btxn_t *s = x->sent_next; s && !tt; s = s->sent_next)
         if (s->to && s->to->proc == dst)
             tt = s->to;

@@ -1,0 +1,21 @@
+set subdevice 0
+subdevice metadata 5
+allocate 0
+block size 8192
+block offset 0
+block phys 0
+allocate id ping 0
+allocate id result 0
+mmap ok 1
+second view reads 90
+second view reads last byte 165
+unallocate id ping 0
+unallocate id result 0
+deallocate 0
+unknown ioctl -25
+queue work 0
+fence is an fd 1
+fence read 8
+fence counter 1
+signal 0
+done

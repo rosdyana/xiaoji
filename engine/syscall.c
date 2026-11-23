@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "binder.h"
+#include "goldfish.h"
 #include "exec.h"
 #include "host.h"
 #include "linux.h"
@@ -348,6 +349,15 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
             if (base >= 0)
                 binder_mmap_done(f->binder, (uint64_t)base);
             return base;
+        }
+        if (f->kind == VFS_GOLDFISH) {
+            /* An address-space block: the window's memfd, mapped at the block's offset (goldfish.c). */
+            if (!f->mfd) {
+                f->mfd = goldfish_as_memfd(f->obj);
+                if (!f->mfd)
+                    return -LE_NODEV;
+            }
+            return mmap_memfd(addr, len, p, LMAP_SHARED, flags, f, off);
         }
         if (f->kind == VFS_MEMFD)
             return mmap_memfd(addr, len, p, type, flags, f, off);

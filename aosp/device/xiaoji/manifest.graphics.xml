@@ -1,0 +1,27 @@
+<!--
+xiaoji: graphics HALs for the ranchu gralloc (docs/graphics.md section 3.1, A2). The allocator and the
+mapper are the goldfish-opengl HALs (device/generic/goldfish-opengl/system/hals); this fragment declares
+them the way build/rootfs's vendor manifest does, so the VINTF check passes without minigbm's 4.0 entries.
+-->
+<manifest version="1.0" type="device" target-level="4">
+    <hal format="hidl">
+        <name>android.hardware.graphics.allocator</name>
+        <transport>hwbinder</transport>
+        <version>3.0</version>
+        <interface>
+            <name>IAllocator</name>
+            <instance>default</instance>
+        </interface>
+        <fqname>@3.0::IAllocator/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.graphics.mapper</name>
+        <transport arch="32+64">passthrough</transport>
+        <version>3.0</version>
+        <interface>
+            <name>IMapper</name>
+            <instance>default</instance>
+        </interface>
+        <fqname>@3.0::IMapper/default</fqname>
+    </hal>
+</manifest>

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "binder.h"
+#include "goldfish.h"
 #include "fdobj.h"
 #include "poll.h"
 #include "host.h"
@@ -1067,6 +1068,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg)
     vfs_fd *f = vfs_get((int)(int32_t)fd);
     if (!f)
         return -LE_BADF;
+    if (f->kind == VFS_GOLDFISH)
+        return goldfish_ioctl(f->obj, (uint32_t)cmd, arg); /* the address space (goldfish.c) */
     if (f->kind != VFS_BINDER)
         return -LE_NOTTY;
     return binder_ioctl(f->binder, (uint32_t)cmd, arg, (f->lflags & LO_NONBLOCK) != 0);

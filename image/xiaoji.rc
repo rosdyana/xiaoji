@@ -132,3 +132,46 @@ property ro.product.cpu.abilist64 arm64-v8a
 # The engine has no OpenGL ES driver (libEGL aborts the preload without one). ZygoteInit skips its GL
 # preload when this property is set (ZygoteInit.java, PROPERTY_DISABLE_OPENGL_PRELOADING).
 property ro.zygote.disable_gl_preload true
+
+# Graphics (G1, docs/graphics.md section 3.1 A2): SurfaceFlinger, the composer (hwcomposer.ranchu through
+# ro.hardware.hwcomposer=ranchu, set in engine/props.c) and the ranchu allocator (goldfish_address_space and
+# goldfish_pipe, served by the engine). Each block is the image's own init rc, class and user as the engine reads them:
+# surfaceflinger from /system/etc/init/surfaceflinger.rc, the composer from its vendor rc, and the allocator from
+# android.hardware.graphics.allocator@3.0-service.rc.
+service surfaceflinger /system/bin/surfaceflinger
+    class core
+    user system
+    group graphics drmrpc readproc
+
+# vendor.hwcomposer-2-4: /vendor/etc/init/android.hardware.graphics.composer@2.4-service.rc
+service vendor.hwcomposer-2-4 /vendor/bin/hw/android.hardware.graphics.composer@2.4-service
+    class hal
+    user system
+    group graphics drmrpc
+
+# vendor.gralloc-3-0: /vendor/etc/init/android.hardware.graphics.allocator@3.0-service.rc
+service vendor.gralloc-3-0 /vendor/bin/hw/android.hardware.graphics.allocator@3.0-service
+    class hal
+    user system
+    group graphics drmrpc
+
+# The vendor servicemanager (G1): the composer and the other vendor HALs find their services on /dev/vndbinder.
+# frameworks/native/cmds/servicemanager/vndservicemanager.rc, class, user and group as the engine reads them
+# (task_profiles and onrestart are left out, as for the blocks above).
+service vndservicemanager /vendor/bin/vndservicemanager /dev/vndbinder
+    class core
+    user system
+    group system readproc
+
+# lmkd (G1): the low-memory killer. ActivityManager connects to its socket and retries once a second without it.
+# system/memory/lmkd/lmkd.rc, class and socket as the engine reads them. The engine does not model user, group or
+# capabilities (init.c), and it has no passcred socket type, so the socket is plain seqpacket.
+service lmkd /system/bin/lmkd
+    class core
+    critical
+    socket lmkd seqpacket 0660 system system
+
+# idmap2d (G1): the overlay idmap daemon. OverlayManagerService connects to it (IdmapDaemon) and blocks in
+# getIdmapService without it. frameworks/base/cmds/idmap2 (system/etc/init/idmap2d.rc), class as the engine reads it.
+service idmap2d /system/bin/idmap2d
+    class main

@@ -2311,3 +2311,116 @@ components"). I did not try a stub, and I did not change the rc beyond the probe
 - **The first-translation count protocol** (BR_ACQUIRE and BR_INCREFS, B4e) differs from the kernel. Not changed.
 - **FP16 vector immediate** (`o2` 1) is not implemented. Not needed yet.
 - **`FLAT_BINDER_FLAG_TXN_SECURITY_CTX`** contexts are still `u:r:kernel:s0` for every sender (B4c gap, unchanged).
+
+## B5: the graphics stack (SurfaceFlinger is published; system_server stops at idmap2d)
+
+Status: **on the product tree (`build/rootfs-xiaoji`), SurfaceFlinger starts and is published as a service, and
+`DisplayManagerService` completes its constructor (`StartDisplayManager took to complete`), the plan's
+`nativeGetCompositionDataspaces` step. `system_server` then reaches `Starting phase 100`, and it stops there: it waits
+for `idmap2d` (`OverlayManagerService` through `IdmapDaemon.getIdmapService`), the watchdog fires, and zygote starts
+`system_server` again. Four such cycles ran in the long boot (about 580 s of guest time). The stop is not
+`lmkd`: `lmkd` exits, and ActivityManager retries it once a second (343 retries) without blocking.**
+The design and the device work are in `docs/graphics.md`, G1.
+
+### What changed in this step
+
+- **Binder: a nested synchronous call went to the wrong thread** (`engine/binder.c`, the send path). The composer, while
+  serving transaction 98 from SurfaceFlinger's main thread (tid 1007), called `onHotplug` back on SurfaceFlinger
+  (transaction 99, synchronous, `IComposerCallback.hal` does not mark it `oneway`). The engine chose the target from the
+  sender's outgoing calls, found none, and queued the request on the process: binder thread 1020 took it and blocked,
+  while the main thread waited for the composer. The driver's rule (6.12 source, `drivers/android/binder.c`, lines
+  3208-3230 in the builder VM: the walk over `thread->transaction_stack` from the top, `target_thread = from` for the
+  first `from` in the target proc) takes the thread that sent the request this thread is serving, here tid 1007. The fix
+  walks `t->recv` (the requests this thread is serving, the newest first) first, and keeps the old walk as the fallback.
+  **No guest test covers it yet** (see gaps).
+- **SIMD: `fabd s0, s0, s1` (0x7ea1d400)** was not implemented, in SurfaceFlinger's hotplug path. It is in the scalar
+  floating-point three-same group (`engine/simd.c`, `scalar_simd` calls `fp_three_same_impl` with `scalar = 1`: lane 0,
+  the rest of the register zeroed). Only the opcodes the architecture allocates in that group are decoded
+  (`scalar_fp3_allocated`). Tests: `tests/guest/fabd-scalar.c` and `tests/guest/fp-scalar3.c` (FMULX, FCMEQ, FCMGE,
+  FCMGT, FACGE, FACGT, FRECPS, FRSQRTS), each compared with the native run: identical.
+- **GL: `glShaderString` (opcode 2254) and `glFinishRoundTrip` are decoded by hand** (`engine/gl_host.c`), as the host does
+  (`gles2_dec.cpp`). The spec marks them `not_api`, so the generator skips them; the first shader source then stopped the
+  GL stream (`opcode 2254 is not decoded`).
+- **GL: every pointer argument carries its wire length** (`tools/gen-glproto.py`). The null backend bounds each write by it
+  (`engine/gl_null.c`), and keeps colour-buffer pixels (RGBA8888).
+- **Init** (`image/xiaoji.rc`): the graphics services, `vndservicemanager` (the composer's vendor binder), `lmkd` and
+  `idmap2d`, from the image's own rc files.
+
+### Milestones (product tree)
+
+The first cycle, from `build/tests/boot/b5f.err` (`XIAOJI_STAMP=1 ... --init-timeout 90`); time and instructions are guest time:
+
+| Milestone | Time | Instructions |
+|---|---|---|
+| allocator@3.0 registered | 1.62 s | 0.179 G |
+| SurfaceFlinger main thread ready; RenderEngine on the GLES backend | 2.02 s | 0.221 G |
+| composer@2.4 registered | 2.18 s | 0.232 G |
+| `Connecting HAL display 0` (SurfaceFlinger) | 3.87 s | 0.411 G |
+| `Entered the Android system server!` | 35.63 s | 3.793 G |
+| `StartDisplayManager took to complete: 17ms` | 39.14 s | 4.137 G |
+
+The long run (`build/tests/boot/long2.err`, `--init-timeout 600`, outer `timeout 900`), last occurrences:
+
+| Milestone | Time | Instructions |
+|---|---|---|
+| `Starting phase 100` (the last of four `system_server` cycles) | 473.6 s | 19.79 G |
+| `WAITED_HALF` (the watchdog, the same cycle) | 532.8 s | 20.61 G |
+| `GOODBYE` (the watchdog kills `system_server`) | 573.4 s | 20.63 G |
+
+Wall clock of the first cycle run: 1:30.06, 51.2 s user and 0.69 s system (57% CPU). B4f reached `StartDisplayManager` at
+33.1 s (3.599 G) on `build/rootfs`. Power: `pmset -g` before and after the run shows `lowpowermode 0`
+(`build/tests/boot/b5f-pmset-before.txt`, `b5f-pmset-after.txt`); the source was AC Power (`pmset -g batt`, checked for
+earlier runs).
+
+### The next blocker (logcat)
+
+`idmap2d` is started by init. It runs, but it refuses the overlay work and then dies:
+
+```
+W/idmap2d(1788): failed to parse idmap header of '/data/resource-cache/product@overlay@EmulatorConnectivityOverlay.apk@idmap'
+E/idmap2d(1788): will not write to /data/resource-cache/product@overlay@EmulatorConnectivityOverlay.apk@idmap: calling uid 0 lacks write accesss
+xiaoji: init: idmap2d exited (status 134, by a signal)
+```
+
+`system_server` waits in it:
+
+```
+at com.android.server.om.IdmapDaemon.getIdmapService(IdmapDaemon.java:292)
+at com.android.server.om.IdmapDaemon.connect(IdmapDaemon.java:316)
+at com.android.server.om.IdmapDaemon.idmapExists(IdmapDaemon.java:171)
+```
+
+The cause is the engine's credential model. Every service runs as uid 0: `engine/init.c` does not model `user` or `group`
+(the stock blocks name `system`, `lmkd` and so on), and `engine/cred.c` states that no permission is enforced. The
+framework's uid checks (`idmap2d` checks its caller is `system`, uid 1000) therefore fail. Making the stock services
+(system_server, idmap2d, lmkd) run as their users is a cross-cutting change to init and to the credential checks, and it
+was not made in this step. It is the next task.
+
+`lmkd` (`service lmkd`, started by init) exits at once, because this kernel model has no PSI and no cgroup-v1 memory
+hierarchy. ActivityManager retries it once a second (343 retries in the long run) and continues. It is noise on the
+critical path, not the stop.
+
+### Tests (this step)
+
+- The boot check (`tests/run.sh`, `XIAOJI_BOOT=1`) requires the lines of the first cycle on both trees (the allocator, the
+  SurfaceFlinger main thread, the RenderEngine GLES start) and no `is not decoded` line. On the product tree (a
+  `vndservicemanager` is present) it also requires `StartDisplayManager took to complete` and no `Since 'SurfaceFlinger'
+  could not be found` line. This is the checkpoint-4 smoke test, read from the log, not a separate `service check` init
+  run.
+- The Google image (`build/rootfs`) does not get the product's composer: it has no `vndservicemanager`, so its composer
+  never registers and SurfaceFlinger never connects its display. Its check does not require the product lines.
+
+### Gaps (B5)
+
+- **The uid model** (above): `idmap2d`, `system_server` and `lmkd` run as root, so `system_server` stops at phase 100.
+- **The binder fix has no guest test** with the kernel as oracle. The plan asked for one. The case to write: a two-hop
+  call (A calls B, B calls back to A before replying, the callback lands on A's calling thread) and a three-hop call
+  (A to B to C to A). A caller waiting for a reply takes no process work, so a misrouted callback deadlocks a single-
+  threaded client. Node passing for the fixture is in `binder-node-reuse.c` and `binder-sg.c`. Not written.
+- **No frame is posted** in these runs (`frame N posted` never appears), so `rcFBPost` has not been exercised.
+- **The GLES calls answered by the default (no-op) backend**, listed once in the log (`xiaoji: gl: <call> answered by the
+  default (no-op) backend`), from the long run: `glAttachShader`, `glBindAttribLocation`, `glBindTexture`,
+  `glCompileShader`, `glEnableVertexAttribArray`, `glGetError`, `glGetUniformLocation`, `glLinkProgram`, `glPixelStorei`,
+  `glTexImage2D`, `glUniformMatrix4fv`, `glUseProgram`, `rcCreateDisplayById`, `rcOpenColorBuffer2`,
+  `rcSetDisplayPoseDpi`, `rcSetPuid`, `rcSetWindowColorBuffer`. None of them stops the boot so far.
+- **`XIAOJI_GF_TRACE=1`** (goldfish) and **`XIAOJI_BINDER_TRACE=1`** (binder) are the two traces used here.

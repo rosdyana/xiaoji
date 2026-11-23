@@ -13,6 +13,16 @@ ENGINE_HDR := $(wildcard engine/*.h)
 # The block translator is wasm-only: the native build leaves engine/jit.c out.
 NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
 JIT_LIB := engine/jit_lib.js
+# The GL decoders, generated from the vulkan-cereal protocol specs (tools/gen-glproto.py; docs/graphics.md, G1).
+# build/spec is fetched from the builder VM's checkout when missing (tools/fetch-remote-protocols.sh).
+GEN_SRC := build/gen/renderControl_dec.c build/gen/gles2_dec.c build/gen/gles1_dec.c build/gen/gl_defaults.c
+GEN_INC := -Ibuild/gen
+
+$(GEN_SRC): build/gen/gen_report.txt
+
+build/gen/gen_report.txt: tools/gen-glproto.py
+	@test -d build/spec/protocols/gles2 || sh tools/fetch-remote-protocols.sh
+	python3 -I tools/gen-glproto.py build/spec/protocols build/gen
 
 .PHONY: all engine wasm wasm-node guest-tests test test-web serve image oracle clean help
 
@@ -23,28 +33,28 @@ help:           ## list targets
 
 engine: build/xiaoji          ## native engine -> build/xiaoji
 
-build/xiaoji: $(NATIVE_SRC) $(ENGINE_HDR)
+build/xiaoji: $(NATIVE_SRC) $(GEN_SRC) $(ENGINE_HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ $(NATIVE_SRC)
+	$(CC) $(CFLAGS) $(GEN_INC) -o $@ $(NATIVE_SRC) $(GEN_SRC)
 
 wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 
 # The web build: a module for a Web Worker (web/worker.js), with the guest
 # filesystem built by the worker in MEMFS (createLazyFile over HTTP).
-build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(ENGINE_HDR) $(JIT_LIB)
+build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
 	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
-	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC)
+	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
 
 wasm-node: build/wasm-node/xiaoji.js   ## wasm engine for Node (reads host files directly)
 
-build/wasm-node/xiaoji.js: $(ENGINE_SRC) $(ENGINE_HDR) $(JIT_LIB)
+build/wasm-node/xiaoji.js: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm-node
-	$(EMENV) emcc -O3 -std=c11 -sNODERAWFS=1 -sENVIRONMENT=node -sALLOW_MEMORY_GROWTH \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -sNODERAWFS=1 -sENVIRONMENT=node -sALLOW_MEMORY_GROWTH \
 	    -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB -sEXIT_RUNTIME=1 \
-	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC)
+	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
 
 guest-tests:    ## freestanding test programs, built in the builder VM -> build/tests/guest
 	$(ORB) -m builder sh -c 'cd $(CURDIR) && mkdir -p build/tests/guest && \

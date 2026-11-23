@@ -538,3 +538,91 @@ boot SystemUI, because HWUI needs EGL anyway.
 - Input in the browser. The engine worker never yields, so it cannot receive `postMessage`. Input needs a
   SharedArrayBuffer ring (cross-origin isolation) polled by the engine, or periodic yielding. There is no input
   path in the repository yet.
+
+## G1: phase 0 and the first half of phase 1 (status, 2026-11-23)
+
+Status: **checkpoints 1 to 4 are done on the product tree (`build/rootfs-xiaoji`): SurfaceFlinger starts and is
+published, and `DisplayManagerService` completes its constructor (the plan's `nativeGetCompositionDataspaces` step).
+Checkpoint 5 is partial: `system_server` reaches `Starting phase 100`, then waits for `idmap2d`, which needs the
+service user model the engine lacks: every service runs as root (`docs/boot.md`, B5).** The Google image (`build/rootfs`) does not get as far, because it has no
+`vndservicemanager` binary, so its composer never registers.
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 1 | Product rebuilt with ranchu gralloc, rootfs refreshed, tests green | Done. Product build exit 0 on the builder (`~/xiaoji-aosp/xiaoji-build.log`). `build/rootfs-xiaoji` replaced. `make test` 184 passed (default tree, final run). |
+| 2 | goldfish_pipe and the renderControl handshake guest test | Done. `tests/guest/goldfish-pipe.c`, expectation `tests/expect/goldfish-pipe.out`. |
+| 3 | Generator and null GL backend | Done, with the validation below. The decoders come from the specs; the null backend answers the calls the boot needs. |
+| 4 | SurfaceFlinger running and registered | **Done** on the product tree: the `SurfaceFlinger` service is found by servicemanager (`Could not find` never appears), and HWC connects its display. No `service check SurfaceFlinger` smoke test was added; the boot check looks for the same facts in the log. |
+| 5 | Boot progress | `StartDisplayManager took to complete: 17ms` at 39.1 s (4.137 G, B5). **Partial**: `system_server` reaches phase 100 and stops at `idmap2d` (the engine runs services as root), and `System now ready` is not reached. |
+
+### What was built (where)
+
+- **Product** (`aosp/device/xiaoji/`, mirrored to the builder with `tools/remote-build.sh`):
+  - `xiaoji_arm64.mk`: `PRODUCT_PACKAGES += vndservicemanager`, and the inherit of `xiaoji_emulator64_vendor.mk`.
+  - `xiaoji_emulator64_vendor.mk` and `xiaoji_vendor.mk`: forks of `device/generic/goldfish/64bitonly/product/{emulator64_vendor,vendor}.mk`. The only change is the minigbm lines (`allocator@4.0-service.minigbm`, `mapper@4.0-impl.minigbm`), replaced by `allocator@3.0-service` and `mapper@3.0-impl-ranchu`, and a `DEVICE_MANIFEST_FILE` line for the fragment below.
+  - `manifest.graphics.xml`: the allocator@3.0 and mapper@3.0 HAL entries. Without it the VINTF check fails: `android.hardware.graphics.mapper` has no provider.
+- **Rootfs**: `build/rootfs-xiaoji` (fetched by `tools/fetch-remote-rootfs.sh`, which also regenerates its linker config). The previous tree was removed after the swap.
+- **Properties** (`engine/props.c`, `engine_props`): `ro.hardware.egl=emulation`, `ro.hardware.hwcomposer=ranchu`, `ro.hardware.gralloc=ranchu`, `ro.opengles.version=196608`, `debug.renderengine.backend=gles`. No `ro.boot.qemu.gltransport*` (the pipe is the default), and no `ro.hardware.vulkan`. `ro.hardware=xiaoji` is unchanged.
+- **Init** (`image/xiaoji.rc`): the `surfaceflinger`, `vendor.hwcomposer-2-4`, `vendor.gralloc-3-0`, `vndservicemanager` and `lmkd` blocks, from the image's own rc files (class and socket as the engine reads them; `task_profiles`, `onrestart`, `user`, `group` and `capabilities` are not modelled by `engine/init.c`, so they are left out).
+- **Fixes on the way** (B5): the binder send path chooses a nested call's target from the thread's received requests, as the driver does (`engine/binder.c`); the scalar floating-point three-same group, including `FABD` (`engine/simd.c`, test `tests/guest/fabd-scalar.c` (and `fp-scalar3.c` for the other scalar forms)); the two custom GL calls the spec marks `not_api` (`engine/gl_host.c`).
+- **Devices** (`engine/goldfish.c`, `engine/goldfish.h`; wired into `vfs.c`, `vfs.h`, `poll.c`, `sysfs.c` and `syscall.c`):
+  - `/dev/goldfish_pipe` (alias `/dev/qemu_pipe`): the services `opengles`, `GLProcessPipe` and `refcount`.
+  - `/dev/goldfish_address_space`: the HostMemoryAllocator subdevice. Blocks are ranges of one sparse memfd, mapped by `mmap(fd, offset)`. Without shared slots, CLAIM_SHARED and UNCLAIM_SHARED are not supported (ENOTTY).
+  - `/dev/goldfish_sync`: QUEUE_WORK returns a signalled eventfd, so the fence is readable at once. SIGNAL is a no-op.
+  - `XIAOJI_GF_TRACE=1` logs each pipe open, request, reply and device call (stderr). It is off by default.
+- **GL host** (`engine/gl_host.h`, `engine/gl_host.c`, `engine/gl_null.c`): `gl_host_decode` dispatches by opcode range to the generated decoders. `gl_null.c` is the null backend (below).
+- **Generator** (`tools/gen-glproto.py`, `tools/fetch-remote-protocols.sh`, Makefile target `build/gen/gen_report.txt`): reads the three specs and writes `build/gen/` (not checked in; see deviations). `make` runs the fetch when `build/spec` is missing.
+- **Tests**: `tests/guest/goldfish-pipe.c` (handshake, GLProcessPipe, refusal of an unknown service, EAGAIN with nothing pending), `tests/guest/goldfish-as.c` (the allocator's ping, allocate, two shared mappings, free, unknown ioctl, and the sync fence). Expectations: `tests/expect/goldfish-pipe.out`, `tests/expect/goldfish-as.out`. Both run as expectation cases (`PROP_CASES`), since the builder VM has no goldfish device to act as an oracle.
+- **Removed**: `engine/rc.c` and `engine/rc.h`, the hand-written handshake, replaced by the generated decoder.
+
+### Protocol facts checked against the sources
+
+- **Opcodes**: the generator's numbers for all 788 calls equal the guest's `renderControl_opcodes.h`, `gl2_opcodes.h` and `gl_opcodes.h` (base 10000, 2048 and 1024). `gl_ranges.h` gives the ranges the dispatcher uses.
+- **Request sizes**: 512 fixed request sizes equal the `sizeWithoutChecksum` constants of the guest encoders (`renderControl_enc.cpp`, `gl2_enc.cpp`, `gl_enc.cpp`). Zero mismatches. The check is `python3 -I tools/gen-glproto.py ... --check-guest`.
+- **Wire rules** (`gles2_dec.cpp`, `glGetShaderiv` and `glShaderSource`): a scalar takes its `.types` width in bytes (`GLboolean` is one byte, as `Unpack<GLboolean,uint8_t>` shows). An `in` or `inout` pointer is a `uint32` length and the bytes. An `out` pointer is a `uint32` length only. The reply is the out bytes in order, then the return value.
+- **Pipe** (`qemu_pipe_guest.cpp`, `HostConnection.cpp`): open `O_RDWR|O_NONBLOCK`, write `pipe:<service>\0`. The `opengles` stream starts with a zero `clientFlags` word.
+- **renderControl values** (`RenderControl.cpp`): renderer version 1; `rcGetFBParam` (width, height, 72 dpi, 60 fps, swap interval 1); string calls return the length with its NUL, or `-len` when the buffer is too small.
+- **EGL configs** (`FbConfig.cpp`): the 34 attributes, in the host's order. The config row is preceded by the attribute-id row.
+- **Address space** (`goldfish_address_space_android.impl`): PING with metadata = subdevice (the first ping); ALLOCATE_BLOCK (24 bytes, the size is rounded to pages); PING ALLOCATE_ID (metadata 1) and UNALLOCATE_ID (2); `mmap(fd, offset)`.
+- **Sync** (`system/egl/goldfish_sync.h`): `goldfish_sync_ioctl_info` is 24 bytes; the fence fd is at offset 16.
+
+### Deviations from `docs/graphics.md`
+
+1. **EGL_KHR_surfaceless_context is not advertised.** RenderEngine takes the surfaceless path with it and calls `eglMakeCurrent(no surface)`. The guest's `libEGL_emulation` (`egl.cpp:1896`) rejects that with `EGL_BAD_MATCH`, which aborts SurfaceFlinger. Without it, RenderEngine uses a stub pbuffer (`GLESRenderEngine.cpp:288-299`), which works. `EGL_ANDROID_native_fence_sync` is advertised.
+2. **GLES1 addon calls are not decoded.** `gles1.addon` (the `*Offset` and `*Data` calls) is numbered by a `gl.in` that is not in the tree: the guest's numbers for them differ from any order the tree gives. Those calls are listed as skipped (12 calls).
+3. **DMA calls are not decoded.** `rcUpdateColorBufferDMA` and `rcReadColorBufferDMA` (`var_flag ... DMA`) carry a 64-bit guest address in place of the data. The DMA transport is not advertised, so the guest does not send them. The generator skips them, and the size check excludes them.
+4. **Calls decoded and skipped** (`build/gen/gen_report.txt`): 630 decoded, of which 524 are plain and 106 are `flag custom_decoder` (their wire is generic, and the backend supplies the call; the null backend answers some of them, the names, the shader and program queries and `glGetIntegerv`, and the rest by default). 170 skipped: 90 `flag unsupported`, 66 `not_api` (both never sent by the guest), 12 GLES1 addon calls (deviation 2) and 2 DMA calls (deviation 3). No pointer return values and no pointers to pointers occur among them.
+5. **The specs are not copied into the repo, and the generated code is not checked in.** `vulkan-cereal`'s `METADATA` says `license_type: BY_EXCEPTION_ONLY` (special licensing), and its `.in`, `.attrib` and `.types` files carry no license header. The plan asked for Apache-2.0 copies with headers, which I could not confirm. `tools/fetch-remote-protocols.sh` reads them from the builder into `build/spec/`, and `make` generates `build/gen/`. **This needs a decision.** The repo has no NOTICE file, so none was updated.
+6. **Product mechanics differ from the plan.** `PRODUCT_PACKAGES_REMOVE` does not exist in this tree, and a `filter-out` at the top of `xiaoji_arm64.mk` does nothing: `inherit-product` expands lazily (`build/make/core/node_fns.mk`, `@inherit:` tags). The two goldfish makefiles are therefore forked. The device manifest fragment was needed for the VINTF check.
+7. **`vndservicemanager` was added** (not in the plan). The composer and the other vendor HALs look services up on `/dev/vndbinder`, and the product does not inherit `base_vendor.mk`, which lists it (`build/make/target/product/base_vendor.mk:76`). Without it the composer blocks in `getContextObject`.
+8. **Display**: 720x1280 at 72 dpi, 60 fps, the B4f NoOp composer's size. One EGL config: RGBA8888, depth 24, stencil 8, window and pbuffer surfaces, ES2 and ES3.
+9. **GLES state**: `glGetIntegerv` answers the ES 3.0 limits the compositor reads, from a table, written only where the guest's buffer has room. `glGenTextures` and the other `glGen*` calls return new names. `glCreateShader` and `glCreateProgram` return names. Compile and link report success with no info log. `glShaderString` (the spec's `not_api`, decoded by hand as the host does) is accepted and dropped. Every other GLES call is the generated no-op default and logs once (`xiaoji: gl: <call> answered by the default`).
+10. **Advertised extensions** (`GL_EXTENSIONS`): `GL_OES_EGL_image_external_essl3` and the three `ANDROID_EMU_` flags of the design (`gles_max_version_3_0`, `native_sync_v2`, `gles_no_host_error`). Nothing else.
+
+### Null backend: the defaults, and what gets an answer
+
+Answered by `engine/gl_null.c`: `rcGetRendererVersion`, `rcGetFBParam`, `rcGetEGLVersion`, `rcQueryEGLString`, `rcGetGLString`, `rcGetNumConfigs`, `rcGetConfigs`, `rcChooseConfig`, `rcCreateContext`, `rcDestroyContext`, `rcCreateWindowSurface`, `rcDestroyWindowSurface`, `rcMakeCurrent`, `rcCreateColorBuffer`, `rcCreateColorBufferDMA`, `rcCloseColorBuffer`, `rcUpdateColorBuffer`, `rcReadColorBuffer`, `rcCreateClientImage`, `rcFBPost` (counted; the first three frames are logged), `rcCreateSyncKHR`, `rcIsSyncSignaled`, `rcClientWaitSyncKHR`, `rcDestroySyncKHR`, and the GLES state and name calls above. Colour buffers keep their pixels (RGBA8888, unsigned byte; other formats are refused), so `rcUpdateColorBuffer` and `rcReadColorBuffer` copy rows, as the plan asked. Every pointer write is bounded by the wire length.
+
+Still answered by the default in the long product boot (`build/tests/boot/long2.err`, listed once each): `glAttachShader`, `glBindAttribLocation`, `glBindTexture`, `glCompileShader`, `glEnableVertexAttribArray`, `glGetError`, `glGetUniformLocation`, `glLinkProgram`, `glPixelStorei`, `glTexImage2D`, `glUniformMatrix4fv`, `glUseProgram`, `rcCreateDisplayById`, `rcOpenColorBuffer2`, `rcSetDisplayPoseDpi`, `rcSetPuid`, `rcSetWindowColorBuffer`. No frame is posted in these runs.
+
+### Tests (final, on the sources of this step)
+
+- `make test` (default tree, `build/rootfs`): 188 passed, 0 failed.
+- `XIAOJI_BOOT=1 make test`: 189 passed, 0 failed. The boot check requires the allocator's registration, SurfaceFlinger's main thread, RenderEngine's GLES start and no `is not decoded` line. On the product tree it also requires `StartDisplayManager took to complete` and no `Since 'SurfaceFlinger' could not be found` line (B5).
+- `XIAOJI_JIT=0 make test`: 188 passed, 0 failed.
+- `make test-web`: 7 checks passed.
+- Product tree, `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh`: 155 passed, 0 failed. The builder-VM oracle cases are skipped (they compare with the Google image's files), and `binder-driver` is skipped (its binary is only in the Google image).
+- New cases in this step: `goldfish-pipe` and `goldfish-as` (expectations, engine and Node), and `fabd-scalar` and `fp-scalar3` (native oracle, engine and Node).
+- Warnings: `clang -std=c11 -Wall -Wextra` and `emcc` (one file at a time) report 0 for the changed engine files and the four generated files. The guest tests are clean under `gcc -Wall -Wextra`.
+- Runs go through `rtk proxy`: the default output filter truncated some make logs.
+
+### Open
+
+- The composer's hotplug callback and SurfaceFlinger (B5). This is the blocker for checkpoint 4.
+- **The rest of the plan's step 5**: the 3.2 subset is answered, but colour buffers store RGBA8888 only, and the rest of the GLES draw path is the no-op default.
+- **The service user model** (B5): `idmap2d`, `system_server` and `lmkd` run as root. `System now ready` needs init and the credential checks to model the stock users. `lmkd` exits (no PSI), but ActivityManager retries it and continues.
+- **The binder fix has no guest test** with the kernel as oracle (the plan asked for one; B5 explains what it needs).
+- **The specs' licensing** (deviation 5), and the NOTICE file.
+- **The Google image** (`build/rootfs`): it has no `vndservicemanager`, so its composer 2.4 does not register and SurfaceFlinger does not connect its display. The product tree does this part.

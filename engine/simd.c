@@ -739,12 +739,14 @@ static double fp_maxmin(double x, double y, int is_min, int nm)
  * "Advanced SIMD three same"). Pairwise forms (FADDP, FMAXP, ...) take adjacent pairs of the
  * concatenation Vn:Vm. Compares write all-ones or zero per lane. NaNs: FMAX and FMIN return the
  * first NaN operand; FMAXNM and FMINNM return the other operand when one is a NaN. */
-static int fp_three_same(cpu_t *c, uint32_t insn)
+/* The vector form (scalar == 0) and the scalar form (scalar == 1: lane 0 only, the rest of Vd zeroed, no pairs). */
+static int fp_three_same_impl(cpu_t *c, uint32_t insn, int scalar)
 {
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, a = (insn >> 23) & 1, sz = (insn >> 22) & 1;
     unsigned rm = (insn >> 16) & 31, opc = (insn >> 11) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
-    unsigned dsz = q ? 16 : 8, esz = sz ? 8 : 4, lanes = dsz / esz;
-    if ((sz && !q) || !fp_default(c))
+    unsigned esz = sz ? 8 : 4;
+    unsigned dsz = scalar ? esz : (q ? 16 : 8), lanes = dsz / esz;
+    if ((!scalar && sz && !q) || !fp_default(c))
         return -1;
     enum { OP_NONE, OP_MAXNM, OP_MINNM, OP_MLA, OP_MLS, OP_ADD, OP_SUB, OP_ABD, OP_MULX, OP_MUL,
            OP_CEQ, OP_CGE, OP_CGT, OP_ACGE, OP_ACGT, OP_MAX, OP_MIN, OP_RECPS, OP_RSQRTS, OP_DIV };
@@ -765,6 +767,8 @@ static int fp_three_same(cpu_t *c, uint32_t insn)
     if (opc == 0x1A && u && !a) { op = OP_ADD; pair = 1; }
     if (opc == 0x18 && u) pair = 1;
     if (opc == 0x1E && u) pair = 1;
+    if (scalar && pair)
+        return -1; /* the pairwise forms are vector-only */
     uint8_t n[16], m[16], d[16], r[16];
     rd_v(c, rn, n);
     rd_v(c, rm, m);
@@ -830,8 +834,13 @@ static int fp_three_same(cpu_t *c, uint32_t insn)
         }
         el_wr(r, i * esz, esz, res);
     }
-    wr_v(c, rd, r, dsz);
+    wr_v(c, rd, r, scalar ? 16 : dsz); /* a scalar result zeroes the rest of the register */
     return 0;
+}
+
+static int fp_three_same(cpu_t *c, uint32_t insn)
+{
+    return fp_three_same_impl(c, insn, 0);
 }
 
 static int three_same(cpu_t *c, uint32_t insn)
@@ -1735,8 +1744,28 @@ static int scalar_addp(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* The opcodes the architecture allocates in the scalar floating-point three-same group (U and a select the
+ * operation): FMULX (U 0, opc 11011), FCMEQ (U 0, 11100), FCMGE (U 1, a 0, 11100), FCMGT (U 1, a 1, 11100),
+ * FACGE (U 1, a 0, 11101), FACGT (U 1, a 1, 11101), FRECPS (U 0, a 0, 11111), FRSQRTS (U 0, a 1, 11111), and
+ * FABD (U 1, a 1, 11010). Anything else in 0x18..0x1F is not an instruction here. */
+static int scalar_fp3_allocated(uint32_t insn)
+{
+    unsigned u = (insn >> 29) & 1, a = (insn >> 23) & 1, opc = (insn >> 11) & 0x1F;
+    switch (opc) {
+    case 0x1A: return u && a;   /* FABD */
+    case 0x1B: return !u;       /* FMULX */
+    case 0x1C: return 1;        /* FCMEQ, FCMGE, FCMGT */
+    case 0x1D: return u;        /* FACGE, FACGT */
+    case 0x1F: return !u;       /* FRECPS, FRSQRTS */
+    default: return 0;
+    }
+}
+
 static int scalar_simd(cpu_t *c, uint32_t insn)
 {
+    /* Scalar floating-point three same (bit 21 and bit 10 set; the allocated opcodes, scalar_fp3_allocated). */
+    if (((insn >> 21) & 1) && ((insn >> 10) & 1) && scalar_fp3_allocated(insn))
+        return fp_three_same_impl(c, insn, 1);
     /* DUP (element), scalar: 01 0 11110000 imm5 0000 1 Rn Rd. The element goes to the low bits
      * of Vd and the rest of the register is zeroed. */
     if (((insn >> 21) & 0xFF) == 0xF0 && ((insn >> 10) & 0x1F) == 0x01) {

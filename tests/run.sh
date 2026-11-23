@@ -11,6 +11,11 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+# The guest root for the expectation cases and the boot check. XIAOJI_ROOT selects another tree (for example
+# build/rootfs-xiaoji); the cases that compare with the builder-VM oracle use build/rootfs and are skipped then.
+RFS=${XIAOJI_ROOT:-build/rootfs}
+OWN_TREE=0
+[ -n "${XIAOJI_ROOT:-}" ] && OWN_TREE=1
 
 ORB=/Applications/OrbStack.app/Contents/MacOS/bin/orb
 ENGINE=build/xiaoji
@@ -187,7 +192,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # prop-* programs need the engine's property service, which the native run lacks:
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
-    case "$name" in prop-*|initsock-*|futex-hang-*) continue ;; esac
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -212,9 +217,9 @@ check_rootfs() {
     local expect_rc
     expect_rc=$(cat "$expect_rc_file")
     if [ "$runner" = engine ]; then
-        "$ENGINE" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        node "$NODE_JS" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect_out" && [ "$rc" = "$expect_rc" ]; then
@@ -240,7 +245,9 @@ check_rootfs() {
 }
 
 rootfs_cases=0
-if [ -d build/rootfs/system/bin ]; then
+if [ "$OWN_TREE" = 1 ]; then
+    echo "note: XIAOJI_ROOT is set, skipping the builder-VM oracle cases (they are for build/rootfs)"
+elif [ -d build/rootfs/system/bin ]; then
     O_ORACLE=build/oracle
     for name in $ROOTFS_CASES; do
         rootfs_argv "$name"
@@ -262,7 +269,7 @@ fi
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -271,6 +278,8 @@ prop_argv() {
     prop-list) ARGV=(/system/bin/sh -c 'n=$(/system/bin/getprop | /system/bin/toybox grep -c "^\["); names=$(/system/bin/getprop | /system/bin/toybox sed "s/^\[\([^]]*\)\].*/\1/"); sorted=$(printf "%s\n" "$names" | /system/bin/toybox sort); if [ "$n" -gt 100 ] && [ "$names" = "$sorted" ]; then echo above 100 and sorted; fi') ;;
     prop-wait) ARGV=(/data/local/tmp/prop-wait) ;;
     evt) ARGV=(/data/local/tmp/evt) ;;
+    goldfish-pipe) ARGV=(/data/local/tmp/goldfish-pipe) ;;
+    goldfish-as) ARGV=(/data/local/tmp/goldfish-as) ;;
     binder-sm) ARGV=(/system/bin/sh -c "/system/bin/servicemanager & $SM_WAIT; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0") ;;
     esac
 }
@@ -287,9 +296,9 @@ check_expect() {
         return 1
     fi
     if [ "$runner" = engine ]; then
-        "$ENGINE" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        node "$NODE_JS" --root build/rootfs "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect" && [ "$rc" = 0 ]; then
@@ -306,13 +315,23 @@ check_expect() {
 if [ -d build/rootfs/system/bin ]; then
     # The futex program (tests/guest/prop-wait.c) runs from the guest: copy it in.
     if [ -f build/tests/guest/prop-wait-O0 ]; then
-        mkdir -p build/rootfs/data/local/tmp
-        cp build/tests/guest/prop-wait-O0 build/rootfs/data/local/tmp/prop-wait
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/prop-wait-O0 "$RFS"/data/local/tmp/prop-wait
     fi
     # Event objects (B3): eventfd, timerfd, epoll and ppoll (tests/guest/evt.c).
     if [ -f build/tests/guest/evt-O0 ]; then
-        mkdir -p build/rootfs/data/local/tmp
-        cp build/tests/guest/evt-O0 build/rootfs/data/local/tmp/evt
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/evt-O0 "$RFS"/data/local/tmp/evt
+    fi
+    # The goldfish pipe (G1): /dev/goldfish_pipe and the renderControl handshake (tests/guest/goldfish-pipe.c).
+    if [ -f build/tests/guest/goldfish-pipe-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/goldfish-pipe-O0 "$RFS"/data/local/tmp/goldfish-pipe
+    fi
+    # The address space and the sync device (G1): tests/guest/goldfish-as.c.
+    if [ -f build/tests/guest/goldfish-as-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/goldfish-as-O0 "$RFS"/data/local/tmp/goldfish-as
     fi
     for name in $PROP_CASES; do
         prop_argv "$name"
@@ -327,12 +346,15 @@ fi
 # the context manager (SM_WAIT above). The engine and Node must both report 17 passed.
 BINDER_TEST=/data/nativetest64/binderDriverInterfaceTest/binderDriverInterfaceTest
 BINDER_SH="/system/bin/servicemanager & $SM_WAIT; $BINDER_TEST --gtest_brief=1; rc=\$?; kill \$!; wait; exit \$rc"
-if [ -f "build/rootfs$BINDER_TEST" ]; then
+if [ ! -f "$RFS$BINDER_TEST" ]; then
+    # The AOSP binder conformance binary is in the builder-VM image (build/rootfs), not in device/xiaoji's product.
+    echo "note: $RFS has no $BINDER_TEST, skipping the binder-driver cases"
+else
     for runner in engine node; do
         if [ "$runner" = engine ]; then
-            "$ENGINE" --root build/rootfs -- /system/bin/sh -c "$BINDER_SH" >"$OUT/binder.$runner.out" 2>&1
+            "$ENGINE" --root "$RFS" -- /system/bin/sh -c "$BINDER_SH" >"$OUT/binder.$runner.out" 2>&1
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --root build/rootfs -- /system/bin/sh -c "$BINDER_SH" >"$OUT/binder.$runner.out" 2>&1
+            node "$NODE_JS" --root "$RFS" -- /system/bin/sh -c "$BINDER_SH" >"$OUT/binder.$runner.out" 2>&1
         else
             continue
         fi
@@ -349,7 +371,7 @@ fi
 # Init (B4a): the built-in init (--init) starts servicemanager and a oneshot that lists the
 # services, then stops init through the xiaoji.exit property. Stdout must equal
 # tests/expect/init-smoke.out and the exit code must be 0. Engine and Node.
-INIT_SMOKE="--init tests/init/smoke.rc --root build/rootfs --init-timeout 60 --init-stdio host"
+INIT_SMOKE="--init tests/init/smoke.rc --root "$RFS" --init-timeout 60 --init-stdio host"
 if [ -d build/rootfs/system/bin ]; then
     for runner in engine node; do
         if [ "$runner" = engine ]; then
@@ -377,9 +399,9 @@ fi
 if [ -d build/rootfs/system/bin ]; then
     for runner in engine node; do
         if [ "$runner" = engine ]; then
-            "$ENGINE" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 --init-stdio host >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
+            "$ENGINE" --init tests/init/classpath.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --init tests/init/classpath.rc --root build/rootfs --init-timeout 60 --init-stdio host >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
+            node "$NODE_JS" --init tests/init/classpath.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-classpath.$runner.out" 2>"$OUT/init-classpath.$runner.err"
         else
             continue
         fi
@@ -399,25 +421,25 @@ fi
 # /dev/null, so the probe writes its report to a file. The report (fdnames, tests/guest/fdnames.c)
 # must equal tests/expect/init-stdio.out. Engine and Node.
 if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/fdnames-O0 ]; then
-    mkdir -p build/rootfs/data/local/tmp
-    cp build/tests/guest/fdnames-O0 build/rootfs/data/local/tmp/fdnames
+    mkdir -p "$RFS/data/local/tmp"
+    cp build/tests/guest/fdnames-O0 "$RFS"/data/local/tmp/fdnames
     for runner in engine node; do
-        rm -f build/rootfs/data/local/tmp/fdnames-init.txt
+        rm -f "$RFS"/data/local/tmp/fdnames-init.txt
         if [ "$runner" = engine ]; then
-            "$ENGINE" --init tests/init/stdio.rc --root build/rootfs --init-timeout 60 >"$OUT/init-stdio.$runner.out" 2>"$OUT/init-stdio.$runner.err"
+            "$ENGINE" --init tests/init/stdio.rc --root "$RFS" --init-timeout 60 >"$OUT/init-stdio.$runner.out" 2>"$OUT/init-stdio.$runner.err"
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --init tests/init/stdio.rc --root build/rootfs --init-timeout 60 >"$OUT/init-stdio.$runner.out" 2>"$OUT/init-stdio.$runner.err"
+            node "$NODE_JS" --init tests/init/stdio.rc --root "$RFS" --init-timeout 60 >"$OUT/init-stdio.$runner.out" 2>"$OUT/init-stdio.$runner.err"
         else
             continue
         fi
         rc=$?
         if [ "$rc" = 0 ] && [ ! -s "$OUT/init-stdio.$runner.out" ] &&
-            cmp -s build/rootfs/data/local/tmp/fdnames-init.txt tests/expect/init-stdio.out; then
+            cmp -s "$RFS"/data/local/tmp/fdnames-init.txt tests/expect/init-stdio.out; then
             echo "PASS  init-stdio $runner"
             pass=$((pass + 1))
         else
             echo "FAIL  init-stdio $runner (exit $rc)"
-            diff tests/expect/init-stdio.out build/rootfs/data/local/tmp/fdnames-init.txt | head -n 6 | sed 's/^/        /'
+            diff tests/expect/init-stdio.out "$RFS"/data/local/tmp/fdnames-init.txt | head -n 6 | sed 's/^/        /'
             fail=$((fail + 1))
         fi
     done
@@ -426,8 +448,8 @@ fi
 # Init cases (B4a): each config runs under --init and must print tests/expect/<name>.out, exit 0.
 # initsock is the program the socket case runs (tests/guest/initsock.c), copied into the guest.
 if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/initsock-O0 ]; then
-    mkdir -p build/rootfs/data/local/tmp
-    cp build/tests/guest/initsock-O0 build/rootfs/data/local/tmp/initsock
+    mkdir -p "$RFS/data/local/tmp"
+    cp build/tests/guest/initsock-O0 "$RFS"/data/local/tmp/initsock
 fi
 for case_name in init-sockets init-ctl init-interface; do
     case "$case_name" in
@@ -437,9 +459,9 @@ for case_name in init-sockets init-ctl init-interface; do
     esac
     for runner in engine node; do
         if [ "$runner" = engine ]; then
-            "$ENGINE" --init "$init_rc" --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
+            "$ENGINE" --init "$init_rc" --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --init "$init_rc" --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
+            node "$NODE_JS" --init "$init_rc" --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/$case_name.$runner.out" 2>"$OUT/$case_name.$runner.err"
         else
             continue
         fi
@@ -460,14 +482,14 @@ done
 # real hang (tests/guest/futex-hang.c, no deadline anywhere) must be reported on stderr; the run ends at
 # --init-timeout, so its exit status is not checked. Engine and Node.
 if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/futex-hang-O0 ]; then
-    mkdir -p build/rootfs/data/local/tmp
-    cp build/tests/guest/futex-hang-O0 build/rootfs/data/local/tmp/futex-hang
+    mkdir -p "$RFS/data/local/tmp"
+    cp build/tests/guest/futex-hang-O0 "$RFS"/data/local/tmp/futex-hang
 fi
 for runner in engine node; do
     if [ "$runner" = engine ]; then
-        "$ENGINE" --init tests/init/idle-sleep.rc --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
+        "$ENGINE" --init tests/init/idle-sleep.rc --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
     elif [ -f "$NODE_JS" ]; then
-        node "$NODE_JS" --init tests/init/idle-sleep.rc --root build/rootfs --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
+        node "$NODE_JS" --init tests/init/idle-sleep.rc --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
     else
         continue
     fi
@@ -482,9 +504,9 @@ for runner in engine node; do
         fail=$((fail + 1))
     fi
     if [ "$runner" = engine ]; then
-        "$ENGINE" --init tests/init/idle-hang.rc --root build/rootfs --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
+        "$ENGINE" --init tests/init/idle-hang.rc --root "$RFS" --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
     elif [ -f "$NODE_JS" ]; then
-        node "$NODE_JS" --init tests/init/idle-hang.rc --root build/rootfs --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
+        node "$NODE_JS" --init tests/init/idle-hang.rc --root "$RFS" --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
     else
         continue
     fi
@@ -507,19 +529,32 @@ done
 # lookup now succeeds, so the boot goes on to DisplayManagerService; it is reached in every cycle
 # of every B4f boot, and the thermal NullPointerException is gone). About 34 s natively. Not in the
 # default run, which is kept short; the boot is stopped by --init-timeout.
-if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d build/rootfs/system/bin ]; then
-    XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root build/rootfs --init-timeout 90 \
+# On a tree with a vendor servicemanager (the product), SurfaceFlinger's service must be found and
+# StartDisplayManager must complete: the smoke test of checkpoint 4, read from the log (no separate init run).
+# G1 adds three graphics lines that both trees produce (the allocator's registration, SurfaceFlinger's main
+# thread, and RenderEngine on the GLES backend), and no GL request may go undecoded. The product tree also
+# reaches SurfaceFlinger's service and the end of StartDisplayManager; that is not required here, because the
+# builder image (build/rootfs) has no vndservicemanager and so no composer (docs/boot.md, B5).
+if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
+    XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 90 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
         grep -q 'Entered the Android system server!' "$OUT/boot.err" &&
         grep -q 'SystemServerTiming([0-9]*): StartPowerManager' "$OUT/boot.err" &&
         grep -q 'SystemServerTiming([0-9]*): InitPowerManagement' "$OUT/boot.err" &&
-        grep -q 'SystemServerTiming([0-9]*): StartDisplayManager' "$OUT/boot.err"; then
-        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement and StartDisplayManager (XIAOJI_BOOT, B4f)"
+        grep -q 'SystemServerTiming([0-9]*): StartDisplayManager' "$OUT/boot.err" &&
+        grep -q 'Registered android.hardware.graphics.allocator@3.0::IAllocator' "$OUT/boot.err" &&
+        grep -q "SurfaceFlinger's main thread ready to run" "$OUT/boot.err" &&
+        grep -q 'RenderEngine with GLES Backend' "$OUT/boot.err" &&
+        ! grep -q 'is not decoded' "$OUT/boot.err" &&
+        { [ ! -f "$RFS/vendor/bin/vndservicemanager" ] ||
+          { grep -q 'StartDisplayManager took to complete' "$OUT/boot.err" &&
+            ! grep -q "Since 'SurfaceFlinger' could not be found" "$OUT/boot.err"; }; }; then
+        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1)"
         pass=$((pass + 1))
     else
-        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement or StartDisplayManager line is missing in $OUT/boot.err"
+        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded') in $OUT/boot.err"
         fail=$((fail + 1))
     fi
 fi
@@ -534,10 +569,10 @@ BL_TEST=/data/nativetest64/binderLibTest/binderLibTest
 if [ -f "build/rootfs$BL_TEST" ] && [ "${XIAOJI_BINDERLIB:-0}" != 1 ]; then
     echo "note  binderLibTest report skipped (set XIAOJI_BINDERLIB=1; it is slow, docs/boot.md B3)"
 elif [ -f "build/rootfs$BL_TEST" ]; then
-    mkdir -p build/rootfs/data/local/tmp
-    cp tests/binderlib.sh build/rootfs/data/local/tmp/binderlib.sh
+    mkdir -p "$RFS/data/local/tmp"
+    cp tests/binderlib.sh "$RFS"/data/local/tmp/binderlib.sh
     BL_SH="/system/bin/servicemanager & $SM_WAIT; LIMIT=20 /system/bin/sh /data/local/tmp/binderlib.sh; kill \$!; wait \$!; exit 0"
-    "$ENGINE" --root build/rootfs -- /system/bin/sh -c "$BL_SH" >"$OUT/binderlib.txt" 2>&1
+    "$ENGINE" --root "$RFS" -- /system/bin/sh -c "$BL_SH" >"$OUT/binderlib.txt" 2>&1
     awk '/ rc=[0-9]+ /{
             t++
             if ($0 ~ / rc=0 \[  PASSED/) p++

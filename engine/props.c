@@ -390,6 +390,15 @@ static const char *const engine_props[][2] = {
      * installs no APEX updates. With this, ApexManager uses ApexManagerFlattenedApex, which does not
      * wait for apexservice (vendor/build.prop says true, and an override is needed to win). */
     {"ro.apex.updatable", "false"},
+    /* Graphics (docs/graphics.md, A2): the engine plays the emulator host. EGL is the goldfish
+     * libEGL_emulation (encoders over /dev/goldfish_pipe "pipe:opengles"); the composer is
+     * hwcomposer.ranchu (HostComposer); gralloc is the ranchu allocator/mapper (goldfish_address_space).
+     * No ro.boot.qemu.gltransport*: the guest uses the pipe transport. No Vulkan (ro.hardware.vulkan unset). */
+    {"ro.hardware.egl", "emulation"},
+    {"ro.hardware.hwcomposer", "ranchu"},
+    {"ro.hardware.gralloc", "ranchu"},
+    {"ro.opengles.version", "196608"},
+    {"debug.renderengine.backend", "gles"},
 };
 
 int props_init(const char *const *overrides, int noverrides)

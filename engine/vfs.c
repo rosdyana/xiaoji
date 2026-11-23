@@ -17,6 +17,7 @@
 #include "linux.h"
 #include "mntns.h"
 #include "binder.h"
+#include "goldfish.h"
 #include "fdobj.h"
 #include "pipe.h"
 #include "poll.h"
@@ -141,6 +142,7 @@ static vfs_syn syn_of(const char *p)
     if (!strcmp(p, "/proc/self/cmdline")) return SYN_DATA;
     if (procfs_known(p)) return SYN_DATA; /* generated at open, see vfs_open */
     if (binder_device(p) >= 0) return SYN_BINDER;
+    if (goldfish_device(p)) return SYN_GOLDFISH;
     switch (selinuxfs_kind(p)) {
     case SELFS_FILE: return SYN_DATA;
     case SELFS_DIR: return SYN_DIR;
@@ -460,6 +462,8 @@ static void desc_unref(vfs_fd *f)
         sock_unref(f->sock);
     if (f->kind == VFS_BINDER)
         binder_release(f->binder); /* the last description of a proc: its death */
+    if (f->kind == VFS_GOLDFISH)
+        goldfish_free(f->obj);
     if (f->kind == VFS_EVENTFD)
         efd_free(f->obj);
     if (f->kind == VFS_TIMERFD)
@@ -628,6 +632,10 @@ int vfs_pipe_block(int fd)
     }
     if (f->kind == VFS_EVENTFD) {
         sched_block_restart((uint64_t)(uintptr_t)f->obj);
+        return 1;
+    }
+    if (f->kind == VFS_GOLDFISH) {
+        sched_block_restart(goldfish_key(f->obj));
         return 1;
     }
     if (f->kind == VFS_TIMERFD) {
@@ -841,6 +849,21 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
+    if (r.syn == SYN_GOLDFISH) {
+        /* /dev/goldfish_pipe: a new pipe (goldfish.c). The name is written by the guest. */
+        if (lflags & LO_DIRECTORY)
+            return -LE_NOTDIR;
+        void *g = goldfish_open(goldfish_device(r.guest));
+        if (!g)
+            return -LE_NOMEM;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_GOLDFISH;
+        f->obj = g;
+        f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
+        f->guest = xstrdup(r.guest);
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     if (r.syn == SYN_SELFS_STATUS) {
         /* The selinux status page: a shared, read-only memfd (as the property area). */
         memfd_t *m = selinuxfs_status_memfd();
@@ -1012,6 +1035,7 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     case VFS_SOCK: return sock_read(f->sock, buf, n);
     case VFS_BINDER: return -LE_INVAL; /* binder fds have no read: work comes through BINDER_WRITE_READ */
     case VFS_EVENTFD: return efd_read(f->obj, buf, n);
+    case VFS_GOLDFISH: return goldfish_read(f->obj, buf, n);
     case VFS_TIMERFD: return tfd_read(f->obj, buf, n);
     case VFS_EPOLL: return -LE_INVAL;
     default: break;
@@ -1034,6 +1058,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_PIPE:
     case VFS_SOCK: return -LE_SPIPE;
     case VFS_BINDER: return -LE_INVAL;
+    case VFS_GOLDFISH:
     case VFS_EVENTFD:
     case VFS_TIMERFD:
     case VFS_EPOLL: return -LE_SPIPE;
@@ -1079,6 +1104,7 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     case VFS_SOCK: return sock_write(f->sock, buf, n);
     case VFS_BINDER: return -LE_INVAL;
     case VFS_EVENTFD: return efd_write(f->obj, buf, n);
+    case VFS_GOLDFISH: return goldfish_write(f->obj, buf, n);
     case VFS_TIMERFD: return -LE_INVAL;
     case VFS_EPOLL: return -LE_INVAL;
     case VFS_MEMFD: {
@@ -1114,6 +1140,7 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
     case VFS_BINDER:
     case VFS_EVENTFD:
     case VFS_TIMERFD:
+    case VFS_GOLDFISH:
     case VFS_EPOLL:
         return -LE_SPIPE;
     case VFS_DIR:

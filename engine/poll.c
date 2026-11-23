@@ -6,6 +6,7 @@
 
 #include "binder.h"
 #include "fdobj.h"
+#include "goldfish.h"
 #include "linux.h"
 #include "mem.h"
 #include "pipe.h"
@@ -79,6 +80,11 @@ uint32_t poll_revents(vfs_fd *f, uint32_t events)
             r |= PX_IN;
         if (efd_writable(f->obj))
             r |= PX_OUT;
+        break;
+    case VFS_GOLDFISH:
+        if (goldfish_readable(f->obj))
+            r |= PX_IN;
+        r |= PX_OUT;
         break;
     case VFS_TIMERFD:
         if (tfd_readable(f->obj))
