@@ -551,9 +551,11 @@ static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
     region_t *r = &cur_mm->regs[i];
     int hfd = r->lazy->hfd;
     uint64_t rstart = r->start, roff = r->off;
-    uint64_t wa = va & ~((uint64_t)lazy_window - 1), we = wa + lazy_window;
-    if (wa < rstart)
-        wa = rstart;
+    /* The window is aligned in the file, not in the guest: a window then never crosses a
+     * boundary of the file's chunks, and two mappings of one file fill the same windows. */
+    uint64_t back = (roff + (va - rstart)) & ((uint64_t)lazy_window - 1);
+    uint64_t wa = (va - rstart > back) ? va - back : rstart;
+    uint64_t we = va + ((uint64_t)lazy_window - back);
     if (we > r->end)
         we = r->end;
     size_t want_len = (size_t)(we - wa);

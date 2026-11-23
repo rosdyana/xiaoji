@@ -43,8 +43,8 @@ uint64_t mem_cur_pc(void);
 /* Mapping. Addresses and lengths must be page aligned. Pages that are already
  * mapped keep their contents and get the new protection. Return 0 or -1. */
 int mem_map(uint64_t va, uint64_t len, unsigned prot);
-/* As mem_map, and records the range as backed by host file path from offset
- * off (path NULL means anonymous). The path is copied. */
+/* As mem_map, and records path (copied; NULL means anonymous) and offset off for display
+ * only: the pages are zero, not read from the file. File mappings use mem_map_lazy. */
 int mem_map_ex(uint64_t va, uint64_t len, unsigned prot, const char *path, uint64_t off);
 /* A host file that lazily backs mappings. Each lazy mapping holds a reference; the host
  * fd is closed when the last one goes. */
@@ -87,8 +87,8 @@ uint64_t mem_find_free(uint64_t len, uint64_t hint);
 /* Moves mapped pages (host pages and region records) from one free range to
  * another without copying. The source range becomes unmapped. Returns 0 or -1. */
 int mem_move(uint64_t from, uint64_t to, uint64_t len);
-/* Releases the host backing of mapped pages in the range; they read as zero
- * (or are refilled by the caller for file-backed pages). */
+/* Releases the host backing of mapped pages in the range. They read as zero, or, in a
+ * lazy file mapping (mem_map_lazy), are read from the file again on the next access. */
 void mem_drop(uint64_t va, uint64_t len);
 /* Protection bits (MEM_PROT_*) of the page at va, or 0 if it is unmapped. */
 unsigned mem_prot_at(uint64_t va);
