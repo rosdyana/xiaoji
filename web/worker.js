@@ -247,6 +247,14 @@ async function runBoot(base, opts) {
     }
   };
 
+  // The download progress for the boot screen (web/bootscreen.js): throttled, and always sent at the end.
+  const dlTick = { last: 0 };
+  const postDownload = (p, force) => {
+    const t = now();
+    if (!force && t - dlTick.last < 100) return;
+    dlTick.last = t;
+    post({ type: 'download', loaded: p.loaded, total: p.total, fromCache: p.fromCache, cacheable: p.cacheable });
+  };
   if (packMode) {
     store = new ChunkStore(base + 'xj/', manifest.chunk_size, (url, n) => {
       // The page's fetch counters count the packs too (one request per pack, the bytes of its body).
@@ -254,7 +262,7 @@ async function runBoot(base, opts) {
       fetched.bytes += n;
       fetched.perUrl.set(url, n);
       onFetch();
-    });
+    }, (p) => postDownload(p, false));
     // The packs load while the engine module is imported and instantiated; the tree waits for them.
     // ?nopack (a test of the fallback only): no packs, so every read is a synchronous chunk fetch.
     packsLoading = opts.noPacks ? Promise.resolve() : store.loadPacks(manifest.packs);

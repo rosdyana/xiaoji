@@ -2,51 +2,152 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>xiaoji: ART in a Web Worker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XiaoJi: Android in the browser</title>
 <style>
-  body { font: 14px/1.4 system-ui, sans-serif; margin: 2em; max-width: 60em; }
-  pre { background: #f4f4f4; padding: 0.75em; min-height: 2em; white-space: pre-wrap; }
+  :root {
+    --bg1: #0b0f14; --bg2: #121a24; --ink: #e8eef5; --dim: #7d8b9b; --acc: #3ddc84;
+    --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    min-height: 100%; font: 14px/1.4 var(--sans); color: var(--ink);
+    background: radial-gradient(120% 80% at 50% 35%, var(--bg2), var(--bg1) 75%);
+  }
+
+  /* The boot screen: a phone frame, centred. On a narrow viewport it fills the screen. */
+  .shell { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; }
+  .phone {
+    position: relative; box-sizing: border-box; overflow: hidden;
+    height: min(760px, 92vh); aspect-ratio: 9 / 19; max-width: 100vw;
+    border-radius: 26px; padding: 18px 18px 14px;
+    background: radial-gradient(120% 70% at 50% 38%, var(--bg2), var(--bg1) 70%);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset, 0 20px 60px rgba(0, 0, 0, 0.45);
+    display: flex; flex-direction: column; align-items: center;
+    font-variant-numeric: tabular-nums;
+  }
+  @media (max-width: 480px) {
+    .phone { width: 100vw; height: 100vh; height: 100dvh; aspect-ratio: auto; border-radius: 0; box-shadow: none; }
+  }
+  .logo { margin-top: 36%; width: 72px; height: 72px; }
+  .logo svg { width: 100%; height: 100%; display: block; }
+  .ring { stroke: rgba(255, 255, 255, 0.08); fill: none; stroke-width: 5; }
+  .arc {
+    stroke: var(--acc); stroke-linecap: round; fill: none; stroke-width: 5;
+    stroke-dasharray: 60 140; transform-origin: 50% 50%; animation: spin 1.6s linear infinite;
+  }
+  .glyph { fill: var(--ink); font: 600 26px "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif; text-anchor: middle; dominant-baseline: central; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .name { margin-top: 16px; font-weight: 650; font-size: 22px; letter-spacing: 0.02em; }
+  .name b { color: var(--acc); font-weight: 650; }
+  .sub { font-size: 11px; color: var(--dim); margin-top: 4px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .bottom { margin-top: auto; width: 100%; }
+  .stage { font-size: 12px; display: flex; justify-content: space-between; gap: 8px; color: var(--ink); min-height: 1.4em; }
+  .stage #stage-count { color: var(--dim); min-width: 4.2em; text-align: right; }
+  .bar {
+    height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.08); margin: 8px 0 6px; overflow: hidden;
+  }
+  .bar i { display: block; height: 100%; width: 0; background: var(--acc); border-radius: 2px; transition: width 0.5s linear; }
+  .detail { font-size: 10.5px; color: var(--dim); min-height: 1.3em; }
+  .steps { display: flex; gap: 4px; margin-top: 10px; }
+  .steps i { flex: 1; height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.1); }
+  .steps i.done { background: var(--acc); }
+  .steps i.now { background: color-mix(in srgb, var(--acc) 50%, transparent); }
+  .actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; min-height: 30px; }
+  button {
+    font: inherit; font-size: 12px; color: var(--ink); background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 999px; padding: 6px 14px; cursor: pointer;
+  }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  button.link { background: none; border: 0; color: var(--dim); padding: 6px 2px; text-decoration: underline; }
+  #boot { background: var(--acc); color: #04140b; border-color: transparent; font-weight: 600; }
+  #stop[hidden], #boot[hidden] { display: none; }
+
+  /* Reduced motion: the arc stays still and the bar jumps. */
+  @media (prefers-reduced-motion: reduce) {
+    .arc { animation: none; }
+    .bar i { transition: none; }
+  }
+
+  /* The developer panels, below the phone. Hidden unless asked for (Show log, ?log=1; ?cases=1). */
+  .dev { background: #f7f7f7; color: #111; padding: 1em 1.5em 2em; font: 14px/1.4 var(--sans); }
+  .dev[hidden] { display: none; }
+  .dev h2 { font-size: 18px; margin: 0.4em 0; }
+  .dev h3 { font-size: 15px; margin: 1em 0 0.3em; }
+  .dev p { margin: 0.4em 0; max-width: 60em; }
+  pre { background: #fff; border: 1px solid #ddd; padding: 0.75em; min-height: 2em; white-space: pre-wrap; }
   table { border-collapse: collapse; }
-  td { padding: 0.15em 1em 0.15em 0; }
+  td, th { padding: 0.15em 1em 0.15em 0; text-align: left; }
   td.n { text-align: right; font-variant-numeric: tabular-nums; }
   #blog { height: 24em; overflow-y: auto; font: 12px/1.3 ui-monospace, Menlo, monospace; }
   #bms td { font-variant-numeric: tabular-nums; }
+  .dev button { background: #fff; color: #111; border-color: #bbb; }
+  #themenote:empty { display: none; }
+  #themenote { color: #8a4b00; }
 </style>
 </head>
 <body>
-<h1>xiaoji: ART in a Web Worker</h1>
-<p>
-  <label>Case
-    <select id="case">
-      <option value="hello-jit">hello-jit: translator on</option>
-      <option value="hello-int">hello-int: interpreter only (-Xint)</option>
-    </select>
-  </label>
-  <button id="run">Run</button>
-  <span id="status">idle</span>
-</p>
-<h3>stdout</h3>
-<pre id="out"></pre>
-<h3>stderr</h3>
-<pre id="err"></pre>
-<h3>Timings</h3>
-<table id="timing"></table>
+<main class="shell">
+  <div class="phone" id="phone" data-state="idle" aria-label="Boot screen">
+    <div class="logo">
+      <svg viewBox="0 0 72 72" aria-hidden="true">
+        <circle class="ring" cx="36" cy="36" r="31"/>
+        <circle class="arc" cx="36" cy="36" r="31"/>
+        <text class="glyph" id="glyph" x="36" y="37">小机</text>
+        <image id="logo-img" x="16" y="16" width="40" height="40" preserveAspectRatio="xMidYMid meet" style="display:none"/>
+      </svg>
+    </div>
+    <div class="name" id="name"><span>Xiao</span><b>Ji</b></div>
+    <div class="sub" id="sub">Android 13</div>
+    <div class="bottom">
+      <div class="stage"><span id="stage-label" role="status" aria-live="polite"></span><span id="stage-count"></span></div>
+      <div class="bar" id="bar" role="progressbar" aria-label="Boot progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="bar-fill"></i></div>
+      <div class="detail" id="detail">Press Boot Android to start</div>
+      <div class="steps" id="steps" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="actions">
+        <button id="boot" type="button">Boot Android</button>
+        <button id="stop" type="button" hidden>Stop</button>
+        <button id="logtoggle" type="button" class="link" aria-expanded="false" aria-controls="devlog">Show log</button>
+      </div>
+    </div>
+  </div>
+</main>
 
-<h2>Boot Android</h2>
-<p>
-  The native product boot (docs/boot.md, B7) in the browser: the same engine, the product tree, and
-  <code>--logcat --init image/xiaoji.rc</code>. It runs until the engine's init timeout, or until Stop.
-  No screen yet (null graphics). See docs/web-preview.md.
-</p>
-<p>
-  <button id="boot">Boot Android</button>
-  <button id="stop" disabled>Stop</button>
-  <span id="bstatus">idle</span>
-</p>
-<p>Fetched: <span id="bfetch">0 requests, 0 files, 0 bytes</span></p>
-<table id="bms"></table>
-<h3>logcat</h3>
-<pre id="blog"></pre>
+<section class="dev" id="devlog" aria-label="Developer log" hidden>
+  <h2>Boot Android: log</h2>
+  <p>
+    The native product boot (docs/boot.md, B7) in the browser: the same engine, the product tree, and
+    <code>--logcat --init image/xiaoji.rc</code>. It runs until the engine's init timeout, or until Stop.
+    No screen yet (null graphics). See docs/web-preview.md. <span id="themenote"></span>
+  </p>
+  <p>Status: <span id="bstatus">idle</span></p>
+  <p>Fetched: <span id="bfetch">0 requests, 0 files, 0 bytes</span></p>
+  <table id="bms"></table>
+  <h3>logcat</h3>
+  <pre id="blog"></pre>
+</section>
+
+<section class="dev" id="cases" aria-label="ART cases" hidden>
+  <h2>xiaoji: ART in a Web Worker</h2>
+  <p>
+    <label>Case
+      <select id="case">
+        <option value="hello-jit">hello-jit: translator on</option>
+        <option value="hello-int">hello-int: interpreter only (-Xint)</option>
+      </select>
+    </label>
+    <button id="run" type="button">Run</button>
+    <span id="status">idle</span>
+  </p>
+  <h3>stdout</h3>
+  <pre id="out"></pre>
+  <h3>stderr</h3>
+  <pre id="err"></pre>
+  <h3>Timings</h3>
+  <table id="timing"></table>
+</section>
 <script type="module" src="./main.js"></script>
 </body>
 </html>

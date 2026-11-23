@@ -1,0 +1,20 @@
+{
+  "name": "Xiao",
+  "accentPart": "Ji",
+  "subtitle": "Android 13",
+  "logo": { "text": "小机" },
+  "colors": {
+    "bg1": "#140b12",
+    "bg2": "#2a1424",
+    "ink": "#e8eef5",
+    "dim": "#7d8b9b",
+    "accent": "#ff6fa8"
+  },
+  "stages": [
+    { "label": "Starting runtime", "from": "boot" },
+    { "label": "Loading framework", "from": "art" },
+    { "label": "Starting system server", "from": "forked" },
+    { "label": "Starting services", "from": "phase100" },
+    { "label": "Starting home", "from": null }
+  ]
+}

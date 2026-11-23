@@ -9,8 +9,7 @@ It is a preview: there is no screen yet, nothing leaves localhost, and a reload 
 make serve            # builds the wasm engine and the manifests, serves http://127.0.0.1:8080/
 ```
 
-Open <http://127.0.0.1:8080/> and click **Boot Android**. The case panel above it is the M4 page (ART
-cases), unchanged. **Stop** ends the run (it terminates the worker). A run otherwise lasts until the
+Open <http://127.0.0.1:8080/> and click **Boot Android**. The ART cases are behind `?cases=1` (the tests use them). **Stop** ends the run (it terminates the worker). A run otherwise lasts until the
 engine's init timeout (900 s on the page), so the page never finishes sooner on its own.
 
 `make serve` needs `build/rootfs-xiaoji`, the product tree (docs/boot.md, B4d and B7). Without it, `make serve`
@@ -23,9 +22,42 @@ file that is fetched from `/rootfs-xiaoji/<path>` on first use. The writable tre
 `/metadata`) keep their directories and nothing else, so the browser starts with an empty `/data`. The
 manifest has 4,888 entries (3,510 files, 723 symbolic links) and is 453 KB. Delete it to regenerate it.
 
-## What it shows
+## The boot screen
 
-- **logcat**: the engine's `--logcat` lines, as they are written. Each line has the engine's stamp
+The page shows a phone-shaped boot screen (W2): the XiaoJi logo, the wordmark, and at the bottom the stage, a
+progress bar, a detail line and a five-step strip. The ART cases are still on the page, behind `?cases=1`.
+
+- **Download** (before the engine starts): "Downloading system" with the real percent and MB of the boot packs
+  (`web/chunks.js` reports the bytes as they arrive), and "cached next time". A warm visit (every pack in the chunk
+  cache) reads "Loading from cache", and no pack is downloaded.
+- **Boot**: five stages, set by `stages` in the theme. 1 "Starting runtime" runs until ART is up, 2 "Loading
+  framework" until system_server is forked (the class preload is inside it: the detail line shows the preloaded
+  class count from the preload's end), 3 "Starting system server" until phase 100, 4 "Starting services" from phase
+  100 on. Stage 5 "Starting home" is reserved and stays pending: the boot does not reach it yet. Stage 4 has no end
+  in the log, so its bar only estimates (its expected time is a guess, 90 s).
+- **Restart**: the log line `xiaoji: init: zygote exited` (init, when the framework's process exits) shows
+  "Android stopped · Restarting…", and the screen keeps that state. In a browser boot without a fatal exception this
+  line appeared after system_server was killed (signal 9), and init restarted the zygote.
+- **Errors**: a system_server fatal exception (`FATAL EXCEPTION IN SYSTEM PROCESS`) or an error of the worker shows
+  "Something went wrong". The worker keeps running, and the bar stays where it was. The fatal path has not been
+  seen in a browser boot yet (the probe that looked for it ran 240 s and saw the restart instead). This is not
+  verified in the browser.
+
+The bar is one value over the boot: each stage's expected seconds (`BOOT.stageSeconds` in `web/cases.js`, from
+one browser boot) weight its slice, and the slice fills toward its end without reaching it. The bar never goes
+back. It starts at 0 when the engine starts; the download has its own bar.
+
+**Theme.** `web/theme.json` is the default: the name parts (`name`, `accentPart`), the subtitle, the logo (`text`
+or an http(s) `image`), the colours (`bg1`, `bg2`, `ink`, `dim`, `accent`) and the stage labels with the milestone
+that starts each stage (`from`, `null` for a stage the boot does not reach). `?theme=pink` loads
+`web/theme-pink.json`. A theme that does not validate (`web/theme.js`) is replaced by the built-in default, and
+the page says why under the log. The logo and colours are checked before they are used.
+
+**Log.** The logcat pane, the milestone table and the fetch counters are behind **Show log** (or `?log=1`).
+
+## What it shows (the log)
+
+- **logcat**: (behind Show log) the engine's `--logcat` lines, as they are written. Each line has the engine's stamp
   (`[ms insn]`, the time since the first log line and the instructions run so far), which the page uses for the
   milestone strip. The pane keeps the last 20,000 lines.
 - **Milestones**: a row for each point of the native boot, from the log text (`BOOT.milestones` in
@@ -91,13 +123,15 @@ and Node are slower than the native run's 90 s.
 
 ```sh
 XIAOJI_WEB_BOOT=1 make test-web          # the ART cases, then the Boot Android check
+# (it also writes build/web-shots/boot-download.png and boot-stage4.png, not committed)
 node tests/web.mjs --boot-only           # the Boot Android check alone
 ```
 
 The check clicks **Boot Android** in headless Chromium and waits (up to `XN_BOOT_TIMEOUT_MS`, default 900000) for
 `Starting phase 100`. It then checks that each earlier milestone was reached (ART, preload, the sensors, health
 and SurfaceFlinger, the fork, the entry), and that the log was still streaming when the milestone arrived (the
-worker was still running). Then it presses **Stop**. Without `XIAOJI_WEB_BOOT=1` the check is not run.
+worker was still running). Then it presses **Stop**, reloads the page (a warm visit, the same profile) and checks that the download reads
+"Loading from cache" with no pack downloaded, and stops that run too. Without `XIAOJI_WEB_BOOT=1` the check is not run.
 
 ## Engine changes for the browser build
 

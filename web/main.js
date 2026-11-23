@@ -1,11 +1,19 @@
 // Page side of the web build (M4): starts one worker per run and shows its output.
-// window.xn holds the state of the last run, for tests/web.mjs. The Boot Android panel (W1) starts
-// a worker for the product boot; window.xb holds its state.
+// window.xn holds the state of the last run, for tests/web.mjs. The Boot Android screen (W2) starts a worker
+// for the product boot; window.xb holds its state, and window.xb.screen what the screen shows.
+//
+// Query parameters: ?theme=<name> (web/theme-<name>.json), ?log=1 (the log panel open), ?cases=1 (the ART
+// cases panel, for the tests), ?boot=manifest and ?trace, ?nopack (docs/web-preview.md).
 
-import { BOOT } from './cases.js';
+import { BOOT, RESTART } from './cases.js';
+import { DEFAULT_THEME, loadTheme } from './theme.js';
+import {
+  newScreen, startRun, onDownload, onBootTree, onMilestone, onRestart, onError, onEnd, onStop, render as renderScreen,
+} from './bootscreen.js';
 
 const $ = (id) => document.getElementById(id);
 const base = new URL('./', location.href).href;
+const params = new URLSearchParams(location.search);
 
 window.xn = { status: 'idle', stdout: [], stderr: [], done: null, error: null };
 
@@ -82,12 +90,74 @@ $('run').addEventListener('click', () => {
   worker.postMessage({ type: 'run', name, base });
 });
 
-// Boot Android (W1). window.xb is the machine-readable state, for tests/web.mjs: status is 'idle',
-// 'loading', 'running', 'stopped', 'done' or 'error'; milestones maps each reached id to its
-// wall time (s, from the worker's start), engine ms and instruction count.
+// ---- Boot Android (W1, W2) ----
+
 const LOG_LINES = 20000;
-window.xb = { status: 'idle', lines: 0, milestones: {}, fetch: null, done: null, error: null };
+window.xb = { status: 'idle', lines: 0, milestones: {}, fetch: null, done: null, error: null, screen: null };
 let bootWorker = null;
+let bootTimer = null;
+let scr = null; // the screen's state (bootscreen.js)
+let theme = DEFAULT_THEME;
+const themeReady = loadTheme(params.get('theme')).then((t) => {
+  theme = t.theme;
+  applyTheme(t.theme);
+  if (t.note) $('themenote').textContent = t.note;
+  scr = newScreen(theme);
+  render();
+  return t;
+});
+
+// The theme is set as CSS custom properties (the colours were checked by validateTheme) and as text.
+function applyTheme(t) {
+  const root = document.documentElement.style;
+  // The stylesheet reads --acc for the accent (the theme key is accent).
+  for (const [k, v] of Object.entries(t.colors)) root.setProperty(k === 'accent' ? '--acc' : '--' + k, v);
+  $('name').firstElementChild.textContent = t.name;
+  $('name').lastElementChild.textContent = t.accentPart;
+  $('sub').textContent = t.subtitle;
+  if (t.logo.image) {
+    $('logo-img').setAttribute('href', t.logo.image);
+    $('logo-img').style.display = '';
+    $('glyph').style.display = 'none';
+  } else {
+    $('glyph').textContent = t.logo.text;
+  }
+}
+
+function setText(el, t) {
+  if (el.textContent !== t) el.textContent = t;
+}
+
+// Draws the screen from its state, and records it in window.xb.screen for the tests.
+function render() {
+  if (!scr) return;
+  const v = renderScreen(scr, performance.now());
+  const phone = $('phone');
+  phone.dataset.state = v.state;
+  setText($('stage-label'), v.label);
+  setText($('stage-count'), v.count);
+  setText($('detail'), v.detail);
+  const pct = Math.round(v.fill);
+  $('bar-fill').style.width = pct + '%';
+  $('bar').setAttribute('aria-valuenow', String(pct));
+  [...$('steps').children].forEach((el, k) => {
+    el.className = v.steps[k] === 'done' ? 'done' : v.steps[k] === 'now' ? 'now' : '';
+  });
+  window.xb.screen = {
+    state: v.state, phase: scr.phase, stage: scr.stage, label: v.label, count: v.count, detail: v.detail,
+    fill: pct, errorKind: v.errorKind, stageLog: scr.stageLog.slice(), fromCache: scr.dl.fromCache,
+  };
+  setControls();
+}
+
+// Start and Stop: Start when no worker runs, Stop while one does.
+function setControls() {
+  const running = bootWorker !== null;
+  $('boot').hidden = running;
+  $('stop').hidden = !running;
+  $('boot').disabled = running;
+  $('stop').disabled = !running;
+}
 
 function setBootStatus(s) {
   window.xb.status = s;
@@ -116,31 +186,43 @@ function appendLog(text) {
 function stopBoot(status) {
   if (bootWorker) bootWorker.terminate();
   bootWorker = null;
-  $('boot').disabled = false;
-  $('stop').disabled = true;
+  if (bootTimer) clearInterval(bootTimer);
+  bootTimer = null;
   if (status) setBootStatus(status);
+  render();
 }
 
-$('boot').addEventListener('click', () => {
+$('boot').addEventListener('click', async () => {
+  await themeReady;
   $('blog').textContent = '';
   $('bfetch').textContent = '0 requests, 0 files, 0 bytes';
   renderMilestoneRows();
-  window.xb = { status: 'loading', lines: 0, milestones: {}, fetch: null, done: null, error: null };
+  window.xb = { status: 'loading', lines: 0, milestones: {}, fetch: null, done: null, error: null, screen: null };
   setBootStatus('loading');
-  $('boot').disabled = true;
-  $('stop').disabled = false;
+  startRun(scr);
+  bootTimer = setInterval(render, 250);
 
   const worker = new Worker(new URL('./worker.js', location.href), { type: 'module' });
   bootWorker = worker;
+  setControls();
+  render();
   worker.onmessage = (ev) => {
     const m = ev.data;
+    const now = performance.now();
     if (m.type === 'boot-start') {
       // The machine status stays 'loading' (Stop depends on it); only the display text changes.
       $('bstatus').textContent = `loading ${m.files} entries`;
+    } else if (m.type === 'download') {
+      onDownload(scr, m);
     } else if (m.type === 'boot-tree') {
+      onBootTree(scr, now);
       setBootStatus('running');
     } else if (m.type === 'bootline') {
       appendLog(m.text);
+      if (RESTART.test(m.text)) {
+        onRestart(scr);
+        render();
+      }
     } else if (m.type === 'milestone') {
       const row = $('ms-' + m.id);
       if (row && m.stamp) {
@@ -149,6 +231,8 @@ $('boot').addEventListener('click', () => {
         row.querySelector('[data-k="insn"]').textContent = (m.stamp.insn / 1e9).toFixed(3) + ' G';
       }
       window.xb.milestones[m.id] = { label: m.label, wall: m.wall, stamp: m.stamp, line: m.line };
+      onMilestone(scr, m.id, m.line, now);
+      render();
     } else if (m.type === 'fetch') {
       window.xb.fetch = { requests: m.requests, files: m.files, bytes: m.bytes };
       $('bfetch').textContent = `${m.requests} requests, ${m.files} files, ${fmtBytes(m.bytes)}`;
@@ -158,11 +242,13 @@ $('boot').addEventListener('click', () => {
       window.xb.trace = m;
     } else if (m.type === 'done') {
       window.xb.done = m;
+      onEnd(scr, m.exitCode, now);
       stopBoot(`exit ${m.exitCode}`);
       window.xb.status = 'done';
     } else if (m.type === 'error') {
       window.xb.error = m.text;
       appendLog(m.text);
+      onError(scr);
       stopBoot('error');
     } else if (m.type === 'out') {
       appendLog(m.text);
@@ -171,10 +257,10 @@ $('boot').addEventListener('click', () => {
   worker.onerror = (ev) => {
     window.xb.error = ev.message || 'worker error';
     appendLog(window.xb.error);
+    onError(scr);
     stopBoot('error');
   };
   // ?trace records the boot's file access (web/trace.js) for docs/loading.md; off by default.
-  const params = new URLSearchParams(location.search);
   // The chunk store and boot packs (web/chunks.js, docs/loading.md) are the default. ?boot=manifest is the
   // lazy-file manifest path, kept until the pack path has run for a while.
   const mode = params.get('boot') === 'manifest' ? 'manifest' : 'pack';
@@ -185,5 +271,19 @@ $('boot').addEventListener('click', () => {
 });
 
 $('stop').addEventListener('click', () => {
-  if (window.xb.status === 'loading' || window.xb.status === 'running') stopBoot('stopped');
+  if (window.xb.status === 'loading' || window.xb.status === 'running') {
+    onStop(scr);
+    stopBoot('stopped');
+  }
 });
+
+// The log panel: hidden by default, opened by "Show log" or ?log=1. The ART cases: ?cases=1.
+function setLogOpen(open) {
+  $('devlog').hidden = !open;
+  $('logtoggle').textContent = open ? 'Hide log' : 'Show log';
+  $('logtoggle').setAttribute('aria-expanded', String(open));
+}
+$('logtoggle').addEventListener('click', () => setLogOpen($('devlog').hidden));
+setLogOpen(params.has('log'));
+$('cases').hidden = !params.has('cases');
+renderMilestoneRows();

@@ -40,10 +40,15 @@ async function openCache() {
 export class ChunkStore {
   // base: URL of the chunk store directory (ends in '/'); chunkSize: from the manifest; onNetwork(url, bytes)
   // is called for each response body the page downloads (the worker's fetch counters use it).
-  constructor(base, chunkSize, onNetwork = () => {}) {
+  // onProgress(p) is called as the boot packs download: p.loaded and p.total are bytes of the packs
+  // (the manifest's sizes), p.fromCache is true when every pack is in the cache, p.cacheable when the
+  // cache could be opened (so the next visit can use it).
+  constructor(base, chunkSize, onNetwork = () => {}, onProgress = () => {}) {
     this.base = base;
     this.chunkSize = chunkSize;
     this.onNetwork = onNetwork;
+    this.onProgress = onProgress;
+    this.progress = { loaded: 0, total: 0, fromCache: false, cacheable: false };
     this.mem = new Map(); // id -> raw Uint8Array
     this.stats = {
       packs: 0, packDownloads: 0, packBytes: 0, packNetBytes: 0, packChunks: 0, packMs: 0, packCpuMs: 0,
@@ -54,6 +59,10 @@ export class ChunkStore {
 
   chunkUrl(id) {
     return this.base + 'chunks/' + id + '.z';
+  }
+
+  emit() {
+    this.onProgress({ ...this.progress });
   }
 
   // Async, before the engine runs. Each chunk is cached under its own hash (the URL of chunks/<id>.z), so a
@@ -72,28 +81,61 @@ export class ChunkStore {
       }
     }
     this.stats.packs = packs.length;
-    await Promise.all(packs.map((p) => this.loadPack(p, cache)));
+    // Probe every pack before the first download, so the progress denominator and the warm/cold decision are known.
+    const have = await Promise.all(packs.map((p) => this.probe(p, cache)));
+    this.progress = {
+      loaded: 0,
+      total: packs.reduce((n, p) => n + p.bytes, 0),
+      fromCache: !!cache && have.every((h) => h && h.every(Boolean)),
+      cacheable: !!cache,
+    };
+    this.emit();
+    await Promise.all(packs.map((p, i) => this.loadPack(p, cache, have[i])));
     this.stats.packMs = now() - t0;
   }
 
-  async loadPack(pack, cache) {
-    const have = cache
-      ? await Promise.all(pack.chunks.map(([id]) => cache.match(this.chunkUrl(id)).catch(() => undefined)))
-      : null;
+  // The cache entries of a pack's chunks, in order (undefined where missing), or null without a cache.
+  async probe(pack, cache) {
+    if (!cache) return null;
+    return Promise.all(pack.chunks.map(([id]) => cache.match(this.chunkUrl(id)).catch(() => undefined)));
+  }
+
+  // Streams one pack's bytes into memory, counting them into the progress as they arrive.
+  async download(pack) {
+    const url = this.base + pack.file;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`pack ${pack.file}: HTTP ${res.status}`);
+    const out = new Uint8Array(pack.bytes);
+    const reader = res.body.getReader();
+    let off = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (off + value.length > pack.bytes) {
+        throw new Error(`pack ${pack.file}: more than ${pack.bytes} bytes, the manifest says ${pack.bytes}`);
+      }
+      out.set(value, off);
+      off += value.length;
+      this.progress.loaded += value.length;
+      this.emit();
+    }
+    if (off !== pack.bytes) throw new Error(`pack ${pack.file}: ${off} bytes, the manifest says ${pack.bytes}`);
+    return out;
+  }
+
+  async loadPack(pack, cache, have) {
     const cached = have ? have.filter(Boolean).length : 0;
     this.stats.chunkCacheHits += cached;
     let buf = null;
     if (!have || cached < pack.chunks.length) {
-      const res = await fetch(this.base + pack.file);
-      if (!res.ok) throw new Error(`pack ${pack.file}: HTTP ${res.status}`);
-      buf = new Uint8Array(await res.arrayBuffer());
-      if (buf.length !== pack.bytes) {
-        throw new Error(`pack ${pack.file}: ${buf.length} bytes, the manifest says ${pack.bytes}`);
-      }
+      buf = await this.download(pack);
       this.stats.packDownloads++;
       this.stats.packBytes += buf.length;
       this.stats.packNetBytes += buf.length;
       this.onNetwork(this.base + pack.file, buf.length);
+    } else {
+      this.progress.loaded += pack.bytes;
+      this.emit();
     }
     const puts = [];
     const t0 = now();

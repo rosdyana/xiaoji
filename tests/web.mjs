@@ -17,7 +17,7 @@
 // profile. Not part of make test; make test-web runs it.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -61,7 +61,7 @@ async function runCase(chromium, baseUrl, name) {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   try {
-    await page.goto(baseUrl, { waitUntil: 'load' });
+    await page.goto(baseUrl + '?cases=1', { waitUntil: 'load' });
     await page.selectOption('#case', name);
     await page.click('#run');
     await page.waitForFunction(() => window.xn && window.xn.status !== 'running', null, {
@@ -88,15 +88,54 @@ async function runCase(chromium, baseUrl, name) {
   }
 }
 
+// Screenshots of the boot screen (W2) go here. Not committed (build/ is ignored).
+const SHOTS = join(ROOT, 'build', 'web-shots');
+const VIEW = { width: 1100, height: 860 };
+
+// The download phase: the packs come over a slow link (40 Mbit/s), so the phase lasts long enough to
+// photograph. The run is stopped before the engine starts. Also checks that a reduced-motion user gets no spin.
+async function runDownloadShot(chromium) {
+  const slow = await startServer({ port: 0, log: () => {}, throttle: { mbps: 40, rttMs: 0 } });
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: VIEW });
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  try {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto(slow.url + '?boot=pack', { waitUntil: 'load' });
+    await page.click('#boot');
+    const spin = await page.evaluate(() => getComputedStyle(document.querySelector('.arc')).animationName);
+    check(spin === 'none', 'boot screen: the arc does not spin with prefers-reduced-motion');
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.waitForFunction(
+      () => window.xb.screen && window.xb.screen.state === 'download' && window.xb.screen.fill >= 25 && window.xb.screen.fill <= 75,
+      null,
+      { timeout: 120000, polling: 100 },
+    );
+    const s = await page.evaluate(() => window.xb.screen);
+    check(s.label === 'Downloading system' && /MB/.test(s.detail), `boot screen, download: "${s.label}", "${s.detail}", ${s.count}`);
+    await page.screenshot({ path: join(SHOTS, 'boot-download.png') });
+    console.log(`    screenshot: ${join(SHOTS, 'boot-download.png')}`);
+    await page.click('#stop');
+    await page.waitForFunction(() => window.xb.status === 'stopped', null, { timeout: 30000, polling: 100 });
+    check(pageErrors.length === 0, `boot screen, download: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
+  } finally {
+    await browser.close();
+    await slow.close();
+  }
+}
+
 // The Boot Android check (W1). Returns nothing; counts failures like the other checks.
 async function runBoot(chromium, baseUrl) {
+  mkdirSync(SHOTS, { recursive: true });
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const page = await browser.newPage({ viewport: VIEW });
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   try {
     // The chunk store and boot packs are the page's default (docs/loading.md); ?boot=pack says so explicitly.
     await page.goto(baseUrl + '?boot=pack', { waitUntil: 'load' });
+    check(await page.isHidden('#devlog'), 'boot screen: the log is hidden by default');
     const t0 = Date.now();
     await page.click('#boot');
     await page.waitForFunction(
@@ -128,6 +167,22 @@ async function runBoot(chromium, baseUrl) {
       check(reached.includes(id), `boot: milestone ${id} reached`);
     }
     check(streaming, 'boot: logcat streams while the engine runs (milestone arrived before the engine stopped)');
+    // The boot screen (W2): stage 4 ("Starting services", 4 / 5) is the one phase 100 starts.
+    const scr = xb.screen;
+    console.log(`    screen: ${JSON.stringify(scr && { state: scr.state, label: scr.label, count: scr.count, detail: scr.detail, fill: scr.fill })}`);
+    check(scr && scr.stage === 3 && scr.label === 'Starting services' && scr.count === '4 / 5',
+      'boot screen: reaches stage 4, "Starting services", 4 / 5');
+    check(scr && scr.stageLog.map((e) => e.index).join(',') === '0,1,2,3', 'boot screen: stages entered in order (1 to 4)');
+    check(scr && scr.fill >= 20 && scr.fill < 90, `boot screen: the bar is partway through the boot at stage 4 (${scr && scr.fill}%)`);
+    const bar = await page.evaluate(() => ({
+      role: document.getElementById('bar').getAttribute('role'),
+      now: Number(document.getElementById('bar').getAttribute('aria-valuenow')),
+      label: document.getElementById('stage-label').textContent,
+    }));
+    check(bar.role === 'progressbar' && Number.isFinite(bar.now), `boot screen: progressbar with aria-valuenow (${bar.now})`);
+    check(bar.label === 'Starting services', `boot screen: the live stage label reads "${bar.label}"`);
+    await page.screenshot({ path: join(SHOTS, 'boot-stage4.png') });
+    console.log(`    screenshot: ${join(SHOTS, 'boot-stage4.png')}`);
     check(pageErrors.length === 0, `boot: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
     // Stop the worker (the page's Stop button), so the run does not hold the browser.
     await page.click('#stop');
@@ -135,6 +190,20 @@ async function runBoot(chromium, baseUrl) {
       timeout: 30000,
       polling: 100,
     });
+    // A warm visit (the same profile): the packs are in the chunk cache, so the download reads "Loading from cache"
+    // and no pack is downloaded.
+    await page.reload({ waitUntil: 'load' });
+    await page.click('#boot');
+    await page.waitForFunction(() => window.xb.screen && window.xb.screen.label === 'Loading from cache', null, {
+      timeout: 120000,
+      polling: 50,
+    }).catch(() => {});
+    const warm = await page.evaluate(() => ({ screen: window.xb.screen, fetch: window.xb.fetch }));
+    check(warm.screen !== null && warm.screen.label === 'Loading from cache' && warm.screen.fromCache === true,
+      'boot screen, warm visit: "Loading from cache"');
+    check(!warm.fetch || warm.fetch.requests === 0, 'boot screen, warm visit: no pack is downloaded');
+    await page.click('#stop');
+    await page.waitForFunction(() => window.xb.status === 'stopped', null, { timeout: 30000, polling: 100 });
   } finally {
     await browser.close();
   }
@@ -170,7 +239,10 @@ async function main() {
     for (const n of names) {
       await runCase(chromium, srv.url, n);
     }
-    if (bootOnly || bootToo) await runBoot(chromium, srv.url);
+    if (bootOnly || bootToo) {
+      await runDownloadShot(chromium);
+      await runBoot(chromium, srv.url);
+    }
   } finally {
     await srv.close();
   }

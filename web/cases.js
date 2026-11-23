@@ -43,6 +43,12 @@ export const BOOT = {
   manifest: 'manifest-xiaoji.json',
   tree: 'rootfs-xiaoji',
   timeoutS: 900,
+  // Expected seconds of stages 1 to 4 of the boot screen (web/bootscreen.js), in the theme's order. From one
+  // browser boot (engine time, the milestones of the W2 check): ART 3.75 s, forked 39.77 s, phase 100 43.76 s.
+  // So stage 1 (to ART) 4 s, stage 2 (to fork, with the preload) 36 s, stage 3 (to phase 100) 4 s. Stage 4 has no
+  // measurement: the boot has not gone past phase 100 in any run here (a probe ran 140 s past it), so 90 s is a
+  // guess that keeps the bar well short of the top while the stage has no end. The bar only estimates.
+  stageSeconds: [4, 36, 4, 90],
   milestones: [
     { id: 'art', label: 'ART up: zygote runs ZygoteInit',
       re: /AndroidRuntime\(\d+\): >>>>>> START com\.android\.internal\.os\.ZygoteInit/ },
@@ -66,6 +72,10 @@ export const BOOT = {
       re: /FATAL EXCEPTION IN SYSTEM PROCESS/ },
   ],
 };
+
+// The line the engine's init prints when the zygote (the framework's process, which holds system_server) exits;
+// init then restarts it. Seen in a browser boot: "xiaoji: init: zygote exited (status 137, by a signal)".
+export const RESTART = /xiaoji: init: zygote\S* exited/;
 
 export const CASES = {
   'hello-jit': {
