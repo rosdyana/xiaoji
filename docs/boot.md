@@ -2825,3 +2825,224 @@ or directory` and `Invalid path /system/framework/framework-res.apk` lines from 
 - `stat` on `/proc/sys` and `/proc/sys/kernel` (directories) is ENOENT, as for `/sys/devices`.
 - `make` with no target printed `Nothing to be done` and did not rebuild `build/xiaoji` in this tree; `make build/xiaoji`
   does. `make test` output is cut by the `rtk` filter, so the summaries here come from `tests/run.sh` run directly.
+
+## B8: the file metadata layer, POSIX record locks and flock, utimensat, and the boot past SettingsProvider (stops at the lmkd and vibrator services)
+
+Status: **B8 parts 1 and 2 done (uncommitted). SettingsProvider now opens its database and generates the Android ID on the
+product tree (3 of 3 runs). `System now ready` and `sys.boot_completed=1` are not reached. The boot is blocked by ActivityManager's
+lmkd connection (lmkd crash-loops in init) and by the missing vibrator service (VibratorManagerService waits for it). Both are
+engine or product-configuration gaps, listed below as the next blocker.** The sections below are in the order of the B8 plan.
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 1 | Record locks, flock, and their guest test | Done. `engine/locks.c`, `engine/locks.h`, `tests/guest/flock.c`. |
+| 2 | utimensat, futimens, and the B8 docs | Done. `sys_utimensat` (`engine/sysfs.c`), `host_utimens` (`engine/host.c`), `meta_utime_check` (`engine/meta.c`), `tests/guest/utimes.c`. |
+| 3 | Boot progress past SettingsProvider | Partial. The lock gap, the ftruncate gap and the pwrite64 gap are fixed. Stopped at the lmkd and vibrator services (next blocker). |
+
+### Part 1: the file metadata layer (`engine/meta.c`, `engine/meta.h`)
+
+- **Design.** Each guest file's owner, group and mode (07777, with setuid, setgid and sticky) live in a record keyed by the
+  host (dev, ino) of the file, so a hard link and a rename keep their record. A stale record is replaced when the same inode
+  number is created again (`meta_new`). A file with no record reports root (0:0) and its host permission bits with the group
+  and other write bits removed. Synthetic files, pipes, sockets and memfds have no record. Enforcement of mode bits on access is
+  not part of this layer. The rules follow Linux 6.12 (`fs/attr.c`, `fs/inode.c`, `fs/namei.c`, `fs/open.c`).
+- **Sidecar format.** With `--root`, the records of the writable trees (`/data`, `/cache`, `/metadata`) are kept in
+  `<root>/.xiaoji-meta`. The first line is `xiaoji-meta 1`. Each other line is one record: the guest path, the uid, the gid
+  and the mode in octal, separated by tabs. The file is loaded at startup (a record whose host file is gone is skipped, and a
+  line that does not parse is ignored). It is written at exit, through an `atexit` handler, to `.xiaoji-meta.tmp` and then
+  renamed over the file. The guest cannot see or name the two files (`meta_hidden_guest`).
+- **`make reset-data`** runs `tools/reset-data.py` on `build/rootfs-xiaoji`. It removes every entry under `data/` and drops the
+  sidecar lines for `/data` and below, so the next boot starts from no records there. The product boot check runs it first (and
+  only the product tree is reset: see Part 4).
+- **Enforcement.** The records answer `access(2)`/`faccessat` (`meta_access`: the caller's fsuid and groups, the owner, group and
+  other bits, and the DAC override and read-search capabilities, as Linux's `generic_permission`), and `execve` (through the
+  guest mode, as before). `open` and the other calls do not enforce mode bits, as before. This is a decision: the shell checks
+  `access(X_OK)` before it runs a script, so `chmod` (which changes only the record) must show up there.
+- **Known limits.**
+  - The sidecar is saved only at a normal exit (a return from `main` or `exit`). A kill by a signal writes nothing, so the
+    records of that run are lost.
+  - The records are keyed by host inode, and the sidecar stores guest paths. A copy of the root that changes the inode numbers
+    loads the records again from the sidecar by path, and a file that is replaced by a new inode with a reused number takes a
+    new record.
+  - Records are not kept for synthetic files, pipes, sockets and memfds.
+  - **The browser build keeps no sidecar** (`XIAOJI_LAZY_FS`, set by the `wasm` target only). Its root is a lazy HTTP file system,
+    and loading the sidecar stats every recorded file: the first stat of a lazy gzip file downloads it, and the Emscripten
+    runtime prints a warning on stdout. That warning broke the `test-web` stdout check, so the browser build skips the load and
+    the save, and its records last for the session. The native build and `wasm-node` (real host files) keep the sidecar.
+
+### Part 2: POSIX record locks and flock (`engine/locks.c`, `engine/locks.h`)
+
+- **Identity and owner.** A lock belongs to an inode: the host (dev, ino) of a regular file (the identity of `meta.c`), or the
+  object of a memfd or a pipe. Other kinds give EINVAL for POSIX locks. The owner of a POSIX lock is the process's fd table
+  (Linux's `files_struct`): threads share the locks, and a fork gets a new table, so the child has none. The owner of a flock
+  lock is the open file description.
+- **Split, merge and replace.** `posix_apply` ports Linux 6.12 `posix_lock_inode` step for step: the same-owner walk, the merge of
+  adjacent or overlapping locks of one type, the split of a lock of another type (with the copy inserted before the right part,
+  as Linux does), and the drop of an unlock. The list order is Linux's (a new lock goes before the first lock of its owner that
+  lies after it), because F_GETLK reports the first conflicting lock in list order. The guest test checks the ranges that
+  come out, through F_GETLK from another process.
+- **Ranges and types.** `l_whence` (SEEK_SET, SEEK_CUR, SEEK_END), a negative `l_len` (the range runs backwards from `l_start`),
+  and `l_len` 0 (to end of file). The read-only and write-only descriptor checks are EBADF, and the type and whence checks are
+  EINVAL, in Linux's order (`fs/locks.c` `flock_to_posix_lock`, `check_fmode_for_setlk`, `fcntl_getlk`).
+- **F_GETLK** reports the first conflicting lock in list order, with its type, its range, and the pid of its holder (`l_pid`,
+  the pid of the process that took the lock). With no conflict only `l_type` changes (F_UNLCK), as on Linux.
+- **F_SETLKW** blocks through the restart mechanism (`sched_block_restart_eintr`). A change on the inode (an unlock, a
+  downgrade, a close, the owner's exit) wakes the waiters, and each rerun repeats the request from the start. A waiter's edge (the
+  lock it waits for) is kept for the deadlock walk, and it is dropped at every rerun, when the thread is gone (found by its tid),
+  and when that lock goes.
+- **EINTR.** A signal that is pending and not blocked, and that the engine would deliver (a caught signal), ends a blocked
+  F_SETLKW or flock with EINTR, as Linux does without SA_RESTART. The engine has no SA_RESTART, so every caught signal does this
+  for these two calls. The pipes keep the restart. The new wait kind completes the call (pc past the `svc`, x0 = -EINTR) when a
+  signal wakes it, so the handler runs before the call returns, and the call is not replayed (`sched_wake`, `wake`).
+- **EDEADLK.** `posix_deadlock` is Linux's `posix_locks_deadlock` walk (at most 10 steps through the waiters' edges). It runs
+  before a thread blocks.
+- **Release.** A close of any descriptor of a file releases the POSIX locks that the process holds on that file (Linux's
+  `filp_close`, through `vfs_close`, `vfs_dup` over a slot, and the close-on-exec close at exec). The process's exit releases all
+  of them (`vfs_fdtab_release`, and an owner purge as a backstop). A flock lock goes with its last open file description
+  (`desc_unref`).
+- **Fork and exec.** A fork gives the child a new owner, so no POSIX lock is inherited. An exec keeps the table, so the locks stay
+  (the close-on-exec slots are closed, as Linux does). The exec case is not in the test.
+- **flock** (`SYS_FLOCK`, 32): LOCK_SH, LOCK_EX, LOCK_UN and LOCK_NB. A lock of the same description is replaced: the old lock goes
+  before the conflict test, so a failed upgrade drops the old lock (Linux's `flock_lock_inode`). LOCK_MAND is ignored, as Linux
+  does. It was a stub (always 0) before this step.
+- **Not done.** OFD locks (not needed, as B8 found for SQLite and bionic). Leases. Locks on sockets and other synthetic kinds
+  (EINVAL for POSIX). A woken waiter reruns its request from the start, so the order in which several eligible waiters get the
+  lock is not Linux's wake order, and it is not tested.
+
+### Part 3: utimensat and futimens (`sys_utimensat`, `host_utimens`)
+
+- **Syscalls.** `utimensat` (88) with a path, `dirfd` and `AT_SYMLINK_NOFOLLOW` or `AT_EMPTY_PATH`. `futimens` is the same call
+  with a NULL path (or an empty path with `AT_EMPTY_PATH`) and a descriptor.
+- **Order of the checks** (`fs/utimes.c`): flags (EINVAL), then both times OMIT (a no-op, which does not look at the path), then the
+  path (ENOENT), then the nanoseconds (EINVAL for a value outside 0 to 10^9 - 1 that is neither UTIME_NOW nor UTIME_OMIT), then
+  a read-only mount (EROFS), then the permission. NULL times and both times NOW are the same ("touch").
+- **Permission** (`meta_utime_check`, `fs/attr.c` setattr_prepare): the owner (the file's record uid is the caller's fsuid) or
+  CAP_FOWNER may set any time. Anyone else may not set an explicit time (EPERM), and may touch the file only with write
+  permission (EACCES): CAP_DAC_OVERRIDE passes, else the group or other class bit is checked.
+- **Synthetic files, pipes and memfds** keep no times, so the call succeeds for them without effect.
+- **Host.** `host_utimens` calls `utimensat` or `futimens` on the host file. The guest's UTIME_NOW and UTIME_OMIT are translated to
+  the host's constants.
+- **Test.** `tests/guest/utimes.c` covers explicit times, OMIT on one time, futimens, both OMIT with a missing path, EINVAL for
+  nanoseconds 10^9 and -1, ENOENT, UTIME_NOW and the NULL form (both checked against the clock), and AT_EMPTY_PATH. The times
+  are compared in whole seconds: the Node build (Emscripten NODERAWFS) keeps no nanoseconds, so the nanosecond fields are not
+  printed (the EINVAL checks still cover the nanosecond argument). The native run is not root, so only the owner case is compared
+  with the native run. The non-owner rules (EPERM, EACCES) are not tested.
+
+### Part 4: boot-path engine gaps fixed in this step
+
+- **ftruncate on host files** (`sys_ftruncate`, `host_ftruncate`). It handled memfds only, so SQLite's truncate of its rollback
+  journal (`settings.db-journal`) failed with EINVAL (SQLITE_IOERR_TRUNCATE). A host regular file opened for writing is truncated now.
+- **pwrite64** (68), which was unimplemented. `vfs_pwrite` follows `vfs_write`'s rules per kind, takes the offset, and leaves the
+  description's offset alone (pipes and sockets are ESPIPE). A host file with O_APPEND appends, as Linux does. SQLite's page
+  writes use it. The engine printed `unimplemented syscall 68` right before the first SQLITE_IOERR_WRITE.
+- **Found by the suite's order** (B8 part 1's boot check). The Google-image boot check (`XIAOJI_BOOT=1`) ran `reset-data` on
+  `build/rootfs`, which removed everything under its `data/`: `/data/local/tmp` (used by `sh-script`) and
+  `build/rootfs/data/hello.dex` (used by `hello-int` and `hello-jit`). Two fixes. The reset now runs only for the product tree
+  (`*-xiaoji`); the Google tree keeps its `/data`. And `sh-script` runs `mkdir -p /data/local/tmp` first (`tests/run.sh` and
+  `tools/oracle.sh`; the expected output is unchanged).
+- **Found by the suite** (the `sh-script` case, after the boot reset above). After `chmod 755`, the shell's `access(X_OK)` read the
+  host file's mode (644) through `faccessat`, so the script was refused (`Permission denied`). `faccessat` now answers from the
+  guest record (`meta_access`, Part 1).
+- **Found by `make test-web`** (after the steps above). The browser build's sidecar load, from part 1, made the first ART case
+  print the lazy-file warning on stdout. The fix is the browser-only exclusion in Part 1.
+- **Stale notes.** B1 and B7 say `fchmodat` (53) is missing. `sys_fchmodat` exists in `engine/sysfs.c`, so those notes are out of date.
+
+### Part 5: milestones (product tree, `build/rootfs-xiaoji`, `make reset-data` first, `--logcat --init image/xiaoji.rc --init-timeout 150`)
+
+Times and instruction counts are guest time (`[ms insn]` in the log). Power: `pmset -g` showed `lowpowermode 1` and
+`pmset -g batt` showed `Now drawing from 'Battery Power'` for these runs (B7 ran on AC with Low Power Mode off, so the times here are
+not comparable to B7's). Scratchpad logs: `boot-r1.err`, `boot-r2.err` (the same command, two runs).
+
+| Milestone | run 1 | run 2 |
+|---|---|---|
+| Sensors HAL: `host sensors mask=6f` | 0.99 s, 0.096 G | 0.98 s, 0.096 G |
+| `Registered android.hardware.sensors@2.1::ISensors/default` | 3.32 s, 0.222 G | 4.72 s, 0.222 G |
+| `Registered android.hardware.health@2.1::IHealth/default` | 3.35 s, 0.223 G | 4.76 s, 0.224 G |
+| `Entered the Android system server!` | 71.6 s, 4.369 G | 73.5 s, 4.372 G |
+| `Starting phase 100` | 77.2 s, 4.696 G | 86.6 s, 4.725 G |
+| `BatteryService: health: Waited 0ms and received the update` | 106.2 s, 6.489 G | 127.7 s, 6.709 G |
+| `SettingsProvider: Generated and saved new ANDROID_ID` (the furthest milestone, in the product check) | 109.3 s, 6.674 G | 131.9 s, 6.949 G |
+| `Failed to connect to lmkd, retry after 1000 ms` (ActivityManager, first) | 97.1 s, 5.921 G | 118.3 s, 6.152 G |
+
+The order of the milestones is the same in both runs and in a third run (the one with a 300 s timeout, below). The times and
+instruction counts are not: phase 100 is 4.70 G and 4.72 G, and BatteryService is 6.49 G and 6.71 G. This boot is not
+instruction-deterministic, so the product check tests presence and order, not counts. The product check (`tests/run.sh`, with
+`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) now requires the ANDROID_ID line, and runs the engine with `--init-timeout 150`.
+
+SettingsProvider's SQLite path before this step: `SQLITE_IOERR_LOCK` (fixed by the record locks), then `SQLITE_IOERR_TRUNCATE`
+(ftruncate, fixed), then `SQLITE_IOERR_WRITE` (pwrite64, fixed). The database opens, and the "Generated and saved new ANDROID_ID" line
+follows.
+
+### Next blocker: lmkd and the vibrator service (the framework does not finish its boot)
+
+After SettingsProvider, ActivityManager cannot reach lmkd, and it retries every second. lmkd crash-loops in init (its cgroup and
+psi files are missing), so `/dev/socket/lmkd` is never served. VibratorManagerService then waits for a vibrator service that init
+cannot start. Logcat excerpt from run 2 (times are guest time):
+
+```
+xiaoji: init: started lmkd (pid 1011)
+[83 ms 52213578 insn] E/lmkd(1011): open() failed for /dev/cgroup_info/cgroup.rc: No such file or directory
+[118273 ms 6151906153 insn] E/ActivityManager(1047): Connection failed: java.io.IOException: Connection refused
+[118273 ms 6151911960 insn] W/ActivityManager(1047): Failed to connect to lowmemorykiller, retry later
+[118273 ms 6151917780 insn] I/ActivityManager(1047): Failed to connect to lmkd, retry after 1000 ms
+[132633 ms 6993237372 insn] I/servicemanager(1001): Found android.hardware.vibrator.IVibratorManager/default in device VINTF manifest.
+[132636 ms 6993471315 insn] I/servicemanager(1001): Since 'android.hardware.vibrator.IVibratorManager/default' could not be found, trying to start it as a lazy AIDL service
+xiaoji: init: Control message: Could not find 'aidl/android.hardware.vibrator.IVibratorManager/default' for ctl.interface_start
+```
+
+Counts over run 2: 31 lines of `Connection refused`, 17 lines of the vibrator's `Could not find`. The logs show that psi and cgroup v1 are missing, so lmkd cannot run as the stock service. The design choices for the next step (not made here):
+a lmkd replacement or a socket endpoint on `/dev/socket/lmkd` (the engine has no kernel psi or cgroup v1, so lmkd cannot run as
+the stock service), and a vibrator HAL in the product (the manifest lists it, and no init service provides it). The engine also
+prints `unimplemented syscall` for 126 (sched_get_priority_min), 282 (userfaultfd) and 26 (inotify_init1).
+
+In a longer run (300 s, `boot3`), a second system_server (pid 1194) appears at 249 s and re-runs phase 100, so pid 1047 ended
+before that. The log has no crash, tombstone or watchdog line for 1047, and no line that shows why it ended. This is open.
+
+### Test results (final, this step)
+
+- `make && make wasm-node && make wasm && tests/run.sh`: **214 passed, 0 failed, 0 xfail** (206 before this step, plus the flock and
+  utimes cases in the engine and in Node, and the 2 binder-driver cases that were restored, see below).
+- `XIAOJI_JIT=0 tests/run.sh`: **214 passed, 0 failed, 0 xfail.**
+- `XIAOJI_BOOT=1 tests/run.sh` (Google image): **215 passed, 0 failed, 0 xfail.**
+- `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product, cleared `/data`): **181 passed, 0 failed, 0 xfail**,
+  including the new ANDROID_ID check.
+- `make test-web`: all checks passed (`hello-int` and `hello-jit`, stdout and exit code).
+- Warnings: `clang -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter` and `emcc` with the same flags on `engine/{locks,sysfs,vfs,
+  signals,syscall,sched,host,meta}.c`: 0 each. `meta.c` with `-DXIAOJI_LAZY_FS=1` (clang and emcc): 0. `gcc -Wall -Wextra` on
+  `tests/guest/{flock,utimes}.c` in the builder VM: 0.
+- The binder conformance binaries (`build/rootfs/data/nativetest64`) were removed by an earlier boot's reset. They are copied back
+  read-only from the remote build output (`~/xiaoji-aosp/out/target/product/xiaoji_arm64/data/nativetest64`, 4 files, 1.1 MB).
+
+### Tests
+
+- New: `tests/guest/flock.c` (`flock-O0`, `flock-O2`) and `tests/guest/utimes.c` (`utimes-O0`, `utimes-O2`). Each is compared
+  with the native builder-VM output (stdout and exit code) in the engine and in Node. The flock case covers: conflicts between
+  processes, F_GETLK's first conflict, its range and its holder's pid, the split and merge of ranges (through F_GETLK from another
+  process), EAGAIN, EBADF, EINVAL, and negative and to-EOF lengths; the release by a close of another descriptor of the file; F_SETLKW
+  blocking (the pipe shows the child still blocked) and waking on an unlock; the release at a child's exit; EDEADLK with two
+  processes; EINTR from SIGUSR1 with a handler and no SA_RESTART; and flock (exclusive, shared, LOCK_NB, a downgrade, an upgrade that
+  fails and drops the old lock, the wake on an unlock, and the release at the last close of a description, with a dup).
+- The native run is deterministic (O0 and O2 give the same bytes).
+
+### Gaps (B8)
+
+- **alarm and setitimer are not implemented** (`alarm` is `setitimer(ITIMER_REAL)` on arm64). The plan asked for the EINTR test
+  to use an alarm. The test uses kill(2) from the parent instead. Building the timer (a per-process deadline that raises SIGALRM,
+  through the scheduler's deadline hook) is a separate decision. The EINTR path it would test is the one built here.
+- The non-owner rules of utimensat (EPERM, EACCES) are not tested: the native run is not root, and the engine's test runs as root.
+- Only the owner case of utimensat is compared natively, and only in whole seconds. On Node the nanoseconds of a time are
+  dropped (the set and the stat both), so the engine (which keeps them) is not checked for a sub-second value on Node.
+- `wait4`, `waitid` and `/proc/<pid>/maps` are unchanged from B1.
+- **xattr labels are not folded into the metadata record.** The labels are keyed by guest path (they survive an unlink, and a
+  rename does not move them), while the metadata records are keyed by host inode. A fold would change the key and the sidecar
+  format (labels are variable-length and may hold spaces), so it is left as it is. The B7 xattr store is unchanged.
+- Locks on sockets and synthetic files give EINVAL.
+- The order in which several waiters that are all eligible get the lock is not tested against Linux's wake order.
+- `pwritev` (70) and `preadv2` are not implemented (SQLite on this path did not need them).
+- The sidecar is saved only at a normal exit (Part 1).
+- Telephony, NFC, Bluetooth and UWB are still on. None of them has blocked the boot so far.
+- `System now ready` and `sys.boot_completed=1` are not reached in any run (checked in the three product runs).
+- The product boot reads the record sidecar (`build/rootfs-xiaoji/.xiaoji-meta`) at start, and `reset-data` is the only thing
+  that clears it for `/data`. The Google tree keeps its sidecar between runs (see Part 4).

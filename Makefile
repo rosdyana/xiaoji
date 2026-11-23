@@ -45,7 +45,7 @@ wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 # filesystem built by the worker in MEMFS (createLazyFile over HTTP).
 build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 -DXIAOJI_WEB=1 $(GEN_INC) -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
 	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
 	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)

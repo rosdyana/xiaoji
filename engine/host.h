@@ -32,6 +32,7 @@ int host_open(const char *path, uint32_t lflags, uint32_t mode);
 int host_close(int fd);
 int64_t host_read(int fd, void *buf, size_t len);
 int64_t host_pread(int fd, void *buf, size_t len, uint64_t off);
+int64_t host_pwrite(int fd, const void *buf, size_t len, uint64_t off);
 int64_t host_write(int fd, const void *buf, size_t len);
 int64_t host_lseek(int fd, int64_t off, int whence);
 int host_dup(int fd);
@@ -46,12 +47,22 @@ int host_access(const char *path, uint32_t mode);
 /* Filesystem changes; each returns 0 or -linux_errno. */
 int host_chmod(const char *path, uint32_t mode);
 int host_fchmod(int fd, uint32_t mode);
+
+/* One time of utimensat, in guest terms: now and omit are the guest's UTIME_NOW and UTIME_OMIT. */
+typedef struct {
+    int64_t sec, nsec;
+    int now, omit;
+} host_time_t;
+/* utimensat on path (follow 0: a symlink's own times), or futimens on fd when path is NULL. Returns 0 or -errno. */
+int host_utimens(const char *path, int fd, int follow, const host_time_t t[2]);
 int host_mkdir(const char *path, uint32_t mode);
 int host_unlink(const char *path);
 int host_rmdir(const char *path);
 int host_rename(const char *from, const char *to);
 int host_link(const char *from, const char *to);
 int host_fsync(int fd);
+/* ftruncate of a host file (len is the new size). Returns 0 or -errno. */
+int host_ftruncate(int fd, uint64_t len);
 /* Returns the link length (truncated to cap) or -LE_*. */
 int64_t host_readlink(const char *path, char *buf, size_t cap);
 

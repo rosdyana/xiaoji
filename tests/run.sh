@@ -62,7 +62,7 @@ rootfs_argv() {
     sh-subshell) ARGV=(/system/bin/sh -c 'x=$(/system/bin/toybox uname -m); echo "arch=$x"; (exit 3); echo "rc=$?"') ;;
     sh-bg) ARGV=(/system/bin/sh -c '/system/bin/toybox sleep 0.1 & wait; echo done') ;;
     sh-loop) ARGV=(/system/bin/sh -c 'for i in 1 2 3; do /system/bin/toybox echo $i; done | /system/bin/toybox tac') ;;
-    sh-script) ARGV=(/system/bin/sh -c 'echo "#!/system/bin/sh" > /data/local/tmp/s.sh; echo "echo script ran \$1" >> /data/local/tmp/s.sh; chmod 755 /data/local/tmp/s.sh; /data/local/tmp/s.sh arg1') ;;
+    sh-script) ARGV=(/system/bin/sh -c 'mkdir -p /data/local/tmp; echo "#!/system/bin/sh" > /data/local/tmp/s.sh; echo "echo script ran \$1" >> /data/local/tmp/s.sh; chmod 755 /data/local/tmp/s.sh; /data/local/tmp/s.sh arg1') ;;
     hello-int) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Xint -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello) ;;
     hello-jit) ARGV=(/apex/com.android.art/bin/dalvikvm64 -Ximage:/system/framework/boot.art:/system/framework/boot-framework.art -cp /data/hello.dex Hello) ;;
     esac
@@ -615,9 +615,13 @@ fi
 # docs/boot.md B7), both HALs register, and BatteryService receives the health HAL's first update. These are
 # the furthest deterministic points (3 of 3 runs); system_server then dies in SettingsProvider (B7, next blocker).
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
-    # A boot starts from a cleared /data and no /data records (B8, tools/reset-data.py), so it is deterministic.
-    python3 -I tools/reset-data.py "$RFS" >/dev/null || { echo "FAIL  reset-data $RFS"; fail=$((fail + 1)); }
-    XIAOJI_STAMP=1 timeout 200 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 90 \
+    # The product tree starts from a cleared /data and no /data records (B8, tools/reset-data.py), so its boot is
+    # deterministic. The Google-image tree keeps its /data: the other cases read files that a reset would remove
+    # (build/rootfs/data/hello.dex, /data/local/tmp).
+    case "$RFS" in
+    *-xiaoji) python3 -I tools/reset-data.py "$RFS" >/dev/null || { echo "FAIL  reset-data $RFS"; fail=$((fail + 1)); } ;;
+    esac
+    XIAOJI_STAMP=1 timeout 240 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 150 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
@@ -637,8 +641,9 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'host sensors mask=6f' "$OUT/boot.err" &&
             grep -q 'Registered android.hardware.sensors@2.1::ISensors/default' "$OUT/boot.err" &&
             grep -q 'Registered android.hardware.health@2.1::IHealth/default' "$OUT/boot.err" &&
-            grep -q 'BatteryService([0-9]*): health: Waited [0-9]*ms and received the update' "$OUT/boot.err"; }; }; then
-        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1)"
+            grep -q 'BatteryService([0-9]*): health: Waited [0-9]*ms and received the update' "$OUT/boot.err" &&
+            grep -q 'SettingsProvider([0-9]*): Generated and saved new ANDROID_ID' "$OUT/boot.err"; }; }; then
+        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8)"
         pass=$((pass + 1))
     else
         echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded') in $OUT/boot.err"

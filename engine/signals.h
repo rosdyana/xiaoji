@@ -43,6 +43,9 @@ void sig_rt_sigreturn(cpu_t *c);
  * one signal: a handler frame, or the default action (which may end the process). */
 void sig_deliver_pending(cpu_t *c);
 
+/* 1 when a signal is pending and not blocked: a wait that signals can interrupt returns EINTR (locks.c). */
+int sig_interrupt_pending(const cpu_t *c);
+
 /* A synchronous fault in the instruction at c->pc (SIGSEGV or SIGILL). Returns 1 if
  * a handler frame was built. Returns 0 if the default action applies (no usable
  * handler), and the caller reports and exits. */

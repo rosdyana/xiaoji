@@ -15,8 +15,8 @@
  * chown_common, chmod_common). Permission checks use the calling process's fsuid, fsgid, supplementary groups
  * and effective capabilities (cred.c). Enforcement of mode bits on access (DAC) is not part of this layer.
  *
- * The records are in memory for the engine's life (meta_save and meta_load are the persistence hook: B8
- * checkpoint 2 writes them to the rootfs). */
+ * The records are in memory for the engine's life. With --root they are loaded from and saved to <root>/.xiaoji-meta
+ * (meta_persist_open and meta_persist_save). */
 
 #include <stdint.h>
 
@@ -53,6 +53,16 @@ void meta_write_privs(uint64_t dev, uint64_t ino);
 
 /* 1 and the record in out when the host file has a record, else 0 (meta_get gives the default). */
 int meta_recorded(const host_stat *st, meta_t *out);
+
+/* utimensat's permission on a host file: 0, or -LE_PERM (an explicit time, and the caller is neither the owner
+ * nor has CAP_FOWNER) or -LE_ACCES (a touch, and the caller has no write permission). explicit_times is 1 when the
+ * call gives a time that is not "now" (vfs_utimes' ATTR_TIMES_SET). */
+int meta_utime_check(const host_stat *st, int explicit_times);
+
+/* access(2) on a host file under its guest owner, group and mode (the caller's fsuid and groups, and the
+ * DAC override and read-search capabilities, as Linux's generic_permission). mode is R_OK 4, W_OK 2, X_OK 1
+ * (0 is the existence check, which the caller does). Returns 0 or -LE_ACCES. */
+int meta_access(const host_stat *st, uint32_t mode);
 
 /* 1 for the guest names the sidecar uses (/.xiaoji-meta and its temporary): the guest cannot see or name them. */
 int meta_hidden_guest(const char *guest);

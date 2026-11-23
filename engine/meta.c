@@ -242,7 +242,7 @@ void meta_write_privs(uint64_t dev, uint64_t ino)
  * "xiaoji-meta 1". The file is loaded when the engine starts and written at exit (an atexit handler, which runs on
  * every normal exit and on exit(1)). A write goes to .xiaoji-meta.tmp and is renamed over the file. A record whose file
  * is gone is not written, so a removed file leaves no entry. A kill by a signal writes nothing. The guest cannot see or
- * name the two files (meta_hidden_guest). The browser build can store the same text (meta_persist_text, later). */
+ * name the two files (meta_hidden_guest). No other store exists for these records. */
 #define META_FILE ".xiaoji-meta"
 #define META_TMP ".xiaoji-meta.tmp"
 #define META_HEADER "xiaoji-meta 1"
@@ -250,6 +250,48 @@ void meta_write_privs(uint64_t dev, uint64_t ino)
 int meta_hidden_guest(const char *guest)
 {
     return !strcmp(guest, "/" META_FILE) || !strcmp(guest, "/" META_TMP);
+}
+
+int meta_utime_check(const host_stat *st, int explicit_times)
+{
+    meta_t m;
+    meta_get(st, &m);
+    if (m.uid == cur()->fsuid || cap(LCAP_FOWNER))
+        return 0;
+    if (explicit_times)
+        return -LE_PERM;
+    if (cap(LCAP_DAC_OVERRIDE))
+        return 0;
+    uint32_t bit = in_group(m.gid) ? 0020u : 0002u; /* the group or the other class (the owner is handled above) */
+    return (m.mode & bit) ? 0 : -LE_ACCES;
+}
+
+int meta_access(const host_stat *st, uint32_t mode)
+{
+    if (!mode)
+        return 0;
+    meta_t m;
+    meta_get(st, &m);
+    int is_dir = (st->mode & M_IFMT) == M_IFDIR;
+    if (cap(LCAP_DAC_OVERRIDE)) {
+        /* Read and write always pass; execute needs an exec bit on a file (a directory always passes). */
+        if (!(mode & 1) || is_dir || (m.mode & 0111))
+            return 0;
+        return -LE_ACCES;
+    }
+    uint32_t cls;
+    if (m.uid == cur()->fsuid)
+        cls = (m.mode >> 6) & 7;
+    else if (in_group(m.gid))
+        cls = (m.mode >> 3) & 7;
+    else
+        cls = m.mode & 7;
+    if ((cls & mode) == mode)
+        return 0;
+    /* CAP_DAC_READ_SEARCH: read any file, and search (execute) a directory; never write. */
+    if (cap(LCAP_DAC_READ_SEARCH) && !(mode & 2) && (!(mode & 1) || is_dir))
+        return 0;
+    return -LE_ACCES;
 }
 
 int meta_recorded(const host_stat *st, meta_t *out)
@@ -263,19 +305,6 @@ int meta_recorded(const host_stat *st, meta_t *out)
     return 1;
 }
 
-#ifdef XIAOJI_WEB
-/* The browser build (W1) keeps the records in memory only: nothing is read from or written to the page's file
- * system at start or exit, and the guest's /data does not outlive the page. */
-int meta_persist_open(const char *root)
-{
-    (void)root;
-    return 0;
-}
-
-void meta_persist_save(void)
-{
-}
-#else
 static char persist_root[4096];
 static int persist_on;
 static const char *const tree_names[] = {"/data", "/cache", "/metadata"};
@@ -332,6 +361,7 @@ static FILE *write_sidecar_tmp(const char *root)
     return out;
 }
 
+#ifndef XIAOJI_LAZY_FS
 static int tree_allowed(const char *guest)
 {
     for (int i = 0; i < NTREES; i++) {
@@ -407,9 +437,18 @@ static void load_sidecar(void)
     }
     fclose(in);
 }
+#endif /* XIAOJI_LAZY_FS */
 
 int meta_persist_open(const char *root)
 {
+#ifdef XIAOJI_LAZY_FS
+    /* The browser build (Makefile target wasm) has a lazy HTTP file system as its root. Loading the sidecar would stat
+     * every recorded file, and the first stat of a lazy file downloads it and prints a warning on stdout (the web test
+     * caught this). The browser build therefore keeps no sidecar: its records last for the session, as B8 part 1 did
+     * before the sidecar. */
+    (void)root;
+    return 0;
+#else
     size_t n = strlen(root);
     while (n > 1 && root[n - 1] == '/')
         n--;
@@ -420,6 +459,7 @@ int meta_persist_open(const char *root)
     persist_on = 1;
     load_sidecar();
     return 0;
+#endif
 }
 
 void meta_persist_save(void)
@@ -439,4 +479,3 @@ void meta_persist_save(void)
     if (rename(tmp, fin) != 0)
         fputs("xiaoji: cannot replace the guest metadata sidecar\n", stderr);
 }
-#endif /* XIAOJI_WEB */

@@ -7,5 +7,7 @@
 /* Handles syscall nr if it is a file syscall. Returns 1 and sets *ret if it was
  * handled, 0 otherwise. Arguments are the raw x0 to x5 registers. */
 int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret);
+/* flock(2) (locks.c): fd and cmd as the guest passes them. */
+int64_t sysfs_flock(uint64_t fd, uint64_t cmd);
 
 #endif

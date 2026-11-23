@@ -260,6 +260,11 @@ static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uin
     return 0;
 }
 
+int sig_interrupt_pending(const cpu_t *c)
+{
+    return (c->sig_pending & ~c->sig_mask) != 0;
+}
+
 void sig_deliver_pending(cpu_t *c)
 {
     uint64_t ready = c->sig_pending & ~c->sig_mask;
