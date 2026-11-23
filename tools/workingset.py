@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Working-set analysis of a Boot Android access trace (docs/loading.md, step 1).
 
-Usage: workingset.py TRACE.json ROOTFS-XIAOJI [--order-out ORDER.json]
+Usage: workingset.py TRACE.json [TRACE.json ...] ROOTFS-XIAOJI [--order-out ORDER.json]
 
 With --order-out, writes the boot's first-read order of 64 KiB chunks ([[path, chunk], ...]) for tools/pack.py.
+With several traces the order is their union (the report is for the first trace).
 
 TRACE.json is the "trace" message of tools/webboot-bench.mjs --trace (web/trace.js): per file the
 4 KiB pages and 64 KiB chunks that the engine's reads touched, and the first-read order of the chunks.
@@ -58,14 +59,17 @@ def main(argv):
         i = args.index("--order-out")
         order_out = args[i + 1]
         del args[i:i + 2]
-    if len(args) != 2:
+    if len(args) < 2:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
         return 2
-    trace_path, root = args
-    with open(trace_path) as f:
-        tr = json.load(f)
-    tr = tr.get("trace", tr)  # tools/webboot-bench.mjs output keeps the page message under "trace"
-    acc = tr["access"]
+    *trace_paths, root = args
+    traces = []
+    for trace_path in trace_paths:
+        with open(trace_path) as f:
+            tr = json.load(f)
+        tr = tr.get("trace", tr)  # tools/webboot-bench.mjs output keeps the page message under "trace"
+        traces.append(tr["access"])
+    acc = traces[0]  # the report is for the first trace; the order is the union of all of them
     files = acc["files"]
 
     total_fs = 0
@@ -141,8 +145,14 @@ def main(argv):
                 entry["all"]["per_chunk_64k"] = per_chunk
             report["compress"][f"{tool}-{lv}"] = entry
     if order_out:
+        union, seen = [], set()
+        for t in traces:  # first-read order: the first trace's entries, then the new ones of each later trace
+            for p, c in t["order"]:
+                if (p, c) not in seen:
+                    seen.add((p, c))
+                    union.append([p, c])
         with open(order_out, "w") as f:
-            json.dump([[p, c] for p, c in acc["order"]], f, separators=(",", ":"))
+            json.dump(union, f, separators=(",", ":"))
             f.write("\n")
     print(json.dumps(report, indent=1))
     return 0
