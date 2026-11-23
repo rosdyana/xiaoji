@@ -62,4 +62,9 @@ int sig_debug_faults(void);
 /* The default SIGSEGV action: message and exit 139. */
 void sig_segv_fatal(uint64_t addr, uint64_t pc);
 
+/* Timers (timers.c): a timer's signal to process p (tid 0) or to thread tid of p; 0, or -1 for no target.
+ * sig_timer_pending says whether sig is already pending on that target. */
+int sig_timer_raise(struct proc *p, int tid, int sig, int code, uint32_t id, uint64_t value);
+int sig_timer_pending(struct proc *p, int tid, int sig);
+
 #endif

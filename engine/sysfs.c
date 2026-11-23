@@ -8,6 +8,7 @@
 
 #include "binder.h"
 #include "cred.h"
+#include "inotify.h"
 #include "goldfish.h"
 #include "fdobj.h"
 #include "poll.h"
@@ -38,6 +39,9 @@
 #define SYS_EVENTFD2 19
 #define SYS_PPOLL 73
 #define SYS_TIMERFD_CREATE 85
+#define SYS_INOTIFY_INIT1 26
+#define SYS_INOTIFY_ADD_WATCH 27
+#define SYS_INOTIFY_RM_WATCH 28
 #define SYS_TIMERFD_SETTIME 86
 #define SYS_TIMERFD_GETTIME 87
 #define SYS_FTRUNCATE 46
@@ -1364,12 +1368,60 @@ static int64_t sys_eventfd2(uint64_t init, uint64_t flags)
                        LO_RDWR | (uint32_t)(flags & LO_NONBLOCK));
 }
 
-/* timerfd_create(clockid, flags). The clocks are CLOCK_MONOTONIC and CLOCK_BOOTTIME; both
- * are the host's monotonic clock in the engine. */
+/* inotify (B9, inotify.c): the instance and its watches. The instance is read-only; no event is queued. */
+static int64_t sys_inotify_init1(uint64_t flags)
+{
+    if (flags & ~(uint64_t)(LO_NONBLOCK | LO_CLOEXEC))
+        return -LE_INVAL;
+    void *o = ino_new();
+    if (!o)
+        return -LE_NOMEM;
+    return vfs_obj_new(VFS_INOTIFY, o, (flags & LO_CLOEXEC) != 0, LO_RDONLY | (uint32_t)(flags & LO_NONBLOCK));
+}
+
+/* inotify_add_watch(fd, path, mask): the path must exist (ENOENT), and the mask must name an event (EINVAL). */
+static int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_va, uint64_t mask)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_INOTIFY)
+        return -LE_INVAL;
+    char path[VFS_PATH_MAX];
+    int rc = get_path(path_va, path, sizeof path);
+    if (rc)
+        return rc;
+    if ((mask & 0xfffu) == 0)
+        return -LE_INVAL;
+    vfs_res r;
+    rc = vfs_resolve(LAT_FDCWD, path, 1, &r);
+    if (rc < 0)
+        return rc;
+    if (!r.exists)
+        return -LE_NOENT;
+    int wd = ino_add(f->obj, r.guest, (uint32_t)mask);
+    return wd < 0 ? -LE_NOSPC : wd;
+}
+
+static int64_t sys_inotify_rm_watch(uint64_t fd, uint64_t wd)
+{
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (f->kind != VFS_INOTIFY)
+        return -LE_INVAL;
+    return ino_rm(f->obj, (int)(int32_t)wd) < 0 ? -LE_INVAL : 0;
+}
+
+/* timerfd_create(clockid, flags). The clocks are CLOCK_REALTIME (0), CLOCK_MONOTONIC (1), CLOCK_BOOTTIME (7) and
+ * the two alarm clocks (8 and 9, which need CAP_WAKE_ALARM: EPERM without it, as Linux). The engine does not
+ * suspend, so the alarm clocks are the realtime and boottime clocks (fdobj.c converts the realtime deadlines). */
 static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags)
 {
-    if (clockid != 1 && clockid != 7)
+    if (clockid != 0 && clockid != 1 && clockid != 7 && clockid != 8 && clockid != 9)
         return -LE_INVAL;
+    if ((clockid == 8 || clockid == 9) && !cred_has_cap(proc_cur(), LCAP_WAKE_ALARM))
+        return -LE_PERM;
     if (flags & ~(uint64_t)(LO_NONBLOCK | LO_CLOEXEC))
         return -LE_INVAL;
     void *o = tfd_new((int)clockid);
@@ -1413,7 +1465,11 @@ static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_va,
         return -LE_BADF;
     if (f->kind != VFS_TIMERFD)
         return -LE_INVAL;
-    if (flags & ~(uint64_t)TFD_TIMER_ABSTIME)
+    /* TFD_TIMER_CANCEL_ON_SET (2): Linux allows it with ABSTIME on CLOCK_REALTIME only. The engine never sets
+     * the realtime clock (no settimeofday), so the cancel is never due (B9). */
+    if (flags & ~(uint64_t)(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET))
+        return -LE_INVAL;
+    if ((flags & TFD_TIMER_CANCEL_ON_SET) && (!(flags & TFD_TIMER_ABSTIME) || tfd_clockid(f->obj) != 0))
         return -LE_INVAL;
     uint8_t it[32];
     if (mem_copy_out(it, new_va, sizeof it) < 0)
@@ -1488,6 +1544,9 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_EPOLL_PWAIT: *ret = poll_epoll_wait((int)(int32_t)a[0], a[1], (int32_t)a[2], (int32_t)a[3]); return 1;
     case SYS_PPOLL: *ret = poll_ppoll(a[0], a[1], a[2], a[3], a[4]); return 1;
     case SYS_TIMERFD_CREATE: *ret = sys_timerfd_create(a[0], a[1]); return 1;
+    case SYS_INOTIFY_INIT1: *ret = sys_inotify_init1(a[0]); return 1;
+    case SYS_INOTIFY_ADD_WATCH: *ret = sys_inotify_add_watch(a[0], a[1], a[2]); return 1;
+    case SYS_INOTIFY_RM_WATCH: *ret = sys_inotify_rm_watch(a[0], a[1]); return 1;
     case SYS_TIMERFD_SETTIME: *ret = sys_timerfd_settime(a[0], a[1], a[2], a[3]); return 1;
     case SYS_TIMERFD_GETTIME: *ret = sys_timerfd_gettime(a[0], a[1]); return 1;
     case SYS_FTRUNCATE: *ret = sys_ftruncate(a[0], a[1]); return 1;

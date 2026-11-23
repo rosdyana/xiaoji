@@ -21,6 +21,7 @@
 #include "binder.h"
 #include "goldfish.h"
 #include "fdobj.h"
+#include "inotify.h"
 #include "pipe.h"
 #include "poll.h"
 #include "powersupply.h"
@@ -481,6 +482,8 @@ static void desc_unref(vfs_fd *f)
         efd_free(f->obj);
     if (f->kind == VFS_TIMERFD)
         tfd_free(f->obj);
+    if (f->kind == VFS_INOTIFY)
+        ino_free(f->obj);
     if (f->kind == VFS_EPOLL)
         poll_epoll_free(f->obj);
     free(f->guest);
@@ -536,6 +539,8 @@ static void obj_free(vfs_kind kind, void *obj)
         efd_free(obj);
     else if (kind == VFS_TIMERFD)
         tfd_free(obj);
+    else if (kind == VFS_INOTIFY)
+        ino_free(obj);
     else if (kind == VFS_EPOLL)
         poll_epoll_free(obj);
 }
@@ -552,7 +557,8 @@ int vfs_obj_new(vfs_kind kind, void *obj, int cloexec, uint32_t lflags)
     d->obj = obj;
     d->lflags = lflags;
     d->guest = xstrdup(kind == VFS_EVENTFD ? "anon_inode:[eventfd]"
-                       : kind == VFS_TIMERFD ? "anon_inode:[timerfd]" : "anon_inode:[eventpoll]");
+                       : kind == VFS_TIMERFD ? "anon_inode:[timerfd]"
+                       : kind == VFS_INOTIFY ? "anon_inode:[inotify]" : "anon_inode:[eventpoll]");
     slot_install(slot, d, cloexec != 0);
     return slot;
 }
@@ -1096,6 +1102,7 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     case VFS_EVENTFD: return efd_read(f->obj, buf, n);
     case VFS_GOLDFISH: return goldfish_read(f->obj, buf, n);
     case VFS_TIMERFD: return tfd_read(f->obj, buf, n);
+    case VFS_INOTIFY: return -LE_AGAIN; /* no event is ever queued (inotify.c) */
     case VFS_EPOLL: return -LE_INVAL;
     default: break;
     }
@@ -1120,6 +1127,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_GOLDFISH:
     case VFS_EVENTFD:
     case VFS_TIMERFD:
+    case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
     default: break;
     }
@@ -1157,6 +1165,8 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
             /* attr/current takes a new context (setcon writes it); the other generated files are read-only. */
             if (procfs_is_attr_current(f->guest))
                 return procfs_attr_write(f->guest, buf, n);
+            if (procfs_writable(f->guest))
+                return procfs_write(f->guest, buf, n);
             return -LE_BADF;
         }
         return (int64_t)n; /* /dev/null, /dev/zero and /dev/random discard writes */
@@ -1164,7 +1174,8 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     case VFS_BINDER: return -LE_INVAL;
     case VFS_EVENTFD: return efd_write(f->obj, buf, n);
     case VFS_GOLDFISH: return goldfish_write(f->obj, buf, n);
-    case VFS_TIMERFD: return -LE_INVAL;
+    case VFS_TIMERFD:
+    case VFS_INOTIFY: return -LE_INVAL;
     case VFS_EPOLL: return -LE_INVAL;
     case VFS_MEMFD: {
         if (f->ro_area)
@@ -1213,6 +1224,7 @@ int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
     case VFS_EVENTFD:
     case VFS_GOLDFISH:
     case VFS_TIMERFD:
+    case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
     default: break;
     }
@@ -1236,6 +1248,7 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
     case VFS_BINDER:
     case VFS_EVENTFD:
     case VFS_TIMERFD:
+    case VFS_INOTIFY:
     case VFS_GOLDFISH:
     case VFS_EPOLL:
         return -LE_SPIPE;

@@ -47,6 +47,8 @@ typedef struct proc {
     int zombie;      /* ended and not reaped: wait4 and waitid report it */
     int vfork;       /* made by vfork: shares its parent's address space */
     int nthreads;
+    int oom_score_adj; /* /proc/<pid>/oom_score_adj: -1000 to 1000 (procfs.c); a fork copies it */
+    char dbg_comm[16]; /* the name of the last thread that ended (XIAOJI_DEBUG_FAULTS exit lines) */
     uint64_t rlim[PROC_RLIM_N][2]; /* soft and hard limit per resource (prlimit64, setrlimit) */
     char attr_current[PROC_ATTR_MAX]; /* attr/current: the context, which setcon writes */
     /* Accounting for getrusage. Instructions and syscalls are this process's own;

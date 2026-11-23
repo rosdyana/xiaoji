@@ -3046,3 +3046,212 @@ before that. The log has no crash, tombstone or watchdog line for 1047, and no l
 - `System now ready` and `sys.boot_completed=1` are not reached in any run (checked in the three product runs).
 - The product boot reads the record sidecar (`build/rootfs-xiaoji/.xiaoji-meta`) at start, and `reset-data` is the only thing
   that clears it for `/data`. The Google tree keeps its sidecar between runs (see Part 4).
+
+## B9: lmkd on PSI, the vibrator HAL, POSIX and interval timers, the death of system_server, and the boot past the lmkd and vibrator services (stops at vold)
+
+Status: **the boot passes ActivityManager's lmkd connection and VibratorManagerService's start (3 of 3 runs of the product
+tree from a cleared `data/`). system_server then dies in StorageManagerService (the `vold` service is not in the engine,
+decision below). `System now ready` and `sys.boot_completed=1` are not reached.** The death of pid 1047 in B8's 300 s run is
+explained (the Watchdog, below), and the fix is in place. The timers are done and tested.
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 0 | The death of pid 1047, captured before the fixes | Done (a 300 s run with `XIAOJI_DEBUG_FAULTS=1`). The cause is below. |
+| 1 | ITIMER_REAL, POSIX timers, and their guest test | Done. `engine/timers.c`, `engine/timers.h`, `tests/guest/timers.c`. |
+| 2 | lmkd running, and the ActivityManager connection | Done. `image/xiaoji.rc`, `engine/procfs.c`, `engine/sock.c`, `engine/init.c`. |
+| 3 | The vibrator HAL, and the death cause | Done. The vibrator block in `image/xiaoji.rc`. The watchdog no longer fires. |
+| 4 | Boot progress | Partial: past lmkd and the vibrator service. Stopped at `vold` (next blocker). |
+
+### Debug output (`XIAOJI_DEBUG_FAULTS=1`)
+
+The existing flag now also logs, on stderr: every guest process end (`xiaoji: exit: pid N (name) status S` or
+`killed by signal S`, with the name of its last thread), every fatal signal with its pid, name and pc
+(`xiaoji: fatal signal S in pid N (name) at pc ...`, `sched.c sched_exit_signal`), every kill(2) between guest processes
+(`xiaoji: kill: pid A sends signal S to pid B`, `signals.c sig_kill`), and each write to `oom_score_adj`. Init's restart
+decisions are already logged (`init: X exited (status S, by a signal)`, `crash-looping`).
+
+### Timers (`engine/timers.c`)
+
+- **ITIMER_REAL** (`setitimer`, `getitimer`): per process, with SIGALRM (SI_KERNEL). A zero value disarms, a zero interval
+  makes a one-shot, and a usec outside [0, 10^6) is EINVAL. `alarm(3)` is `setitimer` on arm64, so it needs no syscall.
+  ITIMER_VIRTUAL and ITIMER_PROF give ENOSYS (not built).
+- **POSIX timers** (`timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete`): clocks
+  REALTIME, MONOTONIC and BOOTTIME. SIGEV_SIGNAL, SIGEV_NONE and SIGEV_THREAD_ID (the kernel's, to one thread of the process,
+  by tid). A NULL sigevent is SIGEV_SIGNAL with SIGALRM and the timer id as the value. TIMER_ABSTIME. The id is the table slot.
+  Timers are per process, so a fork child has none. An exec drops the POSIX timers and keeps ITIMER_REAL (the man page's
+  rule, not checked against the oracle). A process's end drops them all.
+- **Clock and wake-up.** The engine clock is the host monotonic clock (realtime for CLOCK_REALTIME). `sched.c` runs
+  `timers_expire` on every pass, and a due timer raises its signal through `signals.c` (`sig_timer_raise`). A blocked thread
+  wakes with EINTR, as it does for any signal. The scheduler's waits (`pending_deadlines`, `wait_for_timers`, `idle_wait`)
+  include the earliest armed timer, so nothing spins.
+- **Overrun.** If the target still has the signal pending, the expirations are counted and no second signal is raised. Otherwise
+  the count is the expirations this firing skipped. Linux keeps the count for the last delivered signal; the engine's is
+  set at the firing, so it can differ when a signal is delivered late.
+- **The test** (`tests/guest/timers.c`, cases `timers-O0` and `timers-O2`, compared with the builder-VM oracle). It covers a
+  one-shot ITIMER_REAL cutting a 2 s nanosleep short (EINTR), the si_code of that signal, getitimer after the one-shot,
+  the remaining time of a 2 s timer and its disarm (with the old value), an interval (at least three alarms), a POSIX timer
+  to SIGUSR1 (si_code SI_TIMER and si_value 42), its gettime and getoverrun, timer_delete and the EINVAL after it, a
+  SIGEV_THREAD_ID timer to this thread (periodic, value 7), an absolute time in the past (1 ns on CLOCK_MONOTONIC, which is not
+  zero), the EINVAL cases (clock 99, signal 0, a tid outside the process, a bad id, bad flags, a usec of 10^6, a nsec of 10^9),
+  and a fork child whose getitimer is zero. Output holds comparisons and small numbers only, never a time or a timer id.
+- **Differences from the kernel found by the oracle** (the test avoids them, and they are gaps): the kernel accepts
+  clock 2 (CLOCK_PROCESS_CPUTIME_ID), and the engine returns EINVAL. The kernel accepts sigev_notify 2 (SIGEV_THREAD) in
+  timer_create, and the engine returns EINVAL. glibc and bionic convert SIGEV_THREAD in userspace and pass SIGEV_THREAD_ID to
+  the kernel, so no library call reaches this case. The siginfo written for a timer leaves si_overrun at 0.
+- The Node build ran the first version of the test with a negative absolute time (`now - 1 s`), because the Node host clock
+  starts near zero. The test now uses 1 ns, and the value is the same on every host.
+
+### lmkd: the decision and its evidence
+
+Sources: the remote tree `~/xiaoji-aosp/system/memory/lmkd/` (read only). Functions are named, not lines.
+
+- **Why it crashed.** `init_monitors` picks PSI, and falls back to vmpressure. The engine had no `/proc/pressure`, so
+  `init_psi_monitors` failed. Its fallback, `init_mp_common`, returns false unless `memcg_version()` is kV1 (checked in
+  `init_mp_common` before any file is opened). `memcg_version` reads cgroup v1 through `CgroupGetControllerPath`, which reads
+  `/dev/cgroup_info/cgroup.rc`. Neither exists, so `init` fails, `main` exits with status 0, and the `critical` service is
+  restarted until init gives up (the B8 crash loop).
+- **Why PSI is the cheap path.** In `init_psi_monitors` the cgroup check runs only when `use_new_strategy` is false. The
+  default is `low_ram_device || !use_minfree_levels`, and `use_minfree_levels` defaults to false, so the default path reads no
+  cgroup. The vmpressure fallback is not built; it would need a v1 memcg hierarchy the engine does not have.
+- **The PSI files** (`engine/procfs.c`, `pressure_file`, `procfs_write`, `psi_trigger_ok`). `/proc/pressure/{memory,cpu,io}` are
+  generated text with a `some` and a `full` line, all counters zero, since the engine never reports a stall. lmkd opens
+  `/proc/pressure/memory` O_WRONLY and writes its trigger (`some 70000 1000000` and `full ...`, with the NUL, from
+  `libpsi/psi.cpp`). `procfs_write` accepts a well-formed trigger (`some|full`, a window of 0.5 to 10 s, a stall in (0, window])
+  and never fires it. `epoll_ctl(EPOLLPRI)` on it succeeds, and poll reports a synthetic file as IN/OUT only, so a fd
+  registered for EPOLLPRI is never ready (`poll_revents` masks by the registered events). lmkd sleeps in epoll as it should.
+  Not built: a trigger that fires on real engine pressure (no engine pressure source exists).
+- **What lmkd reads, and what the engine does not serve.** `/proc/meminfo` (a stub since B5), `/proc/zoneinfo` and
+  `/proc/vmstat` are read in the PSI event handlers and in the watermark refresh (`mp_event_psi` path,
+  `find_and_kill_process`). Those never run when the trigger never fires, so the engine serves neither file. The one
+  exception is init's read of zoneinfo for a buffer size, which logs `E/lowmemorykiller: Failed to read /proc/zoneinfo` once.
+  It is harmless. `pidfd_open` (434) is not built, so lmkd logs `Process polling is not supported` and uses the pid path.
+  `mlockall` (230), `process_mrelease` (448) and `pthread_setname_np` are not built, and each logs a warning. They are not
+  needed for the protocol.
+- **The socket needs passcred.** `ctrl_data_read` closes a connection whose message has no SCM_CREDENTIALS. The rc block is
+  `socket lmkd seqpacket+passcred 0660 system system`. `init.c` (`parse`, `make_socket`) sets SO_PASSCRED on the listener
+  (`sock_set_passcred`), and `sock.c` (the connect path that creates the accepted socket) copies it to that socket, as Linux does in unix_stream_connect. The
+  engine already attaches the credentials on receive (`sockcall.c`, `sock_passcred`), so only these two pieces were missing.
+- **The per-app memcg branch.** `vendor/build.prop` sets `ro.config.low_ram=true`, which makes `per_app_memcg` default to true.
+  `cmd_procprio` then reads a v1 soft-limit path, logs `Querying MemSoftLimit path failed`, and returns before it records the
+  process. The engine has no memcg, so the image sets `ro.config.per_app_memcg false` in the early-init block. `low_ram` is
+  not changed.
+- **The procprio path.** `cmd_procprio` reads `/proc/<pid>/status` (Tgid, present), writes `/proc/<pid>/oom_score_adj`
+  (new: `procfs_write`, per process, `proc_t.oom_score_adj`, copied by a fork), and then records the process. The evidence is the
+  debug line `xiaoji: oom_score_adj of pid 1045 is -900`, after `ActivityManager: Connection with lmkd established`.
+- **lmkd stays up.** In the 200 s runs `lowmemorykiller(1011)` logs the connection and no exit (`init: lmkd exited` does
+  not appear).
+
+### The death of pid 1047 (B8's 300 s run), and the fix
+
+The log of the 300 s run (scratchpad `run300.err`, with the B9 diagnostics on) shows the cause:
+
+1. system_server's main thread is in `VibratorManagerService.<init>`, in `nativeGetCapabilities` (the binder wait for
+   `IVibratorManager/default`, which no service provides; the log has `Waited one second for ...` repeated).
+2. The Watchdog reports `Blocked in handler on main thread (main)` and `WATCHDOG KILLING SYSTEM PROCESS`, then sends SIGKILL
+   to itself: `Sending signal. PID: 1047 SIG: 9`, `xiaoji: kill: pid 1047 sends signal 9 to pid 1047`.
+3. Zygote (pid 1003): `Process 1047 exited due to signal 9`, `Exit zygote because system server (pid 1047) has terminated`.
+   Init restarts zygote, which forks the second system_server (pid 1194) at about 249 s. That is the second process in B8.
+
+So the "unknown reason" was the Watchdog, and the root cause is the missing vibrator service. The fix is the vibrator block
+in `image/xiaoji.rc` (below). In the runs after it, the Watchdog does not fire and VibratorManagerService's onStart returns.
+
+### The vibrator HAL
+
+- `android.hardware.vibrator-service.example` is the image's binary. Its block is the one in
+  `hardware/interfaces/vibrator/aidl/default/vibrator-default.rc` (class `hal`, user and group `nobody`), added as
+  `vendor.vibrator-default` in `image/xiaoji.rc`. The service registers `IVibrator/default` and `IVibratorManager/default`, the two
+  names in `android.hardware.vibrator.xml` (the manifest servicemanager reads). The stock rc has no socket and no interface line.
+- **No sysfs.** The example (`Vibrator.cpp`, `VibratorManager.cpp`) reads no sysfs file (checked: no `/sys` or `fopen`), so
+  the `/sys/class/leds/vibrator` line in the plan is not needed.
+
+### Milestones (product tree, `build/rootfs-xiaoji`, `make reset-data` first, `--logcat --init image/xiaoji.rc`)
+
+Times and instruction counts are guest time (`[ms insn]`, with `XIAOJI_STAMP=1`). Power: `pmset -g` shows `lowpowermode 0`, and
+`pmset -g batt` shows `Now drawing from 'AC Power'` (scratchpad: `pmset-b9.txt`, `pmset-batt-b9.txt`).
+
+| Milestone | run `t200` (200 s) | run `t200b` (200 s) |
+|---|---|---|
+| `Found android.hardware.vibrator.IVibratorManager/default` (servicemanager) | 1.9 s | 1.9 s |
+| `Entered the Android system server!` | 43.4 s, 4.37 G | 43.4 s, 4.37 G |
+| `Starting phase 100` | 45.1 s | 47.0 s, 4.69 G |
+| `ActivityManager: Connection with lmkd established` | 56.4 s, 5.88 G | 59.4 s, 5.89 G |
+| `SettingsProvider: Generated and saved new ANDROID_ID` | 62.1 s | 65.3 s, 6.48 G |
+| `StartVibratorManagerService took to complete` (VibratorManagerService `onStart`) | 63.0 s, 0.143 s | 66.3 s, 6.57 G (250 ms) |
+| `FATAL EXCEPTION IN SYSTEM PROCESS: StorageManagerService` (next blocker) | not reached in this run | 79.6 s, 7.92 G |
+
+The order is the same in every run (lmkd connection, then ANDROID_ID, then the vibrator service). The times vary by about 3 s,
+so the product check (`tests/run.sh`) tests presence and order, not counts. Two more 150 s runs (not in the table) show the same
+order.
+
+### Next blocker: vold (the framework does not finish its boot)
+
+After the vibrator service, `StorageManagerService`'s idle maintenance calls `fstrim`, which calls `IVold.needsCheckpoint()` on
+a null object (`vold` is not registered; the engine has no vold). The handler thread dies, and system_server aborts:
+
+```
+[79573 ms 7912121713 insn] I/Watchdog(1045): ...
+[79601 ms 7915080270 insn] I/StorageManagerService(1045): Running fstrim idle maintenance
+[79609 ms 7915902107 insn] E/AndroidRuntime(1045): *** FATAL EXCEPTION IN SYSTEM PROCESS: StorageManagerService
+java.lang.NullPointerException: Attempt to invoke interface method 'boolean android.os.IVold.needsCheckpoint()' on a null object reference
+	at com.android.server.StorageManagerService.needsCheckpoint(StorageManagerService.java:3175)
+	at com.android.server.StorageManagerService.fstrim(StorageManagerService.java:2589)
+[79646 ms 7919272731 insn] I/Process(1045): Sending signal. PID: 1045 SIG: 9
+xiaoji: kill: pid 1045 sends signal 9 to pid 1045
+```
+
+**Decision for the user (not made here).** The real vold needs device-mapper, loop devices, fs-verity keys and fscrypt, and the
+engine has none of them. Two options: (a) a minimal `vold` binder service in the engine (answers `needsCheckpoint` false and the
+other calls the boot makes, and fails the rest), which keeps the framework's own code paths; or (b) keep vold absent and turn
+off idle fstrim by a configuration property, which avoids the null call but leaves the framework without its storage daemon.
+Recommendation: (a), with the calls logged, so the next boot shows which ones the framework makes.
+
+### inotify and the alarm clocks (found on the way)
+
+- **Alarm clocks.** AlarmManagerService's JNI aborts unless `timerfd_create` takes CLOCK_REALTIME, CLOCK_BOOTTIME_ALARM and
+  CLOCK_REALTIME_ALARM (`com_android_server_alarm_AlarmManagerService.cpp`, `log_timerfd_create_error`). The engine now accepts
+  0, 1, 7, 8 and 9. The ALARM clocks need CAP_WAKE_ALARM (EPERM without it, as Linux), and run on the engine's realtime and
+  boottime clocks (the engine does not suspend). An absolute deadline on a realtime clock is converted to the engine's
+  monotonic clock (`fdobj.c`, `tfd_abs_deadline`).
+- **TFD_TIMER_CANCEL_ON_SET.** The RTC-change timer passes it with ABSTIME on CLOCK_REALTIME (Linux's rule, checked in
+  `sys_timerfd_settime`). The engine never sets the realtime clock, so the cancel is never due.
+- **inotify** (`engine/inotify.c`, `engine/inotify.h`, syscalls 26, 27 and 28, the `VFS_INOTIFY` kind). EventHub aborts with
+  `Could not register INotify for /dev` unless `inotify_add_watch` succeeds. The instance records its watches (the path must
+  exist: ENOENT; the mask must name an event: EINVAL) and never queues an event (a read gives EAGAIN, and poll never reports it
+  readable). **Gap:** a consumer that waits on inotify (FileObserver's native thread) does not wait; it logs
+  `android_os_fileobserver_observe() got a short event` (seen twice in the run). No file change is ever reported.
+
+### Tests
+
+- `tests/run.sh`: the product check (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) now also requires ActivityManager's
+  lmkd connection, VibratorManagerService's `StartVibratorManagerService took to complete`, and no `Could not find
+  'aidl/android.hardware.vibrator` line. Its furthest milestone is the vibrator start (about 63 to 67 s, under the 150 s timeout).
+- New guest test: `tests/guest/timers.c` (`timers-O0`, `timers-O2`), compared with the builder-VM oracle, engine and Node.
+- Results: see the final section below.
+
+### Gaps (B9)
+
+- **The boot stops at vold** (above). `System now ready` and `sys.boot_completed=1` are not reached.
+- **inotify never reports an event**, and its blocking read does not wait (above).
+- **lmkd never reports pressure.** Its kill path does not run (no engine pressure source). The `cgroup.rc` error line from
+  libprocessgroup is logged once and does not stop lmkd. Where it is called from was not traced.
+- **Timers:** CPU-time clocks, SIGEV_THREAD and ITIMER_VIRTUAL/PROF are not built (the kernel accepts the first two). Overrun is
+  approximate (above). The exec rule for POSIX timers is the man page's, not checked.
+- **Passcred on accepted sockets** is copied at connect, as Linux does for unix stream sockets. Only lmkd uses it so far.
+- **The second system_server** in a 300 s run comes from zygote being restarted after a system_server death (B8's explanation).
+  It is not a separate fault.
+
+### Test results (B9)
+
+- `make && make wasm-node && make wasm && tests/run.sh`: **218 passed, 0 failed, 0 xfail** (214 before B9, plus `timers-O0` and
+  `timers-O2` in the engine and in Node).
+- `XIAOJI_JIT=0 tests/run.sh`: **218 passed, 0 failed, 0 xfail.**
+- `XIAOJI_BOOT=1 tests/run.sh` (Google image): **219 passed, 0 failed, 0 xfail.**
+- `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product, cleared `/data`): **185 passed, 0 failed, 0 xfail**
+  (181 before, plus the lmkd and vibrator checks).
+- `make test-web`: all web checks passed.
+- Warnings: `clang -O2 -std=c11 -Wall -Wextra` and `emcc` with the same flags on the 14 changed engine files
+  (`timers, sched, signals, syscall, exec, procfs, sock, init, fdobj, sysfs, vfs, poll, inotify, proc`): 0 each.
+- The first Node run of `timers` failed on the negative absolute time in the test (fixed, above). The first build of
+  `inotify.c` failed under `-std=c11` on `strdup` (replaced with `malloc` and `memcpy`).

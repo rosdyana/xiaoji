@@ -4,6 +4,7 @@
  * built and loaded. The old one is dropped after the new one is ready, so a failed exec
  * leaves the caller as it was. */
 #include "exec.h"
+#include "timers.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -357,6 +358,7 @@ int64_t exec_run(cpu_t *c, int dirfd, uint64_t pathva, uint64_t argvva, uint64_t
     p->mm = nm;
     mem_mm_unref(old);
     vfs_close_cloexec();
+    timers_proc_exec(p); /* POSIX timers go; ITIMER_REAL stays (timers.c) */
     cred_exec(p); /* the ids and capability sets of the new program (cred.c) */
     sig_exec_reset(c);
     sched_exec_threads(c); /* the other threads of the process are gone */

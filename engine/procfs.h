@@ -26,5 +26,9 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len);
  * writes. procfs_attr_write stores a context (the n bytes, its NUL dropped) and returns n, or -LE_*. */
 int procfs_is_attr_current(const char *guest);
 int64_t procfs_attr_write(const char *guest, const uint8_t *buf, size_t n);
+/* Writes to the generated files that take one: /proc/pressure/<memory|cpu|io> (a PSI trigger, B9) and
+ * /proc/<pid>/oom_score_adj. Returns n, or a negative errno. procfs_writable says whether guest takes writes. */
+int procfs_writable(const char *guest);
+int64_t procfs_write(const char *guest, const uint8_t *buf, size_t n);
 
 #endif

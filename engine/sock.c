@@ -455,6 +455,11 @@ int sock_passcred(const sock_t *s)
     return s->passcred;
 }
 
+void sock_set_passcred(sock_t *s, int on)
+{
+    s->passcred = on != 0;
+}
+
 int sock_listen(sock_t *s, int backlog)
 {
     if (s->type == SOCK_T_DGRAM || s->ops)
@@ -559,6 +564,7 @@ int sock_connect(sock_t *s, const uint8_t *name, size_t nlen, int fsnode, int ex
     sock_t *c = sock_alloc(s->type);
     if (!c)
         return -LE_NOMEM;
+    c->passcred = l->passcred; /* the accepted socket inherits SO_PASSCRED of its listener */
     if (l->nacc == l->acccap) {
         int cap = l->acccap ? 2 * l->acccap : 4;
         sock_t **a = realloc(l->acc, (size_t)cap * sizeof *a);

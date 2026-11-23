@@ -9,10 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "linux.h"
 #include "loader.h"
 #include "mem.h"
 #include "mntns.h"
 #include "proc.h"
+#include "signals.h"
 #include "sched.h"
 #include "vfs.h"
 
@@ -98,6 +100,25 @@ static proc_t *live_proc(const char *guest, const char **rest)
     return p && !p->zombie && !p->exited ? p : NULL;
 }
 
+/* The PSI files (B9): /proc/pressure/memory, cpu and io. Their text is the kernel's format, with a some and a
+ * full line; the engine never reports a stall, so every counter is zero. lmkd writes its trigger to the open
+ * file (procfs_write), and that trigger never fires. */
+static int pressure_file(const char *guest)
+{
+    return !strcmp(guest, "/proc/pressure/memory") || !strcmp(guest, "/proc/pressure/cpu") ||
+           !strcmp(guest, "/proc/pressure/io");
+}
+
+/* /proc/self/oom_score_adj and /proc/<pid>/oom_score_adj: the process it names, or NULL. */
+static proc_t *oom_target(const char *guest)
+{
+    if (!strcmp(guest, "/proc/self/oom_score_adj"))
+        return proc_cur();
+    const char *rest;
+    proc_t *p = live_proc(guest, &rest);
+    return p && !strcmp(rest, "/oom_score_adj") ? p : NULL;
+}
+
 /* The security context of the process (attr/current): the same for every process. */
 static int is_self_attr(const char *guest)
 {
@@ -113,13 +134,68 @@ int procfs_known(const char *guest)
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/status") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
         is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
-        !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo"))
+        !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo") || pressure_file(guest) ||
+        !strcmp(guest, "/proc/self/oom_score_adj"))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
         return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline") ||
-               !strcmp(rest, "/attr/current") || !strcmp(rest, "/mounts") || !strcmp(rest, "/mountinfo");
+               !strcmp(rest, "/attr/current") || !strcmp(rest, "/mounts") || !strcmp(rest, "/mountinfo") ||
+               !strcmp(rest, "/oom_score_adj");
     return 0;
+}
+
+int procfs_writable(const char *guest)
+{
+    return pressure_file(guest) || oom_target(guest) != NULL;
+}
+
+/* A PSI trigger: "some <stall_us> <window_us>" or "full <stall_us> <window_us>" (the kernel's
+ * psi_trigger_create, for the window range it accepts). The trigger is checked and then never fires. */
+static int psi_trigger_ok(const uint8_t *buf, size_t n)
+{
+    size_t len = 0;
+    while (len < n && buf[len])
+        len++;
+    char s[64];
+    if (len == 0 || len >= sizeof s)
+        return 0;
+    memcpy(s, buf, len);
+    s[len] = 0;
+    char type[8];
+    unsigned long long stall = 0, window = 0;
+    if (sscanf(s, "%7s %llu %llu", type, &stall, &window) != 3)
+        return 0;
+    if (strcmp(type, "some") && strcmp(type, "full"))
+        return 0;
+    return window >= 500000ull && window <= 10000000ull && stall > 0 && stall <= window;
+}
+
+int64_t procfs_write(const char *guest, const uint8_t *buf, size_t n)
+{
+    if (pressure_file(guest)) {
+        if (!psi_trigger_ok(buf, n))
+            return -LE_INVAL;
+        return (int64_t)n;
+    }
+    proc_t *p = oom_target(guest);
+    if (!p)
+        return -LE_BADF;
+    /* A decimal from -1000 to 1000, with optional leading blanks and a trailing newline (procfs writes). */
+    char s[16];
+    size_t len = n < sizeof s - 1 ? n : sizeof s - 1;
+    memcpy(s, buf, len);
+    s[len] = 0;
+    char *end = NULL;
+    while (*s == ' ' || *s == '\t')
+        memmove(s, s + 1, strlen(s));
+    long v = strtol(s, &end, 10);
+    if (end == s || (*end && *end != '\n' && *end != ' ') || v < -1000 || v > 1000)
+        return -LE_INVAL;
+    p->oom_score_adj = (int)v;
+    if (sig_debug_faults()) /* the procprio evidence in a traced boot (B9) */
+        fprintf(stderr, "xiaoji: oom_score_adj of pid %d is %d\n", p->pid, p->oom_score_adj);
+    return (int64_t)n;
 }
 
 /* /proc/mounts and /proc/<pid>/mounts (and the mountinfo forms): the mount namespace of the
@@ -157,7 +233,8 @@ int procfs_dir(const char *guest)
     return !strcmp(guest, "/proc/self/task") || !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
            !strcmp(guest, "/proc/sys") || !strcmp(guest, "/proc/sys/kernel") || !strcmp(guest, "/proc/sys/kernel/random") ||
            !strcmp(guest, "/sys/devices/system/cpu") || !strcmp(guest, "/proc/self/attr") ||
-           !strcmp(guest, "/proc/thread-self") || !strcmp(guest, "/proc/thread-self/attr");
+           !strcmp(guest, "/proc/thread-self") || !strcmp(guest, "/proc/thread-self/attr") ||
+           !strcmp(guest, "/proc/pressure");
 }
 
 int procfs_task_dir(const char *guest)
@@ -299,6 +376,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
             sb_add(&b, (const char *)bytes, n);
         } else if (!strcmp(rest, "/attr/current")) {
             sb_fmt(&b, "%s", target->attr_current);
+        } else if (!strcmp(rest, "/oom_score_adj")) {
+            sb_fmt(&b, "%d\n", target->oom_score_adj);
         } else {
             return -1;
         }
@@ -317,6 +396,12 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         sb_fmt(&b, "5c1d9a40-2f3e-4b7a-9e61-0d2c8f7a3b10\n");
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
+    } else if (pressure_file(guest)) {
+        /* A stall never happens in the engine: the averages and totals are zero (the kernel's text). */
+        const char *line = " avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        sb_fmt(&b, "some%sfull%s", line, line);
+    } else if (!strcmp(guest, "/proc/self/oom_score_adj")) {
+        sb_fmt(&b, "%d\n", proc_cur()->oom_score_adj);
     } else if (!strcmp(guest, "/proc/meminfo")) {
         /* An engine stub: a fixed 2 GiB guest with 1 GiB free and nothing cached or swapped. The
          * keys are the ones libmeminfo reads (system/memory/libmeminfo, kDefaultSysMemInfoTags). The
