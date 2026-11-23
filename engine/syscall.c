@@ -17,6 +17,7 @@
 #include "prof.h"
 #include "props.h"
 #include "sched.h"
+#include "timers.h"
 #include "signals.h"
 #include "sysfs.h"
 #include "vfs.h"
@@ -54,6 +55,13 @@
 #define SYS_RT_SIGSUSPEND 133
 #define SYS_UNAME 160
 #define SYS_PRCTL 167
+#define SYS_GETITIMER 102
+#define SYS_SETITIMER 103
+#define SYS_TIMER_CREATE 107
+#define SYS_TIMER_GETTIME 108
+#define SYS_TIMER_GETOVERRUN 109
+#define SYS_TIMER_SETTIME 110
+#define SYS_TIMER_DELETE 111
 #define SYS_GETPPID 173
 #define SYS_GETPID 172
 #define SYS_GETUID 174
@@ -144,6 +152,13 @@ const char *syscall_name(uint64_t nr)
     case 99: return "set_robust_list";
     case 101: return "nanosleep";
     case 113: return "clock_gettime";
+    case 102: return "getitimer";
+    case 103: return "setitimer";
+    case 107: return "timer_create";
+    case 108: return "timer_gettime";
+    case 109: return "timer_getoverrun";
+    case 110: return "timer_settime";
+    case 111: return "timer_delete";
     case 169: return "gettimeofday";
     case 120: return "sched_getscheduler";
     case 123: return "sched_getaffinity";
@@ -1349,6 +1364,27 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_CLOCK_GETTIME:
         *ret = sys_clock_gettime(a[0], a[1]);
+        return;
+    case SYS_GETITIMER:
+        *ret = timers_getitimer(a[0], a[1]);
+        return;
+    case SYS_SETITIMER:
+        *ret = timers_setitimer(a[0], a[1], a[2]);
+        return;
+    case SYS_TIMER_CREATE:
+        *ret = timers_create(a[0], a[1], a[2]);
+        return;
+    case SYS_TIMER_SETTIME:
+        *ret = timers_settime(a[0], a[1], a[2], a[3]);
+        return;
+    case SYS_TIMER_GETTIME:
+        *ret = timers_gettime(a[0], a[1]);
+        return;
+    case SYS_TIMER_GETOVERRUN:
+        *ret = timers_getoverrun(a[0]);
+        return;
+    case SYS_TIMER_DELETE:
+        *ret = timers_delete(a[0]);
         return;
     case SYS_PRLIMIT64:
         if (a[0] != 0 && (int64_t)a[0] != proc_cur()->pid)

@@ -108,6 +108,11 @@ void tfd_free(void *o)
     free(o);
 }
 
+int tfd_clockid(void *o)
+{
+    return ((tfd_t *)o)->clockid;
+}
+
 /* Counts the expirations up to now and moves the timer to its next one. */
 static void tfd_update(tfd_t *t, uint64_t now)
 {
@@ -153,6 +158,16 @@ int64_t tfd_read(void *o, void *buf, size_t n)
     return 8;
 }
 
+/* An absolute deadline on a realtime clock (0, or the alarm clock 8) is a realtime time: the engine's deadlines are
+ * host monotonic, so it is converted with the offset of the two clocks now. A time already past is due at once. */
+static uint64_t tfd_abs_deadline(const tfd_t *t, uint64_t value_ns)
+{
+    if (t->clockid != 0 && t->clockid != 8)
+        return value_ns;
+    uint64_t mo = fdobj_now(), rt = host_realtime_ns();
+    return value_ns <= rt ? mo : mo + (value_ns - rt);
+}
+
 void tfd_settime(void *o, int abs, uint64_t value_ns, uint64_t interval_ns)
 {
     tfd_t *t = o;
@@ -163,7 +178,7 @@ void tfd_settime(void *o, int abs, uint64_t value_ns, uint64_t interval_ns)
         t->interval = 0;
         return;
     }
-    t->next = abs ? value_ns : fdobj_now() + value_ns;
+    t->next = abs ? tfd_abs_deadline(t, value_ns) : fdobj_now() + value_ns;
     if (t->next == 0)
         t->next = 1; /* an absolute time of 0 still arms the timer */
     poll_notify();

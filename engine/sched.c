@@ -24,6 +24,7 @@
 #include "mem.h"
 #include "prof.h"
 #include "proc.h"
+#include "timers.h"
 #include "signals.h"
 
 #define MAX_THREADS SCHED_MAX_THREADS
@@ -117,6 +118,8 @@ static void reap(int slot)
     dead_icount += threads[slot]->cpu.icount;
     threads[slot]->proc->dead_icount += threads[slot]->cpu.icount;
     threads[slot]->proc->nthreads--;
+    if (sig_debug_faults()) /* the process's name outlives its threads for the exit line (B9) */
+        memcpy(threads[slot]->proc->dbg_comm, threads[slot]->comm, sizeof threads[slot]->proc->dbg_comm);
     free(threads[slot]);
     threads[slot] = NULL;
 }
@@ -349,6 +352,7 @@ int64_t sched_futex_requeue(uint64_t from, uint64_t from_obj, uint64_t to, uint6
 
 static void expire_timers(uint64_t now)
 {
+    timers_expire(); /* ITIMER_REAL and POSIX timers: their signals (timers.c) */
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_t *t = threads[i];
         if (!t || t->state == TS_RUNNABLE || !t->has_deadline || t->deadline > now)
@@ -394,6 +398,12 @@ static int wait_for_timers(void)
             earliest = t->deadline;
         any = 1;
     }
+    uint64_t tdl;
+    if (timers_next(&tdl)) {
+        if (!any || tdl < earliest)
+            earliest = tdl;
+        any = 1;
+    }
     if (!any)
         return 0;
     uint64_t now = host_monotonic_ns();
@@ -415,6 +425,12 @@ static int pending_deadlines(uint64_t *earliest)
             continue;
         if (!n || t->deadline < *earliest)
             *earliest = t->deadline;
+        n++;
+    }
+    uint64_t tdl;
+    if (timers_next(&tdl)) { /* an armed timer is a pending wake-up (B9) */
+        if (!n || tdl < *earliest)
+            *earliest = tdl;
         n++;
     }
     return n;
@@ -450,6 +466,20 @@ static void report_deadlock(void)
  * zombie. Its children go to the initial process, and its parent learns of it. */
 static void finish_process(proc_t *p)
 {
+    timers_proc_gone(p); /* the process's ITIMER_REAL and POSIX timers (B9) */
+    if (sig_debug_faults()) {
+        /* XIAOJI_DEBUG_FAULTS=1: every process end, with the name of its first thread and how it ended. */
+        const char *comm = p->dbg_comm;
+        for (int i = 0; i < MAX_THREADS; i++)
+            if (threads[i] && threads[i]->proc == p) {
+                comm = threads[i]->comm;
+                break;
+            }
+        if (p->term_sig)
+            fprintf(stderr, "xiaoji: exit: pid %d (%s) killed by signal %d\n", p->pid, comm, p->term_sig);
+        else
+            fprintf(stderr, "xiaoji: exit: pid %d (%s) status %d\n", p->pid, comm, p->exit_code);
+    }
     for (int i = 0; i < MAX_THREADS; i++)
         if (threads[i] && threads[i]->proc == p)
             reap(i);
@@ -476,6 +506,9 @@ static void idle_wait(uint64_t (*deadline)(void))
 {
     uint64_t now = host_monotonic_ns();
     uint64_t dl = deadline ? deadline() : 0;
+    uint64_t tdl;
+    if (timers_next(&tdl) && (!dl || tdl < dl))
+        dl = tdl;
     if (dl && dl <= now)
         return;
     uint64_t wait = IDLE_POLL_NS;
@@ -642,6 +675,9 @@ void sched_exit_process(uint64_t code)
 void sched_exit_signal(int sig)
 {
     proc_t *p = cur() ? cur()->proc : proc_cur();
+    if (sig_debug_faults() && cur())
+        fprintf(stderr, "xiaoji: fatal signal %d in pid %d (%s) at pc 0x%llx\n", sig, p->pid,
+                cur()->comm, (unsigned long long)cur()->cpu.pc);
     if (!p->exited) {
         p->exited = 1;
         p->exit_code = (128 + sig) & 0xFF; /* the engine's status for a fatal signal */

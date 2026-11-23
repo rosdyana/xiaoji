@@ -60,6 +60,7 @@ static int cap_lookup(const char *name, uint32_t *out);
 typedef struct {
     char name[32];
     int type; /* SOCK_T_* (sock.h) */
+    int passcred; /* +passcred on the socket line: SO_PASSCRED */
     uint32_t mode;
 } sockdef_t;
 
@@ -304,7 +305,17 @@ static int parse_config(char *text)
         if (!cur)
             continue;
         if (!strcmp(tok[0], "socket") && n >= 4) {
-            int t = parse_socktype(tok[2]);
+            /* "socket <name> <type>[+passcred] <mode> <user> <group>": +passcred is SO_PASSCRED on the socket
+             * (lmkd reads the sender's credentials from every message; system/memory/lmkd/lmkd.rc). */
+            char tbuf[32];
+            snprintf(tbuf, sizeof tbuf, "%s", tok[2]);
+            int pc = 0;
+            char *plus = strchr(tbuf, '+');
+            if (plus) {
+                *plus = 0;
+                pc = !strcmp(plus + 1, "passcred");
+            }
+            int t = pc || !plus ? parse_socktype(tbuf) : 0;
             if (!t || cur->nsocks == INIT_MAX_SOCK || strlen(tok[1]) >= sizeof cur->socks[0].name) {
                 fprintf(stderr, "xiaoji: init: line %d: bad socket\n", lineno);
                 return -1;
@@ -312,6 +323,7 @@ static int parse_config(char *text)
             sockdef_t *d = &cur->socks[cur->nsocks++];
             snprintf(d->name, sizeof d->name, "%s", tok[1]);
             d->type = t;
+            d->passcred = pc;
             d->mode = (uint32_t)strtoul(tok[3], NULL, 8);
         } else if (!strcmp(tok[0], "oneshot")) {
             cur->oneshot = 1;
@@ -680,6 +692,8 @@ static int make_socket(const sockdef_t *d, int *fd_out)
     int fd = vfs_socket(0, d->type, 0);
     if (fd < 0)
         return fd;
+    if (d->passcred)
+        sock_set_passcred(vfs_get(fd)->sock, 1);
     char path[128];
     snprintf(path, sizeof path, "/dev/socket/%s", d->name);
     size_t n = strlen(path);

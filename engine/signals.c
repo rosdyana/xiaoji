@@ -516,8 +516,11 @@ int64_t sig_kill(uint64_t pid64, uint64_t sig)
         proc_t *p = proc_find(pid);
         if (!p || p->zombie || p->exited)
             return -LE_SRCH;
-        if (sig)
+        if (sig) {
+            if (sig_debug_faults())
+                fprintf(stderr, "xiaoji: kill: pid %d sends signal %d to pid %d\n", me->pid, (int)sig, p->pid);
             signal_process(p, (int)sig, SI_USER, (uint32_t)me->pid, 0);
+        }
         return 0;
     }
     int64_t group = pid == 0 ? me->pgid : -(int64_t)pid;
@@ -548,6 +551,40 @@ static int64_t thread_kill(uint64_t tid, uint64_t sig)
 }
 
 int64_t sig_tkill(uint64_t tid, uint64_t sig) { return thread_kill(tid, sig); }
+
+/* A timer's signal (timers.c): to process p, or to thread tid of p when tid is not 0. Returns 0, or -1
+ * when there is no such target. si_pid holds the timer id for SI_TIMER and si_value the sigevent value. */
+int sig_timer_raise(proc_t *p, int tid, int sig, int code, uint32_t id, uint64_t value)
+{
+    if (!tid) {
+        if (p->zombie || p->exited)
+            return -1;
+        signal_process(p, sig, code, id, value);
+        return 0;
+    }
+    cpu_t *list[SCHED_MAX_THREADS];
+    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    for (int i = 0; i < n; i++)
+        if ((int)list[i]->tid == tid) {
+            raise_for(list[i], sig, code, id, value);
+            return 0;
+        }
+    return -1;
+}
+
+/* Whether sig is pending for the target of a timer (the same target as sig_timer_raise). */
+int sig_timer_pending(proc_t *p, int tid, int sig)
+{
+    cpu_t *list[SCHED_MAX_THREADS];
+    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    for (int i = 0; i < n; i++) {
+        if (tid && (int)list[i]->tid != tid)
+            continue;
+        if (list[i]->sig_pending & bit(sig))
+            return 1;
+    }
+    return 0;
+}
 
 /* Raises sig for the running thread (SIGPIPE from a write to a pipe with no reader). */
 void sig_raise_current(int sig)

@@ -88,6 +88,8 @@ int sock_bind(sock_t *s, const uint8_t *name, size_t nlen, int fsnode, const uin
 int sock_can_bind(const sock_t *s);
 /* SO_PASSCRED: the receiver gets SCM_CREDENTIALS. */
 int sock_passcred(const sock_t *s);
+/* SO_PASSCRED on a socket (init's socket line, seqpacket+passcred). */
+void sock_set_passcred(sock_t *s, int on);
 /* Records that a socket node exists at a guest path (bind created the file). */
 int sock_fsnode_add(const char *guest);
 /* 1 when guest is a socket node made by bind (stat reports S_IFSOCK). */

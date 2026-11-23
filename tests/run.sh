@@ -642,8 +642,11 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'Registered android.hardware.sensors@2.1::ISensors/default' "$OUT/boot.err" &&
             grep -q 'Registered android.hardware.health@2.1::IHealth/default' "$OUT/boot.err" &&
             grep -q 'BatteryService([0-9]*): health: Waited [0-9]*ms and received the update' "$OUT/boot.err" &&
-            grep -q 'SettingsProvider([0-9]*): Generated and saved new ANDROID_ID' "$OUT/boot.err"; }; }; then
-        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8)"
+            grep -q 'SettingsProvider([0-9]*): Generated and saved new ANDROID_ID' "$OUT/boot.err" &&
+            grep -q 'ActivityManager([0-9]*): Connection with lmkd established' "$OUT/boot.err" &&
+            grep -q 'SystemServerTiming([0-9]*): StartVibratorManagerService took to complete' "$OUT/boot.err" &&
+            ! grep -q "Could not find 'aidl/android.hardware.vibrator" "$OUT/boot.err"; }; }; then
+        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
         pass=$((pass + 1))
     else
         echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded') in $OUT/boot.err"

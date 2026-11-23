@@ -107,6 +107,7 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     c->securebits = parent->securebits;
     c->subreaper = parent->subreaper;
     c->timerslack = parent->timerslack;
+    c->oom_score_adj = parent->oom_score_adj;
     c->capbset = parent->capbset;
     c->brk_base = parent->brk_base;
     c->brk_cur = parent->brk_cur;

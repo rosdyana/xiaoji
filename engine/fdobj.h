@@ -9,6 +9,7 @@
 
 #define EFD_SEMAPHORE 1u
 #define TFD_TIMER_ABSTIME 1u
+#define TFD_TIMER_CANCEL_ON_SET 2u
 
 void *efd_new(uint64_t init, int semaphore);
 void efd_free(void *o);
@@ -25,6 +26,8 @@ int tfd_deadline(void *o, uint64_t *dl);
 int64_t tfd_read(void *o, void *buf, size_t n);
 /* Arms (value_ns != 0, relative or absolute) or disarms (value_ns == 0) the timer. */
 void tfd_settime(void *o, int abs, uint64_t value_ns, uint64_t interval_ns);
+/* The clock the timer was made on (CLOCK_REALTIME 0, and so on): timerfd_settime checks CANCEL_ON_SET with it. */
+int tfd_clockid(void *o);
 /* The time to the next expiry (0 if disarmed) and the interval. */
 void tfd_gettime(void *o, uint64_t *remain_ns, uint64_t *interval_ns);
 /* The host monotonic clock that timers and deadlines use. */

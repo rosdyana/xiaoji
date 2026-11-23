@@ -103,6 +103,8 @@ uint32_t poll_revents(vfs_fd *f, uint32_t events)
     }
     case VFS_EPOLL:
         break; /* an epoll fd is not itself polled (nesting is not modelled) */
+    case VFS_INOTIFY:
+        break; /* no event is ever queued (inotify.c): never readable */
     case VFS_DIR:
         r |= PX_IN;
         break;
