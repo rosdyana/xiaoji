@@ -464,6 +464,30 @@ if [ -f "$RFS/system/bin/toybox" ]; then
     done
 fi
 
+# Init cgroups (B11): the cgroup.rc image, a group made and removed, a process's membership (inherited by its child,
+# seen in /proc/self/cgroup), EBUSY on a populated group, and a store in a v1 file. The report must equal
+# tests/expect/init-cgroups.out. Engine and Node.
+if [ -d build/rootfs/system/bin ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/cgroups.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-cgroups.$runner.out" 2>"$OUT/init-cgroups.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/cgroups.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-cgroups.$runner.out" 2>"$OUT/init-cgroups.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/init-cgroups.$runner.out" tests/expect/init-cgroups.out; then
+            echo "PASS  init-cgroups $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-cgroups $runner (exit $rc)"
+            diff tests/expect/init-cgroups.out "$OUT/init-cgroups.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 # Init stdio (B4b): with the default --init-stdio null, a service's stdin, stdout and stderr are
 # /dev/null, so the probe writes its report to a file. The report (fdnames, tests/guest/fdnames.c)
 # must equal tests/expect/init-stdio.out. Engine and Node.
@@ -621,7 +645,9 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
     case "$RFS" in
     *-xiaoji) python3 -I tools/reset-data.py "$RFS" >/dev/null || { echo "FAIL  reset-data $RFS"; fail=$((fail + 1)); } ;;
     esac
-    XIAOJI_STAMP=1 timeout 240 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 150 \
+    # The limit is 300 s (B11): the milestones are fixed in guest instructions, but the boot waits on the clock too, and at
+    # Low Power Mode or on a busy host the lmkd and vibrator lines came after 150 s. The wrapper timeout is above the limit.
+    XIAOJI_STAMP=1 timeout 360 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 300 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
@@ -645,8 +671,13 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'SettingsProvider([0-9]*): Generated and saved new ANDROID_ID' "$OUT/boot.err" &&
             grep -q 'ActivityManager([0-9]*): Connection with lmkd established' "$OUT/boot.err" &&
             grep -q 'SystemServerTiming([0-9]*): StartVibratorManagerService took to complete' "$OUT/boot.err" &&
-            ! grep -q "Could not find 'aidl/android.hardware.vibrator" "$OUT/boot.err"; }; }; then
-        echo "PASS  zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
+            ! grep -q "Could not find 'aidl/android.hardware.vibrator" "$OUT/boot.err" &&
+            ! grep -q 'Failed to find cgroup v2 root' "$OUT/boot.err" &&
+            ! grep -q 'cgroup_info/cgroup.rc: No such file' "$OUT/boot.err" &&
+            ! grep -q 'Failed to open /dev/cpuset/' "$OUT/boot.err" &&
+            ! grep -q 'init: netd exited' "$OUT/boot.err" &&
+            grep -q 'libnetd_updatable_init: Initializing' "$OUT/boot.err"; }; }; then
+        echo "PASS  cgroups (B11): no cgroup.rc or cgroup v2 root error, no cpuset open error, netd reaches libnetd_updatable_init, no netd exit; zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
         pass=$((pass + 1))
     else
         echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded') in $OUT/boot.err"

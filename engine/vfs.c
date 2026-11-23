@@ -19,6 +19,7 @@
 #include "meta.h"
 #include "mntns.h"
 #include "binder.h"
+#include "cgroupfs.h"
 #include "goldfish.h"
 #include "fdobj.h"
 #include "inotify.h"
@@ -145,6 +146,12 @@ static vfs_syn syn_of(const char *p)
     if (!strcmp(p, "/dev/urandom") || !strcmp(p, "/dev/random")) return SYN_RANDOM;
     if (!strcmp(p, "/proc/self/cmdline")) return SYN_DATA;
     if (procfs_known(p)) return SYN_DATA; /* generated at open, see vfs_open */
+    switch (cgroupfs_lookup(p)) { /* the cgroup namespace (B11) */
+    case CG_DIR: return SYN_DIR;
+    case CG_FILE: return SYN_CGROUP;
+    case CG_RC: return SYN_CGROUP_RC;
+    default: break;
+    }
     if (binder_device(p) >= 0) return SYN_BINDER;
     if (goldfish_device(p)) return SYN_GOLDFISH;
     if (!strcmp(p, "/dev/ashmem")) return SYN_ASHMEM;
@@ -330,6 +337,14 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 strcpy(cur, "/");
                 continue;
             }
+            if (cgroupfs_under(cand)) { /* a missing cgroup path (B11): the last component is creatable, never on the host */
+                if (!last)
+                    return -LE_NOENT;
+                strcpy(cur, cand);
+                out->exists = 0;
+                out->syn = SYN_CGROUP;
+                break;
+            }
             return -LE_NOENT;
         }
 
@@ -395,6 +410,12 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
     if (out->syn == SYN_NONE && !out->is_link && procfs_task_dir(cur)) { /* task and fd listings */
         out->exists = 1;
         out->syn = SYN_DIR;
+    }
+
+    /* A missing path under a cgroup mount: ENOENT (or mkdir's, in sysfs.c), never a host path (B11). */
+    if (out->syn == SYN_NONE && !out->is_link && cgroupfs_under(cur)) {
+        out->exists = 0;
+        out->syn = SYN_CGROUP;
     }
 
     /* Resolved: cur holds the canonical guest path. */
@@ -910,6 +931,23 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
+    if (r.syn == SYN_CGROUP && !r.exists)
+        return (lflags & LO_CREAT) ? -LE_PERM : -LE_NOENT;
+    if (r.syn == SYN_CGROUP_RC) {
+        /* cgroup.rc is mapped (MAP_SHARED, read-only) by libprocessgroup: a memfd, as the status page. */
+        memfd_t *m = cgroupfs_rc_memfd();
+        if (!m)
+            return -LE_NOENT;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_MEMFD;
+        f->mfd = m;
+        memfd_ref(m);
+        f->ro_area = 1;
+        f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
+        f->guest = xstrdup(r.guest);
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     if (r.syn == SYN_SELFS_STATUS) {
         /* The selinux status page: a shared, read-only memfd (as the property area). */
         memfd_t *m = selinuxfs_status_memfd();
@@ -940,6 +978,8 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
             return -LE_NOMEM;
         if (r.syn == SYN_DATA && selinuxfs_kind(r.guest) == SELFS_FILE &&
             selinuxfs_read(r.guest, &gen, &glen) < 0)
+            return -LE_NOMEM;
+        if (r.syn == SYN_CGROUP && cgroupfs_read(r.guest, &gen, &glen) < 0)
             return -LE_NOMEM;
         if (r.syn == SYN_DATA && powersupply_kind(r.guest) == PSFS_FILE &&
             powersupply_read(r.guest, &gen, &glen) < 0)
@@ -1062,6 +1102,7 @@ static int64_t syn_read(vfs_fd *f, void *buf, size_t n, uint64_t off, int use_of
     case SYN_DIR:
         return -LE_ISDIR;
     case SYN_DATA:
+    case SYN_CGROUP:
     case SYN_SELFS_ACCESS: {
         uint64_t p = use_off ? off : f->dpos;
         if (p >= f->dlen)
@@ -1161,6 +1202,8 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
         }
         if (f->syn == SYN_SELFS_CONTEXT)
             return selinuxfs_check_context((const char *)buf, n) < 0 ? -LE_INVAL : (int64_t)n;
+        if (f->syn == SYN_CGROUP)
+            return cgroupfs_write(f->guest, buf, n);
         if (f->syn == SYN_DATA) {
             /* attr/current takes a new context (setcon writes it); the other generated files are read-only. */
             if (procfs_is_attr_current(f->guest))
@@ -1266,7 +1309,7 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
                 f->dpos = 0; /* rewinddir */
             return 0;
         }
-        if (f->syn != SYN_DATA)
+        if (f->syn != SYN_DATA && f->syn != SYN_CGROUP)
             return 0;
         int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->dpos : (int64_t)f->dlen;
         if (base + off < 0)
@@ -1348,6 +1391,7 @@ static int64_t syn_getdents(vfs_fd *f, uint8_t *buf, size_t cap)
         } else if (!selinuxfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
                    !powersupply_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
                    !procfs_task_child(f->guest, (int)(f->dpos - 2), &name) &&
+                   !cgroupfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
                    !fd_child(f->guest, (int)(f->dpos - 2), &name)) {
             break;
         }
@@ -1481,6 +1525,8 @@ static void synthetic_stat(vfs_syn s, uint64_t size, host_stat *out)
     switch (s) {
     case SYN_NULL: out->mode = LS_IFCHR | 0666; out->rdev = 0x103; out->ino = 0x1001; break;
     case SYN_DIR: out->mode = LS_IFDIR | 0555; out->ino = 0x1005; break;
+    case SYN_CGROUP: out->mode = LS_IFREG | 0644; out->ino = 0x1006; break;
+    case SYN_CGROUP_RC: out->mode = LS_IFREG | 0444; out->ino = 0x1007; break;
     case SYN_ZERO: out->mode = LS_IFCHR | 0666; out->rdev = 0x105; out->ino = 0x1002; break;
     case SYN_RANDOM: out->mode = LS_IFCHR | 0666; out->rdev = 0x109; out->ino = 0x1003; break;
     default: out->mode = LS_IFREG | 0444; out->ino = 0x1004; break;
@@ -1553,7 +1599,7 @@ int vfs_stat_fd(int fd, host_stat *out)
         return 0;
     }
     if (f->kind == VFS_SYN) {
-        synthetic_stat(f->syn, f->syn == SYN_DATA ? f->dlen : 0, out);
+        synthetic_stat(f->syn, (f->syn == SYN_DATA || f->syn == SYN_CGROUP) ? f->dlen : 0, out);
         rc = 0;
     } else if (f->hfd >= 0) {
         rc = host_stat_fd(f->hfd, out);

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "binder.h"
+#include "cgroupfs.h"
 #include "cred.h"
 #include "inotify.h"
 #include "goldfish.h"
@@ -567,6 +568,8 @@ static int64_t sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t mode)
         return rc;
     if (r.ro)
         return -LE_ROFS;
+    if (cgroupfs_under(r.guest)) /* a cgroup: mkdir makes the cgroup's directory (B11) */
+        return cgroupfs_mkdir(r.guest);
     if (r.exists || r.is_link)
         return -LE_EXIST;
     if (r.syn != SYN_NONE)
@@ -593,6 +596,8 @@ static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
         return -LE_NOENT;
     if (r.ro)
         return -LE_ROFS;
+    if (cgroupfs_under(r.guest)) /* rmdir of a cgroup; a cgroup file cannot be unlinked (B11) */
+        return (flags & LAT_REMOVEDIR) ? cgroupfs_rmdir(r.guest) : -LE_PERM;
     if (r.syn != SYN_NONE)
         return -LE_PERM;
     if (flags & LAT_REMOVEDIR)
@@ -951,6 +956,8 @@ static int64_t sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t mode)
         return rc;
     if (!r.exists)
         return -LE_NOENT;
+    if (cgroupfs_under(r.guest)) /* cgroup modes are not kept: the call succeeds (B11) */
+        return 0;
     if (r.syn != SYN_NONE)
         return -LE_PERM;
     if (r.ro)

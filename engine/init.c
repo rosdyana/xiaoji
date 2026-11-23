@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cgroupfs.h"
 #include "cred.h"
 #include "host.h"
 #include "ids_gen.h"
@@ -119,7 +120,8 @@ static char *genv[INIT_MAX_GENV];
 static int ngenv;
 static char *bprop_k[INIT_MAX_BPROP], *bprop_v[INIT_MAX_BPROP];
 static int nbprop;
-#define INIT_MAX_DIR 16
+/* The on-block mkdirs of the rc (B11: the product rc has more than 16; the old cap dropped the rest without a word). */
+#define INIT_MAX_DIR 128
 static char *boot_dir[INIT_MAX_DIR];
 static int nboot_dir;
 static ctl_req_t ctlq[INIT_CTLQ];
@@ -293,8 +295,12 @@ static int parse_config(char *text)
         if (in_block) {
             if (!strcmp(tok[0], "export") && n >= 3)
                 genv_set(tok[1], tok[2]);
-            else if (!strcmp(tok[0], "mkdir") && n >= 2 && nboot_dir < INIT_MAX_DIR)
-                boot_dir[nboot_dir++] = dupn(tok[1], strlen(tok[1]));
+            else if (!strcmp(tok[0], "mkdir") && n >= 2) {
+                if (nboot_dir < INIT_MAX_DIR)
+                    boot_dir[nboot_dir++] = dupn(tok[1], strlen(tok[1]));
+                else
+                    fprintf(stderr, "xiaoji: init: more than %d mkdir actions; %s is not made\n", INIT_MAX_DIR, tok[1]);
+            }
             else if (!strcmp(tok[0], "setprop") && n >= 3 && nbprop < INIT_MAX_BPROP) {
                 bprop_k[nbprop] = dupn(tok[1], strlen(tok[1]));
                 bprop_v[nbprop] = dupn(tok[2], strlen(tok[2]));
@@ -1082,12 +1088,22 @@ int init_main(const char *config, uint64_t timeout_s)
     timeout_ns = timeout_s * 1000000000ull;
     signal(SIGINT, on_sigint);
 
-    /* mkdir (an on-block action, in order): a directory of the root, made if missing. */
+    /* The cgroups of the system (B11): the mounts of /system/etc/cgroups.json and /dev/cgroup_info/cgroup.rc. Before the
+     * mkdirs, which may make subgroups of them. */
+    cgroupfs_init();
+    /* mkdir (an on-block action, in order): a directory of the root, made if missing. A cgroup directory is made in the
+     * cgroup namespace (cgroupfs.c). */
     for (int i = 0; i < nboot_dir; i++) {
         vfs_res r;
-        if (vfs_resolve(-100, boot_dir[i], 1, &r) == 0 && r.syn == SYN_NONE &&
-            mkdir(r.host, 0771) < 0 && errno != EEXIST)
+        if (vfs_resolve(-100, boot_dir[i], 1, &r) != 0)
+            continue;
+        if (cgroupfs_under(r.guest)) {
+            int crc = cgroupfs_mkdir(r.guest);
+            if (crc && crc != -LE_EXIST)
+                fprintf(stderr, "xiaoji: init: mkdir %s failed (cgroup error %d)\n", boot_dir[i], -crc);
+        } else if (r.syn == SYN_NONE && mkdir(r.host, 0771) < 0 && errno != EEXIST) {
             fprintf(stderr, "xiaoji: init: mkdir %s failed (errno %d)\n", boot_dir[i], errno);
+        }
     }
     for (int i = 0; i < nbprop; i++)
         props_set(bprop_k[i], strlen(bprop_k[i]), bprop_v[i], strlen(bprop_v[i]));

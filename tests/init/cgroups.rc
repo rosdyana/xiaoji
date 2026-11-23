@@ -1,0 +1,19 @@
+# Cgroups (B11): the cgroup.rc image (8 bytes and one 56-byte record per controller), a uid/pid group made and
+# removed with mkdir and rmdir, a process's membership (cgroup.procs; the cat it starts inherits the group, seen
+# in /proc/self/cgroup; the shell and its grep are the two members), rmdir of a populated group (EBUSY), a store in
+# a v1 controller file, and libprocessgroup's own task profiles: settaskprofile (system/core/libprocessgroup/tools)
+# joins the shell to the background cpuset and blkio groups, and an unknown profile is refused. The report goes to
+# stdout; tests/expect/init-cgroups.out is its expected text (engine and Node, the same for both trees).
+on early-init
+    mkdir /dev/cpuset/background
+    mkdir /dev/blkio/background
+
+service cgtest /system/bin/sh -c "T=/system/bin/toybox; s=$($T wc -c < /dev/cgroup_info/cgroup.rc); echo rc-tail $(( (s - 8) % 56 )); mkdir /sys/fs/cgroup/uid_1000 && mkdir /sys/fs/cgroup/uid_1000/pid_42 && echo made; echo $$ > /sys/fs/cgroup/uid_1000/pid_42/cgroup.procs; $T grep -c . /sys/fs/cgroup/uid_1000/pid_42/cgroup.procs; $T cat /proc/self/cgroup | grep -c '^0::/uid_1000/pid_42$'; rmdir /sys/fs/cgroup/uid_1000/pid_42 || echo busy; echo $$ > /sys/fs/cgroup/cgroup.procs; rmdir /sys/fs/cgroup/uid_1000/pid_42 && echo removed; rmdir /sys/fs/cgroup/uid_1000 && echo removed-uid; echo 0.5 > /dev/cpuctl/cpu.uclamp.min; $T cat /dev/cpuctl/cpu.uclamp.min; /system/bin/settaskprofile $$ ProcessCapacityLow LowIoPriority >/dev/null && echo profiles-applied; $T grep -c . /dev/cpuset/background/cgroup.procs; /system/bin/settaskprofile $$ NoSuchProfile >/dev/null 2>&1 || echo profile-refused; /system/bin/setprop xiaoji.cg1 done"
+    oneshot
+
+# The same calls as the system user (system_server and SurfaceFlinger run as system): libprocessgroup must apply a profile,
+# and a uid group must be made and removed. It runs after the root service, and it ends the run.
+service cgsys /system/bin/sh -c "T=/system/bin/toybox; until test $(/system/bin/getprop xiaoji.cg1) = done; do $T sleep 0.1; done; /system/bin/settaskprofile $$ ProcessCapacityLow >/dev/null && echo sys-profile; mkdir /sys/fs/cgroup/uid_2000 && echo sys-mkdir; rmdir /sys/fs/cgroup/uid_2000 && echo sys-rmdir; echo uid $($T id -u); /system/bin/setprop xiaoji.exit 1"
+    user system
+    group system
+    oneshot
