@@ -54,6 +54,7 @@ typedef struct thread {
     uint32_t bitset;     /* wake mask of a FUTEX_WAIT_BITSET */
     int has_deadline;
     uint64_t deadline;   /* host monotonic ns */
+    int restart_eintr;   /* TS_RESTART from sched_block_restart_eintr: a signal ends the call with EINTR */
     uint64_t clear_child_tid;
     int settid_pending;  /* CLONE_CHILD_SETTID: write the tid into the child's memory on its first slice */
     uint64_t settid_va;
@@ -146,6 +147,7 @@ static void block_current(thr_state st, uint64_t key, uint32_t bitset, int has_d
     t->bitset = bitset;
     t->has_deadline = has_deadline;
     t->deadline = deadline;
+    t->restart_eintr = 0;
     t->cpu.blocked = 1;
     t->cpu.stop = 1;
 }
@@ -176,6 +178,15 @@ void sched_block_restart(uint64_t key)
     thread_t *t = cur();
     t->cpu.pc -= 4; /* the svc runs again when the thread wakes */
     block_current(TS_RESTART, key, 0, 0, 0);
+}
+
+/* A restart wait that a signal ends with -EINTR instead of a restart (locks.c: F_SETLKW, flock). */
+void sched_block_restart_eintr(uint64_t key)
+{
+    thread_t *t = cur();
+    t->cpu.pc -= 4;
+    block_current(TS_RESTART, key, 0, 0, 0);
+    t->restart_eintr = 1;
 }
 
 void sched_block_restart_until(uint64_t key, int has_deadline, uint64_t deadline)
@@ -233,7 +244,12 @@ sched_wait_t sched_wait_kind(const cpu_t *c)
 void sched_wake(cpu_t *c, int64_t ret)
 {
     thread_t *t = (thread_t *)c;
-    if (t->state == TS_RESTART)
+    if (t->state == TS_RESTART && t->restart_eintr && ret < 0) {
+        /* The interrupted call returns the error, and the signal's frame returns past the svc
+         * (Linux without SA_RESTART). The signal stays pending for its handler. */
+        t->cpu.pc += 4;
+        wake(t, ret);
+    } else if (t->state == TS_RESTART)
         wake_restart(t);
     else if (t->state != TS_RUNNABLE)
         wake(t, ret);

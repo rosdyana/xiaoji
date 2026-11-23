@@ -127,10 +127,15 @@ int vfs_cloexec_set(int fd, int on);
 int64_t vfs_read(int fd, void *buf, size_t n);
 int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off);
 int64_t vfs_write(int fd, const void *buf, size_t n);
+/* pwrite: writes at off and leaves the description's offset alone. Pipes and sockets are not seekable (ESPIPE).
+ * A host file with O_APPEND appends, as Linux does for pwrite. */
+int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off);
 int64_t vfs_lseek(int fd, int64_t off, int whence);
 /* dup: exact=0 takes the lowest free fd >= minfd; exact=1 uses minfd and closes it. */
 int vfs_dup(int oldfd, int minfd, int exact, int cloexec);
 vfs_fd *vfs_get(int fd);
+/* The running process's fd table as an opaque owner key (the POSIX record lock owner, locks.h). */
+void *vfs_owner(void);
 /* Linux dirent64 records into buf. Returns the byte count or -LE_*. */
 int64_t vfs_getdents(int fd, uint8_t *buf, size_t cap);
 

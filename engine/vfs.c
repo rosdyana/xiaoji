@@ -15,6 +15,7 @@
 
 #include "host.h"
 #include "linux.h"
+#include "locks.h"
 #include "meta.h"
 #include "mntns.h"
 #include "binder.h"
@@ -465,6 +466,7 @@ static void desc_unref(vfs_fd *f)
 {
     if (!f || --f->refs > 0)
         return;
+    lk_flock_release(f); /* flock locks belong to the description */
     if (f->hfd >= 0)
         host_close(f->hfd);
     if (f->kind == VFS_PIPE)
@@ -523,6 +525,7 @@ int vfs_close(int fd)
         return -LE_BADF;
     cur_fdt->slots[fd].desc = NULL;
     cur_fdt->slots[fd].cloexec = 0;
+    lk_posix_close(cur_fdt, f); /* any close drops the POSIX locks of this file (Linux filp_close) */
     desc_unref(f);
     return 0;
 }
@@ -711,6 +714,8 @@ void vfs_fdtab_copy_ns(fdtab_t *t)
 /* Makes t the running fd table. */
 void vfs_fdtab_switch(fdtab_t *t) { cur_fdt = t; }
 
+void *vfs_owner(void) { return cur_fdt; }
+
 fdtab_t *vfs_fdtab_fork(fdtab_t *src)
 {
     fdtab_t *t = vfs_fdtab_new();
@@ -745,8 +750,10 @@ void vfs_fdtab_release(fdtab_t *t)
         if (!d)
             continue;
         t->slots[i].desc = NULL;
+        lk_posix_close(t, d);
         desc_unref(d);
     }
+    lk_posix_owner_release(t); /* the table is freed: its pointer must not keep any lock or waiter */
     if (cur_fdt == t)
         cur_fdt = NULL;
     mntns_unref(t->ns);
@@ -1179,6 +1186,41 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     if (f->has_id)
         meta_write_privs(f->hdev, f->hino); /* a write clears setuid and setgid (meta.c) */
     return host_write(f->hfd, buf, n);
+}
+
+int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
+{
+    vfs_fd *f = vfs_get(fd);
+    if (!f)
+        return -LE_BADF;
+    switch (f->kind) {
+    case VFS_PATH: return -LE_BADF;
+    case VFS_DIR: return -LE_ISDIR;
+    case VFS_SYN:
+        if (f->syn == SYN_DIR)
+            return -LE_ISDIR;
+        return vfs_write(fd, buf, n); /* the synthetic files take no offset (writes go to the file) */
+    case VFS_MEMFD:
+        if (f->ro_area)
+            return -LE_BADF;
+        {
+            int64_t r = memfd_pwrite(f->mfd, buf, n, off);
+            return r < 0 ? -LE_NOMEM : r;
+        }
+    case VFS_PIPE:
+    case VFS_SOCK:
+    case VFS_BINDER:
+    case VFS_EVENTFD:
+    case VFS_GOLDFISH:
+    case VFS_TIMERFD:
+    case VFS_EPOLL: return -LE_SPIPE;
+    default: break;
+    }
+    if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
+        return -LE_BADF;
+    if (f->has_id)
+        meta_write_privs(f->hdev, f->hino);
+    return host_pwrite(f->hfd, buf, n, off);
 }
 
 int64_t vfs_lseek(int fd, int64_t off, int whence)

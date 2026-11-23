@@ -23,6 +23,7 @@
 #include "syscall.h"
 #include "props.h"
 #include "ashmem.h"
+#include "locks.h"
 #include "xattr.h"
 #include "selinuxfs.h"
 #include "sock.h"
@@ -64,6 +65,7 @@
 #define SYS_READV 65
 #define SYS_WRITEV 66
 #define SYS_PREAD64 67
+#define SYS_PWRITE64 68
 #define SYS_READLINKAT 78
 #define SYS_NEWFSTATAT 79
 #define SYS_FSTAT 80
@@ -187,6 +189,24 @@ static int64_t fs_read(int fd, uint64_t buf, uint64_t n)
     if (r > 0 && mem_copy_in(buf, iobuf, (size_t)r) < 0)
         return -LE_FAULT;
     return r;
+}
+
+/* pwrite64(fd, buf, n, off): the chunks of fs_write, at off. */
+static int64_t fs_pwrite(int fd, uint64_t buf, uint64_t n, uint64_t off)
+{
+    uint64_t done = 0;
+    do {
+        size_t chunk = n - done < IO_CHUNK ? (size_t)(n - done) : IO_CHUNK;
+        if (mem_copy_out(iobuf, buf + done, chunk) < 0)
+            return done ? (int64_t)done : -LE_FAULT;
+        int64_t w = vfs_pwrite(fd, iobuf, chunk, off + done);
+        if (w < 0)
+            return done ? (int64_t)done : w;
+        done += (uint64_t)w;
+        if ((size_t)w < chunk)
+            break;
+    } while (done < n);
+    return (int64_t)done;
 }
 
 static int64_t fs_pread(int fd, uint64_t buf, uint64_t n, uint64_t off)
@@ -516,7 +536,17 @@ static int64_t sys_faccessat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
         return -LE_NOENT;
     if (r.syn != SYN_NONE)
         return 0;
-    return host_access(r.host, (uint32_t)a2);
+    if (a2 & ~7ull)
+        return -LE_INVAL;
+    if ((a2 & 2) && r.ro)
+        return -LE_ROFS;
+    if (!a2)
+        return 0;
+    host_stat st;
+    int srv = host_stat_path(r.host, !(a3 & LAT_SYMLINK_NOFOLLOW), &st);
+    if (srv)
+        return srv;
+    return meta_access(&st, (uint32_t)a2); /* the guest's owner and mode (meta.c), not the host's */
 }
 
 #define LAT_REMOVEDIR 0x200
@@ -652,6 +682,100 @@ static int64_t sys_fsync(uint64_t fd)
 /* fchownat (54): the owner and group go to the guest metadata (meta.c), with the Linux permission rules. -1 for an
  * id changes nothing. AT_SYMLINK_NOFOLLOW (0x100) changes a final link itself. A synthetic file takes no record and
  * the call is accepted. (capget and capset are in cred.c.) */
+/* utimensat(dirfd, path, times, flags) (88), and futimens (path NULL). The checks come in Linux's order
+ * (fs/utimes.c): the flags, then both OMIT (a no-op that does not look at the path), then the path (ENOENT), then
+ * the times (EINVAL), the read-only mount (EROFS) and the permission (meta_utime_check). Synthetic files, pipes and
+ * memfds keep no times, so the call succeeds for them. */
+#define UT_NOW ((int64_t)((1ll << 30) - 1))
+#define UT_OMIT ((int64_t)((1ll << 30) - 2))
+#define AT_SYMLINK_NOFOLLOW_ 0x100
+#define AT_EMPTY_PATH_ 0x1000
+
+static int64_t sys_utimensat(uint64_t a0, uint64_t a1, uint64_t times, uint64_t flags)
+{
+    static char path[VFS_PATH_MAX];
+    static vfs_res r;
+    if (flags & ~(uint64_t)(AT_SYMLINK_NOFOLLOW_ | AT_EMPTY_PATH_))
+        return -LE_INVAL;
+    host_time_t t[2] = { { 0, 0, 1, 0 }, { 0, 0, 1, 0 } }; /* NULL times: both now */
+    int explicit_times = 0, bad_nsec = 0;
+    if (times) {
+        int64_t tv[4];
+        if (mem_copy_out(tv, times, sizeof tv) < 0)
+            return -LE_FAULT;
+        for (int i = 0; i < 2; i++) {
+            int64_t ns = tv[2 * i + 1];
+            t[i].now = t[i].omit = 0;
+            if (ns == UT_OMIT) {
+                t[i].omit = 1;
+            } else if (ns == UT_NOW) {
+                t[i].now = 1;
+            } else if (ns < 0 || ns >= 1000000000ll) {
+                bad_nsec = 1;
+            } else {
+                t[i].sec = tv[2 * i];
+                t[i].nsec = ns;
+                explicit_times = 1;
+            }
+        }
+        if (t[0].omit && t[1].omit)
+            return 0;
+        if (t[0].now && t[1].now) { /* vfs_utimes: both now is the NULL form */
+            t[0].now = t[1].now = 1;
+        } else {
+            explicit_times = 1; /* ATTR_TIMES_SET for any non-NULL time pair (OMIT and NOW included) */
+        }
+    }
+    int follow = (flags & AT_SYMLINK_NOFOLLOW_) == 0;
+    int rc, fdform = a1 == 0;
+    if (!fdform) {
+        rc = get_path(a1, path, sizeof path);
+        if (rc)
+            return rc;
+        fdform = path[0] == 0 && (flags & AT_EMPTY_PATH_) != 0;
+    }
+    if (fdform) { /* futimens, or an empty path with AT_EMPTY_PATH: the descriptor dirfd */
+        if (a1 == 0 && dirfd_of(a0) == -100) /* AT_FDCWD */
+            return -LE_FAULT;
+        if (!follow)
+            return -LE_INVAL;
+        vfs_fd *f = vfs_get(dirfd_of(a0));
+        if (!f)
+            return -LE_BADF;
+        if (bad_nsec)
+            return -LE_INVAL;
+        if (f->kind != VFS_FILE || !f->has_id)
+            return 0;
+        host_stat st;
+        rc = vfs_stat_fd(dirfd_of(a0), &st);
+        if (rc)
+            return rc;
+        rc = meta_utime_check(&st, explicit_times);
+        if (rc)
+            return rc;
+        return host_utimens(NULL, f->hfd, 1, t);
+    }
+    rc = vfs_resolve(dirfd_of(a0), path, follow, &r);
+    if (rc)
+        return rc;
+    if (!r.exists && !r.is_link)
+        return -LE_NOENT;
+    if (bad_nsec)
+        return -LE_INVAL;
+    if (r.ro)
+        return -LE_ROFS;
+    if (r.syn != SYN_NONE)
+        return 0;
+    host_stat st;
+    rc = host_stat_path(r.host, follow, &st);
+    if (rc)
+        return rc;
+    rc = meta_utime_check(&st, explicit_times);
+    if (rc)
+        return rc;
+    return host_utimens(r.host, -1, follow, t);
+}
+
 static int64_t sys_fchownat(uint64_t a0, uint64_t a1, uint64_t uid, uint64_t gid, uint64_t flags)
 {
     static char path[VFS_PATH_MAX];
@@ -968,6 +1092,152 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t cnt)
 #define LF_SETPIPE_SZ 1031
 #define LF_GETPIPE_SZ 1032
 
+/* fcntl record locks (F_GETLK 5, F_SETLK 6, F_SETLKW 7) and flock(2) (LOCK_*), on the guest's
+ * struct flock (arm64: 32 bytes, l_start and l_len at 8 and 16, l_pid at 24). locks.c does the work. */
+#define LF_GETLK 5
+#define LF_SETLK 6
+#define LF_SETLKW 7
+#define LF_RDLCK 0
+#define LF_WRLCK 1
+#define LF_UNLCK 2
+#define LF_OFFSET_MAX INT64_MAX
+
+typedef struct {
+    int16_t l_type, l_whence;
+    int64_t l_start, l_len;
+    int32_t l_pid;
+} guest_flock_t;
+_Static_assert(sizeof(guest_flock_t) == 32, "struct flock is 32 bytes on arm64");
+
+static int fd_readable(const vfs_fd *f)
+{
+    return !(f->lflags & LO_PATH) && (f->lflags & LO_ACCMODE) != LO_WRONLY;
+}
+
+static int fd_writable(const vfs_fd *f)
+{
+    return !(f->lflags & LO_PATH) && (f->lflags & LO_ACCMODE) != LO_RDONLY;
+}
+
+/* flock_to_posix_lock: the range of a struct flock, from its whence (SEEK_SET, SEEK_CUR, SEEK_END) and
+ * its start and length (a negative length counts backwards, 0 runs to the end of the file). */
+static int lk_range(int ifd, const guest_flock_t *l, int64_t *start, int64_t *end)
+{
+    int64_t base;
+    switch (l->l_whence) {
+    case 0: /* SEEK_SET */
+        base = 0;
+        break;
+    case 1: { /* SEEK_CUR: a pipe has no offset */
+        int64_t p = vfs_lseek(ifd, 0, 1);
+        base = p < 0 ? 0 : p;
+        break;
+    }
+    case 2: { /* SEEK_END */
+        host_stat st;
+        if (vfs_stat_fd(ifd, &st) < 0)
+            return -LE_BADF;
+        base = (int64_t)st.size;
+        break;
+    }
+    default:
+        return -LE_INVAL;
+    }
+    if (l->l_start > LF_OFFSET_MAX - base)
+        return -LE_OVERFLOW;
+    int64_t s = base + l->l_start;
+    if (s < 0)
+        return -LE_INVAL;
+    if (l->l_len > 0) {
+        if (l->l_len - 1 > LF_OFFSET_MAX - s)
+            return -LE_OVERFLOW;
+        *end = s + (l->l_len - 1);
+    } else if (l->l_len < 0) {
+        if (s + l->l_len < 0)
+            return -LE_INVAL;
+        *end = s - 1;
+        s += l->l_len;
+    } else {
+        *end = LF_OFFSET_MAX;
+    }
+    *start = s;
+    return 0;
+}
+
+static int64_t sys_fcntl_lock(int ifd, int cmd, uint64_t arg)
+{
+    vfs_fd *f = vfs_get(ifd);
+    guest_flock_t l;
+    if (mem_copy_out(&l, arg, sizeof l) < 0)
+        return -LE_FAULT;
+    int type = l.l_type;
+    /* F_GETLK accepts only the two lock types, and checks them before the range (fcntl_getlk). */
+    if (cmd == LF_GETLK && type != LF_RDLCK && type != LF_WRLCK)
+        return -LE_INVAL;
+    int64_t start = 0, end = 0;
+    int rc = lk_range(ifd, &l, &start, &end);
+    if (rc < 0)
+        return rc;
+    if (type != LF_RDLCK && type != LF_WRLCK && type != LF_UNLCK)
+        return -LE_INVAL;
+    if (cmd != LF_GETLK) /* check_fmode_for_setlk */
+        if ((type == LF_RDLCK && !fd_readable(f)) || (type == LF_WRLCK && !fd_writable(f)))
+            return -LE_BADF;
+
+    void *owner = vfs_owner();
+    if (cmd == LF_GETLK) {
+        lk_conflict_t cf;
+        rc = lk_posix_test(owner, f, type, start, end, &cf);
+        if (rc < 0)
+            return rc;
+        if (rc == 1) { /* posix_lock_to_flock: the conflicting lock's range and its holder's pid */
+            l.l_type = (int16_t)cf.type;
+            l.l_whence = 0;
+            l.l_start = cf.start;
+            l.l_len = cf.end == LF_OFFSET_MAX ? 0 : cf.end - cf.start + 1;
+            l.l_pid = cf.pid;
+        } else {
+            l.l_type = LF_UNLCK; /* the other fields stay as the caller gave them */
+        }
+        if (mem_copy_in(arg, &l, sizeof l) < 0)
+            return -LE_FAULT;
+        return 0;
+    }
+    rc = lk_posix_set(owner, proc_cur()->pid, f, type, start, end, cmd == LF_SETLKW);
+    if (rc == LK_BLOCKED)
+        return 0;
+    return rc;
+}
+
+/* flock(2): LOCK_SH, LOCK_EX, LOCK_UN, and LOCK_NB (no wait). LOCK_MAND is ignored, as on Linux. */
+#define LF_LOCK_SH 1
+#define LF_LOCK_EX 2
+#define LF_LOCK_NB 4
+#define LF_LOCK_UN 8
+#define LF_LOCK_MAND 32
+
+int64_t sysfs_flock(uint64_t fd, uint64_t cmd)
+{
+    if (cmd & LF_LOCK_MAND)
+        return 0;
+    int type;
+    switch (cmd & ~(uint64_t)LF_LOCK_NB) {
+    case LF_LOCK_SH: type = LK_RD; break;
+    case LF_LOCK_EX: type = LK_WR; break;
+    case LF_LOCK_UN: type = LK_UN; break;
+    default: return -LE_INVAL;
+    }
+    vfs_fd *f = vfs_get((int)(int32_t)fd);
+    if (!f)
+        return -LE_BADF;
+    if (type != LK_UN && !fd_readable(f) && !fd_writable(f))
+        return -LE_BADF;
+    int rc = lk_flock(f, type, !(cmd & LF_LOCK_NB));
+    if (rc == LK_BLOCKED)
+        return 0;
+    return rc;
+}
+
 static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
     int ifd = (int)(int32_t)fd;
@@ -982,6 +1252,10 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         if (cmd == LF_SETPIPE_SZ && (arg == 0 || arg > (1u << 20)))
             return -LE_INVAL;
         return (int64_t)PIPE_CAP;
+    case LF_GETLK:
+    case LF_SETLK:
+    case LF_SETLKW:
+        return sys_fcntl_lock(ifd, (int)cmd, arg);
     case LF_DUPFD:
         return vfs_dup(ifd, (int)arg, 0, 0);
     case LF_DUPFD_CLOEXEC:
@@ -1055,12 +1329,18 @@ static int64_t sys_memfd_create(uint64_t name_va, uint64_t flags)
     return vfs_memfd_create(name, (uint32_t)flags);
 }
 
-/* ftruncate(fd, len) on a memfd. Other files are not resized (EINVAL). */
+/* ftruncate(fd, len) on a memfd, or on a host regular file opened for writing (SQLite truncates its
+ * journal this way). Other kinds are not resized (EINVAL), as is a read-only descriptor. */
 static int64_t sys_ftruncate(uint64_t fd, uint64_t len)
 {
     vfs_fd *f = vfs_get((int)(int32_t)fd);
     if (!f)
         return -LE_BADF;
+    if (f->kind == VFS_FILE && f->hfd >= 0) {
+        if ((f->lflags & LO_ACCMODE) == LO_RDONLY || len > (1ull << 40))
+            return -LE_INVAL;
+        return host_ftruncate(f->hfd, len);
+    }
     if (f->kind != VFS_MEMFD)
         return -LE_INVAL;
     if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
@@ -1219,6 +1499,7 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_READV: *ret = fs_readv((int)(int32_t)a[0], a[1], a[2]); return 1;
     case SYS_WRITEV: *ret = fs_writev((int)(int32_t)a[0], a[1], a[2]); return 1;
     case SYS_PREAD64: *ret = fs_pread((int)(int32_t)a[0], a[1], a[2], a[3]); return 1;
+    case SYS_PWRITE64: *ret = fs_pwrite((int)(int32_t)a[0], a[1], a[2], a[3]); return 1;
     case SYS_LSEEK: *ret = vfs_lseek((int)(int32_t)a[0], (int64_t)a[1], (int)(int32_t)a[2]); return 1;
     case SYS_FSTAT: *ret = sys_fstat(a[0], a[1]); return 1;
     case SYS_NEWFSTATAT: *ret = sys_newfstatat(a[0], a[1], a[2], a[3]); return 1;
@@ -1233,6 +1514,7 @@ int sysfs_call(uint64_t nr, const uint64_t a[6], int64_t *ret)
     case SYS_FSYNC:
     case SYS_FDATASYNC: *ret = sys_fsync(a[0]); return 1;
     case SYS_FCHMODAT: *ret = sys_fchmodat(a[0], a[1], a[2]); return 1;
+    case 88: /* utimensat, and futimens (path NULL) */ *ret = sys_utimensat(a[0], a[1], a[2], a[3]); return 1;
     case SYS_FCHMOD: *ret = vfs_fchmod((int)(int32_t)a[0], (uint32_t)a[1]); return 1;
     /* Extended attributes (xattr_do above): the l forms do not follow a final link. */
     case 5: /* setxattr */ *ret = xattr_path_call(a[0], 1, XA_SET, a[1], a[2], a[3], (int)a[4]); return 1;

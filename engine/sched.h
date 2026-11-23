@@ -94,6 +94,8 @@ void sched_exit_signal(int sig);
  * (sched_wake): the call restarts after the handler, except a part-done pipe write,
  * which returns the bytes it wrote. No EINTR is returned. */
 void sched_block_restart(uint64_t key);
+/* As sched_block_restart, but a signal that wakes the wait ends the call with -EINTR (no restart). */
+void sched_block_restart_eintr(uint64_t key);
 /* As sched_block_restart, and the thread also wakes (to rerun) at the host monotonic
  * deadline, if has_deadline. */
 void sched_block_restart_until(uint64_t key, int has_deadline, uint64_t deadline);

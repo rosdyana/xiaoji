@@ -133,6 +133,7 @@ const char *syscall_name(uint64_t nr)
     case 212: return "recvmsg";
     case 242: return "accept4";
     case 67: return "pread64";
+    case 68: return "pwrite64";
     case 78: return "readlinkat";
     case 79: return "newfstatat";
     case 80: return "fstat";
@@ -1363,7 +1364,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = -LE_ACCES;
         return;
     case SYS_FLOCK:
-        *ret = 0; /* single process: file locks always succeed */
+        *ret = sysfs_flock(a[0], a[1]);
         return;
     case SYS_GETRLIMIT:
         *ret = sys_prlimit64(a[0], 0, a[1]);

@@ -37,6 +37,7 @@
 #define LE_RANGE 34
 #define LE_NAMETOOLONG 36
 #define LE_NOSYS 38
+#define LE_DEADLK 35
 #define LE_NOTEMPTY 39
 #define LE_LOOP 40
 #define LE_OVERFLOW 75

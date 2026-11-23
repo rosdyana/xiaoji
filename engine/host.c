@@ -191,6 +191,25 @@ int host_fchmod(int fd, uint32_t mode)
     return fchmod(fd, (mode_t)(mode & 07777)) == 0 ? 0 : neg_errno();
 }
 
+int host_utimens(const char *path, int fd, int follow, const host_time_t t[2])
+{
+    struct timespec ts[2];
+    for (int i = 0; i < 2; i++) {
+        if (t[i].omit) {
+            ts[i].tv_sec = 0;
+            ts[i].tv_nsec = UTIME_OMIT;
+        } else if (t[i].now) {
+            ts[i].tv_sec = 0;
+            ts[i].tv_nsec = UTIME_NOW;
+        } else {
+            ts[i].tv_sec = (time_t)t[i].sec;
+            ts[i].tv_nsec = (long)t[i].nsec;
+        }
+    }
+    int rc = path ? utimensat(AT_FDCWD, path, ts, follow ? 0 : AT_SYMLINK_NOFOLLOW) : futimens(fd, ts);
+    return rc == 0 ? 0 : neg_errno();
+}
+
 int host_mkdir(const char *path, uint32_t mode)
 {
     return mkdir(path, (mode_t)(mode & 07777)) == 0 ? 0 : neg_errno();
@@ -215,6 +234,11 @@ int host_rename(const char *from, const char *to)
 int host_link(const char *from, const char *to)
 {
     return link(from, to) == 0 ? 0 : neg_errno();
+}
+
+int host_ftruncate(int fd, uint64_t len)
+{
+    return ftruncate(fd, (off_t)len) == 0 ? 0 : neg_errno();
 }
 
 int host_fsync(int fd)
@@ -256,6 +280,12 @@ int64_t host_read(int fd, void *buf, size_t len)
 int64_t host_pread(int fd, void *buf, size_t len, uint64_t off)
 {
     ssize_t n = pread(fd, buf, len, (off_t)off);
+    return n < 0 ? neg_errno() : (int64_t)n;
+}
+
+int64_t host_pwrite(int fd, const void *buf, size_t len, uint64_t off)
+{
+    ssize_t n = pwrite(fd, buf, len, (off_t)off);
     return n < 0 ? neg_errno() : (int64_t)n;
 }
 
