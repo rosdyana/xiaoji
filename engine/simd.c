@@ -126,14 +126,20 @@ static uint64_t nan_pick(uint64_t a, uint64_t b, int dbl)
     return isqnan_b(a, dbl) ? a : b;
 }
 
-/* The NaN rules of a vector FP lane, as the scalar forms apply them (fp_arith2, fp_3src). Host arithmetic gives the
- * x86 sign (negative) to a NaN made by an invalid operation; the Arm default NaN is positive. Of the nin operands
- * (x, y, and acc for the fused forms) a NaN operand propagates: the first signalling NaN, quieted, else the first
- * quiet NaN. With no NaN operand, a NaN result is the default NaN. FMAXNM and FMINNM (nm) return the number when
- * one operand is a NaN, unless that NaN is signalling. */
+/* The NaN rules of a vector FP lane. Host arithmetic gives the x86 sign (negative) to a NaN made by an invalid
+ * operation; the Arm default NaN is positive. With no NaN operand, a NaN result is the default NaN. Otherwise a NaN
+ * operand propagates, quieted if it is signalling. The order: a signalling NaN outranks a quiet one; within a class
+ * the fused forms (nin 3) take the addend first, then the multiplicands x and y, and the other forms take x, then y.
+ * This is the order the arm64 hardware gives (checked with fmaf on an arm64 Mac). FMAXNM and FMINNM (nm) return the
+ * number when one operand is a NaN, unless that NaN is signalling. */
 static uint64_t fp_vec_nan(uint64_t res, int dbl, int nm, int nin, uint64_t x, uint64_t y, uint64_t acc)
 {
-    uint64_t v[3] = {x, y, acc};
+    uint64_t v[3] = {x, y, acc}, ord[3] = {x, y, acc};
+    if (nin == 3) {
+        ord[0] = acc;
+        ord[1] = x;
+        ord[2] = y;
+    }
     int any = 0;
     for (int i = 0; i < nin; i++)
         any |= isnan_b(v[i], dbl);
@@ -147,11 +153,11 @@ static uint64_t fp_vec_nan(uint64_t res, int dbl, int nm, int nin, uint64_t x, u
         return xn ? y : x;
     }
     for (int i = 0; i < nin; i++)
-        if (isnan_b(v[i], dbl) && !isqnan_b(v[i], dbl))
-            return quiet_b(v[i], dbl);
+        if (isnan_b(ord[i], dbl) && !isqnan_b(ord[i], dbl))
+            return quiet_b(ord[i], dbl);
     for (int i = 0; i < nin; i++)
-        if (isqnan_b(v[i], dbl))
-            return v[i];
+        if (isqnan_b(ord[i], dbl))
+            return ord[i];
     return res; /* not reached: some operand is a NaN */
 }
 
