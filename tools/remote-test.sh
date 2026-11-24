@@ -138,12 +138,13 @@ do_run() {
     mkdir -p "$LOCAL_OUT"
     rm -rf "$LOCAL_OUT"/*
     echo "run: tests/run.sh on $HOST, XIAOJI_JOBS=$JOBS XIAOJI_ORACLE=recorded$pass_env"
-    # The guest programs use fixed /tmp/xiaoji-* paths: start from none, and leave none behind.
-    ssh "$HOST" "rm -f /tmp/xiaoji-*" 2>/dev/null || true
+    # The guest programs use fixed /tmp/xiaoji-* paths, and the engine makes /tmp/xiaoji-tmpfs-<pid>-<n> for tmpfs
+    # mounts (a boot killed at its timeout leaves them): start from none, and leave none behind.
+    ssh "$HOST" "rm -rf /tmp/xiaoji-*" 2>/dev/null || true
     rc=0
     ssh "$HOST" "cd $RDIR && env PATH=\$HOME/$RDIR/tools/node/bin:\$PATH XIAOJI_ORACLE=recorded XIAOJI_JOBS=$JOBS$pass_env tests/run.sh" \
         >"$LOCAL_OUT/report.txt" 2>&1 || rc=$?
-    ssh "$HOST" "rm -f /tmp/xiaoji-*" 2>/dev/null || true
+    ssh "$HOST" "rm -rf /tmp/xiaoji-*" 2>/dev/null || true
     cat "$LOCAL_OUT/report.txt"
 
     # The outputs of the failing cases: the names in the FAIL lines (binder-driver's files are binder.*).
