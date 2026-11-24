@@ -12,6 +12,7 @@
 #include "filecache.h"
 #include "cred.h"
 #include "inotify.h"
+#include "evdev.h"
 #include "goldfish.h"
 #include "fdobj.h"
 #include "poll.h"
@@ -1571,6 +1572,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg)
         return -LE_BADF;
     if (f->kind == VFS_GOLDFISH)
         return goldfish_ioctl(f->obj, (uint32_t)cmd, arg); /* the address space (goldfish.c) */
+    if (f->kind == VFS_EVDEV)
+        return evdev_ioctl(f->obj, (uint32_t)cmd, arg); /* the input device's ioctls (evdev.c) */
     if (f->kind == VFS_MEMFD && f->ashmem)
         return ashmem_ioctl(f, (uint32_t)cmd, arg); /* /dev/ashmem (ashmem.c) */
     if (f->kind != VFS_BINDER)

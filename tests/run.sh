@@ -206,7 +206,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
     # bpfpin-* runs as the system user with the graphics group, as an init service (init-bpf, B15): not an oracle case.
-    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*) continue ;; esac
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*|evdev-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -230,10 +230,13 @@ check_rootfs() {
     fi
     local expect_rc
     expect_rc=$(cat "$expect_rc_file")
+    # The input devices' test source (evdev.c): the evdev case reads its scripted events from the environment.
+    local input_env=()
+    [ "$name" = evdev ] && input_env=(XIAOJI_INPUT_SCRIPT="$ROOT/tests/input/evdev.script")
     if [ "$runner" = engine ]; then
-        "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        env "${input_env[@]}" "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        env "${input_env[@]}" node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect_out" && [ "$rc" = "$expect_rc" ]; then
@@ -283,7 +286,7 @@ fi
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as sensors power-supply ashmem"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as sensors power-supply ashmem evdev"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -296,6 +299,7 @@ prop_argv() {
     goldfish-as) ARGV=(/data/local/tmp/goldfish-as) ;;
     sensors) ARGV=(/data/local/tmp/sensors) ;;
     ashmem) ARGV=(/data/local/tmp/ashmem) ;;
+    evdev) ARGV=(/data/local/tmp/evdev) ;;
     power-supply) ARGV=(/system/bin/sh -c 'for d in /sys/class/power_supply/*; do echo "dir ${d##*/}"; for f in $d/*; do echo "${f##*/} $(cat $f)"; done; done') ;;
     binder-sm) ARGV=(/system/bin/sh -c "/system/bin/servicemanager & $SM_WAIT; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0") ;;
     esac
@@ -359,6 +363,11 @@ if [ -d build/rootfs/system/bin ]; then
     if [ -f build/tests/guest/ashmem-O0 ]; then
         mkdir -p "$RFS/data/local/tmp"
         cp build/tests/guest/ashmem-O0 "$RFS"/data/local/tmp/ashmem
+    fi
+    # /dev/input (B16): tests/guest/evdev.c, the input devices of evdev.c; its scripted events come from the environment.
+    if [ -f build/tests/guest/evdev-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/evdev-O0 "$RFS"/data/local/tmp/evdev
     fi
     for name in $PROP_CASES; do
         prop_argv "$name"
