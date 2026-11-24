@@ -14,7 +14,9 @@ tests/run.sh                   # the suite alone (needs build/xiaoji, build/wasm
 XIAOJI_JOBS=1 tests/run.sh     # serial, the order the suite had before it ran in parallel
 ```
 
-The report is printed in the original order, whatever the job count, and saved to `build/tests/out/report.txt`.
+The report is printed in the original order, whatever the job count, and saved to `build/tests/out/report.txt`. It
+is printed at the end of the run (the sections are assembled after the jobs finish), so a long run shows nothing
+until then.
 The per-case outputs stay in `build/tests/out/` (`<name>.<engine|node>.{out,err}`). The count is the number of
 `PASS`, `FAIL` and `XFAIL` lines. At 3a04429 it is 228 passed, 0 failed, 0 xfail, with the serial run, the parallel
 run, `XIAOJI_JIT=0` and the recorded-oracle mode; the reports are byte-identical.
@@ -36,7 +38,7 @@ M2 (8 GB, already swapping) well inside its memory.
 
 | Variable | Effect |
 |---|---|
-| `XIAOJI_JIT=0` | The engine's block translator is off (the interpreter only). The same report as with the JIT. |
+| `XIAOJI_JIT=0` | Turns the block translator off in the Node (wasm) build, so its runs use the interpreter only; the report is the same. The native engine has no translator, so its runs do not change. |
 | `XIAOJI_BOOT=1` | Boots the zygote of `image/xiaoji.rc` (about 34 s natively) and checks the log. It runs after the other jobs drain. |
 | `XIAOJI_ROOT=build/rootfs-xiaoji` | Runs the root cases on another tree (the product tree). The builder-VM oracle cases are skipped. |
 | `XIAOJI_BINDERLIB=1` | Adds the binderLibTest report (report only, slow). |
@@ -125,18 +127,19 @@ parallel runs were back to back, with no other engine process running before or 
 | Remote, first sync (whole trees, about 2.8 GB) | 67 min | rc 0 |
 | Remote, sync after a change (delta) | 5 s | |
 | Remote, build (Node install, gcc engine) | 20 s | gcc 9.4.0, 0 warnings |
-| Remote, default suite (`XIAOJI_SKIP=exec`) | 109 to 114 s, with the sync | 224 passed, 0 failed (exec: 4 cases not run) |
-| Remote, product tree (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) | 383 s | 190 passed, 1 failed (the zygote boot check) |
+| Remote, default suite (`XIAOJI_SKIP=exec`) | 110 s (109 to 114 s in three runs) | 224 passed, 0 failed (exec: 4 cases not run) |
+| Remote, default suite with `XIAOJI_BINDERLIB=1` | 229 s | 224 passed, 0 failed; binderLibTest (report only): 48 cases, 45 passed, 2 failed, 1 skipped |
+| Remote, product tree (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) | 379 s | 190 passed, 1 failed (the zygote boot check, see below) |
 | Local, product tree | not completed | see below |
 
-The local product-tree run was started, and I stopped it: B15's boot started on the same machine while it ran, and
-the boot check is timing-sensitive. The remote product failure is the boot check (`XIAOJI_BOOT`): the boot reaches
-the same milestones as the Google-image boot (zygote preload, the fork and entry of system_server, StartPowerManager,
-InitPowerManagement, StartDisplayManager, the allocator and SurfaceFlinger's start), and then the product tree's
-audio HAL is missing. `vendor.audio-hal: cannot read /vendor/bin/hw/xiaoji_audio_hal` (the binary is built from
-`aosp/device/xiaoji/audio` by the AOSP build; the copy of `build/rootfs-xiaoji` on the Mac has no such binary either),
-so AudioService and `System now ready` never come, and the boot is stopped at its 300 s limit. So the remote and the
-Mac agree on this tree: the check needs the audio HAL in the product tree, which is not in this copy.
+The product-tree numbers are one run each, and the boot check fails in both of the remote runs made so far. The first
+was made before the worktree's `build/rootfs-xiaoji` was refreshed from the main checkout's copy (that copy lacked the
+netd, thermal and audio HAL files, so the boot stopped at the audio HAL). After the refresh (no differences between
+the two copies, data/ excepted), the boot logs `Cannot find entry android.hardware.graphics.allocator@3.0::IAllocator/default
+in either framework or device VINTF manifest`: the product tree's manifest has no allocator entry, so the boot never
+reaches SurfaceFlinger or the audio HAL, and it is stopped at its 300 s limit. The engine runs the same boot path as on
+the Mac; the difference is the tree's content. A local product-tree run on the same tree was not completed, because a
+boot from another checkout was running on this machine during each attempt (the boot check is timing-sensitive).
 
 The root lane is the critical path: every `--root` case is serial (the sidecar), so the parallel run cannot be faster
 than that lane. The guest jobs fit in its shadow, which is why the parallel gain on the Mac is about 17%. Cloned roots
