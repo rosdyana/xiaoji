@@ -100,7 +100,7 @@ make_oracle() {
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
     # oracles run as root (passwordless sudo in the builder VM).
     local runas=""
-    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | creds-* | fmeta-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | creds-* | fmeta-* | bpfmap-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -205,7 +205,8 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # prop-* programs need the engine's property service, which the native run lacks:
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
-    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*) continue ;; esac
+    # bpfpin-* runs as the system user with the graphics group, as an init service (init-bpf, B15): not an oracle case.
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -491,6 +492,33 @@ if [ -d build/rootfs/system/bin ]; then
     done
 fi
 
+# Init bpf (B15): bpfloader's pre-created maps (the stderr of the engine names the gpu_mem pin), and the pin as
+# libmeminfo reads it from a service that runs as system with the graphics group (tests/guest/bpfpin.c, expected text
+# tests/expect/init-bpf.out). The access checks are the engine's own: the root oracle does not run them. Engine and Node.
+if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/bpfpin-O0 ]; then
+    mkdir -p "$RFS/data/local/tmp"
+    cp build/tests/guest/bpfpin-O0 "$RFS"/data/local/tmp/bpfpin
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/bpf.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-bpf.$runner.out" 2>"$OUT/init-bpf.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/bpf.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-bpf.$runner.out" 2>"$OUT/init-bpf.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/init-bpf.$runner.out" tests/expect/init-bpf.out &&
+            grep -q '^bpfloader: [0-9][0-9]* maps pinned under /sys/fs/bpf$' "$OUT/init-bpf.$runner.err"; then
+            echo "PASS  init-bpf $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-bpf $runner (exit $rc)"
+            diff tests/expect/init-bpf.out "$OUT/init-bpf.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 # Init stdio (B4b): with the default --init-stdio null, a service's stdin, stdout and stderr are
 # /dev/null, so the probe writes its report to a file. The report (fdnames, tests/guest/fdnames.c)
 # must equal tests/expect/init-stdio.out. Engine and Node.
@@ -693,7 +721,9 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'Registered android.hardware.thermal@2.0::IThermal/default' "$OUT/boot.err" &&
             grep -q 'SystemServerTiming([0-9]*): StartHardwarePropertiesManagerService took to complete' "$OUT/boot.err" &&
             grep -q 'Registered android.hardware.authsecret@1.0::IAuthSecret/default' "$OUT/boot.err" &&
-            grep -q 'ActivityManager([0-9]*): System now ready' "$OUT/boot.err"; }; }; then
+            grep -q 'ActivityManager([0-9]*): System now ready' "$OUT/boot.err" &&
+            grep -q '^bpfloader: [0-9][0-9]* maps pinned under /sys/fs/bpf$' "$OUT/boot.err" &&
+            ! grep -q 'Fatal signal' "$OUT/boot.err"; }; }; then
         echo "PASS  cgroups (B11) and xiaoji_netd (B12): no cgroup.rc or cgroup v2 root error, no cpuset open error, xiaoji_netd registers netd and dnsresolver, no null INetd, StartNetworkManagementService and StartConnectivityService complete, no netd exit; the audio HAL (device/xiaoji/audio) registers, audioserver loads the primary module, StartAudioService completes, and ActivityManager reports System now ready (B13); zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
         pass=$((pass + 1))
     else

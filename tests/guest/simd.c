@@ -442,6 +442,31 @@ int main(int argc, char **argv)
     FPD("fcvtmu-d-w", "fcvtmu w5, d1");
     FPD("fcvtzs-d-w", "fcvtzs w5, d1");
     FPD("fcvtzu-d-x", "fcvtzu x5, d1");
+    /* Scalar integer three same, 64-bit (libft2). */
+    FPD("cmgt-d", "cmgt d0, d1, d2");
+    FPD("cmhi-d", "cmhi d0, d1, d2");
+    FPD("cmge-d", "cmge d0, d1, d2");
+    FPD("cmhs-d", "cmhs d0, d1, d2");
+    FPD("cmeq-d", "cmeq d0, d1, d2");
+    FPD("cmtst-d", "cmtst d0, d1, d2");
+    FPD("add-d", "add d0, d1, d2");
+    FPD("sub-d", "sub d0, d1, d2");
+    FPD("sshl-d", "sshl d0, d1, d2");
+    FPD("ushl-d", "ushl d0, d1, d2");
+    FPD("srshl-d", "srshl d0, d1, d2");
+    FPD("urshl-d", "urshl d0, d1, d2");
+    /* Fixed point (bit 21 clear): scale by 2^fbits, truncate and saturate; SCVTF/UCVTF divide. */
+    FPS("fcvtzs-w-fix6", "fcvtzs w5, s1, #6");
+    FPS("fcvtzs-x-fix20", "fcvtzs x5, s1, #20");
+    FPS("fcvtzu-w-fix1", "fcvtzu w5, s1, #1");
+    FPS("fcvtzu-x-fix32", "fcvtzu x5, s1, #32");
+    FPD("fcvtzs-d-w-fix16", "fcvtzs w5, d1, #16");
+    FPD("fcvtzs-d-x-fix64", "fcvtzs x5, d1, #64");
+    FPD("fcvtzu-d-w-fix32", "fcvtzu w5, d1, #32");
+    CASE("scvtf-s-w-fix8", "scvtf s0, w5, #8");
+    CASE("ucvtf-s-x-fix31", "ucvtf s0, x5, #31");
+    CASE("scvtf-d-x-fix64", "scvtf d0, x5, #64");
+    CASE("ucvtf-d-w-fix3", "ucvtf d0, w5, #3");
 
     /* Scalar compares: the NZCV result is read back into x6. */
     FPS("fcmp-s", "fcmp s1, s2\n mrs x6, nzcv");

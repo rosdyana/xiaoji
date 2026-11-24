@@ -16,11 +16,12 @@
 #define VFS_MAX_FD 1024
 
 typedef enum { VFS_FILE, VFS_DIR, VFS_PATH, VFS_SYN, VFS_MEMFD, VFS_PIPE, VFS_SOCK, VFS_BINDER, VFS_EVENTFD, VFS_TIMERFD, VFS_EPOLL,
-               VFS_GOLDFISH, VFS_INOTIFY } vfs_kind;
+               VFS_GOLDFISH, VFS_INOTIFY, VFS_BPF /* bpf.c: a map (bpf(2)) */ } vfs_kind;
 typedef enum { SYN_NONE, SYN_NULL, SYN_ZERO, SYN_RANDOM, SYN_DATA, SYN_BINDER,
                SYN_DIR, SYN_SELFS_STATUS, SYN_SELFS_ACCESS,
                SYN_SELFS_CONTEXT, SYN_GOLDFISH, SYN_ASHMEM,
-               SYN_CGROUP, SYN_CGROUP_RC /* cgroupfs.c (B11): a cgroup file or directory's file; the cgroup.rc memfd */ } vfs_syn;
+               SYN_CGROUP, SYN_CGROUP_RC /* cgroupfs.c (B11): a cgroup file or directory's file; the cgroup.rc memfd */,
+               SYN_BPF_OBJ /* bpf.c (B15): a pinned object on the bpffs; SYN_DIR for its directories */ } vfs_syn;
 
 /* An open file description: the offset, the status flags and the object. Every fd
  * that refers to it (dup, fork) shares it; it is freed when refs drops to 0. */

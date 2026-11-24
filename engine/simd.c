@@ -409,19 +409,10 @@ static int fp_from_int(cpu_t *c, uint32_t insn)
     return 0;
 }
 
-/* FCVTNS/FCVTNU, FCVTPS/FCVTPU, FCVTMS/FCVTMU, FCVTZS/FCVTZU: to integer with
- * rounding mode rmode (0 nearest, 1 up, 2 down, 3 toward zero). FCVTAS/FCVTAU (opcode 4 and 5,
- * rmode 0) round to nearest with ties away from zero. Saturates; NaN gives 0. */
-static int fp_to_int(cpu_t *c, uint32_t insn)
+/* The saturated integer for rounded value r of source x (NaN gives 0), 32-bit (sf=0) or 64-bit,
+ * signed or unsigned, as FCVT*S/U store it. */
+static uint64_t fp_sat_int(double x, double r, unsigned sf, unsigned uns)
 {
-    unsigned sf = insn >> 31, type = (insn >> 22) & 3, rmode = (insn >> 19) & 3, uns = (insn >> 16) & 1;
-    unsigned op = (insn >> 16) & 7;
-    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
-    int away = op >= 4; /* FCVTAS, FCVTAU */
-    if (type > 1 || !fp_default(c) || (away && rmode != 0))
-        return -1;
-    double x = type == 0 ? (double)as_f((uint32_t)c->v[rn][0]) : as_d(c->v[rn][0]);
-    double r = away ? round(x) : rmode == 0 ? rint(x) : rmode == 1 ? ceil(x) : rmode == 2 ? floor(x) : trunc(x);
     uint64_t out;
     if (x != x) {
         out = 0;
@@ -447,8 +438,57 @@ static int fp_to_int(cpu_t *c, uint32_t insn)
         else
             out = (uint64_t)(uint32_t)(int32_t)r;
     }
+    return out;
+}
+
+/* FCVTNS/FCVTNU, FCVTPS/FCVTPU, FCVTMS/FCVTMU, FCVTZS/FCVTZU: to integer with
+ * rounding mode rmode (0 nearest, 1 up, 2 down, 3 toward zero). FCVTAS/FCVTAU (opcode 4 and 5,
+ * rmode 0) round to nearest with ties away from zero. Saturates; NaN gives 0. */
+static int fp_to_int(cpu_t *c, uint32_t insn)
+{
+    unsigned sf = insn >> 31, type = (insn >> 22) & 3, rmode = (insn >> 19) & 3, uns = (insn >> 16) & 1;
+    unsigned op = (insn >> 16) & 7;
+    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+    int away = op >= 4; /* FCVTAS, FCVTAU */
+    if (type > 1 || !fp_default(c) || (away && rmode != 0))
+        return -1;
+    double x = type == 0 ? (double)as_f((uint32_t)c->v[rn][0]) : as_d(c->v[rn][0]);
+    double r = away ? round(x) : rmode == 0 ? rint(x) : rmode == 1 ? ceil(x) : rmode == 2 ? floor(x) : trunc(x);
+    uint64_t out = fp_sat_int(x, r, sf, uns);
     gpr_w(c, rd, sf ? out : (uint32_t)out);
     return 0;
+}
+
+/* Conversions between floating point and fixed point (bit 21 clear): FCVTZS and FCVTZU (rmode 3,
+ * opcode 0/1) multiply by 2^fbits and truncate, saturating; SCVTF and UCVTF (rmode 0, opcode 2/3)
+ * divide by 2^fbits, rounding to nearest once. fbits = 64 - scale; a 32-bit form needs scale >= 32. */
+static int fp_fixed(cpu_t *c, uint32_t insn)
+{
+    unsigned sf = insn >> 31, type = (insn >> 22) & 3, rmode = (insn >> 19) & 3, op = (insn >> 16) & 7;
+    unsigned scale = (insn >> 10) & 0x3F, rn = (insn >> 5) & 31, rd = insn & 31;
+    if (type > 1 || !fp_default(c) || (!sf && scale < 32))
+        return -1;
+    int fbits = 64 - (int)scale;
+    if (rmode == 3 && op < 2) {
+        double x = type == 0 ? (double)as_f((uint32_t)c->v[rn][0]) : as_d(c->v[rn][0]);
+        double r = trunc(ldexp(x, fbits)); /* exact scaling: a power of two */
+        uint64_t out = fp_sat_int(x, r, sf, op & 1);
+        gpr_w(c, rd, sf ? out : (uint32_t)out);
+        return 0;
+    }
+    if (rmode == 0 && (op == 2 || op == 3)) {
+        int uns = op == 3;
+        uint64_t x = gpr_r(c, rn);
+        if (!sf)
+            x = uns ? (uint64_t)(uint32_t)x : (uint64_t)(int64_t)(int32_t)(uint32_t)x;
+        /* One rounding (integer to the format), then an exact scale unless the result is subnormal. */
+        if (type == 0)
+            put_fs(c, rd, f_bits(ldexpf(uns ? (float)x : (float)(int64_t)x, -fbits)));
+        else
+            put_fd(c, rd, d_bits(ldexp(uns ? (double)x : (double)(int64_t)x, -fbits)));
+        return 0;
+    }
+    return -1;
 }
 
 /* ---------- FMOV between general and SIMD registers ---------- */
@@ -1804,6 +1844,18 @@ static int scalar_simd(cpu_t *c, uint32_t insn)
     /* Scalar floating-point three same (bit 21 and bit 10 set; the allocated opcodes, scalar_fp3_allocated). */
     if (((insn >> 21) & 1) && ((insn >> 10) & 1) && scalar_fp3_allocated(insn))
         return fp_three_same_impl(c, insn, 1);
+    /* Scalar integer three same on 64-bit elements (size 11): ADD/SUB (10000), CMGT/CMHI (00110),
+     * CMGE/CMHS (00111), CMTST/CMEQ (10001), SSHL/USHL (01000), SRSHL/URSHL (01010). They are the
+     * 2D vector operation on lane 0: run it (bit 28 clear, Q set) and zero the upper lane. */
+    if (((insn >> 21) & 1) && ((insn >> 10) & 1) && ((insn >> 22) & 3) == 3) {
+        unsigned opc = (insn >> 11) & 0x1F;
+        if (opc == 0x10 || opc == 0x06 || opc == 0x07 || opc == 0x11 || opc == 0x08 || opc == 0x0A) {
+            int r = three_same(c, insn & ~(1u << 28));
+            if (r == 0)
+                c->v[insn & 31][1] = 0;
+            return r;
+        }
+    }
     /* DUP (element), scalar: 01 0 11110000 imm5 0000 1 Rn Rd. The element goes to the low bits
      * of Vd and the rest of the register is zeroed. */
     if (((insn >> 21) & 0xFF) == 0xF0 && ((insn >> 10) & 0x1F) == 0x01) {
@@ -1972,8 +2024,10 @@ int simd_exec(cpu_t *c, uint32_t insn)
     if (top == 0x1E) { /* scalar floating point: bits 30 and 29 are zero (0x5E and 0x7E are AdvSIMD) */
         if ((insn >> 30) & 1) /* scalar AdvSIMD: bit 31 is zero */
             return (insn >> 31) ? -1 : scalar_simd(c, insn);
-        if (((insn >> 29) & 3) || !((insn >> 21) & 1))
+        if ((insn >> 29) & 3)
             return -1;
+        if (!((insn >> 21) & 1)) /* conversion between floating point and fixed point */
+            return fp_fixed(c, insn);
         unsigned low6 = (insn >> 10) & 0x3F;
         if (low6 == 0) {
             /* opcode 0/1: FCVT{N,P,M,Z}{S,U}; 2/3: SCVTF, UCVTF; 6/7: FMOV general */

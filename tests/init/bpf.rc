@@ -1,0 +1,7 @@
+# bpfloader's pre-creation (B15) and the gpu_mem pin as libmeminfo reads it. The service runs as the system user with
+# the graphics group, as system_server does (the pin is mode 0640, gid 1003). tests/guest/bpfpin.c prints the report;
+# tests/expect/init-bpf.out is its expected text. The run ends when the service sets xiaoji.exit.
+service bpfpin /system/bin/sh -c "/data/local/tmp/bpfpin; /system/bin/setprop xiaoji.exit 1"
+    user system
+    group system graphics
+    oneshot

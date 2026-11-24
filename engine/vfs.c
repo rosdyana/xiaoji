@@ -20,6 +20,7 @@
 #include "meta.h"
 #include "mntns.h"
 #include "binder.h"
+#include "bpf.h"
 #include "cgroupfs.h"
 #include "goldfish.h"
 #include "fdobj.h"
@@ -156,6 +157,13 @@ static vfs_syn syn_of(const char *p)
     if (binder_device(p) >= 0) return SYN_BINDER;
     if (goldfish_device(p)) return SYN_GOLDFISH;
     if (!strcmp(p, "/dev/ashmem")) return SYN_ASHMEM;
+    if (bpffs_under(p)) { /* the bpffs at /sys/fs/bpf (B15) */
+        switch (bpffs_lookup(p)) {
+        case BPFFS_DIR: return SYN_DIR;
+        case BPFFS_OBJ: return SYN_BPF_OBJ;
+        default: break;
+        }
+    }
     switch (selinuxfs_kind(p)) {
     case SELFS_FILE: return SYN_DATA;
     case SELFS_DIR: return SYN_DIR;
@@ -346,6 +354,14 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
                 out->syn = SYN_CGROUP;
                 break;
             }
+            if (bpffs_under(cand)) { /* a missing bpffs path (B15): creatable as the last component, never on the host */
+                if (!last)
+                    return -LE_NOENT;
+                strcpy(cur, cand);
+                out->exists = 0;
+                out->syn = SYN_BPF_OBJ;
+                break;
+            }
             return -LE_NOENT;
         }
 
@@ -500,6 +516,8 @@ static void desc_unref(vfs_fd *f)
         binder_release(f->binder); /* the last description of a proc: its death */
     if (f->kind == VFS_GOLDFISH)
         goldfish_free(f->obj);
+    if (f->kind == VFS_BPF)
+        bpf_map_unref(f->obj);
     if (f->kind == VFS_EVENTFD)
         efd_free(f->obj);
     if (f->kind == VFS_TIMERFD)
@@ -563,6 +581,8 @@ static void obj_free(vfs_kind kind, void *obj)
         tfd_free(obj);
     else if (kind == VFS_INOTIFY)
         ino_free(obj);
+    else if (kind == VFS_BPF)
+        bpf_map_unref(obj);
     else if (kind == VFS_EPOLL)
         poll_epoll_free(obj);
 }
@@ -580,7 +600,8 @@ int vfs_obj_new(vfs_kind kind, void *obj, int cloexec, uint32_t lflags)
     d->lflags = lflags;
     d->guest = xstrdup(kind == VFS_EVENTFD ? "anon_inode:[eventfd]"
                        : kind == VFS_TIMERFD ? "anon_inode:[timerfd]"
-                       : kind == VFS_INOTIFY ? "anon_inode:[inotify]" : "anon_inode:[eventpoll]");
+                       : kind == VFS_INOTIFY ? "anon_inode:[inotify]"
+                       : kind == VFS_BPF ? "anon_inode:bpf-map" : "anon_inode:[eventpoll]");
     slot_install(slot, d, cloexec != 0);
     return slot;
 }
@@ -934,6 +955,8 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
     }
     if (r.syn == SYN_CGROUP && !r.exists)
         return (lflags & LO_CREAT) ? -LE_PERM : -LE_NOENT;
+    if (r.syn == SYN_BPF_OBJ) /* a pinned map (no BTF) opens with bpffs_obj_fops: EIO; a new name is EACCES (inode.c, B15) */
+        return r.exists ? -LE_IO : (lflags & LO_CREAT) ? -LE_ACCES : -LE_NOENT;
     if (r.syn == SYN_CGROUP_RC) {
         /* cgroup.rc is mapped (MAP_SHARED, read-only) by libprocessgroup: a memfd, as the status page. */
         memfd_t *m = cgroupfs_rc_memfd();
@@ -1161,6 +1184,7 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     case VFS_GOLDFISH: return goldfish_read(f->obj, buf, n);
     case VFS_TIMERFD: return tfd_read(f->obj, buf, n);
     case VFS_INOTIFY: return -LE_AGAIN; /* no event is ever queued (inotify.c) */
+    case VFS_BPF: return -LE_INVAL;     /* a map fd has no read (bpf.c) */
     case VFS_EPOLL: return -LE_INVAL;
     default: break;
     }
@@ -1190,6 +1214,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
+    case VFS_BPF: return -LE_INVAL; /* a map fd has no read or write (bpf.c) */
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_WRONLY)
@@ -1241,7 +1266,8 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     case VFS_EVENTFD: return efd_write(f->obj, buf, n);
     case VFS_GOLDFISH: return goldfish_write(f->obj, buf, n);
     case VFS_TIMERFD:
-    case VFS_INOTIFY: return -LE_INVAL;
+    case VFS_INOTIFY:
+    case VFS_BPF: return -LE_INVAL;
     case VFS_EPOLL: return -LE_INVAL;
     case VFS_MEMFD: {
         if (f->ro_area)
@@ -1298,6 +1324,7 @@ int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
+    case VFS_BPF: return -LE_INVAL; /* a map fd has no read or write (bpf.c) */
     default: break;
     }
     if ((f->lflags & LO_ACCMODE) == LO_RDONLY)
@@ -1330,6 +1357,7 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_GOLDFISH:
+    case VFS_BPF:
     case VFS_EPOLL:
         return -LE_SPIPE;
     case VFS_DIR:
@@ -1573,6 +1601,20 @@ static void synthetic_stat(vfs_syn s, uint64_t size, host_stat *out)
 int vfs_stat_res(const vfs_res *r, host_stat *out)
 {
     int rc;
+    if (r->exists && bpffs_under(r->guest)) { /* the bpffs (B15): the node's mode, owner and group */
+        uint32_t mode, uid, gid;
+        if (bpffs_stat(r->guest, &mode, &uid, &gid) < 0)
+            return -LE_NOENT;
+        memset(out, 0, sizeof *out);
+        out->dev = 0x10;
+        out->ino = 0x2000;
+        out->mode = mode;
+        out->nlink = 1;
+        out->blksize = 4096;
+        out->uid = uid;
+        out->gid = gid;
+        return 0;
+    }
     if (r->syn != SYN_NONE) {
         synthetic_stat(r->syn, 0, out);
         rc = 0;
@@ -1633,6 +1675,15 @@ int vfs_stat_fd(int fd, host_stat *out)
         out->size = memfd_size(f->mfd);
         out->blksize = 4096;
         out->blocks = (out->size + 511) / 512;
+        return 0;
+    }
+    if (f->kind == VFS_BPF) { /* a map: an anonymous inode, S_IFREG 0600 (anon_inode_mkinode) (B15) */
+        memset(out, 0, sizeof *out);
+        out->dev = 0x0b;
+        out->ino = 0x3000;
+        out->mode = 0100000u | 0600u;
+        out->nlink = 1;
+        out->blksize = 4096;
         return 0;
     }
     if (f->kind == VFS_SYN) {

@@ -10,6 +10,7 @@
  * Classpaths: BOOTCLASSPATH, DEX2OATBOOTCLASSPATH, SYSTEMSERVERCLASSPATH and
  * STANDALONE_SYSTEMSERVER_JARS are read from the classpath fragments (classpaths.proto) in the
  * order of derive_classpath.cpp: the ART fragment, then the system one, then the APEX ones. */
+#include "bpf.h"
 #include "init.h"
 
 #include <dirent.h>
@@ -1183,6 +1184,8 @@ int init_main(const char *config, uint64_t timeout_s)
     /* The cgroups of the system (B11): the mounts of /system/etc/cgroups.json and /dev/cgroup_info/cgroup.rc. Before the
      * mkdirs, which may make subgroups of them. */
     cgroupfs_init();
+    bpffs_init(); /* the bpffs at /sys/fs/bpf (B15) */
+    bpf_preload(); /* bpfloader's maps, created and pinned before any service starts (B15) */
     /* The on-block actions, in file order (the mkdirs, mounts and symlinks of the rc; see boot_act_t). A failed action is
      * reported and the next one runs, as the stock init does for its builtins. */
     for (int i = 0; i < nboot_act; i++)

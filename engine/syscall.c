@@ -1,5 +1,6 @@
 /* Linux arm64 syscalls. Numbers are from asm-generic/unistd.h (checked against
  * the builder VM's headers). File and directory calls live in sysfs.c. */
+#include "bpf.h"
 #include "syscall.h"
 
 #include <stdint.h>
@@ -1401,6 +1402,9 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case SYS_SETRLIMIT:
         *ret = sys_prlimit64(a[0], a[1], 0);
+        return;
+    case 280: /* bpf(2): the maps-only subset (bpf.c, B15) */
+        *ret = bpf_syscall(a[0], a[1], a[2]);
         return;
     default:
         if (nr < 1024) {

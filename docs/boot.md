@@ -4159,3 +4159,191 @@ them, and the engine output matched the oracle again (gcc builds, O0 and O2).
   XIAOJI_BOOT run), not by the image build. The rootfs builder does not know about them yet.
 - The mountinfo fields the test prints are the target, the options and the fs type. The device numbers and the `shared:` peer groups are not
   compared with Linux.
+
+## B15: bpf(2) for the maps (the subset), the bpfloader's maps pinned at boot, and the boot past the libmeminfo abort (stops at a watchdog kill in systemReady)
+
+Status: **partial.** The decision of B14 (option 3, maps only) is implemented: `bpf(2)` has the map subset and a synthetic bpffs,
+and the maps of the image's BPF objects are created and pinned at init, as bpfloader does (without the programs). The libmeminfo read
+that aborted in B14 no longer aborts, and system_server reaches `ActivityManager: System now ready` in these runs. The product boot does
+not reach `sys.boot_completed=1`, the launcher or a HOME intent. It stops in one of two ways, with the same binary: an illegal
+instruction in the `android.display` thread at about 128 s (`fcvtzs w10, s0, #6`, the scalar fixed-point convert, not decoded; it kills
+system_server, and it makes the product check fail), or a watchdog kill at 211 s in `systemReady` (the first run, below). The product
+boots ran in Low Power Mode (see Power), so their times are not comparable with B14's.
+
+### Checkpoints
+
+| # | Checkpoint | Result |
+|---|---|---|
+| 1 | bpf subset, and the guest test against the native oracle | Done. `tests/guest/bpfmap.c` (oracle as root in the builder VM, `sudo -n`, 81 lines of output) and the engine print the same 81 lines, including the bpffs tree and the open errnos. |
+| 2 | map pre-creation, and the libmeminfo abort gone | Done. 49 maps pinned at init (`bpfloader: 49 maps pinned under /sys/fs/bpf`); no `Fatal signal` in the product boot. |
+| 3 | sys.boot_completed, the launcher | Not reached. Two blockers, both in system_server's boot after `System now ready`: the fixed-point FCVTZS in `libhwui.so` (SIGILL, the next blocker below), and a watchdog kill at 211 s in `ConnectivityService.systemReadyInternal` (the first run). |
+
+### The bpf subset (`engine/bpf.c`, `engine/bpf.h`)
+
+Syscall 280 (`engine/syscall.c`) calls `bpf_syscall`. Its semantics are those of Linux 6.12 (`kernel/bpf/syscall.c`, `hashtab.c`,
+`arraymap.c`, `inode.c`, read from the builder VM's source), and every errno below comes from the native oracle, not from memory:
+
+- `BPF_MAP_CREATE` for HASH (1), LRU_HASH (9, as a HASH: a full map gives E2BIG where Linux evicts), PERCPU_HASH (5) and
+  LRU_PERCPU_HASH (10), ARRAY (2) and PERCPU_ARRAY (6), each PERCPU type with one CPU slot (a lookup fills the first slot of the
+  caller's buffer; an update reads the first slot), and DEVMAP_HASH (25) as a HASH (the image's `tether_dev_map`; no interface is
+  checked and no program redirects into it). Any other known type: EOPNOTSUPP. A type number outside the enum: EINVAL. The create
+  checks (zero sizes, key size 4 for arrays, flags, E2BIG for an element past 4 MiB or a per-CPU value past 32 KiB) are the kernel's.
+- `BPF_MAP_LOOKUP_ELEM`, `UPDATE_ELEM` (BPF_ANY, BPF_NOEXIST, BPF_EXIST; BPF_F_LOCK is EINVAL), `DELETE_ELEM`, `GET_NEXT_KEY`
+  (a key that is missing starts at the first element; a last key gives ENOENT; an array's out-of-range key starts at 0).
+- `BPF_OBJ_PIN` and `BPF_OBJ_GET` on a bpffs at `/sys/fs/bpf` (the root is mode 01777 and cannot be removed: EBUSY). A pin is a
+  regular file with the owner and mode of the pin (0600 for a pin made by a process, umask applied). `BPF_OBJ_GET` checks the access
+  the `file_flags` ask for (`BPF_F_RDONLY`, `BPF_F_WRONLY`, else read and write) against the owner, group or other bits;
+  CAP_DAC_OVERRIDE bypasses them. A get of a directory is EACCES. `bpf_fd` must be 0 for a get.
+- Filesystem: `mkdir`, `rmdir` and `unlink` under the bpffs (EISDIR for unlink on a directory, ENOTEMPTY for a non-empty rmdir),
+  `stat` (`S_IFDIR` or `S_IFREG` with the node's owner and mode), `faccessat`, `openat` (EIO for an existing pin, which has no
+  file operations because a map without BTF uses `bpffs_obj_fops`; ENOENT for a missing name; EACCES for O_CREAT on a missing
+  name). A bpffs directory cannot be listed yet (`getdents` on it is not built).
+- `BPF_OBJ_GET_INFO_BY_FD` for a map fd: type, id, key and value sizes, max entries, flags and name (88 bytes, as
+  `struct bpf_map_info`).
+- Map fds are `VFS_BPF` descriptions (`vfs.c`): `read` and `write` are EINVAL, `lseek` is ESPIPE, `fstat` is an anonymous inode
+  (`S_IFREG|0600`), and the description holds a reference to the map. fork, dup and SCM_RIGHTS share the description, so the map is
+  shared engine-wide.
+- Every other command: EPERM for a known command (`PROG_LOAD`, `PROG_ATTACH`, links, tokens, iterators and the batch commands), and
+  EINVAL for a number above the last command of 6.12. No program is loaded, so nothing reads a program's output.
+
+`XIAOJI_DEBUG_BPF=1` prints one stderr line per failing command (`bpf: cmd N errno E`) and one per `BPF_OBJ_GET`
+(`bpf: OBJ_GET <path> file_flags <flags>`).
+
+### The bpfloader's maps (`bpf_preload`, `engine/bpf.c`; called from `init.c` after `bpffs_init`)
+
+The directories and pin prefixes are the loader's (`system/bpf/bpfloader/BpfLoader.cpp`, 0.19): `/apex/com.android.tethering/etc/bpf/`
+(prefix `tethering/`) and its `netd_shared/`, `netd_readonly/`, `net_shared/` and `net_private/` subdirectories, `/system/etc/bpf/`
+(no prefix) and `/vendor/etc/bpf/` (`vendor/`). Each `*.o` directly in a directory is read through the guest tree, and for each one:
+
+- the object's `bpfloader_min_ver` and `bpfloader_max_ver` sections gate the whole object (the image's `offload.o` and `test.o`
+  have a minimum of 2; the engine's loader version is 0.19, `0x13`);
+- `size_of_bpf_map_def` (default 32) is how much of each def is read, and the fields past it take the loader's defaults;
+- each map's def gives the type, key and value sizes, max entries and flags, the owner (`uid:gid`) and the mode. A def with a
+  `pin_subdir` is not built (the image's objects have none), and a map whose pin exists is reused, as the loader does;
+- the map is pinned at `/sys/fs/bpf/<prefix>map_<file>_<map>` (`<file>` empty when `shared`), in its prefix directory (mode 01777,
+  made first, as `createSysFsBpfSubDir` does), with the def's owner and mode.
+
+The product image has 49 maps in 9 objects with maps (`/system/etc/bpf`: `gpu_mem`, `gpu_work`, `time_in_state`; the apex: `offload` and
+`test` for tethering, and the four `net_shared` and `netd_shared` objects; `fuse_media` has none). Their types are 1, 2, 5, 6 and 25 (no other type is in the image).
+`XIAOJI_DEBUG_BPF=1` also prints each pin. No `bpf.progs_loaded` property is set: no program is loaded. Whether a caller waits for it
+was not checked.
+
+### What the boot asks of the maps (per caller, from the product boot's trace)
+
+The trace below is the product boot's, with `XIAOJI_DEBUG_BPF=1` (the log of the run in Milestones: `/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-projects-xiaonux/02218bd1-8168-4b28-a0fa-30c789f8f133/scratchpad/boot-cp2.err`). The trace has no pid, so the callers are not named. It lists each `BPF_OBJ_GET` and its result:
+
+| `BPF_OBJ_GET` path (file_flags) | Result | Note |
+|---|---|---|
+| `netd_shared/map_netd_*` (uid_owner, uid_permission, uid_counterset, cookie_tag, stats A and B, app_uid_stats, iface_index_name, iface_stats, configuration) (0) | ok | the pins exist; the trace's one `GET_NEXT_KEY` ENOENT is the end of a key walk, not a missing map |
+| `net_shared/map_clatd_*`, `map_dscp_policy_*`, `map_block_blocked_ports_map` (0) | ok | |
+| `net_shared/prog_block_bind4_block_port` (0x8, RDONLY) | ENOENT (2) | a program pin: no program is loaded, so nothing is pinned under a `prog_` name |
+| `KernelCpuUid{FreqTime,ActiveTime,ClusterTime}BpfMapReader` (logged at 80 s, not in the trace) | "Failed to start tracking" (a warning, not fatal) | the map pins are present; the readers' own program is not loaded (not checked in the framework source) |
+
+The libmeminfo read (`map_gpu_mem_gpu_mem_total_map`) is the one B14 aborted on. In this boot it is not called before the watchdog
+kill; its own access check is exercised by `tests/guest/bpfpin.c` (the init case below), not by the boot.
+
+The errnos are the kernel's, not chosen per caller: an absent pin is ENOENT, and a program command is EPERM (no CAP_BPF). Within
+this boot, no caller got EPERM from a program command, because none was issued (the trace shows no `PROG_*` command).
+
+### The init-level check (`tests/init/bpf.rc`, `tests/expect/init-bpf.out`, `tests/guest/bpfpin.c`)
+
+A service runs as `system` with the `graphics` group (the way system_server does) and reads the gpu_mem pin as libmeminfo does.
+It prints the pin's owner and mode (`0x1a0` = 0640, uid 0, gid 1003), the groups, then a get with the read-write flags (EACCES: the
+group has no write bit), a get with `BPF_F_RDONLY` (ok), the info (type 1, key 8, value 8, max 1024), a lookup of a missing key
+(ENOENT) and an update through the read-only fd (EPERM). The root oracle cannot check these: root bypasses the access checks. The
+expected text is the Linux DAC result for those modes and was not run against a non-root oracle (the builder VM has no gid 1003
+user). It is checked for engine and Node by `tests/run.sh`, together with the bpfloader summary line.
+
+### Milestones (product tree, `make reset-data` first; guest time and instruction count)
+
+Run: `XIAOJI_DEBUG_BPF=1 build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs-xiaoji --init-timeout 300`, the same
+arguments as the `XIAOJI_BOOT` check. The times are the engine's guest clock (`[ms insn]` in the log).
+
+| Milestone | time | instructions |
+|---|---|---|
+| `Registered android.hardware.thermal@2.0::IThermal/default` | 4.3 s | 0.30 G |
+| `InitBeforeStartServices took to complete` | 79.7 s | 4.81 G |
+| `StartAudioService took to complete: 10659ms` | 153.9 s | 9.81 G |
+| `ActivityManager: System now ready` | 163.8 s | 10.47 G |
+| `WATCHDOG KILLING SYSTEM PROCESS: Blocked in handler on main thread` | 211.2 s | 13.53 G |
+| `failed to create relro file` (WebView, not fatal) | 212.4 s | 13.60 G |
+| `*** GOODBYE!` (watchdog, system_server killed with SIGKILL) | 213.0 s | 13.64 G |
+| `Fatal signal` (libmeminfo or any abort) | none | none |
+
+The run ended at the 300 s init timeout (exit 0). `sys.boot_completed` and `Launcher` were not logged.
+
+### Next blocker: the fixed-point FCVTZS in libhwui (android.display, SIGILL)
+
+The unimplemented instruction is `0x1e18e80a`, at pc `0x6fffe7c4014c` (file offset `0x44014c` of
+`build/rootfs-xiaoji/system/lib64/libhwui.so`). `llvm-objdump -d` (the emsdk copy) gives `fcvtzs w10, s0, #0x6`: the scalar FCVTZS
+with fixed-point scale (bit 21 clear, scale 58 in bits 15:10, so 6 fractional bits), used on a single-precision value in a thread of
+system_server (`android.display`). `engine/simd.c` `fp_to_int` decodes only the integer form (bit 21 set). The fix is to add the
+fixed-point form: `x * 2^fbits`, truncated toward zero, saturated as the integer form, with NaN giving 0 (`fbits = 64 - scale`, and
+`fbits` 1..32 for a 32-bit result). It needs a case in `tests/guest/simd.c` checked against the native oracle. Not built here.
+
+### The watchdog kill in `systemReady` (PermissionMonitor, `registerReceiver`), the first run
+
+In the first product run (`boot-cp2`, with `XIAOJI_DEBUG_BPF=1`) no SIGILL occurred, and the watchdog killed system_server instead.
+
+The watchdog's annotated stack (the log of the run in Milestones, lines at 211 s to 213 s) puts the main thread here:
+
+```
+at android.app.ContextImpl.registerReceiverInternal(ContextImpl.java:1798)
+at com.android.server.connectivity.PermissionMonitor.startMonitoring(PermissionMonitor.java:400)
+at com.android.server.ConnectivityService.systemReadyInternal(ConnectivityService.java:3107)
+at com.android.server.ConnectivityService.systemReady(ConnectivityService.java:3089)
+at android.net.ConnectivityManager.systemReady(ConnectivityManager.java:1162)
+at com.android.server.am.ActivityManagerService.systemReady(ActivityManagerService.java:8141)
+at com.android.server.SystemServer.startOtherServices(SystemServer.java:2801)
+```
+
+The main thread was in this call for about 60 s of guest time (the watchdog's limit), and the log shows the same main thread's
+`Slow dispatch` lines before it (`android.ui` 231 ms, `android.fg` 450 ms). I did not determine why the registration takes that long:
+the boot ran in Low Power Mode, and the trace has no BPF call on the main thread in that window. A cascade follows: the
+WebView relro process dies (`webviewchromiumloader`: `libdl.so` not found, not fatal), and the permission controller's
+`DeadSystemException` is the death of system_server, not a cause.
+
+**Recommendation** (not built): run this boot once more with `XIAOJI_DEBUG_FAULTS=1` and the power state recorded at each point
+(`pmset -g`, both before and after), and with the trace of the main thread's binder transactions. If the time is the Low Power Mode
+throttle, rerun on AC with Low Power Mode off before any change. If it is a binder call that never returns, the fix belongs in the
+service it waits for (the blocked transaction's target is in the log).
+
+### Power
+
+`pmset -g` recorded `lowpowermode 1` before this boot (`/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-projects-xiaonux/02218bd1-8168-4b28-a0fa-30c789f8f133/scratchpad/pmset-boot15-start.txt`) and again after it
+(`/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-projects-xiaonux/02218bd1-8168-4b28-a0fa-30c789f8f133/scratchpad/pmset-boot15-end.txt`), with the Mac on `Battery Power` at the end. The memory note requires AC and Low Power Mode off before timing; this
+boot did not meet that, so its milestone times are not used for comparison.
+
+### Verification (B15, final sources)
+
+Final sources. The suites ran after the last code change (`bpfpin` excluded from the oracle cases, and the product check's `Fatal signal` condition).
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` | exit 0 |
+| `tests/run.sh` (default) | **234 passed, 0 failed, 0 xfail** (228 before, plus `bpfmap-O0/O2` on engine and Node, and `init-bpf` on engine and Node) |
+| `XIAOJI_JIT=0 tests/run.sh` | **234 passed, 0 failed, 0 xfail** |
+| `XIAOJI_BOOT=1 tests/run.sh` (Google image) | **235 passed, 0 failed, 0 xfail** |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product) | **200 passed, 1 failed**: the zygote boot check. Its one failing condition is the new `! grep 'Fatal signal'`, and the log has the SIGILL in `android.display` (below). Every other condition of the check matched. |
+| `make test-web` | all web checks passed, exit 0 |
+| `clang -std=c11 -Wall -Wextra -fsyntax-only` and `emcc -std=c11 -Wall -Wextra -fsyntax-only` on `engine/bpf.c`, `vfs.c`, `sysfs.c`, `syscall.c`, `init.c` | 0 warnings each |
+| `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | no process of this checkout. Two processes of another checkout (`/Users/rosdyanakusuma/Ross/projects/xiaoji-w1`) are listed; they were not touched |
+
+The product check's failure is a real boot failure, not a test artefact: the same SIGILL was reproduced in a foreground run
+(`XIAOJI_DEBUG_FAULTS=1`): `xiaoji: unimplemented A64 instruction 0x1e18e80a at pc 0x6fffe7c4014c`,
+`xiaoji: region ... libhwui.so off 0x200000: pc is file offset 0x44014c`, `F/libc(1068): Fatal signal 4 (SIGILL)` in `android.display`,
+and `exit: pid 1068 (LockSettingsSer) killed by signal 4`. That run's `System now ready` line comes before the SIGILL (line order; it
+has no time stamps, since `XIAOJI_STAMP` was not set).
+
+### Gaps (B15)
+
+- Not reached: `sys.boot_completed=1`, the launcher and the HOME intent. The next blocker is the fixed-point FCVTZS in libhwui (not built,
+  above); the watchdog kill of the first run is not diagnosed beyond its stack.
+- The product check (`XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1`) fails on the SIGILL. That is the check working, not a regression of the
+  bpf work, and it stays failing until the instruction is decoded.
+- No programs: `PROG_LOAD` and the attach commands are EPERM, so no BPF program runs and the time_in_state and tracking readers
+  stay in their "not tracking" state.
+- LRU maps are HASH maps (no eviction), per-CPU maps have one CPU slot, and DEVMAP_HASH has no interface checks.
+- The bpffs cannot be listed (`getdents` on `/sys/fs/bpf` is not built), and the pins' open returns EIO for the non-BTF path only.
+- `bpf.progs_loaded` is not set. Whether a caller waits on it was not checked.
+- The guest test and the init case use the engine's own uid and group checks for the gpu_mem pin; the oracle cannot check them.

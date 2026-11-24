@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bpf.h"
 #include "binder.h"
 #include "cgroupfs.h"
 #include "filecache.h"
@@ -571,6 +572,8 @@ static int64_t sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t mode)
         return -LE_ROFS;
     if (cgroupfs_under(r.guest)) /* a cgroup: mkdir makes the cgroup's directory (B11) */
         return cgroupfs_mkdir(r.guest);
+    if (bpffs_under(r.guest)) /* the bpffs (B15): a directory of pins */
+        return bpffs_mkdir(r.guest, (uint32_t)(mode & ~(uint64_t)proc_cur()->umask) & 07777u);
     if (r.exists || r.is_link)
         return -LE_EXIST;
     if (r.syn != SYN_NONE)
@@ -599,6 +602,8 @@ static int64_t sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t flags)
         return -LE_ROFS;
     if (cgroupfs_under(r.guest)) /* rmdir of a cgroup; a cgroup file cannot be unlinked (B11) */
         return (flags & LAT_REMOVEDIR) ? cgroupfs_rmdir(r.guest) : -LE_PERM;
+    if (bpffs_under(r.guest)) /* the bpffs (B15): unlink drops a pin, rmdir an empty directory */
+        return bpffs_unlink(r.guest, (flags & LAT_REMOVEDIR) != 0);
     if (r.syn != SYN_NONE)
         return -LE_PERM;
     if (flags & LAT_REMOVEDIR)

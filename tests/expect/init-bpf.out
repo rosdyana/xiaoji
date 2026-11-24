@@ -1,0 +1,9 @@
+uid 1000
+graphics group: yes
+stat: 0x1a0 uid 0 gid 1003
+get read-write: errno 13
+get rdonly: ok
+info: ok
+info: type 1 key 8 value 8 max 1024
+lookup 1: errno 2
+update rdonly: errno 1
