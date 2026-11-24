@@ -5,7 +5,7 @@
  * (shared/qemupipe/qemu_pipe_guest.cpp; HostConnection.cpp for the framing).
  *   opengles:      the first 4 bytes are clientFlags (zero), then GL requests (gl_host.c, the generated decoders).
  *   GLProcessPipe: a write of int32 100 is answered with the process id, a uint64.
- *   refcount:      a write of a color-buffer handle (uint32); nothing is returned.
+ *   refcount:      a write of a color-buffer handle (uint32); nothing is returned; closing the pipe releases the reference.
  *   qemud:sensors: framed messages (4 hex digits, then the payload), the qemud sensors protocol of sensors.c.
  *                  Its event batches are made when a read finds the time due (goldfish_read, goldfish_readable,
  *                  and the deadline that vfs_pipe_block and poll wait on), so no thread runs for them.
@@ -45,6 +45,8 @@ typedef struct {
     size_t inlen, incap;
     uint8_t *out;      /* reply bytes not yet read */
     size_t outoff, outlen, outcap;
+    uint32_t rc_handles[64]; /* refcount: the color buffers this pipe holds a reference to */
+    uint32_t rc_n;
 } gfpipe_t;
 
 static uint64_t next_puid = 1;
@@ -154,6 +156,11 @@ void goldfish_free(void *o)
     int kind = *(int *)o;
     if (kind == GF_PIPE) {
         gfpipe_t *p = o;
+        if (p->svc == SVC_REFCOUNT && p->rc_n) {
+            const gl_host_t *h = gl_host_current();
+            for (uint32_t i = 0; i < p->rc_n; i++)
+                h->rc->rcCloseColorBuffer(p, p->rc_handles[i]);
+        }
         free(p->in);
         free(p->out);
         free(p);
@@ -283,7 +290,7 @@ static void process(gfpipe_t *p)
             gl_reply rep = {0};
             if (gf_trace())
                 fprintf(stderr, "xiaoji: gf: opengles request op %u, %u bytes\n", (unsigned)rd32(p->in), (unsigned)total);
-            if (gl_host_decode(gl_host_null(), p, rd32(p->in), p->in, total, &rep) != 0) {
+            if (gl_host_decode(gl_host_current(), p, rd32(p->in), p->in, total, &rep) != 0) {
                 fprintf(stderr, "xiaoji: goldfish: opengles: opcode %u is not decoded (packet %u bytes)\n",
                         (unsigned)rd32(p->in), (unsigned)total);
                 free(rep.buf);
@@ -330,7 +337,13 @@ static void process(gfpipe_t *p)
                 reply(p, (const uint8_t *)rb, rl);
         }
     } else {
-        p->inlen = 0; /* refcount: the handles are accepted and not tracked yet */
+        /* refcount: each write is a color-buffer handle (uint32), and this pipe holds one reference to it. The
+         * references are released when the pipe closes (goldfish_free), as the host's refcount pipe does. */
+        while (p->inlen >= 4) {
+            if (p->rc_n < sizeof p->rc_handles / sizeof p->rc_handles[0])
+                p->rc_handles[p->rc_n++] = rd32(p->in);
+            in_drop(p, 4);
+        }
     }
 }
 

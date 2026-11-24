@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "display.h"
 #include "init.h"
 #include "logd.h"
 #include "memfd.h"
@@ -400,6 +401,8 @@ static const char *const engine_props[][2] = {
     {"ro.hardware.gralloc", "ranchu"},
     {"ro.opengles.version", "196608"},
     {"debug.renderengine.backend", "gles"},
+    /* The display's density (display.h): 240 dpi, with FB_XDPI the host reports the same. */
+    {"ro.sf.lcd_density", XJ_DISPLAY_DPI_STR},
 };
 
 int props_init(const char *const *overrides, int noverrides)

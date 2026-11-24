@@ -16,6 +16,10 @@ import { BOOT, CASES, ENGINE_ENV_ARGS } from './cases.js';
 import { openTrace } from './trace.js';
 import { ChunkStore, buildChunkTree, earlyPackIndex } from './chunks.js';
 
+// The display the engine presents (engine/display.h, XJ_DISPLAY_W and XJ_DISPLAY_H): the size of the OffscreenCanvas.
+const FB_WIDTH = 540;
+const FB_HEIGHT = 960;
+
 // The packs' layout from the downloader (web/packloader.js), relayed by the page: the manifest, the shared buffer and
 // the control words. The engine's module loads while it is on its way, so the boot waits for it here.
 let resolveLayout;
@@ -258,6 +262,11 @@ async function runBoot(base, opts) {
     }
   };
 
+  // The GL backend (docs/graphics.md, G2): the engine makes its WebGL2 context on the OffscreenCanvas of this worker
+  // (self.xjCanvas, engine/gl_webgl.c). The frame counters are in a shared Int32Array (the page takes the frames).
+  const webgl = !!(opts && opts.gl === 'webgl');
+  self.xjFrameCtl = opts && opts.frameSab ? new Int32Array(opts.frameSab) : null;
+  self.xjCanvas = webgl ? new OffscreenCanvas(FB_WIDTH, FB_HEIGHT) : null;
   const { default: createXiaoji } = await import(base + 'xiaoji.mjs');
   const Module = await createXiaoji({
     print: (line) => post({ type: 'out', text: line }),
@@ -296,6 +305,7 @@ async function runBoot(base, opts) {
   if (opts && opts.lazyWindow) argv.push('--lazy-window', String(Number(opts.lazyWindow)));
   // ?statsat: the engine prints its instruction count and lazy reads at phase 100 (for the A/B runs).
   if (opts && opts.statsAt) argv.push('--stats-at', 'Starting phase 100');
+  if (webgl) argv.push('--gl', 'webgl');
   let exitCode;
   try {
     exitCode = Module.callMain(argv);
@@ -312,16 +322,35 @@ async function runBoot(base, opts) {
   post({ type: 'done', name: 'boot', exitCode, wall: now() - t0, sync: { ...sync }, store: store ? store.stats : null });
 }
 
+// The frame path without a guest (tests/web.mjs, XIAOJI_WEB_FRAMES=1; engine/gl_webgl.c, xj_gl_selftest): the engine
+// draws a test picture on its WebGL2 color buffer and posts it as a frame. 'done' follows the frame, with the frames posted
+// (-1: no backend), the alias path's pixel and the quad's pixel (RGB, packed).
+async function glSelfTest(base, frameSab) {
+  self.xjFrameCtl = new Int32Array(frameSab);
+  self.xjCanvas = new OffscreenCanvas(FB_WIDTH, FB_HEIGHT);
+  const { default: createXiaoji } = await import(base + 'xiaoji.mjs');
+  const Module = await createXiaoji({
+    print: (line) => post({ type: 'out', text: line }),
+    printErr: (line) => post({ type: 'err', text: line }),
+  });
+  const frames = Module._xj_gl_selftest();
+  post({
+    type: 'done', name: 'glselftest', exitCode: frames, alias: Module._xj_gl_selftest_alias(),
+    quad: Module._xj_gl_selftest_quad(), life: Module._xj_gl_selftest_life(),
+  });
+}
+
 self.onmessage = async (ev) => {
   const msg = ev.data;
   if (!msg) return;
   try {
     if (msg.type === 'run') await run(msg.name, msg.base);
     else if (msg.type === 'layout') resolveLayout(msg);
+    else if (msg.type === 'glselftest') await glSelfTest(msg.base, msg.frameSab);
     else if (msg.type === 'boot') {
       await runBoot(msg.base, {
         trace: msg.trace, mode: msg.mode, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
-        statsAt: !!msg.statsAt, early: msg.early,
+        statsAt: !!msg.statsAt, early: msg.early, gl: msg.gl, frameSab: msg.frameSab,
       });
     }
   } catch (e) {

@@ -45,7 +45,7 @@ wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 # filesystem built by the worker in MEMFS (createLazyFile over HTTP).
 build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
 	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
 	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
@@ -93,8 +93,8 @@ build/web/xj/manifest-xiaoji-v2.json: tools/pack.py image/boot-order.json
 test-chunks: build/web/xj/manifest-xiaoji-v2.json   ## check the chunk store: every chunk hashes, every file reassembles (tests/chunks.mjs)
 	node tests/chunks.mjs
 
-test-web: wasm build/web/manifest.json   ## run the web build in headless Chromium (tests/web.mjs); XIAOJI_WEB_BOOT=1 adds the boot check
-	@if [ "$(XIAOJI_WEB_BOOT)" = 1 ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json && node tests/chunks.mjs; fi
+test-web: wasm build/web/manifest.json   ## run the web build in headless Chromium (tests/web.mjs); XIAOJI_WEB_BOOT=1 adds the boot check, XIAOJI_WEB_FRAMES=1 the Android frame check
+	@if [ "$(XIAOJI_WEB_BOOT)" = 1 ] || [ "$(XIAOJI_WEB_FRAMES)" = 1 ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json && node tests/chunks.mjs; fi
 	node tests/web.mjs hello-jit hello-int
 
 serve: wasm build/web/manifest.json   ## dev server for the web page (web/serve.mjs), port 8080

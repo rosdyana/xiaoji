@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "display.h"
 #include "gl_host.h"
 
 extern const renderControl_backend_t renderControl_null_defaults;
@@ -36,9 +37,9 @@ extern const gles1_backend_t gles1_null_defaults;
 #define EGL_NONE 0x3038
 #define EGL_DONT_CARE (-1)
 
-/* The display the engine presents: the size of the B4f NoOp composer, at the host's 72 dpi. */
-#define NULL_FB_WIDTH 720
-#define NULL_FB_HEIGHT 1280
+/* The display the engine presents (display.h, the one setting). */
+#define NULL_FB_WIDTH XJ_DISPLAY_W
+#define NULL_FB_HEIGHT XJ_DISPLAY_H
 #define NULL_RENDERER_VERSION 1
 
 /* What the null host advertises. Only the features the design lists (docs/graphics.md, 3.2): GLES 3.0 and
@@ -121,8 +122,8 @@ static int32_t fb_param(int32_t param)
     switch (param) {
     case FB_WIDTH: return NULL_FB_WIDTH;
     case FB_HEIGHT: return NULL_FB_HEIGHT;
-    case FB_XDPI: return 72;
-    case FB_YDPI: return 72;
+    case FB_XDPI: return XJ_DISPLAY_DPI;
+    case FB_YDPI: return XJ_DISPLAY_DPI;
     case FB_FPS: return 60;
     case FB_MIN_SWAP_INTERVAL: return 1;
     case FB_MAX_SWAP_INTERVAL: return 1;
@@ -569,6 +570,30 @@ static int32_t null_glFinishRoundTrip(void *ctx)
     return 0;
 }
 
+/* The client-array and client-index calls: no draws, so the data is dropped. */
+static void null_glVertexAttribPointerData(void *ctx, uint32_t index, int32_t size, uint32_t type, uint8_t normalized,
+                                           int32_t stride, const void *data, uint32_t datalen)
+{
+    (void)ctx; (void)index; (void)size; (void)type; (void)normalized; (void)stride; (void)data; (void)datalen;
+}
+
+static void null_glVertexAttribPointerOffset(void *ctx, uint32_t index, int32_t size, uint32_t type, uint8_t normalized,
+                                             int32_t stride, uint32_t offset)
+{
+    (void)ctx; (void)index; (void)size; (void)type; (void)normalized; (void)stride; (void)offset;
+}
+
+static void null_glDrawElementsData(void *ctx, uint32_t mode, int32_t count, uint32_t type, const void *data,
+                                    uint32_t datalen)
+{
+    (void)ctx; (void)mode; (void)count; (void)type; (void)data; (void)datalen;
+}
+
+static void null_glDrawElementsOffset(void *ctx, uint32_t mode, int32_t count, uint32_t type, uint32_t offset)
+{
+    (void)ctx; (void)mode; (void)count; (void)type; (void)offset;
+}
+
 static renderControl_backend_t rc_table;
 static gles2_backend_t gles2_table;
 static gles1_backend_t gles1_table;
@@ -623,6 +648,10 @@ const gl_host_t *gl_host_null(void)
         gles1_table = gles1_null_defaults;
         custom_table.glShaderString = null_glShaderString;
         custom_table.glFinishRoundTrip = null_glFinishRoundTrip;
+        custom_table.glVertexAttribPointerData = null_glVertexAttribPointerData;
+        custom_table.glVertexAttribPointerOffset = null_glVertexAttribPointerOffset;
+        custom_table.glDrawElementsData = null_glDrawElementsData;
+        custom_table.glDrawElementsOffset = null_glDrawElementsOffset;
         host_table.rc = &rc_table;
         host_table.gles2 = &gles2_table;
         host_table.gles1 = &gles1_table;

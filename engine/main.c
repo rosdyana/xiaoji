@@ -16,6 +16,7 @@
  * such hook, so this does nothing there. */
 EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); });
 #endif
+#include "gl_host.h"
 #include "host.h"
 #include "init.h"
 #include "linux.h"
@@ -91,6 +92,7 @@ static int usage(FILE *out)
           "  --no-lazy-mmap  fill file mappings at mmap time (as XIAOJI_LAZY=0); the default fills on first access\n"
           "  --lazy-window BYTES  the lazy fill window, a power of two from 4096 to 1 MiB (as XIAOJI_LAZY_WINDOW)\n"
           "  --stats-at TEXT  print the instructions and lazy reads at the first log line containing TEXT (as XIAOJI_STATS_AT)\n"
+          "  --gl null|webgl  the GL backend for the guest's GLES calls (default null; webgl is the web build's, gl_webgl.c)\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
           out);
     return out == stdout ? 0 : 2;
@@ -161,6 +163,12 @@ int main(int argc, char **argv)
             if (i + 1 >= argc)
                 return usage(stderr);
             lazy_window_arg = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--gl")) {
+            if (i + 1 >= argc || gl_host_select(argv[i + 1]) != 0)
+                return usage(stderr);
+            i++;
             continue;
         }
         if (!strcmp(a, "--init")) {
