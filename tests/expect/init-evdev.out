@@ -1,0 +1,35 @@
+add device 1: /dev/input/event0
+  name:     "xiaoji_touchscreen"
+  events:
+    KEY (0001): BTN_TOUCH            
+    ABS (0003): ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0, flat 0, resolution 0
+                ABS_MT_POSITION_X     : value 0, min 0, max 719, fuzz 0, flat 0, resolution 0
+                ABS_MT_POSITION_Y     : value 0, min 0, max 1279, fuzz 0, flat 0, resolution 0
+                ABS_MT_TRACKING_ID    : value 0, min 0, max 65535, fuzz 0, flat 0, resolution 0
+                ABS_MT_PRESSURE       : value 0, min 0, max 255, fuzz 0, flat 0, resolution 0
+  input props:
+    INPUT_PROP_DIRECT
+add device 2: /dev/input/event1
+  name:     "xiaoji_keyboard"
+  events:
+    KEY (0001): KEY_ESC               KEY_1                 KEY_2                 KEY_3                
+                KEY_4                 KEY_5                 KEY_6                 KEY_7                
+                KEY_8                 KEY_9                 KEY_0                 KEY_MINUS            
+                KEY_EQUAL             KEY_BACKSPACE         KEY_TAB               KEY_Q                
+                KEY_W                 KEY_E                 KEY_R                 KEY_T                
+                KEY_Y                 KEY_U                 KEY_I                 KEY_O                
+                KEY_P                 KEY_LEFTBRACE         KEY_RIGHTBRACE        KEY_ENTER            
+                KEY_LEFTCTRL          KEY_A                 KEY_S                 KEY_D                
+                KEY_F                 KEY_G                 KEY_H                 KEY_J                
+                KEY_K                 KEY_L                 KEY_SEMICOLON         KEY_APOSTROPHE       
+                KEY_GRAVE             KEY_LEFTSHIFT         KEY_BACKSLASH         KEY_Z                
+                KEY_X                 KEY_C                 KEY_V                 KEY_B                
+                KEY_N                 KEY_M                 KEY_COMMA             KEY_DOT              
+                KEY_SLASH             KEY_RIGHTSHIFT        KEY_LEFTALT           KEY_SPACE            
+                KEY_CAPSLOCK          KEY_RIGHTCTRL         KEY_RIGHTALT          KEY_HOME             
+                KEY_UP                KEY_PAGEUP            KEY_LEFT              KEY_RIGHT            
+                KEY_END               KEY_DOWN              KEY_PAGEDOWN          KEY_DELETE           
+                KEY_LEFTMETA          KEY_MENU              KEY_BACK              KEY_HOMEPAGE         
+    REP (0014): REP_DELAY             REP_PERIOD           
+  input props:
+    <none>

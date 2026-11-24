@@ -153,6 +153,8 @@ static void devs_init(void)
         bit_set(k->bits[EV_KEY], keys[i]);
     bit_set(k->bits[EV_SYN], SYN_REPORT);
     bit_set(k->bits[EV_SYN], SYN_DROPPED);
+    bit_set(k->bits[EV_REP], 0); /* REP_DELAY */
+    bit_set(k->bits[EV_REP], 1); /* REP_PERIOD */
     k->rep[0] = 250; /* the kernel's defaults: 250 ms delay, 33 ms period */
     k->rep[1] = 33;
 }
@@ -187,6 +189,30 @@ int evdev_index(const char *guest)
 int evdev_is_dir(const char *guest)
 {
     return !strcmp(guest, EVDEV_DIR);
+}
+
+/* The configuration file EventHub reads for the touchscreen, by its canonical name (/vendor/usr/idc/<name>.idc). It is a
+ * synthetic file: its text is made at open (vfs.c), as powersupply's are. */
+int evdev_file(const char *guest)
+{
+    return !strcmp(guest, "/vendor/usr/idc/xiaoji_touchscreen.idc");
+}
+
+int evdev_file_read(const char *guest, uint8_t **data, size_t *len)
+{
+    static const char text[] =
+        "# The virtual touchscreen (engine/evdev.c, B16): a direct touchscreen, oriented with the display.\n"
+        "touch.deviceType = touchScreen\n"
+        "touch.orientationAware = 1\n";
+    (void)guest;
+    size_t n = sizeof text - 1;
+    uint8_t *d = malloc(n);
+    if (!d)
+        return -1;
+    memcpy(d, text, n);
+    *data = d;
+    *len = n;
+    return 0;
 }
 
 int evdev_child(const char *dir, int idx, const char **name, int *is_dir)

@@ -23,6 +23,11 @@
 /* The guest path of device idx's node: its index, or -1. The directory /dev/input: 1 or 0. */
 int evdev_index(const char *guest);
 int evdev_is_dir(const char *guest);
+/* The configuration file of the touchscreen (EventHub looks it up by name): evdev_file names it, evdev_file_read gives its
+ * text (malloc'd; the caller owns it). */
+int evdev_file(const char *guest);
+int evdev_file_read(const char *guest, uint8_t **data, size_t *len);
+
 /* The idx-th child of a directory for getdents (the chain in vfs.c syn_getdents): 1 with the name, or 0 when there is none
  * (the nodes are not directories). */
 int evdev_child(const char *dir, int idx, const char **name, int *is_dir);

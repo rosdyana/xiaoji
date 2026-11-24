@@ -501,6 +501,28 @@ if [ -d build/rootfs/system/bin ]; then
     done
 fi
 
+# Input devices (B16): getevent -lp under init lists both virtual devices (tests/init/evdev.rc, tests/expect/init-evdev.out).
+if [ -d build/rootfs/system/bin ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/evdev.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-evdev.$runner.out" 2>"$OUT/init-evdev.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/evdev.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-evdev.$runner.out" 2>"$OUT/init-evdev.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/init-evdev.$runner.out" tests/expect/init-evdev.out; then
+            echo "PASS  init-evdev $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-evdev $runner (exit $rc)"
+            diff tests/expect/init-evdev.out "$OUT/init-evdev.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 # Init bpf (B15): bpfloader's pre-created maps (the stderr of the engine names the gpu_mem pin), and the pin as
 # libmeminfo reads it from a service that runs as system with the graphics group (tests/guest/bpfpin.c, expected text
 # tests/expect/init-bpf.out). The access checks are the engine's own: the root oracle does not run them. Engine and Node.

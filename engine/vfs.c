@@ -160,6 +160,7 @@ static vfs_syn syn_of(const char *p)
     if (evdev_is_dir(p)) return SYN_DIR; /* /dev/input (evdev.c, B16) */
     if (evdev_index(p) == EVDEV_TOUCH) return SYN_EVDEV0;
     if (evdev_index(p) == EVDEV_KEYBOARD) return SYN_EVDEV1;
+    if (evdev_file(p)) return SYN_DATA; /* the touchscreen's idc (evdev.c) */
     if (!strcmp(p, "/dev/ashmem")) return SYN_ASHMEM;
     if (bpffs_under(p)) { /* the bpffs at /sys/fs/bpf (B15) */
         switch (bpffs_lookup(p)) {
@@ -1034,6 +1035,8 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
             return -LE_NOMEM;
         if (r.syn == SYN_DATA && powersupply_kind(r.guest) == PSFS_FILE &&
             powersupply_read(r.guest, &gen, &glen) < 0)
+            return -LE_NOMEM;
+        if (r.syn == SYN_DATA && evdev_file(r.guest) && evdev_file_read(r.guest, &gen, &glen) < 0)
             return -LE_NOMEM;
         vfs_fd *f = desc_new();
         f->kind = VFS_SYN;
