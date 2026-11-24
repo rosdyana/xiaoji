@@ -1630,8 +1630,8 @@ static void synthetic_stat(vfs_syn s, uint64_t size, host_stat *out)
     case SYN_CGROUP_RC: out->mode = LS_IFREG | 0444; out->ino = 0x1007; break;
     case SYN_ZERO: out->mode = LS_IFCHR | 0666; out->rdev = 0x105; out->ino = 0x1002; break;
     case SYN_RANDOM: out->mode = LS_IFCHR | 0666; out->rdev = 0x109; out->ino = 0x1003; break;
-    case SYN_EVDEV0: out->mode = LS_IFCHR | 0660; out->rdev = (13u << 8) | 64u; out->ino = 0x1008; break;
-    case SYN_EVDEV1: out->mode = LS_IFCHR | 0660; out->rdev = (13u << 8) | 65u; out->ino = 0x1009; break;
+    case SYN_EVDEV0: out->mode = LS_IFCHR | 0660; out->rdev = (13u << 8) | 64u; out->ino = 0x1008; out->gid = 1004; /* group input, as ids_gen.h */ break;
+    case SYN_EVDEV1: out->mode = LS_IFCHR | 0660; out->rdev = (13u << 8) | 65u; out->ino = 0x1009; out->gid = 1004; break;
     default: out->mode = LS_IFREG | 0444; out->ino = 0x1004; break;
     }
 }
@@ -1721,6 +1721,7 @@ int vfs_stat_fd(int fd, host_stat *out)
         out->ino = 0x4000 + (uint64_t)evdev_index(f->guest);
         out->mode = 0020000u | 0660u;
         out->rdev = (13u << 8) | (64u + (uint32_t)evdev_index(f->guest));
+        out->gid = 1004; /* group input (ids_gen.h) */
         out->nlink = 1;
         out->blksize = 4096;
         return 0;

@@ -17,3 +17,8 @@
 300 1 0 0 0
 300 1 1 158 0
 300 1 0 0 0
+# At 600 ms: the Menu key, for the epoll wait that follows the Back key's read.
+600 1 1 139 1
+600 1 0 0 0
+600 1 1 139 0
+600 1 0 0 0

@@ -36,6 +36,11 @@ check('displayPoint centre', displayPoint(rect, 190, 340), { x: 360, y: 640 });
 check('displayPoint clamped', displayPoint(rect, 1000, -50), { x: DISPLAY_W - 1, y: 0 });
 check('displayPoint corner', displayPoint(rect, 370, 660), { x: DISPLAY_W - 1, y: DISPLAY_H - 1 });
 check('displayPoint zero rect', displayPoint({ left: 0, top: 0, width: 0, height: 0 }, 5, 5), { x: 0, y: 0 });
+// The display's size is the engine's (engine/display.h); the page keeps its own copy, which must match.
+const displayH = readFileSync(join(root, 'engine/display.h'), 'utf8');
+check('page display size is engine/display.h',
+  [Number(displayH.match(/XJ_DISPLAY_W (\d+)/)[1]), Number(displayH.match(/XJ_DISPLAY_H (\d+)/)[1])],
+  [DISPLAY_W, DISPLAY_H]);
 
 // Protocol B: the frames a touch sends, as (dev, type, code, value) and SYN_REPORT at each frame's end.
 const sent = [];

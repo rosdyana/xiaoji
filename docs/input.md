@@ -13,7 +13,7 @@ EventHub, getevent and the input stack read them with their own ioctls and reads
 
 The ranges come from `engine/display.h` (`XJ_DISPLAY_W` and `XJ_DISPLAY_H`, 720 by 1280). `rcGetFBParam` reads the same
 two values (`engine/gl_null.c`), so the framebuffer and the touchscreen have one size. Both nodes are character devices,
-`13:64` and `13:65`, mode `0660`. `/dev/input` lists `event0` and `event1` (getdents), so EventHub's first scan finds them
+`13:64` and `13:65`, owner root, group `input` (1004, `engine/ids_gen.h`), mode `0660`, as on a phone. `/dev/input` lists `event0` and `event1` (getdents), so EventHub's first scan finds them
 and the inotify watch on the directory succeeds (B9). Nothing is added with IN_CREATE, because the devices exist at startup.
 
 Two configuration files:
@@ -41,14 +41,15 @@ ioctls return the bytes copied, and the fixed ones return 0, as the kernel does 
 | `EVIOCGPROP(len)` | `INPUT_PROP_DIRECT` for the touchscreen, none for the keyboard |
 | `EVIOCGBIT(0, len)` | the types the device has (EV_SYN, EV_KEY, EV_ABS; EV_REP for the keyboard) |
 | `EVIOCGBIT(ev, len)` | the codes of type `ev`, in `min(len, longs)` bytes; the bit length is the kernel's `*_MAX` |
-| `EVIOCGABS(abs)` | the absinfo (six `__s32`), return 0; `-EINVAL` for an axis the device lacks |
+| `EVIOCGABS(abs)` | the absinfo (six `__s32`), return 0; `value` is the axis's last value from the events (EventHub's `getAbsoluteAxisValue` reads it); `-EINVAL` for an axis the device lacks |
 | `EVIOCGKEY(len)` | the keys held down (kept from the events) |
 | `EVIOCGLED`, `EVIOCGSND`, `EVIOCGSW` | all zero |
 | `EVIOCGRAB` | one fd holds the device; a second grab is `-EBUSY`; a release by a non-owner is `-EINVAL` |
 | `EVIOCSCLOCKID` | `CLOCK_REALTIME` (0, the default), `CLOCK_MONOTONIC` (1) and `CLOCK_BOOTTIME` (7); others `-EINVAL` |
 
 Not implemented (`-ENOTTY`): `EVIOCGKEYCODE`, `EVIOCSKEYCODE`, `EVIOCGMTSLOTS`, `EVIOCSABS`, `EVIOCSFF` (no force feedback),
-`EVIOCREVOKE`. EventHub and getevent do not use them (getevent -lp is the check).
+`EVIOCREVOKE`. None of them is used by getevent or by the remote inputflinger and libinput sources, except `EVIOCSFF`:
+EventHub calls it only to vibrate a device that has force feedback, and these devices have none.
 
 ## Reads, readiness, queues
 
@@ -70,7 +71,8 @@ Not implemented (`-ENOTTY`): `EVIOCGKEYCODE`, `EVIOCSKEYCODE`, `EVIOCGMTSLOTS`, 
 - **Browser (`XIAOJI_WEB`):** the ring, below. `--input-script` is refused there.
 
 Each device gets the events of its own type; a code the device lacks is dropped, as the kernel's input core does. A
-device's key state follows its EV_KEY values, and a value of 2 (repeat) leaves it unchanged.
+device's key state follows its EV_KEY values, and a value of 2 (repeat) leaves it unchanged. An event with no open fd on
+its device is taken from the source and dropped, as with the kernel (a client that is not open gets nothing).
 
 ## The ring buffer (page to engine)
 
@@ -94,7 +96,11 @@ that is not cross-origin isolated has no `SharedArrayBuffer`, so it gets no ring
 ## The page
 
 - **The screen:** `#android-screen`, a 9:16 element inside `#phone`. `web/input.js` creates it when the page has none (the
-  graphics canvas takes this element when it lands; the code finds it by id). It is shown only while the boot runs.
+  graphics canvas takes this element when it lands; the code finds it by id). It is shown only while the boot runs. It is
+  transparent and under the boot's controls (`web/index.html` raises the other children of `#phone`), so the Stop button and
+  the progress bar keep their clicks.
+- **The display size on the page:** `web/input.js` keeps its own 720 by 1280 (`DISPLAY_W`, `DISPLAY_H`), because the page does
+  not read the engine's header. `tests/input.mjs` fails if it differs from `engine/display.h`.
 - **Pointers:** `pointerdown`, `pointermove`, `pointerup` and `pointercancel` on the screen become protocol B
   (`createTouch`): a slot per pointer id (10 slots), a tracking id per contact, `ABS_MT_POSITION_X/Y` from the element's rect
   mapped to 720 by 1280 (clamped), `ABS_MT_PRESSURE` from the pointer's pressure (0.5 for a mouse), and `BTN_TOUCH` while any
@@ -110,11 +116,13 @@ that is not cross-origin isolated has no `SharedArrayBuffer`, so it gets no ring
 ## Tests
 
 - `tests/guest/evdev.c` with `tests/expect/evdev.out` (engine and Node, with `tests/input/evdev.script`): the directory and
-  the nodes, the ioctls above, the reads (including EINVAL and EAGAIN), the grab and clock results, an inotify watch on
-  `/dev/input`, and an epoll wait for a key 300 ms in. The expectation is derived from the uapi and the script (there is no
-  native oracle for these devices).
-- `tests/init/evdev.rc` with `tests/expect/init-evdev.out`: `getevent -lp` under init, which lists both devices (the names,
-  the ranges, the props, the keys and REP). getevent exits after the scan with `-p`.
+  the nodes, the ioctls above (EVIOCGABS reports the last value), a stamp check (an event's time lies in the window of the
+  read, in the monotonic clock EVIOCSCLOCKID chose), the reads (including EINVAL and EAGAIN), a blocking read on a fresh fd
+  (the Back key at 300 ms), the grab results, an inotify watch on `/dev/input`, an epoll wait for the Menu key at 600 ms,
+  and a ppoll that times out after 100 ms. The expectation is derived from the uapi and the script (there is no native
+  oracle for these devices).
+- `tests/init/evdev.rc` with `tests/expect/init-evdev.out`: `getevent -lp` under init as `system:input`, which lists both
+  devices (the names, the ranges, the props, the keys and REP). getevent exits after the scan with `-p`.
 - `tests/input.mjs` (in `make test-web`): the key map, the display mapping, the frames of a two-finger touch, and the ring
   round trip through the engine's own `xiaoji_input_pop`, loaded from `engine/jit_lib.js`.
 

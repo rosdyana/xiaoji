@@ -21,6 +21,7 @@
 #define SYS_EPOLL_CREATE1 20
 #define SYS_EPOLL_CTL 21
 #define SYS_EPOLL_PWAIT 22
+#define SYS_PPOLL 73
 #define AT_FDCWD (-100)
 #define O_RDWR_V 2
 #define O_NONBLOCK_V 04000
@@ -220,9 +221,23 @@ int main(int argc, char **argv)
 
     /* The reads: the touchscreen's frame (7 events: four ABS, BTN_TOUCH, SYN_REPORT), then the keyboard's (4). */
     ev_rec ev[16];
+    struct { i64 sec, nsec; } ts0, ts1;
+    sys_clock_gettime(1, &ts0);
     i64 n = rd((int)t, ev, sizeof ev);
+    sys_clock_gettime(1, &ts1);
     line("read touch bytes", n);
     print_events("touch", ev, n / 24);
+    {
+        /* The events are stamped when the read pumps them, in the clock EVIOCSCLOCKID chose (monotonic): the read's window. */
+        i64 at = ev[0].sec * 1000000000 + ev[0].usec * 1000;
+        line("touch stamp in window", at >= ts0.sec * 1000000000 + ts0.nsec && at <= ts1.sec * 1000000000 + ts1.nsec);
+    }
+    {
+        /* EVIOCGABS reports the axis's last value: the touch frame put X at 360. */
+        struct { i32 value, min, max, fuzz, flat, res; } ax;
+        ioctl_((int)t, EVIOCGABS(ABS_MT_POSITION_X_V), &ax);
+        line("abs x value", ax.value);
+    }
     line("read short buffer", rd((int)t, ev, 23));
     line("read drained", rd((int)t, ev, sizeof ev));
     n = rd((int)k, ev, sizeof ev);
@@ -233,6 +248,12 @@ int main(int argc, char **argv)
     ioctl_((int)k, EVIOCGKEY(sizeof keys), keys);
     line("key state a", bit(keys, KEY_A_V));
 
+    /* A blocking read: a second keyboard fd, opened after the tap was read, waits for the Back key at 300 ms. */
+    i64 k2 = openat("/dev/input/event1", O_RDWR_V | O_CLOEXEC_V);
+    n = rd((int)k2, ev, sizeof ev);
+    line("blocking read bytes", n);
+    print_events("blocking", ev, n / 24);
+
     /* EVIOCGRAB: one fd holds the touchscreen, a second open cannot take it, and it is given back. */
     int one = 1, zero = 0;
     line("grab", ioctl_((int)t, EVIOCGRAB, &one));
@@ -241,7 +262,11 @@ int main(int argc, char **argv)
     line("ungrab", ioctl_((int)t, EVIOCGRAB, &zero));
     sc6(SYS_CLOSE, t2, 0, 0, 0, 0, 0);
 
-    /* The keyboard's Back key at 300 ms: epoll on the keyboard, then its read. */
+    /* The keyboard fd k got the Back key in the same pump as k2's read, so its queue holds it. */
+    n = rd((int)k, ev, sizeof ev);
+    line("read back bytes", n);
+    print_events("back", ev, n / 24);
+    /* epoll waits for the Menu key at 600 ms (the wait is real: nothing is queued on k now). */
     i64 ep = sc6(SYS_EPOLL_CREATE1, O_CLOEXEC_V, 0, 0, 0, 0, 0);
     struct { u32 events; u32 pad; u64 data; } ee = {EPOLLIN_V, 0, (u64)k};
     line("epoll_ctl", sc6(SYS_EPOLL_CTL, ep, EPOLL_CTL_ADD_V, k, (i64)&ee, 0, 0));
@@ -249,8 +274,13 @@ int main(int argc, char **argv)
     line("epoll_pwait", sc6(SYS_EPOLL_PWAIT, ep, (i64)out, 4, 3000, 0, 8));
     line("epoll events", out[0].events);
     n = rd((int)k, ev, sizeof ev);
-    line("read back bytes", n);
-    print_events("keyboard", ev, n / 24);
+    line("read menu bytes", n);
+    print_events("menu", ev, n / 24);
+    /* ppoll: nothing more is due, so it times out after 100 ms with no ready fd. */
+    struct { int fd; short events; short revents; } pfd = {(int)k, 1, 0};
+    struct { i64 sec, nsec; } pto = {0, 100000000};
+    line("ppoll timeout", sc6(SYS_PPOLL, (i64)&pfd, 1, (i64)&pto, 0, 8, 0));
+    line("ppoll revents", pfd.revents);
 
     sc6(SYS_CLOSE, t, 0, 0, 0, 0, 0);
     sc6(SYS_CLOSE, k, 0, 0, 0, 0, 0);

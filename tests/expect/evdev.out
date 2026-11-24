@@ -60,6 +60,8 @@ touch type=3 code=54 value=640
 touch type=3 code=58 value=80
 touch type=1 code=330 value=1
 touch type=0 code=0 value=0
+touch stamp in window 1
+abs x value 360
 read short buffer -22
 read drained -11
 read keyboard bytes 96
@@ -68,14 +70,26 @@ keyboard type=0 code=0 value=0
 keyboard type=1 code=30 value=0
 keyboard type=0 code=0 value=0
 key state a 0
+blocking read bytes 96
+blocking type=1 code=158 value=1
+blocking type=0 code=0 value=0
+blocking type=1 code=158 value=0
+blocking type=0 code=0 value=0
 grab 0
 grab by second fd -16
 ungrab 0
+read back bytes 96
+back type=1 code=158 value=1
+back type=0 code=0 value=0
+back type=1 code=158 value=0
+back type=0 code=0 value=0
 epoll_ctl 0
 epoll_pwait 1
 epoll events 1
-read back bytes 96
-keyboard type=1 code=158 value=1
-keyboard type=0 code=0 value=0
-keyboard type=1 code=158 value=0
-keyboard type=0 code=0 value=0
+read menu bytes 96
+menu type=1 code=139 value=1
+menu type=0 code=0 value=0
+menu type=1 code=139 value=0
+menu type=0 code=0 value=0
+ppoll timeout 0
+ppoll revents 0

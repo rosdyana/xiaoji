@@ -19,7 +19,9 @@
   /* The boot screen: a phone frame, centred. On a narrow viewport it fills the screen. */
   .shell { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
   /* The Android screen (web/input.js): the phone's display, 720 x 1280, shown only while the boot runs. */
-  .android-screen { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); height: 100%; max-width: 100%; aspect-ratio: 720 / 1280; background: #000; border-radius: 14px; outline: none; }
+  /* The screen is under the boot's controls (they are raised above it), so the Stop button and the bar stay usable. */
+  .android-screen { position: absolute; z-index: 0; left: 50%; top: 50%; transform: translate(-50%, -50%); height: 100%; max-width: 100%; aspect-ratio: 720 / 1280; background: transparent; border-radius: 14px; outline: none; }
+  .phone > :not(.android-screen) { position: relative; z-index: 1; }
   .android-screen[hidden] { display: none; }
   .android-screen:focus-visible { box-shadow: 0 0 0 2px #8ab4ff; }
   .nav { display: flex; gap: 12px; }

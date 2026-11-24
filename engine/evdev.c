@@ -349,6 +349,8 @@ void evdev_pump(void)
         vdev *d = &devs[s[0]];
         if (s[1] != EV_SYN && !bit_test(d->bits[s[1]], (unsigned)s[2]))
             continue; /* a code the device doesn't have is dropped, as the kernel's input core does */
+        if (s[1] == EV_ABS) /* the axis's current value (EVIOCGABS reports it; EventHub reads it as getAbsoluteAxisValue) */
+            d->abs[s[2]].value = s[3];
         if (s[1] == EV_KEY && s[3] == 1)
             bit_set(d->keystate, (unsigned)s[2]);
         else if (s[1] == EV_KEY && s[3] == 0)
