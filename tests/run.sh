@@ -238,13 +238,15 @@ run_case() {
 }
 
 # One job: the guest units with the given indices (UNIT_NAME, UNIT_STRETCH), in order. Each unit's
-# lines go to $RES/g<index>, so the report can be put back together in the original order.
+# lines go to $RES/g<index>, so the report can be put back together in the original order. A unit that
+# finished leaves $RES/d<index>; the report says FAIL for a unit without it (its job was killed).
 guest_units() {
     local i name stretch
     for i in "$@"; do
         name=${UNIT_NAME[$i]}
         stretch=${UNIT_STRETCH[$i]}
         run_case "$name" "$stretch" >"$(printf '%s/g%03d' "$RES" "$i")"
+        : >"$(printf '%s/d%03d' "$RES" "$i")"
     done
 }
 
@@ -838,7 +840,7 @@ while [ "$next" -lt "$NJ" ] || [ "$NR" -gt 0 ]; do
         if [ "$used" -gt 0 ] && [ $((used + w)) -gt "$JOBS" ]; then
             break
         fi
-        ( ${JFN[$next]} ${JARG[$next]} ) >"$RES/job.$next" 2>&1 &
+        ( ${JFN[$next]} ${JARG[$next]}; : >"$RES/done.$next" ) >"$RES/job.$next" 2>&1 &
         RPID[$NR]=$!
         RW[$NR]=$w
         NR=$((NR + 1))
@@ -858,12 +860,19 @@ binderlib_section >"$RES/binderlib.txt" 2>&1
     cat "$RES/h0"
     i=0
     while [ "$i" -lt "$NU" ]; do
-        f=$(printf '%s/g%03d' "$RES" "$i")
-        [ -f "$f" ] && cat "$f"
+        if [ -f "$(printf '%s/d%03d' "$RES" "$i")" ]; then
+            cat "$(printf '%s/g%03d' "$RES" "$i")"
+        else
+            echo "FAIL  ${UNIT_NAME[$i]} (no result: its job stopped before the case finished)"
+        fi
         i=$((i + 1))
     done
     [ -f "$RES/static" ] && cat "$RES/static"
-    cat "$RES/job.0"
+    if [ -f "$RES/done.0" ]; then
+        cat "$RES/job.0"
+    else
+        echo "FAIL  root lane (no result: the job stopped)"
+    fi
     cat "$RES/boot.txt" "$RES/binderlib.txt"
 } >"$RES/report.txt"
 for f in "$RES"/job.[1-9]*; do
