@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "cgroupfs.h"
+#include "kernel.h"
 #include "linux.h"
 #include "loader.h"
 #include "mem.h"
@@ -171,7 +172,8 @@ int procfs_known(const char *guest)
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
         self_attr_p(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
         !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo") || pressure_file(guest) ||
-        !strcmp(guest, "/proc/self/oom_score_adj") || !strcmp(guest, "/proc/self/cgroup"))
+        !strcmp(guest, "/proc/self/oom_score_adj") || !strcmp(guest, "/proc/self/cgroup") ||
+        !strcmp(guest, "/proc/version") || !strcmp(guest, "/proc/config.gz"))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
@@ -398,6 +400,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
     int mrc;
     if (mounts_read(guest, data, len, &mrc))
         return mrc;
+    if (!strcmp(guest, "/proc/config.gz")) /* the kernel's configuration (kernel.c, B18) */
+        return kernel_config_gz(data, len);
     sbuf b = {0};
     const char *rest;
     proc_t *target = live_proc(guest, &rest);
@@ -447,6 +451,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
         sb_fmt(&b, "5c1d9a40-2f3e-4b7a-9e61-0d2c8f7a3b10\n");
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
+    } else if (!strcmp(guest, "/proc/version")) {
+        sb_fmt(&b, "%s", kernel_proc_version());
     } else if (pressure_file(guest)) {
         /* A stall never happens in the engine: the averages and totals are zero (the kernel's text). */
         const char *line = " avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";

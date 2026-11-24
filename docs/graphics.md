@@ -863,3 +863,82 @@ possibly through host composition too; the cause is not found (docs/boot.md, B17
 released; share groups are still not mapped; `GL_OES_EGL_image_external_essl3` is still advertised without WebGL2
 support (external textures are read as 2D); renderbuffer aliases are still attachments only; GLES 1, queries, program
 binaries, compute and image calls still get the null answers.
+
+## G4: why GL-drawn buffers were black, and the fixes (status, 2026-11-25)
+
+Status: **GL-drawn windows show in the browser.** In the last run (b18q, docs/boot.md B18) the launcher's home screen
+(the default wallpaper, the status bar with its clock and battery, the search widget), the all-apps drawer with its
+labels, and Settings are drawn on `#android-screen`. Six defects made GL pictures black or wrong: five in the WebGL2
+backend and its build, one in the generated wire decoder. Each has a page self test (`tests/web.mjs` with
+`XIAOJI_WEB_FRAMES=1`) that was run failing without the fix and passing with it.
+
+1. **One vertex array object 0 for every guest context.** `apply()` bound the guest's VAO name, so every context on
+   VAO 0 (Skia on GLES, in HWUI and in RenderEngine, uses VAO 0) shared WebGL's one default VAO: attribute pointers,
+   enables, divisors, the element buffer. Skia caches that state per context, so another process's setup broke its
+   draws. Now each guest context has a host VAO of its own standing for 0 (`host_vao`, made on first use, deleted with
+   the context); binding 0, deleting the bound VAO and `glGetIntegerv(GL_VERTEX_ARRAY_BINDING)` keep the guest's names.
+   `glGetIntegerv` also answers the framebuffer and 2D texture bindings with the guest's names (it gave host names, such
+   as a back buffer's FBO), and the renderbuffer binding likewise. Self test: `xj_gl_selftest_vao` bits 1, 2, 4.
+2. **Emscripten's client-side array emulation (`-sFULL_ES3`).** It keeps one "client side" flag per attribute index for
+   the whole WebGL context, set whenever `glVertexAttribPointer` runs with no array buffer bound; every later draw of any
+   context then uploads bytes from the wasm heap at the attribute's "pointer" (an offset, so near address 0) and rebinds
+   the attribute to them. The guest never sends client pointers (its encoder sends the data, `glVertexAttribPointerData`,
+   which the backend puts into buffers), so the emulation only corrupted geometry: RenderEngine's layers were drawn from
+   heap bytes (a pixel, streaks, or nothing; `b18a-home1.png` shows the streaks). The web build now uses
+   `-sMAX_WEBGL_VERSION=2` without `-sFULL_ES3` (the plan's text in 3.3 still names it). Self test: `xj_gl_selftest_vao`
+   bit 8.
+3. **Re-specifying a texture that stands for a colour buffer.** `rcBindTexture` (the guest's
+   `glEGLImageTargetTexture2DOES` on a gralloc buffer) makes a guest texture name an alias of the colour buffer's texture.
+   RenderEngine re-specifies its output texture as 1x1 RGB with `glTexImage2D` each frame; the backend applied that to
+   the aliased colour buffer, so the client target it had just composed became 1x1 and the posted frame read back black.
+   In GLES the name gets new storage and the image (the buffer) is left as it was (EGL_KHR_image_base). Now
+   `glTexImage2D`, `glTexStorage2D`, `glCopyTexImage2D` and `glTexImage2DOffsetAEMU` drop the name's alias and bind its
+   own texture first (`unalias_bound`); `glRenderbufferStorage*` drop a renderbuffer alias. Self test:
+   `xj_gl_selftest_respec`.
+4. **Renderbuffer names, and the renderbuffer binding.** The guest's encoder makes renderbuffer names with
+   `glGenFramebuffers` (`GL2Encoder::s_glGenRenderbuffers` calls `m_glGenFramebuffers_enc`; a host with one name space
+   per object type does not notice). WebGL objects are typed, so `glBindRenderbuffer` bound nothing and Skia's MSAA
+   coverage atlas (an R8 multisampled colour renderbuffer and a stencil renderbuffer) got no storage: its framebuffer was
+   incomplete (`GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT` on every draw), and its resolve texture, read by text and
+   path draws, held whatever the texture held. A guest renderbuffer name now maps to a host renderbuffer made on first
+   use (`host_rb`); names the backend made as renderbuffers map to themselves. The renderbuffer binding is also context
+   state now (`apply()` did not rebind it). Self test: `xj_gl_selftest_state` bits 256, 512, 1024.
+5. **Float arguments on the wire.** The generated decoder (`tools/gen-glproto.py`) read every `GLfloat` and `GLclampf`
+   scalar as `(float)(uint32_t)bits`, a conversion of the bit pattern as an integer: 0.25 became 1048576000.0. Every
+   `glUniform{1,2,3,4}f`, `glClearColor`, `glBlendColor`, `glVertexAttrib*f`, `glDepthRangef`, `glLineWidth`,
+   `glPolygonOffset`, `glTexParameterf` and `glSamplerParameterf` reached WebGL with such values (48 GLES 2/3 and 74
+   GLES 1 decodes); colours clamped to 1 and Skia's glyph atlas scale (`uAtlasSizeInv`) was 9.8e8, so no glyph showed.
+   The decoder now reinterprets the bits. The self tests had used the backend's functions directly, not the wire, for
+   these calls. Self test: `xj_gl_selftest_wirefloat` (a `glClearColor` packet through `gl_host_decode`).
+6. **Texture uploads without data.** A `glTexImage2D` packet with no pixels has a zero length but a pointer into the
+   packet; the backend passed the pointer on, and WebGL read the wasm heap there as the texture's contents (atlases
+   started with garbage). A zero length now passes NULL, which WebGL fills with zeros. Self test: `xj_gl_selftest_respec`
+   bit 8.
+
+What the earlier observations were: under client composition (RenderEngine, from about 409 s in B17) every frame was
+black because of 2 and 3; with 1 to 3 fixed the wallpaper and the launcher composed, with text missing or drawn as boxes
+because of 4, 5 and 6. For B17's black under host composition: in b18a (fix 1 only) the opaque full-screen GL layer
+under the dialog (colour buffer 24, as in B17's b9) was a window surface whose only work had been one clear to black
+(0 draws, `flush 0 of surface 25 ... 0 draws, 1 clears`), so its black was its content, not a loss in the composition;
+the composer then went to client composition, and B17's case was not isolated further. The
+colour buffer orientation, the formats and the read-back size were checked and were right (the back buffer at
+`eglSwapBuffers` and the colour buffer after the flush held the same picture, turned upright).
+
+**Debug aids** (`--debug-faults`, the page's `?debug=1`), all bounded: at a window flush, a summary of the back buffer
+and of the colour buffer (counts of non-black and non-transparent pixels, the centre pixel, the first non-black pixel)
+with the draws and clears since the last flush; each Device layer's colour buffer when the composition's layer set
+changes; the posted frame (the first 40, then every 25th) with each context's draws into framebuffer objects;
+RenderEngine's draws and clears into colour buffers (the colour buffers its texture units read, the target after the
+draw, the draw's arguments, viewport, scissor and blend state, the enabled attribute arrays with their first values, the
+program's float uniforms); draws that read a one-channel texture (glyph and coverage atlases) with the atlas's contents,
+the same state and the program's shader sources; the first GL errors of each context (after each of its first 3,000
+draws, and at flushes) with the 16 opcodes before them (`gl_host_ops`, kept by `gl_host_decode`) and, for an incomplete
+framebuffer, its status and attachments; the first texture and renderbuffer allocations, attachments and one-channel
+uploads, each with the GL error after it.
+
+Known gaps after G4: one `GL_INVALID_OPERATION` on RenderEngine's first draw of a run (its own output texture is bound on
+unit 0 while it draws into it; not investigated further); the remaining G3 gaps (share groups, stream slots, external
+textures read as 2D, GLES 1 and the other null answers). The scratch buffers for client arrays are still one per
+attribute index for all contexts; a context's data and its draw arrive together, so this was not seen to matter. The
+renderbuffer name map (1,024 entries) is not released when a guest process dies; when it is full, a new guest name binds
+no renderbuffer again (not reached in the runs).

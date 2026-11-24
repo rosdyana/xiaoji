@@ -26,6 +26,7 @@
 
 #include "bpf.h"
 #include "cred.h"
+#include "kernel.h"
 #include "linux.h"
 #include "mem.h"
 #include "proc.h"
@@ -888,7 +889,6 @@ static const struct {
 };
 
 #define BPFLOADER_VERSION 0x13u /* (0 << 16) | 19, Loader.cpp */
-#define BPF_KVERS 0x060100u     /* KVER(6, 1, 0): the release uname reports (syscall.c) */
 #define BPF_DEF_SIZE 116u       /* sizeof(struct bpf_map_def), bpf_map_def.h */
 #define BPF_DEF_DEFAULT_MAX_VER 0x10000u
 #define BPF_DEF_DEFAULT_MAX_KVER 0xffffffffu
@@ -918,7 +918,7 @@ static void preload_map(const char *prefix, const char *fname, const char *mapna
         minv = rd32(f + 32), maxv = rd32(f + 36);
     if (dsz >= 44)
         mink = rd32(f + 40), maxk = rd32(f + 44);
-    if (BPFLOADER_VERSION < minv || BPFLOADER_VERSION >= maxv || BPF_KVERS < mink || BPF_KVERS >= maxk)
+    if (BPFLOADER_VERSION < minv || BPFLOADER_VERSION >= maxv || kernel_kver() < mink || kernel_kver() >= maxk)
         return; /* skipped by the version gates, as the loader logs and skips it */
     if (dsz >= 112 && f[80] != 0) {
         fprintf(stderr, "bpfloader: %s map %s: pin_subdir is not built\n", fname, mapname);

@@ -77,4 +77,10 @@ const gl_host_t *gl_host_current(void);
 
 int gl_host_decode(const gl_host_t *h, void *ctx, uint32_t op, const uint8_t *pkt, size_t len, gl_reply *rep);
 
+/* The last opcodes decoded (a ring of GL_HOST_NOPS, gl_host_nops counts them all): the WebGL backend's --debug-faults
+ * reports name the calls before a GL error with them. */
+#define GL_HOST_NOPS 16
+extern uint32_t gl_host_ops[GL_HOST_NOPS];
+extern uint32_t gl_host_nops;
+
 #endif

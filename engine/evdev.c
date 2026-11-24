@@ -368,9 +368,10 @@ void evdev_pump(void)
             deliver(e, (uint16_t)s[1], (uint16_t)s[2], s[3], mono, real);
             nopen++;
         }
-        /* --debug-faults: the first events from the source, and how many open fds took each (B17). */
-        static int noted;
-        if (sig_debug_faults() && noted < 64) {
+        /* --debug-faults: the first events from the source, and how many open fds took each (B17); key events of the
+         * keyboard (event1) up to 400 more, so typing after many touches is still seen (B18). */
+        static int noted, keys;
+        if (sig_debug_faults() && (noted < 64 || (s[0] == 1 && s[1] == 1 && keys++ < 400))) {
             noted++;
             fprintf(stderr, "xiaoji: evdev: event%d type %d code %d value %d to %d open fd(s)\n", s[0], s[1], s[2], s[3], nopen);
         }

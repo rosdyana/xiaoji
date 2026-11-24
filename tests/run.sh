@@ -284,7 +284,7 @@ fi
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-gl goldfish-as sensors power-supply ashmem evdev"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-gl goldfish-as sensors power-supply ashmem evdev kernel"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -299,6 +299,9 @@ prop_argv() {
     sensors) ARGV=(/data/local/tmp/sensors) ;;
     ashmem) ARGV=(/data/local/tmp/ashmem) ;;
     evdev) ARGV=(/data/local/tmp/evdev) ;;
+    # The kernel the engine presents (B18): uname, /proc/version and /proc/config.gz agree, and toybox's zcat
+    # (which checks the gzip trailer's CRC and length) reads the configuration of the matrix's 5.15 entry.
+    kernel) ARGV=(/system/bin/sh -c 'uname -r; uname -v; cat /proc/version; zcat /proc/config.gz > /data/local/tmp/kconfig && echo zcat ok; grep -c "^CONFIG_" /data/local/tmp/kconfig; grep -c "is not set" /data/local/tmp/kconfig; grep -E "^CONFIG_(ARM64|ANDROID_BINDER_DEVICES|BPF_SYSCALL|OF)=" /data/local/tmp/kconfig; rm /data/local/tmp/kconfig') ;;
     power-supply) ARGV=(/system/bin/sh -c 'for d in /sys/class/power_supply/*; do echo "dir ${d##*/}"; for f in $d/*; do echo "${f##*/} $(cat $f)"; done; done') ;;
     binder-sm) ARGV=(/system/bin/sh -c "/system/bin/servicemanager & $SM_WAIT; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0") ;;
     esac

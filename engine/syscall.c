@@ -9,6 +9,7 @@
 
 #include "binder.h"
 #include "filecache.h"
+#include "kernel.h"
 #include "goldfish.h"
 #include "exec.h"
 #include "host.h"
@@ -552,8 +553,8 @@ static int64_t sys_uname(uint64_t buf)
     memset(u, 0, sizeof u);
     strcpy(u + 0 * 65, "Linux");
     strcpy(u + 1 * 65, "xiaoji");
-    strcpy(u + 2 * 65, "6.1.0-xiaoji");
-    strcpy(u + 3 * 65, "#1 xiaoji M1");
+    strcpy(u + 2 * 65, kernel_release()); /* the release libvintf checks (kernel.h) */
+    strcpy(u + 3 * 65, kernel_version());
     strcpy(u + 4 * 65, "aarch64");
     strcpy(u + 5 * 65, "(none)");
     if (mem_copy_in(buf, u, sizeof u) < 0)

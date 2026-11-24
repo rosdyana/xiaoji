@@ -4752,3 +4752,197 @@ Files changed (all under the repo): `engine/simd.c`, `engine/mem.c`, `engine/gl_
 `web/cases.js`, `web/theme.js`, `web/theme.json`, `web/theme-pink.json`; `docs/boot.md`, `docs/graphics.md`,
 `docs/web-preview.md`, `docs/input.md`. `docs/testing.md` and `tools/remote-test.sh`, which the brief names, are not in this
 repository; every check ran locally.
+
+## B18: GL-drawn windows in the browser, the compatibility check passes, and tap and typing reach apps
+
+Status: **the launcher renders in the browser, and a tap and typing demonstrably act in apps.** In the last runs (b18q, and b18r on the final
+sources; headless Chromium, the product tree) the page shows the launcher's home screen (the default wallpaper, the status bar
+with clock and battery, the search widget), the all-apps drawer with Files and Settings and their labels, and Settings
+after a tap on its icon; typing "files" into the drawer's search field shows the text in the field and leaves only
+Files. The "Android System: There's an internal problem with your device" dialog no longer appears: the engine reports
+the kernel release `5.15.41-android13-8-xiaoji` with the configuration the Android 13 compatibility matrix requires for
+5.15, and the compatibility check passes (2; a plain `5.15.41-xiaoji` was refused for this product). The black screen
+of B17 had six causes, all fixed (docs/graphics.md, G4).
+
+Screenshots (headless Chromium, `build/web-shots/`, not committed):
+
+| File | What it shows |
+|---|---|
+| `b18q-home.png` | home screen: wallpaper, status bar (clock 5:06, battery), "Search" widget |
+| `b18r-home.png`, `b18r-allapps.png`, `b18r-settings.png`, `b18r-search-focused.png`, `b18r-after-type.png`, `b18r-control-*.png` | the same sequence on the final sources (b18r) |
+| `b18q-control-start.png`, `b18q-control-end.png` | the same screen 30 s apart with no input (the control) |
+| `b18q-allapps.png` | after a swipe up: the all-apps drawer, "Search apps", Files and Settings with labels |
+| `b18q-settings.png` | 25 s after a tap on the Settings icon: the Settings home (Network & internet, Connected devices, Apps, ...) |
+| `b18q-search-focused.png`, `b18q-after-type.png` | the drawer's search field focused; after typing "files": the field reads "files" and only Files is listed |
+| `b18a-home1.png` | before fixes 2 and 3 of G4: the wallpaper drawn as streaks by RenderEngine from wasm heap bytes |
+| `b18i-l1.png`, `b18i-allapps2.png`, `b18i-settings3.png` | after G4 fixes 1 to 3: pictures right, text missing or boxes |
+| `b18i-anr-control.png`, `b18i-anr-after-tap.png` | a slow run: "System UI isn't responding", then the tap on Wait (below) |
+
+### 1. GL-drawn buffers (docs/graphics.md, G4)
+
+The approach was to sample pixels at each step with `--debug-faults` (window back buffer at `eglSwapBuffers`, colour
+buffer after the flush, each Device layer at composition, RenderEngine's draws into the client target, the posted
+frame) and to log GL errors with the opcodes before them, then reproduce each finding in a page self test. In order of
+discovery (the runs are in the table below):
+
+- b18a: the wallpaper's window held a correct picture, RenderEngine's client target did not; the shared VAO 0 was
+  suspected and reproduced (`xj_gl_selftest_vao`), fixed before b18a. b18a then showed streaks (`b18a-home1.png`).
+- b18d: RenderEngine drew its layers with geometry read from the wasm heap: emscripten's `-sFULL_ES3` client-array
+  emulation (`glGetVertexAttrib*v on client-side array` warnings in the log); removed from the web build.
+- b18g: each frame, `glTexImage2D(1x1)` on RenderEngine's output texture name resized the colour buffer it aliased;
+  fixed with the alias dropped on re-specification.
+- b18i, b18j: pictures right; text missing or drawn as boxes. b18l, b18n: Skia's MSAA atlas renderbuffers got
+  `GL_INVALID_OPERATION` at storage because the bound name was not a WebGL renderbuffer: the guest makes renderbuffer
+  names with `glGenFramebuffers`; fixed with a name map.
+- b18p: the glyph atlas uniform read 9.8e8: the decoder converted float arguments; fixed in `tools/gen-glproto.py`.
+- b18q: text and pictures right.
+
+Each fix's test (all in `tests/web.mjs`, `XIAOJI_WEB_FRAMES=1`; each was run failing without its fix and passing with
+it): `xj_gl_selftest_vao` (0xF), `xj_gl_selftest_respec` (0xF, with the zero-length texture upload), `xj_gl_selftest_state`
+(0x7FF, with the renderbuffer binding, multisampled R8 and stencil storage, and a guest-made renderbuffer name),
+`xj_gl_selftest_wirefloat` (0x4080BF).
+
+### 2. The compatibility check (`Build.isBuildConsistent`, the "internal problem" dialog)
+
+- **The engine's kernel** is in `engine/kernel.c` and `engine/kernel.h`: `uname` (release and version, `syscall.c`),
+  `/proc/version` and `/proc/config.gz` (`procfs.c`), and the KVER number the bpf loader's version gates compare with
+  (`bpf.c`, which had its own 6.1 constant) all come from it. The configuration and the release's parts are
+  `engine/kconfig.inc`, generated by `tools/gen-kconfig.py` from the image's framework compatibility matrices (checked
+  in, so the engine builds without the image): the required `CONFIG_` lines of the matrix entry libvintf picks for the
+  kernel's x.y and kernel FCM level, with the conditional entries applied to a fixed point from a few facts (arm64,
+  device tree, ext4). 289 lines for 5.15: 275 set, 14 `is not set`. `/proc/config.gz` is a gzip member of stored
+  deflate blocks with its CRC-32 and length.
+- **A plain 5.15 release is refused for this product** (b18a, `5.15.41-xiaoji`): `VintfObject.verifyWithoutAvb() returns
+  1: ... Kernel FCM Version is 5 and kernel version is 5.15.41, but the first kernel FCM version allowed for kernel
+  version 5.15.y is 7`. The device manifest (`vendor/etc/vintf/manifest.xml`) declares `<kernel target-level="5"/>`, and
+  libvintf (`KernelInfo::getMatchedKernelRequirements`) picks, among the matrices at or above the kernel FCM level, the
+  lowest that lists the kernel's x.y; 5.15 first appears in `compatibility_matrix.7.xml`, and level 5 lists 4.14, 4.19
+  and 5.4.
+- **What passes:** (a) **5.4.61-xiaoji** (the level-5 matrix's 5.4 minimum LTS and configuration; runs b18b to b18q), and
+  (b) the GKI-form release **5.15.41-android13-8-xiaoji** (run b18r). libvintf parses a GKI release
+  (`android::kver::KernelRelease::Parse`, `w.x.y-androidN-G` with a suffix allowed) and takes the kernel FCM level from
+  its Android release (13: level 7, `RuntimeInfo::gkiAndroidReleaseToLevel`); `VintfObject` then only warns: `uname()
+  reports kernel level 7 but device manifest sets kernel level 5. Using kernel level 7` (b18r). The engine reports (b),
+  which keeps the lead's 5.15 decision; the generator takes the Android release as an argument
+  (`tools/gen-kconfig.py build/rootfs-xiaoji 5.15 engine/kconfig.inc 13`) and refuses an x.y the level does not allow
+  (`... 5.15 is first allowed at level 7, the kernel FCM level is 5`).
+- **Evidence** (b18r, and b18b to b18q with 5.4.61): no `Could not open /proc/config.gz`, no `VintfObject.verifyWithoutAvb()
+  returns`, no `Vendor interface is incompatible`, no `Build fingerprint is not consistent`, and no dialog in any
+  screenshot. libvintf still logs `Cannot read /proc/cpuinfo` (a warning; not part of the check). `bpfloader: 49 maps
+  pinned` as before. The E-level log tags of b18q against B17's b10: new are `E/Settings` (Settings looks for
+  `com.android.settings.intelligence`, not installed), `E/UserRestrictionsUtils` (an unknown restriction queried) and
+  `E/InputMethodBindingController` (no input method installed), all after the taps; gone are `E/Build`,
+  `E/ActivityTaskManager` and `E/libvintf` (the check) and `E/WebViewUpdateServiceImpl` (a relro timeout).
+- **Kernel-version-dependent behaviour:** the engine's only version-gated code is the bpf loader's gate. No map in the
+  image's BPF objects has a kernel gate; the programs' gates (read from their `progs` sections: `offload.o`,
+  `netd.o`, `block.o`, `dscp_policy.o`, `test.o`) are all at or below 5.9 (minimums 4.14, 5.4, 5.8, 5.9; maximums 4.14,
+  5.4, 5.8), so 5.15 and 6.1 select the same programs, and the engine loads none. The engine has no io_uring (ENOSYS, as
+  before). Uname-gated code in the guest's own binaries was not audited; no failure attributable to the release was seen
+  in the logs.
+- **Test:** the `kernel` expectation case (`tests/run.sh`, engine and Node): `uname -r`, `uname -v`, `/proc/version`,
+  toybox `zcat /proc/config.gz` (which checks the gzip trailer's CRC and length), the line counts and four required
+  lines. `tests/expect/kernel.out` was made from the engine's output and checked against the generator's counts; the
+  independent checks are zcat's CRC check and libvintf's verdict in the boots.
+
+### 3. Tap and typing
+
+- **The page could not type.** `#android-screen` is a canvas without a `tabindex`, so `focus()` on a press did nothing
+  and keys never reached `web/input.js`'s listener (b18m: zero keyboard events at the engine while "set" was typed).
+  The canvas now has `tabindex="0"`. Test: `tests/input.mjs` checks that the canvas in `web/index.html` is focusable.
+  `evdev.c`'s debug log now records the keyboard's key events after its first 64 events (it showed only touches).
+- **Tap, b18q** (`build/b18/b18q-browser.log`; page time in the demo log, engine time in the logcat): a swipe up opened
+  the drawer; the tap at display (205, 201) at page 502.8 s was followed at engine 499.1 s (the page clock runs about 5 s ahead of the engine stamp here) by
+  `START u0 {act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] ... cmp=com.android.settings/.Settings
+  bnds=[141,131][270,311]} from uid 10047` (the launcher; the tap lies in the icon's bounds) and `Displayed
+  com.android.settings/.Settings` at 512.1 s. Control: in the 30 s before the swipe with no input, the screen did not
+  change (`b18q-control-*.png`) and no `START` was logged after the launcher's own HOME start (380.6 s). The same tap
+  sequence gave the same `START` line in b18l (565.3 s) and b18i (1287.2 s).
+- **Typing, b18q:** after Home (the page's button, KEY_HOMEPAGE), a swipe up and a tap on the search field, `files` typed
+  on the page reached the keyboard device (`evdev: event1 type 1 code 33/23/38/18/31`, value 1 and 0 each) and the
+  drawer shows "files" in the field with only Files listed (`b18q-after-type.png`, against `b18q-search-focused.png`).
+- **Repeated on the final sources, b18r:** the tap at page 485.7 s on the Settings icon was followed by the same
+  `START u0 {... cat=[android.intent.category.LAUNCHER] ... cmp=com.android.settings/.Settings bnds=[141,131][270,311]}
+  from uid 10047` at engine 481.9 s (page about 5.6 s ahead) and `Displayed` at 494.1 s; no `START` in the 30 s control
+  window before; the page's Home button gave the launcher's HOME `START` at 506.9 s; typing `files` reached the keyboard
+  device (KEY_F, I, L, E, S down and up) and the drawer shows "files" with only Files (`b18r-after-type.png`).
+- **A tap on a system dialog, b18i** (slow run, SystemUI ANR): the tap on "Wait" at display (180, 571) was delivered
+  (`evdev: event0 ... code 53 value 181 ... code 54 value 572`) and system_server's UI thread ran
+  `AppNotRespondingDialog$1 ... m=2` (2 is WAIT) at 932.6 s; with no tap in the preceding 20 s the dialog stayed
+  (`b18i-anr-control.png`). The dialog came back about 20 s later (ErrorDialogController), as the app was still slow.
+
+### Engine and page changes (each with its test)
+
+| Change | Where | Test |
+|---|---|---|
+| per-context VAO 0; guest names for the VAO, framebuffer and 2D texture bindings | `engine/gl_webgl.c` | `xj_gl_selftest_vao` |
+| no `-sFULL_ES3` in the web build | `Makefile` | `xj_gl_selftest_vao` bit 8 |
+| texture and renderbuffer re-specification drops the alias | `engine/gl_webgl.c` | `xj_gl_selftest_respec` |
+| renderbuffer name map; renderbuffer binding per context | `engine/gl_webgl.c` | `xj_gl_selftest_state` |
+| float scalars decoded by their bits | `tools/gen-glproto.py` (generated `build/gen/*_dec.c`) | `xj_gl_selftest_wirefloat` |
+| zero-length texture data passed as NULL | `engine/gl_webgl.c` | `xj_gl_selftest_respec` bit 8 |
+| `glGetVertexAttribiv` answered by the backend | `engine/gl_webgl.c` | used by `xj_gl_selftest_vao` |
+| kernel `5.15.41-android13-8-xiaoji`, `/proc/version`, `/proc/config.gz`, bpf KVER from it | `engine/kernel.c`, `kernel.h`, `kconfig.inc`, `syscall.c`, `procfs.c`, `bpf.c`, `tools/gen-kconfig.py` | `kernel` expectation case |
+| the screen canvas is focusable | `web/index.html` | `tests/input.mjs` |
+| the boot frame check waits (within its limit) for a frame that is not one colour: with no dialog the first frames are uniform | `tests/web.mjs` | itself |
+| `?timeout=S` overrides the engine's 900 s `--init-timeout` (debugging only; the default is unchanged) | `web/main.js`, `web/worker.js` | none |
+| debug aids: pixel samples, GL errors with opcodes, allocations, atlas and draw state; key events in the evdev log | `engine/gl_webgl.c`, `engine/gl_host.c`, `engine/gl_host.h`, `engine/evdev.c` | none (debug output) |
+
+**Policy and timeout changes:** the page accepts `?timeout=S` for the engine's wall-clock limit (used by the demo runs at
+2400 s, because a loaded machine took more than 900 s to reach HOME in b18h); the default stays 900 s. The reported
+kernel release changed from `6.1.0-xiaoji` to `5.15.41-android13-8-xiaoji` (above).
+
+### Browser runs (headless Chromium, `build/b18/demo.mjs`, not committed)
+
+The page with `?boot=pack&gl=webgl&debug=1` (and `&timeout=2400` from b18i), a fresh profile per run. **The machine was
+on battery with Low Power Mode on, with 4 to 7 GB of swap in use and other applications loading it**; b18a and b18h to
+b18k ran under heavy load. The numbers compare nothing and are not a benchmark. Times are the page's wall clock from the
+press, with the engine's stamp in brackets.
+
+| Run | Change since the last run | First frame | `sys.boot_completed=1` | Launcher as HOME | Screen after HOME |
+|---|---|---|---|---|---|
+| b18a | per-context VAO 0, kernel 5.15.41 | 521.7 s | 570.4 s (563.0 s) | 604.6 s (597.7 s) | streaks, then black; the dialog (5.15 refused) |
+| b18b | kernel 5.4.61 (5.4 until b18q) | 369.7 s | 383.7 s (379.1 s) | 413.9 s (408.3 s) | black; no dialog |
+| b18e | no `-sFULL_ES3` | 372.1 s | 390.2 s | 433.2 s | black (the output texture re-specified) |
+| b18i | re-specification fix (+ timeout) | 749.0 s | 785.1 s | 849.6 s | wallpaper and launcher; no text; SystemUI ANR |
+| b18l | renderbuffer binding, debug | 351.6 s | 365.7 s | 393.8 s | as b18i; tap opens Settings |
+| b18n | (diagnostics) | 343.4 s | 359.5 s | 385.6 s | as b18l |
+| b18o | renderbuffer name map, NULL texture data, focusable canvas | 345.4 s | 359.5 s | 387.7 s | pictures right, text missing |
+| b18q | float decode | 343.3 s | 357.4 s (351.7 s) | 385.5 s (380.6 s) | launcher, text, Settings, typing |
+| b18r | GKI release 5.15.41-android13-8, renderbuffer binding query, zero-data test (the final sources) | 343.3 s | 357.4 s (351.6 s) | 389.6 s (384.0 s) | as b18q; no dialog |
+
+The other runs (b18c, d, f, g, h, j, k, m, p) were diagnostic builds between these; b18h stopped at the 900 s limit
+before the first frame, b18k at a crash in a debug aid (since replaced).
+
+### Verification (B18, final sources)
+
+The web checks need Chromium's headless shell. `~/Library/Caches/ms-playwright` was deleted twice during this work (not
+by it), so the shell was installed into `build/pw-browsers` and every web check ran with
+`PLAYWRIGHT_BROWSERS_PATH=$PWD/build/pw-browsers` (install: `PLAYWRIGHT_BROWSERS_PATH=$PWD/build/pw-browsers
+<xiaonux>/bench/node_modules/.bin/playwright-core install chromium-headless-shell`).
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` (after touching every engine source) | exit 0; no warning or error in the log (`build/b18/build-final.log`) |
+| `XIAOJI_JOBS=4 tests/run.sh` | **282 passed, 0 failed, 0 xfail** (with the new `kernel` case on engine and Node) |
+| `make test-web` | all checks passed, exit 0 |
+| `node tests/input.mjs` | all passed (with the new focusable-canvas check) |
+| `XIAOJI_WEB_FRAMES=1 make test-web` | **all passed, exit 0**: the 17 self tests (with the new VAO, re-specification, renderbuffer, zero-data and wire float checks) and the boot frame check (63 frames; the first at 343.2 s after the press; a frame with 4 distinct colours in the sample). Before the frame check's change, the same run failed only "the frame is not one colour" (1 distinct colour: the first frame without the dialog is uniform) |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (after `make reset-data`) | **248 passed, 1 failed: NOT green.** The failure is the zygote boot check, on time, as in B17: `sys.boot_completed=1` at 458.7 s and the engine's 480 s limit ended the boot before the 60 s window. The launcher's process started (427.6 s); the log has no `Fatal signal`, no `FATAL EXCEPTION` and no `is not decoded`; libvintf logs `uname() reports kernel level 7 but device manifest sets kernel level 5. Using kernel level 7` and no incompatibility. The machine had 4 to 7 GB of swap in use |
+| `pgrep -fl "headless_shell|demo.mjs|build/xiaoji|wasm-node|tests/run.sh|tests/web.mjs"` at the end | nothing |
+
+Files (from `git status --short`): changed `Makefile`, `engine/bpf.c`, `engine/evdev.c`, `engine/gl_host.c`,
+`engine/gl_host.h`, `engine/gl_webgl.c`, `engine/procfs.c`, `engine/syscall.c`, `tests/input.mjs`, `tests/run.sh`,
+`tests/web.mjs`, `tools/gen-glproto.py`, `web/index.html`, `web/main.js`, `web/worker.js`, `docs/boot.md`,
+`docs/graphics.md`; new `engine/kernel.c`, `engine/kernel.h`, `engine/kconfig.inc`, `tools/gen-kconfig.py`,
+`tests/expect/kernel.out`. The generated decoders (`build/gen`) are not checked in; `make` regenerates them from
+`tools/gen-glproto.py`.
+
+### Open
+
+1. **One `GL_INVALID_OPERATION` on RenderEngine's first draw** of each run (its output texture is bound on unit 0 while
+   it draws into it); later frames are right. Not investigated.
+2. **SystemUI is slow enough to be ANR'd on a loaded machine** (b18i, b18j); not on the lighter runs.
+3. **No input method** is installed (`No software keyboard is found`), so text comes only from the keyboard device.
+   Settings' search needs `com.android.settings.intelligence`, which the product does not include.
+4. **`/proc/cpuinfo`** is not served (libvintf warns; not part of the check).
+5. The B17 blockers not touched here remain (B16 `txn_build`, `IStoraged`, QC of the saturating narrows).

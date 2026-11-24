@@ -257,6 +257,9 @@ async function runGlSelfTest(chromium, baseUrl) {
             got.life = m.life;
             got.ctxState = m.state;
             got.compose = m.compose;
+            got.vao = m.vao;
+            got.respec = m.respec;
+            got.wirefloat = m.wirefloat;
             finish();
           } else if (m.type === 'error') {
             clearTimeout(timer);
@@ -292,7 +295,10 @@ async function runGlSelfTest(chromium, baseUrl) {
     check(near(unpack(got.alias), [230, 230, 26]), `selftest: a texture bound by name and attached to a guest FBO through rcBindTexture draws into the color buffer (${unpack(got.alias)})`);
     check(got.life === 1, 'selftest: color buffer references: open and close count, and the last close deletes');
     check(got.compose === 0x3f, `selftest: host composition (rcCompose) draws a CPU-written buffer top row first, a solid color blended over it, a flushed GL window surface reads top row first, and the GLSL version and EGL vendor are advertised (${got.compose})`);
-    check(got.ctxState === 0xff, `selftest: each context's enables, blend func, unpack alignment and array buffer are switched with it (${got.ctxState})`);
+    check(got.ctxState === 0x7ff, `selftest: each context's enables, blend func, unpack alignment, array buffer and renderbuffer binding are switched with it; a multisampled R8 and a stencil renderbuffer get storage, also under a name the guest made with glGenFramebuffers (${got.ctxState})`);
+    check(got.vao === 0xf, `selftest: each context has its own vertex array object 0: a draw keeps its attributes after another context sets its own (also to no buffer), the guest reads binding 0, and the enables stay per context (${got.vao})`);
+    check(got.respec === 0xf, `selftest: re-specifying a texture that stands for a colour buffer (glTexImage2D after rcBindTexture) gives the name its own storage and leaves the colour buffer's size and picture; a glTexImage2D without data reads as zeros (${got.respec})`);
+    check(near(unpack(got.wirefloat), [64, 128, 191]), `selftest: float arguments decoded from the wire keep their values (glClearColor 0.25, 0.5, 0.75 sent as a packet clears to ${unpack(got.wirefloat)})`);
     check(stopOnTop, 'selftest: Stop is still the element at its centre, over the Android canvas');
     check(pageErrors.length === 0, `selftest: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
     await page.locator('#phone').screenshot({ path: join(SHOTS, 'glselftest.png') });
@@ -320,13 +326,20 @@ async function runFrames(chromium, baseUrl) {
       timeout: FRAME_TIMEOUT_MS,
       polling: 500,
     }).catch(() => {});
+    // The first composed frames can be one colour (B18: with no first-boot dialog, the screen before the launcher draws
+    // is a solid layer), so wait, within the same limit, for a frame that is not.
+    const left = Math.max(0, FRAME_TIMEOUT_MS - (Date.now() - t0));
+    await page.waitForFunction(() => window.xb.frames && window.xb.frames.distinct > 1, null, {
+      timeout: left || 1,
+      polling: 500,
+    }).catch(() => {});
     const xb = await page.evaluate(() => ({ frames: window.xb.frames, status: window.xb.status, error: window.xb.error }));
     const f = xb.frames;
     console.log(`--- frames: ${f ? f.frames : 0} frame(s), first at ${f && f.firstMs !== null ? (f.firstMs / 1000).toFixed(1) : '-'} s after the press, ` +
       `${Math.round((Date.now() - t0) / 1000)} s wait, status "${xb.status}"`);
     if (xb.error) console.log(`    error: ${xb.error.split('\n')[0]}`);
     check(f && f.frames > 0, 'frames: at least one frame arrives (rcFBPost, WebGL2 backend)');
-    check(f && f.distinct > 1, `frames: the frame is not one colour (${f ? f.distinct : 0} distinct colours in a sample)`);
+    check(f && f.distinct > 1, `frames: a frame that is not one colour arrives (${f ? f.distinct : 0} distinct colours in a sample)`);
     check(f && f.w === 540 && f.h === 960, `frames: the frame is the display size (${f ? f.w + 'x' + f.h : '-'})`);
     check(pageErrors.length === 0, `frames: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
     await page.waitForTimeout(500);

@@ -67,6 +67,7 @@ typedef struct gctx {
     GLuint fbo;          /* the guest's draw framebuffer binding: 0 is the draw surface's back buffer */
     GLuint rfbo;         /* the guest's read framebuffer binding: 0 is the read surface's back buffer */
     GLuint program, vao;
+    GLuint vao0;         /* the host vertex array object that stands for this context's VAO 0 (B18), made when first used */
     GLuint rbo;          /* the guest's renderbuffer binding */
     GLuint unit;         /* the active texture unit */
     GLuint tex[32];      /* the guest's GL_TEXTURE_2D binding on each unit (a guest name; aliases map it) */
@@ -91,6 +92,9 @@ typedef struct gctx {
     GLint unpack_align, pack_align, unpack_row, unpack_skip_rows, unpack_skip_px;
     GLuint sampler[32];     /* sampler bindings per unit */
     GLuint nunits;          /* units used so far: the ones apply rebinds */
+    uint32_t fdraw;         /* --debug-faults: draws into framebuffer objects (not the window) */
+    uint32_t ndraws;        /* --debug-faults: draws so far (the first ones are checked for GL errors) */
+    uint32_t nerr;          /* --debug-faults: GL errors reported for it */
 } gctx_t;
 
 typedef struct surf {
@@ -104,6 +108,7 @@ typedef struct surf {
      * through rcUpdateColorBuffer, RenderEngine through an EGLImage). */
     GLuint btex, bds, bfbo;
     uint32_t bw, bh;
+    uint32_t ndraw, nclear, nflush; /* --debug-faults: draws and clears into the back buffer since the last flush */
 } surf_t;
 
 typedef struct cb {
@@ -414,6 +419,55 @@ static GLuint host_rfbo(const gctx_t *c, GLuint guest)
     return surf_back(surf_find(c->read ? c->read : c->draw));
 }
 
+/* Renderbuffer names. The guest's encoder makes its renderbuffer names with glGenFramebuffers (GL2Encoder.cpp,
+ * s_glGenRenderbuffers calls m_glGenFramebuffers_enc), which a host with one name space per object type (gfxstream)
+ * does not notice. WebGL objects are typed, so here a guest renderbuffer name maps to a host renderbuffer made on its
+ * first use; names this backend generated as renderbuffers map to themselves (B18). */
+#define NRBMAP 1024
+static struct { GLuint guest, host; } rbmap[NRBMAP];
+static int nrbmap;
+
+static GLuint host_rb(GLuint guest, int make)
+{
+    if (!guest)
+        return 0;
+    for (int i = 0; i < nrbmap; i++)
+        if (rbmap[i].guest == guest)
+            return rbmap[i].host;
+    if (!make || nrbmap >= NRBMAP)
+        return 0;
+    GLuint h = 0;
+    glGenRenderbuffers(1, &h);
+    rbmap[nrbmap].guest = guest;
+    rbmap[nrbmap++].host = h;
+    return h;
+}
+
+static void rb_forget(GLuint guest)
+{
+    for (int i = 0; i < nrbmap; i++)
+        if (rbmap[i].guest == guest) {
+            rbmap[i] = rbmap[--nrbmap];
+            return;
+        }
+}
+
+/* The host vertex array a guest VAO name stands for. 0 is the context's own default VAO: GLES gives each context one,
+ * and its attribute arrays and element buffer are state Skia and RenderEngine set once and then assume kept. WebGL has
+ * one default VAO for the one context every guest context shares, so each guest context gets a VAO of its own (B18). */
+static GLuint host_vao(gctx_t *c, GLuint guest)
+{
+    if (guest)
+        return guest;
+    if (!c->vao0) {
+        GLint was = 0;
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &was);
+        glGenVertexArrays(1, &c->vao0);
+        glBindVertexArray((GLuint)was); /* made, not bound: the caller binds it */
+    }
+    return c->vao0;
+}
+
 /* The host texture a guest texture name stands for (through an EGLImage or rcBindTexture alias). */
 static GLuint host_tex(GLuint name)
 {
@@ -446,6 +500,398 @@ static void set_alias(alias_t *table, GLuint name, uint32_t cb, GLuint src)
             table[i].name = name;
             table[i].cb = cb;
             table[i].src = src;
+            return;
+        }
+}
+
+/* ---------- --debug-faults: pixel samples and GL errors (B18) ----------
+ * What a frame holds at each step: the window's back buffer at eglSwapBuffers (rcFlushWindowColorBuffer), each Device
+ * layer's colour buffer at composition, and the posted frame; and the first GL errors, with the opcodes before them.
+ * Bounded: a few lines per surface and colour buffer. */
+static void px_summary(const uint8_t *px, uint32_t w, uint32_t h, char *out, size_t outlen)
+{
+    uint64_t n = (uint64_t)w * h, rgb = 0, alpha = 0;
+    uint32_t first = ~0u;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t *p = px + i * 4;
+        if (p[0] | p[1] | p[2]) {
+            if (!rgb)
+                first = (uint32_t)i;
+            rgb++;
+        }
+        if (p[3])
+            alpha++;
+    }
+    const uint8_t *c = px + ((uint64_t)(h / 2) * w + w / 2) * 4;
+    const uint8_t *f = first != ~0u ? px + (uint64_t)first * 4 : c;
+    snprintf(out, outlen, "rgb!=0 %llu/%llu alpha!=0 %llu centre %02x%02x%02x%02x first (%u,%u) %02x%02x%02x%02x",
+             (unsigned long long)rgb, (unsigned long long)n, (unsigned long long)alpha, c[0], c[1], c[2], c[3],
+             first != ~0u ? first % w : 0, first != ~0u ? first / w : 0, f[0], f[1], f[2], f[3]);
+}
+
+/* Reads a framebuffer's colour attachment 0 (w by h) and summarises it. */
+static void fbo_summary(GLuint fbo, uint32_t w, uint32_t h, char *out, size_t outlen)
+{
+    uint8_t *px = malloc((size_t)w * h * 4);
+    if (!px) {
+        snprintf(out, outlen, "(no memory)");
+        return;
+    }
+    hstate_t hs;
+    save_host(&hs);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    restore_host(&hs);
+    applied = NULL;
+    px_summary(px, w, h, out, outlen);
+    free(px);
+}
+
+/* The GL error flag, with the opcodes decoded before it and the context's bindings. Checked after each of a context's
+ * first draws, and at flushes. glGetError also returns an error of an earlier call (the flag is kept until read). */
+static void dbg_error(const char *where, const gctx_t *c)
+{
+    static int reported;
+    if (!sig_debug_faults() || reported >= 400)
+        return;
+    GLenum e = glGetError();
+    if (!e)
+        return;
+    if (c) { /* a few per context, so one context's repeated error does not hide the others' */
+        gctx_t *m = (gctx_t *)c;
+        if (m->nerr++ >= 8)
+            return;
+    }
+    reported++;
+    char ops[GL_HOST_NOPS * 7 + 1];
+    size_t o = 0;
+    uint32_t n = gl_host_nops < GL_HOST_NOPS ? gl_host_nops : GL_HOST_NOPS;
+    for (uint32_t i = 0; i < n; i++)
+        o += (size_t)snprintf(ops + o, sizeof ops - o, " %u", (unsigned)gl_host_ops[(gl_host_nops - n + i) % GL_HOST_NOPS]);
+    fprintf(stderr, "xiaoji: gl(webgl): GL error 0x%x at %s (ctx %u draw %u, vao %u, program %u, fbo %u); the last opcodes:%s\n",
+            (unsigned)e, where, c ? (unsigned)c->handle : 0, c ? (unsigned)c->ndraws : 0, c ? (unsigned)c->vao : 0,
+            c ? (unsigned)c->program : 0, c ? (unsigned)c->fbo : 0, ops);
+    if (e == GL_INVALID_FRAMEBUFFER_OPERATION) { /* the draw framebuffer is incomplete: why */
+        static const GLenum att[] = {GL_COLOR_ATTACHMENT0, GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT};
+        static const char *const an[] = {"color0", "depth", "stencil"};
+        char d[256];
+        size_t o2 = (size_t)snprintf(d, sizeof d, "status 0x%x", (unsigned)glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+        for (int i = 0; i < 3; i++) {
+            GLint type = 0, name = 0, r = 0, st = 0, dp = 0;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (!type)
+                continue;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att[i], GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE, &r);
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att[i], GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE, &dp);
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att[i], GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE, &st);
+            o2 += (size_t)snprintf(d + o2, sizeof d - o2, "; %s %s %d (r%d d%d s%d)", an[i],
+                                   type == GL_TEXTURE ? "tex" : type == GL_RENDERBUFFER ? "rb" : "?", name, r, dp, st);
+            if (o2 >= sizeof d)
+                break;
+        }
+        glGetError(); /* the queries' own errors, if any */
+        fprintf(stderr, "xiaoji: gl(webgl):   draw framebuffer: %s\n", d);
+    }
+}
+
+/* --debug-faults: the first allocations and attachments, to read an incomplete framebuffer against. */
+static void dbg_alloc(const char *what, unsigned a, unsigned b, unsigned c2, unsigned d, unsigned e)
+{
+    static int n;
+    if (sig_debug_faults() && n++ < 300) {
+        GLenum err = glGetError(); /* the call just made (or an earlier one: the flag is kept until read) */
+        fprintf(stderr, "xiaoji: gl(webgl): %s %u %u %u %u %u%s", what, a, b, c2, d, e, err ? "" : "\n");
+        if (err)
+            fprintf(stderr, " -> GL error 0x%x\n", (unsigned)err);
+    }
+}
+
+static void apply(gctx_t *c);
+static int en_bit(GLenum cap);
+/* emscripten's WebGL 2 library has it (getBufferSubData); the GLES 3 header does not declare it. */
+extern void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data);
+
+/* The last draw call's arguments (--debug-faults only). */
+static char dbg_desc[120];
+#define DBG_DESC(...) do { if (sig_debug_faults()) snprintf(dbg_desc, sizeof dbg_desc, __VA_ARGS__); } while (0)
+
+static cb_t *cb_of_tex(GLuint tex)
+{
+    for (int i = 0; i < NCB; i++)
+        if (cbs[i].used && cbs[i].tex == tex)
+            return &cbs[i];
+    return NULL;
+}
+
+static void dbg_draw_state(gctx_t *c)
+{
+    /* The enabled attribute arrays and the first values each one reads. */
+    for (GLuint a = 0; a < 8; a++) {
+        GLint en = 0, buf = 0, size = 0, type = 0, stride = 0, div = 0, norm = 0;
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+        if (!en)
+            continue;
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_DIVISOR, &div);
+        glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &norm);
+        void *ptr = NULL;
+        glGetVertexAttribPointerv(a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+        float v[8] = {0};
+        GLint was = 0;
+        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &was);
+        if (buf) {
+            glBindBuffer(GL_ARRAY_BUFFER, (GLuint)buf);
+            GLint bsize = 0;
+            glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bsize);
+            uintptr_t off = (uintptr_t)ptr;
+            if (off + sizeof v <= (uintptr_t)bsize)
+                glGetBufferSubData(GL_ARRAY_BUFFER, (GLintptr)off, sizeof v, v);
+            glBindBuffer(GL_ARRAY_BUFFER, (GLuint)was);
+            fprintf(stderr, "xiaoji: gl(webgl):   attr %u: buf %d (%d bytes) size %d type 0x%x norm %d stride %d off %u div %d:"
+                            " %g %g %g %g %g %g %g %g (bytes %08x %08x %08x %08x)\n", (unsigned)a, buf, bsize, size, (unsigned)type,
+                    norm, stride, (unsigned)off, div, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], ((uint32_t *)v)[0],
+                    ((uint32_t *)v)[1], ((uint32_t *)v)[2], ((uint32_t *)v)[3]);
+        }
+    }
+    /* The program's float vector uniforms. */
+    GLint nu = 0;
+    glGetProgramiv(c->program, GL_ACTIVE_UNIFORMS, &nu);
+    for (GLint i = 0; i < nu && i < 12; i++) {
+        char nm[64];
+        GLsizei len = 0;
+        GLint usz = 0;
+        GLenum ut = 0;
+        glGetActiveUniform(c->program, (GLuint)i, sizeof nm, &len, &usz, &ut, nm);
+        if (ut != GL_FLOAT_VEC4 && ut != GL_FLOAT_VEC2 && ut != GL_FLOAT_MAT3 && ut != GL_FLOAT && ut != GL_FLOAT_VEC3)
+            continue;
+        GLint loc = glGetUniformLocation(c->program, nm);
+        float u[9] = {0};
+        if (loc >= 0)
+            glGetUniformfv(c->program, loc, u);
+        fprintf(stderr, "xiaoji: gl(webgl):   uniform %s (0x%x): %g %g %g %g %g %g\n", nm, (unsigned)ut, u[0], u[1], u[2], u[3], u[4], u[5]);
+    }
+    glGetError();
+}
+
+/* A draw into a framebuffer object whose colour is a colour buffer (RenderEngine's client composition, B18): the
+ * colour buffers its texture units read, and the target after the draw. The first draws only. */
+static void dbg_fbo_draw(gctx_t *c, int clear)
+{
+    static int n;
+    if (n >= 120)
+        return;
+    GLint type = 0, name = 0;
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type == GL_TEXTURE)
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+    cb_t *t = type == GL_TEXTURE ? cb_of_tex((GLuint)name) : NULL;
+    if (!t)
+        return;
+    n++;
+    char sum[160];
+    char ops[GL_HOST_NOPS * 7 + 1];
+    size_t o = 0;
+    for (uint32_t i = 0; i < GL_HOST_NOPS && i < gl_host_nops; i++)
+        o += (size_t)snprintf(ops + o, sizeof ops - o, " %u",
+                              (unsigned)gl_host_ops[(gl_host_nops - GL_HOST_NOPS + i) % GL_HOST_NOPS]);
+    fprintf(stderr, "xiaoji: gl(webgl): fbo %s (ctx %u fbo %u program %u) into cb %u; the last opcodes:%s\n",
+            clear ? "clear" : "draw", (unsigned)c->handle, (unsigned)c->fbo, (unsigned)c->program, (unsigned)t->handle, ops);
+    if (clear) {
+        fbo_summary(t->fbo, t->w, t->h, sum, sizeof sum);
+        fprintf(stderr, "xiaoji: gl(webgl):   scissor %s %d,%d %dx%d; target after: %s\n",
+                (c->en & (1u << en_bit(GL_SCISSOR_TEST))) ? "on" : "off", c->sc[0], c->sc[1], c->sc[2], c->sc[3], sum);
+        apply(c);
+        return;
+    }
+    for (GLuint u = 0; u < c->nunits && u < 8; u++) {
+        GLuint h = host_tex(c->tex[u]);
+        cb_t *src = h ? cb_of_tex(h) : NULL;
+        if (src) {
+            fbo_summary(src->fbo, src->w, src->h, sum, sizeof sum);
+            fprintf(stderr, "xiaoji: gl(webgl):   unit %u: tex %u = cb %u (%ux%u) sampler %u: %s\n", (unsigned)u,
+                    (unsigned)c->tex[u], (unsigned)src->handle, (unsigned)src->w, (unsigned)src->h, (unsigned)c->sampler[u], sum);
+        } else if (c->tex[u]) {
+            fprintf(stderr, "xiaoji: gl(webgl):   unit %u: tex %u (host %u, not a colour buffer) sampler %u\n", (unsigned)u,
+                    (unsigned)c->tex[u], (unsigned)h, (unsigned)c->sampler[u]);
+        }
+    }
+    fprintf(stderr, "xiaoji: gl(webgl):   draw: %s; viewport %d,%d %dx%d scissor %s %d,%d %dx%d\n", dbg_desc, c->vp[0], c->vp[1],
+            c->vp[2], c->vp[3], (c->en & (1u << en_bit(GL_SCISSOR_TEST))) ? "on" : "off", c->sc[0], c->sc[1], c->sc[2], c->sc[3]);
+    {
+        GLint hs = 0, hd = 0, heq = 0;
+        GLboolean cmask[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_BLEND_SRC_RGB, &hs);
+        glGetIntegerv(GL_BLEND_DST_RGB, &hd);
+        glGetIntegerv(GL_BLEND_EQUATION_RGB, &heq);
+        glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+        fprintf(stderr, "xiaoji: gl(webgl):   blend: tracked %s 0x%x 0x%x eq 0x%x; host %s 0x%x 0x%x eq 0x%x; mask %d%d%d%d\n",
+                (c->en & (1u << en_bit(GL_BLEND))) ? "on" : "off", (unsigned)c->bf[0], (unsigned)c->bf[1], (unsigned)c->beq[0],
+                glIsEnabled(GL_BLEND) ? "on" : "off", (unsigned)hs, (unsigned)hd, (unsigned)heq, cmask[0], cmask[1], cmask[2],
+                cmask[3]);
+    }
+    dbg_draw_state(c);
+    glGetError();
+    fbo_summary(t->fbo, t->w, t->h, sum, sizeof sum);
+    fprintf(stderr, "xiaoji: gl(webgl):   target after: %s\n", sum);
+    apply(c);
+}
+
+/* --debug-faults: the guest textures made with one-channel formats (glyph and coverage atlases), and the draws that
+ * read one (text), with what the atlas holds. */
+static GLuint dbg_r8[64];
+static int dbg_nr8;
+
+static void dbg_note_tex(gctx_t *c, uint32_t ifmt)
+{
+    if (!sig_debug_faults() || !c || dbg_nr8 >= 64)
+        return;
+    if (ifmt == 0x8229 /* R8 */ || ifmt == GL_ALPHA || ifmt == GL_LUMINANCE || ifmt == 0x803C /* ALPHA8 */ || ifmt == GL_RED)
+        dbg_r8[dbg_nr8++] = c->tex[c->unit];
+}
+
+/* --debug-faults: the sources the guest gave its shaders and the shaders attached to each program, to print a program. */
+static struct { GLuint sh; char *src; } dbg_src[96];
+static struct { GLuint prog, sh; } dbg_att[256];
+static int dbg_nsrc, dbg_natt;
+
+static void dbg_note_source(GLuint sh, const char *src)
+{
+    if (!sig_debug_faults())
+        return;
+    int i = dbg_nsrc < 96 ? dbg_nsrc++ : (int)(sh % 96);
+    free(dbg_src[i].src);
+    dbg_src[i].sh = sh;
+    size_t n = strlen(src) + 1;
+    dbg_src[i].src = malloc(n);
+    if (dbg_src[i].src)
+        memcpy(dbg_src[i].src, src, n);
+}
+
+static void dbg_note_attach(GLuint prog, GLuint sh)
+{
+    if (sig_debug_faults() && dbg_natt < 256) {
+        dbg_att[dbg_natt].prog = prog;
+        dbg_att[dbg_natt++].sh = sh;
+    }
+}
+
+static void dbg_program_source(GLuint prog)
+{
+    static GLuint shown[8];
+    for (int i = 0; i < 8; i++) {
+        if (shown[i] == prog)
+            return;
+        if (!shown[i]) {
+            shown[i] = prog;
+            break;
+        }
+        if (i == 7)
+            return;
+    }
+    for (int a = 0; a < dbg_natt; a++) {
+        if (dbg_att[a].prog != prog)
+            continue;
+        for (int k = 0; k < dbg_nsrc; k++)
+            if (dbg_src[k].sh == dbg_att[a].sh && dbg_src[k].src) {
+                char buf[3072];
+                snprintf(buf, sizeof buf, "%s", dbg_src[k].src);
+                for (char *q = buf; *q; q++)
+                    if (*q == '\n')
+                        *q = '|';
+                fprintf(stderr, "xiaoji: gl(webgl):   program %u shader %u: %s\n", (unsigned)prog, (unsigned)dbg_att[a].sh, buf);
+            }
+    }
+}
+
+static void dbg_text_draw(gctx_t *c)
+{
+    static int n;
+    static GLuint dfbo;
+    if (n >= 30)
+        return;
+    for (GLuint u = 0; u < c->nunits && u < 8; u++) {
+        GLuint name = c->tex[u];
+        int hit = 0;
+        for (int i = 0; i < dbg_nr8 && !hit; i++)
+            hit = name && dbg_r8[i] == name;
+        if (!hit)
+            continue;
+        n++;
+        fprintf(stderr, "xiaoji: gl(webgl): text draw (ctx %u fbo %u program %u) unit %u tex %u: %s; viewport %d,%d %dx%d\n",
+                (unsigned)c->handle, (unsigned)c->fbo, (unsigned)c->program, (unsigned)u, (unsigned)name, dbg_desc,
+                c->vp[0], c->vp[1], c->vp[2], c->vp[3]);
+        /* The atlas: its red channel over its first 512x512 texels. */
+        hstate_t hs;
+        save_host(&hs);
+        if (!dfbo)
+            glGenFramebuffers(1, &dfbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, dfbo);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, host_tex(name), 0);
+        GLenum st = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+        uint32_t nz = 0, w = 512, h = 512;
+        uint8_t *px = st == GL_FRAMEBUFFER_COMPLETE ? malloc((size_t)w * h * 4) : NULL;
+        if (px) {
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            for (size_t i = 0; i < (size_t)w * h; i++)
+                nz += px[i * 4] != 0;
+            free(px);
+        }
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        GLenum e = glGetError();
+        restore_host(&hs);
+        applied = NULL;
+        fprintf(stderr, "xiaoji: gl(webgl):   atlas status 0x%x, red!=0 in 512x512: %u (error 0x%x); sampler %u\n", (unsigned)st,
+                (unsigned)nz, (unsigned)e, (unsigned)c->sampler[u]);
+        dbg_draw_state(c);
+        dbg_program_source(c->program);
+        apply(c);
+        return;
+    }
+}
+
+/* After a draw (or a clear, clear 1): counted on the window or on the context's framebuffer objects. */
+static void dbg_draw(gctx_t *c, int clear)
+{
+    if (!sig_debug_faults() || !c)
+        return;
+    if (!clear && ++c->ndraws <= 3000)
+        dbg_error("draw", c);
+    if (!clear && dbg_nr8)
+        dbg_text_draw(c);
+    if (c->fbo) {
+        c->fdraw++;
+        dbg_fbo_draw(c, clear);
+        return;
+    }
+    surf_t *s = surf_find(c->draw);
+    if (s) {
+        if (clear)
+            s->nclear++;
+        else
+            s->ndraw++;
+    }
+}
+
+/* A texture re-specified by the guest (glTexImage2D, glTexStorage2D, glCopyTexImage2D) on a name that stands for a
+ * colour buffer or an EGLImage source: in GLES the name gets new storage of its own and the image (the gralloc buffer)
+ * is left as it was (EGL_KHR_image_base: respecifying an EGLImage sibling orphans it). So the alias goes and the
+ * name's own host texture (guest names are host names) is bound for the call (B18). Without this, RenderEngine's
+ * 1x1 re-specification of its output texture each frame resized the colour buffer it had just drawn. */
+static void unalias_bound(gctx_t *c, uint32_t target)
+{
+    if (!c || (target != GL_TEXTURE_2D && target != XJ_TEXTURE_EXTERNAL_OES))
+        return;
+    GLuint name = c->tex[c->unit];
+    for (int i = 0; i < NALIAS; i++)
+        if (tex_alias[i].used && tex_alias[i].name == name) {
+            tex_alias[i].used = 0;
+            glBindTexture(GL_TEXTURE_2D, name);
             return;
         }
 }
@@ -503,8 +949,9 @@ static void apply(gctx_t *c)
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, host_fbo(c, c->fbo));
     glBindFramebuffer(GL_READ_FRAMEBUFFER, host_rfbo(c, c->rfbo));
     glUseProgram(c->program);
-    glBindVertexArray(c->vao);
+    glBindVertexArray(host_vao(c, c->vao));
     glBindBuffer(GL_ARRAY_BUFFER, c->abuf);
+    glBindRenderbuffer(GL_RENDERBUFFER, host_rb(c->rbo, 1)); /* context state: glRenderbufferStorage applies to it (B18) */
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, c->unpack_buf);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, c->pack_buf);
     for (GLuint u = 0; u < c->nunits; u++) {
@@ -680,6 +1127,11 @@ static void rc_DestroyContext(void *ctx, uint32_t context)
     for (int i = 0; i < NSTREAM; i++)
         if (streams[i].cur == c)
             streams[i].cur = NULL;
+    if (c->vao0) {
+        glDeleteVertexArrays(1, &c->vao0);
+        c->vao0 = 0;
+        applied = NULL; /* the host binding may have been that VAO */
+    }
     c->used = 0;
 }
 
@@ -723,7 +1175,6 @@ static void rc_SetWindowColorBuffer(void *ctx, uint32_t windowSurface, uint32_t 
  * WindowSurface::flushColorBuffer). The blit is not clipped by the guest's scissor or masked by its color mask. */
 static int32_t rc_FlushWindowColorBuffer(void *ctx, uint32_t windowSurface)
 {
-    (void)ctx;
     surf_t *s = surf_find(windowSurface);
     cb_t *cb = s ? surf_cb(s) : NULL;
     if (!cb || !s->bfbo || s->bw != cb->w || s->bh != cb->h) {
@@ -732,6 +1183,13 @@ static int32_t rc_FlushWindowColorBuffer(void *ctx, uint32_t windowSurface)
             fprintf(stderr, "xiaoji: gl(webgl): flush of surface %u skipped (cb %s, back %ux%u)\n", (unsigned)windowSurface,
                     cb ? "set" : "none", s ? (unsigned)s->bw : 0, s ? (unsigned)s->bh : 0);
         return 0;
+    }
+    static int flush_logs;
+    int dbg = sig_debug_faults() && flush_logs < 400 && (s->nflush < 3 || s->nflush % 200 == 0);
+    char before[160] = "";
+    if (dbg) {
+        dbg_error("flush", stream_ctx(ctx));
+        fbo_summary(s->bfbo, s->bw, s->bh, before, sizeof before);
     }
     hstate_t hs;
     save_host(&hs);
@@ -743,6 +1201,18 @@ static int32_t rc_FlushWindowColorBuffer(void *ctx, uint32_t windowSurface)
     glBlitFramebuffer(0, 0, (GLint)cb->w, (GLint)cb->h, 0, (GLint)cb->h, (GLint)cb->w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     restore_host(&hs);
     applied = NULL; /* the enables and the mask come back from the context on its next call */
+    if (dbg) {
+        char after[160];
+        fbo_summary(cb->fbo, cb->w, cb->h, after, sizeof after);
+        gctx_t *c = stream_ctx(ctx);
+        flush_logs++;
+        fprintf(stderr, "xiaoji: gl(webgl): flush %u of surface %u (ctx %u) into cb %u (%ux%u): %u draws, %u clears, %u fbo draws;"
+                        " back: %s; cb: %s\n", (unsigned)s->nflush, (unsigned)windowSurface, c ? (unsigned)c->handle : 0,
+                (unsigned)cb->handle, (unsigned)cb->w, (unsigned)cb->h, (unsigned)s->ndraw, (unsigned)s->nclear,
+                c ? (unsigned)c->fdraw : 0, before, after);
+    }
+    s->nflush++;
+    s->ndraw = s->nclear = 0;
     return 0;
 }
 
@@ -975,6 +1445,17 @@ static void rc_FBPost(void *ctx, uint32_t colorBuffer)
     xj_frame_send(px, (int)w, (int)h, (int)frames_posted);
     if (frames_posted <= 3)
         fprintf(stderr, "xiaoji: gl(webgl): frame %u posted (%ux%u)\n", (unsigned)frames_posted, (unsigned)w, (unsigned)h);
+    if (sig_debug_faults() && (frames_posted <= 40 || frames_posted % 25 == 0)) {
+        char sum[160];
+        px_summary(px, w, h, sum, sizeof sum);
+        fprintf(stderr, "xiaoji: gl(webgl): frame %u (cb %u): %s\n", (unsigned)frames_posted, (unsigned)colorBuffer, sum);
+        for (int i = 0; i < NCTX; i++) /* RenderEngine draws into framebuffer objects and never flushes a window */
+            if (ctxs[i].used && ctxs[i].fdraw) {
+                fprintf(stderr, "xiaoji: gl(webgl):   ctx %u: %u fbo draws since the last frame (fbo %u)\n",
+                        (unsigned)ctxs[i].handle, (unsigned)ctxs[i].fdraw, (unsigned)ctxs[i].fbo);
+                ctxs[i].fdraw = 0;
+            }
+    }
     free(px);
 }
 
@@ -1095,6 +1576,11 @@ static int32_t compose(const void *buffer, uint32_t buffer_len, int post)
                     (int)rd_u32(l + 8), (int)rd_u32(l + 12), (int)rd_u32(l + 16), (int)rd_u32(l + 20), rd_f32(l + 24),
                     rd_f32(l + 28), rd_f32(l + 32), rd_f32(l + 36), (unsigned)rd_u32(l + 40), rd_f32(l + 44), l[48], l[49],
                     l[50], l[51], (unsigned)rd_u32(l + 52));
+            if (lc) {
+                char sum[160];
+                fbo_summary(lc->fbo, lc->w, lc->h, sum, sizeof sum);
+                fprintf(stderr, "xiaoji: gl(webgl):     cb %u: %s\n", (unsigned)lc->handle, sum);
+            }
         }
     }
     if (!t || !comp_init())
@@ -1312,7 +1798,12 @@ static void w_glClearStencil(void *ctx, int32_t s)
     if (c) c->cstencil = s;
     glClearStencil(s);
 }
-static void w_glClear(void *ctx, uint32_t mask) { enter(ctx); glClear(mask); }
+static void w_glClear(void *ctx, uint32_t mask)
+{
+    gctx_t *c = enter(ctx);
+    glClear(mask);
+    dbg_draw(c, 1);
+}
 static void w_glColorMask(void *ctx, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
 {
     gctx_t *c = enter(ctx);
@@ -1441,7 +1932,7 @@ static void put_ints(void *params, uint32_t params_len, const GLint *v, uint32_t
 
 static void w_glGetIntegerv(void *ctx, uint32_t pname, void *params, uint32_t params_len)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     if (!params)
         return;
     /* The counts this backend answers itself (they match the advertised extensions and the ES 3.0 version). */
@@ -1467,12 +1958,31 @@ static void w_glGetIntegerv(void *ctx, uint32_t pname, void *params, uint32_t pa
     /* The arrays of those lists (more than the buffer of 16 below) are left to the null answers. */
     if (pname == 0x86A3 || pname == 0x8DF8)
         return;
+    /* The bindings whose host objects stand for guest names: the guest's own names. */
+    if (c && (pname == GL_VERTEX_ARRAY_BINDING || pname == GL_DRAW_FRAMEBUFFER_BINDING ||
+              pname == GL_READ_FRAMEBUFFER_BINDING || pname == GL_TEXTURE_BINDING_2D || pname == GL_RENDERBUFFER_BINDING)) {
+        GLint b = (GLint)(pname == GL_VERTEX_ARRAY_BINDING ? c->vao : pname == GL_DRAW_FRAMEBUFFER_BINDING ? c->fbo
+                          : pname == GL_READ_FRAMEBUFFER_BINDING ? c->rfbo : pname == GL_RENDERBUFFER_BINDING ? c->rbo
+                          : c->tex[c->unit]);
+        put_ints(params, params_len, &b, 1);
+        return;
+    }
     GLint v[16] = {0};
     glGetIntegerv(pname, v);
     uint32_t n = 16;
     if (pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX || pname == GL_MAX_VIEWPORT_DIMS)
         n = 4;
     put_ints(params, params_len, v, n);
+}
+
+static void w_glGetVertexAttribiv(void *ctx, uint32_t index, uint32_t pname, void *params, uint32_t params_len)
+{
+    enter(ctx);
+    if (!params)
+        return;
+    GLint v[4] = {0, 0, 0, 0};
+    glGetVertexAttribiv(index, pname, v);
+    put_ints(params, params_len, v, pname == GL_CURRENT_VERTEX_ATTRIB ? 4 : 1);
 }
 
 static void w_glGetFloatv(void *ctx, uint32_t pname, void *params, uint32_t params_len)
@@ -1616,14 +2126,21 @@ static void w_glBindTexture(void *ctx, uint32_t target, uint32_t texture)
 static void w_glTexImage2D(void *ctx, uint32_t target, int32_t level, int32_t internalformat, int32_t width, int32_t height,
                            int32_t border, uint32_t format, uint32_t type, const void *pixels, uint32_t pixels_len)
 {
-    enter(ctx);
+    unalias_bound(enter(ctx), target);
     void *c = NULL;
+    if (!pixels_len)
+        pixels = NULL; /* no data: WebGL fills the texture with zeros (the decoder's pointer is not to be read) */
     if (pixels && pixels_len && ((uintptr_t)pixels & 3)) {
         c = copy_in(pixels, pixels_len);
         pixels = c;
     }
     glTexImage2D(tgt(target), level, internalformat, width, height, border, format, type, pixels);
     free(c);
+    if (level == 0 && applied)
+        dbg_note_tex(applied, (uint32_t)internalformat);
+    if (level == 0 && applied)
+        dbg_alloc("teximage (tex ifmt fmt w h)", applied->tex[applied->unit], (unsigned)internalformat, format, (unsigned)width,
+                  (unsigned)height);
 }
 
 static void w_glTexSubImage2D(void *ctx, uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t width,
@@ -1637,17 +2154,33 @@ static void w_glTexSubImage2D(void *ctx, uint32_t target, int32_t level, int32_t
     }
     glTexSubImage2D(tgt(target), level, xoffset, yoffset, width, height, format, type, pixels);
     free(c);
+    if (sig_debug_faults() && applied && (format == GL_RED || format == GL_ALPHA || format == GL_LUMINANCE)) {
+        static int n;
+        uint32_t nz = 0;
+        for (uint32_t i = 0; pixels && i < pixels_len; i++)
+            nz += ((const uint8_t *)pixels)[i] != 0;
+        if (n++ < 30)
+            fprintf(stderr, "xiaoji: gl(webgl): texsub (tex %u) %d,%d %dx%d fmt 0x%x type 0x%x: %u bytes, %u non-zero; unpack align %d"
+                            " row %d skip %d,%d buf %u\n", (unsigned)applied->tex[applied->unit], xoffset, yoffset, width, height,
+                    (unsigned)format, (unsigned)type, (unsigned)pixels_len, (unsigned)nz, applied->unpack_align,
+                    applied->unpack_row, applied->unpack_skip_px, applied->unpack_skip_rows, (unsigned)applied->unpack_buf);
+    }
 }
 
 static void w_glTexStorage2D(void *ctx, uint32_t target, int32_t levels, uint32_t internalformat, int32_t width, int32_t height)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
+    unalias_bound(c, target);
     glTexStorage2D(tgt(target), levels, internalformat, width, height);
+    dbg_note_tex(c, internalformat);
+    dbg_alloc("texstorage (tex levels fmt w h)", c ? c->tex[c->unit] : 0, (unsigned)levels, internalformat, (unsigned)width, (unsigned)height);
 }
 
 static void w_glTexParameteri(void *ctx, uint32_t target, uint32_t pname, int32_t param)
 {
-    enter(ctx);
+    gctx_t *c0 = enter(ctx);
+    if (pname >= 0x8E42 && pname <= 0x8E46) /* GL_TEXTURE_SWIZZLE_*: not in WebGL 2 */
+        dbg_alloc("texswizzle (tex pname param - -)", c0 ? c0->tex[c0->unit] : 0, pname, (unsigned)param, 0, 0);
     glTexParameteri(tgt(target), pname, param);
 }
 
@@ -1717,7 +2250,7 @@ static void w_glCopyTexSubImage2D(void *ctx, uint32_t target, int32_t level, int
 static void w_glCopyTexImage2D(void *ctx, uint32_t target, int32_t level, uint32_t internalformat, int32_t x, int32_t y,
                                int32_t width, int32_t height, int32_t border)
 {
-    enter(ctx);
+    unalias_bound(enter(ctx), target);
     glCopyTexImage2D(tgt(target), level, internalformat, x, y, width, height, border);
 }
 
@@ -1771,8 +2304,10 @@ static void w_glVertexAttribDivisor(void *ctx, uint32_t index, uint32_t divisor)
 
 static void w_glDrawArraysInstanced(void *ctx, uint32_t mode, int32_t first, int32_t count, int32_t primcount)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     glDrawArraysInstanced(mode, first, count, primcount);
+    DBG_DESC("arrays-inst mode %u first %d count %d inst %d", (unsigned)mode, (int)first, (int)count, (int)primcount);
+    dbg_draw(c, 0);
 }
 
 /* The guest's framebuffer 0 is a real framebuffer here (the back buffer), so GL_BACK names its attachment 0. */
@@ -1831,8 +2366,14 @@ static void w_glFramebufferTextureLayer(void *ctx, uint32_t target, uint32_t att
 static void w_glRenderbufferStorageMultisample(void *ctx, uint32_t target, int32_t samples, uint32_t internalformat,
                                                int32_t width, int32_t height)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
+    for (int i = 0; c && i < NALIAS; i++) /* new storage of its own: no longer the colour buffer (as unalias_bound) */
+        if (rb_alias[i].used && rb_alias[i].name == c->rbo)
+            rb_alias[i].used = 0;
+    if (sig_debug_faults())
+        glGetError(); /* so the storage call's own error is the one dbg_alloc reports */
     glRenderbufferStorageMultisample(target, samples, internalformat, width, height);
+    dbg_alloc("rbstorage-ms (rb fmt w h samples)", c ? c->rbo : 0, internalformat, (unsigned)width, (unsigned)height, (unsigned)samples);
 }
 
 static void w_glTexParameterfv(void *ctx, uint32_t target, uint32_t pname, const void *params, uint32_t params_len)
@@ -1859,38 +2400,69 @@ static uint32_t w_glCheckFramebufferStatus(void *ctx, uint32_t target)
 
 static void w_glFramebufferTexture2D(void *ctx, uint32_t target, uint32_t attachment, uint32_t textarget, uint32_t texture, int32_t level)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     glFramebufferTexture2D(target, attachment, tgt(textarget), host_tex(texture), level);
+    dbg_alloc("fbtex (fbo att guest host target)", c ? c->fbo : 0, attachment, texture, host_tex(texture), textarget);
 }
 
 static void w_glGenRenderbuffers(void *ctx, int32_t n, void *rbs, uint32_t len)
 {
     enter(ctx);
     gen_into(glGenRenderbuffers, n, rbs, len);
+    for (int32_t i = 0; i < n && (uint64_t)(i + 1) * 4 <= len && nrbmap < NRBMAP; i++) {
+        GLuint name;
+        memcpy(&name, (const uint8_t *)rbs + 4 * i, 4);
+        if (name) {
+            rbmap[nrbmap].guest = name;
+            rbmap[nrbmap++].host = name;
+        }
+    }
 }
 
 static void w_glDeleteRenderbuffers(void *ctx, int32_t n, const void *rbs, uint32_t len)
 {
-    enter(ctx);
-    delete_from(glDeleteRenderbuffers, n, rbs, len);
+    gctx_t *c = enter(ctx);
+    if (n <= 0 || (uint64_t)n * 4 > len)
+        return;
+    for (int32_t i = 0; i < n; i++) {
+        GLuint name;
+        memcpy(&name, (const uint8_t *)rbs + 4 * i, 4);
+        GLuint h = host_rb(name, 0);
+        if (h) {
+            glDeleteRenderbuffers(1, &h);
+            rb_forget(name);
+        }
+        for (int k = 0; k < NALIAS; k++)
+            if (rb_alias[k].used && rb_alias[k].name == name)
+                rb_alias[k].used = 0;
+        if (c && name && c->rbo == name)
+            c->rbo = 0; /* deleting the bound renderbuffer binds 0 */
+    }
 }
 
 static void w_glBindRenderbuffer(void *ctx, uint32_t target, uint32_t rb)
 {
     gctx_t *c = enter(ctx);
     c->rbo = rb;
-    glBindRenderbuffer(target, rb);
+    glBindRenderbuffer(target, host_rb(rb, 1));
 }
 
 static void w_glRenderbufferStorage(void *ctx, uint32_t target, uint32_t internalformat, int32_t width, int32_t height)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
+    for (int i = 0; c && i < NALIAS; i++) /* new storage of its own: no longer the colour buffer (as unalias_bound) */
+        if (rb_alias[i].used && rb_alias[i].name == c->rbo)
+            rb_alias[i].used = 0;
+    if (sig_debug_faults())
+        glGetError(); /* so the storage call's own error is the one dbg_alloc reports */
     glRenderbufferStorage(target, internalformat, width, height);
+    dbg_alloc("rbstorage (rb fmt w h -)", c ? c->rbo : 0, internalformat, (unsigned)width, (unsigned)height, 0);
 }
 
 static void w_glFramebufferRenderbuffer(void *ctx, uint32_t target, uint32_t attachment, uint32_t rbtarget, uint32_t rb)
 {
-    enter(ctx);
+    gctx_t *c0 = enter(ctx);
+    dbg_alloc("fbrb (fbo att rb - -)", c0 ? c0->fbo : 0, attachment, rb, 0, 0);
     for (int i = 0; i < NALIAS; i++)
         if (rb_alias[i].used && rb_alias[i].name == rb) {
             cb_t *cb = cb_find(rb_alias[i].cb);
@@ -1899,7 +2471,7 @@ static void w_glFramebufferRenderbuffer(void *ctx, uint32_t target, uint32_t att
                 return;
             }
         }
-    glFramebufferRenderbuffer(target, attachment, rbtarget, rb);
+    glFramebufferRenderbuffer(target, attachment, rbtarget, host_rb(rb, 1));
 }
 
 static void w_glEGLImageTargetRenderbufferStorageOES(void *ctx, uint32_t target, uint64_t image)
@@ -2003,6 +2575,7 @@ static void w_glAttachShader(void *ctx, uint32_t program, uint32_t shader)
 {
     enter(ctx);
     glAttachShader(program, shader);
+    dbg_note_attach(program, shader);
 }
 
 static void w_glDetachShader(void *ctx, uint32_t program, uint32_t shader)
@@ -2304,21 +2877,38 @@ static void w_glGenVertexArrays(void *ctx, int32_t n, void *arrays, uint32_t len
 
 static void w_glDeleteVertexArrays(void *ctx, int32_t n, const void *arrays, uint32_t len)
 {
-    enter(ctx);
-    delete_from(glDeleteVertexArrays, n, arrays, len);
+    gctx_t *c = enter(ctx);
+    if (n <= 0 || (uint64_t)n * 4 > len)
+        return;
+    GLuint *names = copy_in(arrays, (size_t)n * 4);
+    if (!names)
+        return;
+    for (int32_t i = 0; i < n; i++) {
+        for (int k = 0; k < NCTX; k++) /* a context's own VAO 0 is not the guest's to delete */
+            if (ctxs[k].used && names[i] && names[i] == ctxs[k].vao0)
+                names[i] = 0;
+        if (c && names[i] && names[i] == c->vao) {
+            c->vao = 0; /* deleting the bound VAO binds 0 (GLES 3.0, 2.10) */
+            glBindVertexArray(host_vao(c, 0));
+        }
+    }
+    glDeleteVertexArrays(n, names);
+    free(names);
 }
 
 static void w_glBindVertexArray(void *ctx, uint32_t array)
 {
     gctx_t *c = enter(ctx);
     c->vao = array;
-    glBindVertexArray(array);
+    glBindVertexArray(host_vao(c, array));
 }
 
 static void w_glDrawArrays(void *ctx, uint32_t mode, int32_t first, int32_t count)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     glDrawArrays(mode, first, count);
+    DBG_DESC("arrays mode %u first %d count %d", (unsigned)mode, (int)first, (int)count);
+    dbg_draw(c, 0);
 }
 
 /* The client-array calls (gl_host.c decodes the wire). The data goes to a scratch buffer, one per attribute index,
@@ -2359,18 +2949,20 @@ static void w_glDrawElementsData(void *ctx, uint32_t mode, int32_t count, uint32
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, datalen, data, GL_STREAM_DRAW);
     glDrawElements(mode, count, type, NULL);
     restore_host(&hs);
+    DBG_DESC("elements-data mode %u count %d type 0x%x", (unsigned)mode, (int)count, (unsigned)type);
+    dbg_draw(applied, 0);
 }
 
 static void w_glDrawElementsOffset(void *ctx, uint32_t mode, int32_t count, uint32_t type, uint32_t offset)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     glDrawElements(mode, count, type, (const void *)(uintptr_t)offset);
+    DBG_DESC("elements mode %u count %d type 0x%x offset %u", (unsigned)mode, (int)count, (unsigned)type, (unsigned)offset);
+    dbg_draw(c, 0);
 }
 
 /* The not_api calls with data or out-parameters (gl_host.c, not_api_data), as gfxstream's GLESv2Decoder does them. */
 
-/* emscripten's WebGL 2 library has it (getBufferSubData); the GLES 3 header does not declare it. */
-extern void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data);
 
 /* A map copies the range out for a read, or for a write that keeps the old contents (GLESv2Decoder::s_glMapBufferRangeAEMU). */
 static void w_glMapBufferRangeAEMU(void *ctx, uint32_t target, uint32_t offset, uint32_t length, uint32_t access,
@@ -2456,6 +3048,8 @@ static void draw_with_indices(const void *data, uint32_t datalen, void (*draw)(c
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, datalen, data, GL_STREAM_DRAW);
     draw(arg);
     restore_host(&hs);
+    DBG_DESC("elements-data (instanced or range), %u index bytes", (unsigned)datalen);
+    dbg_draw(applied, 0);
 }
 
 typedef struct {
@@ -2486,8 +3080,10 @@ static void w_glDrawElementsInstancedDataAEMU(void *ctx, uint32_t mode, int32_t 
 static void w_glDrawElementsInstancedOffsetAEMU(void *ctx, uint32_t mode, int32_t count, uint32_t type, uint32_t offset,
                                                 int32_t primcount)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     glDrawElementsInstanced(mode, count, type, (const void *)(uintptr_t)offset, primcount);
+    DBG_DESC("elements-inst mode %u count %d type 0x%x offset %u inst %d", (unsigned)mode, (int)count, (unsigned)type, (unsigned)offset, (int)primcount);
+    dbg_draw(c, 0);
 }
 
 static void w_glDrawRangeElementsDataAEMU(void *ctx, uint32_t mode, uint32_t start, uint32_t end, int32_t count,
@@ -2501,8 +3097,10 @@ static void w_glDrawRangeElementsDataAEMU(void *ctx, uint32_t mode, uint32_t sta
 static void w_glDrawRangeElementsOffsetAEMU(void *ctx, uint32_t mode, uint32_t start, uint32_t end, int32_t count,
                                             uint32_t type, uint32_t offset)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
     glDrawRangeElements(mode, start, end, count, type, (const void *)(uintptr_t)offset);
+    DBG_DESC("range mode %u count %d type 0x%x offset %u", (unsigned)mode, (int)count, (unsigned)type, (unsigned)offset);
+    dbg_draw(c, 0);
 }
 
 static void w_glVertexAttribIPointerDataAEMU(void *ctx, uint32_t index, int32_t size, uint32_t type, int32_t stride,
@@ -2534,15 +3132,22 @@ static void w_glVertexAttribIPointerOffsetAEMU(void *ctx, uint32_t index, int32_
 static void w_glTexImage2DOffsetAEMU(void *ctx, uint32_t target, int32_t level, int32_t internalformat, int32_t width,
                                      int32_t height, int32_t border, uint32_t format, uint32_t type, uint32_t offset)
 {
-    enter(ctx);
+    unalias_bound(enter(ctx), target);
     glTexImage2D(tgt(target), level, internalformat, width, height, border, format, type, (const void *)(uintptr_t)offset);
 }
 
 static void w_glTexSubImage2DOffsetAEMU(void *ctx, uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset,
                                         int32_t width, int32_t height, uint32_t format, uint32_t type, uint32_t offset)
 {
-    enter(ctx);
+    gctx_t *c0 = enter(ctx);
     glTexSubImage2D(tgt(target), level, xoffset, yoffset, width, height, format, type, (const void *)(uintptr_t)offset);
+    if (sig_debug_faults() && c0 && (format == GL_RED || format == GL_ALPHA || format == GL_LUMINANCE)) {
+        static int n;
+        if (n++ < 30)
+            fprintf(stderr, "xiaoji: gl(webgl): texsub-pbo (tex %u) %d,%d %dx%d fmt 0x%x type 0x%x offset %u; unpack align %d row %d buf %u\n",
+                    (unsigned)c0->tex[c0->unit], xoffset, yoffset, width, height, (unsigned)format, (unsigned)type, (unsigned)offset,
+                    c0->unpack_align, c0->unpack_row, (unsigned)c0->unpack_buf);
+    }
 }
 
 static void w_glReadPixelsOffsetAEMU(void *ctx, int32_t x, int32_t y, int32_t width, int32_t height, uint32_t format,
@@ -2563,6 +3168,7 @@ static void w_glShaderString(void *ctx, uint32_t shader, const void *string, uin
     GLint l = (GLint)n;
     const GLchar *p = src;
     glShaderSource(shader, 1, &p, &l);
+    dbg_note_source(shader, src);
     free(src);
 }
 
@@ -2887,7 +3493,9 @@ uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_compose(void)
 
 /* Per-context state (B17): two contexts on two streams. Context A enables blending with ONE, ONE, sets an unpack
  * alignment of 1 and binds an array buffer; context B keeps the defaults. Each switch must give the WebGL2 context the
- * state of the context made current on the stream. Returns a bit per check (0xFF when all hold). */
+ * state of the context made current on the stream; and each keeps its renderbuffer binding (and a multisampled R8 and a stencil renderbuffer get storage, also under a name made by
+ * glGenFramebuffers, as the guest makes them). Returns a bit per check (0x7FF when
+ * all hold). */
 static char selftest_stream_a, selftest_stream_b;
 
 uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_state(void)
@@ -2925,9 +3533,270 @@ uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_state(void)
     r |= v == 1 ? 64u : 0;
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &v);
     r |= (GLuint)v == buf ? 128u : 0;
+    /* The renderbuffer binding (B18): A binds one, B binds another, A gives storage to its own. */
+    GLuint rba = 0, rbb = 0;
+    g2->glGenRenderbuffers(ka, 1, &rba, sizeof rba);
+    g2->glBindRenderbuffer(ka, GL_RENDERBUFFER, rba);
+    g2->glGenRenderbuffers(kb, 1, &rbb, sizeof rbb);
+    g2->glBindRenderbuffer(kb, GL_RENDERBUFFER, rbb);
+    g2->glRenderbufferStorage(ka, GL_RENDERBUFFER, GL_RGBA8, 3, 3);
+    glBindRenderbuffer(GL_RENDERBUFFER, rba);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &v);
+    r |= v == 3 ? 256u : 0;
+    /* A multisampled one-channel renderbuffer and a stencil renderbuffer, as Skia's MSAA atlas makes them. */
+    glGetError();
+    GLuint rbm = 0;
+    g2->glGenRenderbuffers(ka, 1, &rbm, sizeof rbm);
+    g2->glBindRenderbuffer(ka, GL_RENDERBUFFER, rbm);
+    g2->glRenderbufferStorageMultisample(ka, GL_RENDERBUFFER, 4, 0x8229 /* R8 */, 64, 32);
+    GLenum e1 = glGetError();
+    g2->glRenderbufferStorage(ka, GL_RENDERBUFFER, GL_STENCIL_INDEX8, 16, 16);
+    GLenum e2 = glGetError();
+        r |= (!e1 && !e2) ? 512u : 0;
+    /* A renderbuffer name made as the guest's encoder makes it (glGenFramebuffers): bound, given stencil storage and
+     * attached to a framebuffer with a colour texture, the framebuffer is complete. */
+    GLuint gname = 0, cfb = 0, ctex = 0;
+    g2->glGenFramebuffers(ka, 1, &gname, sizeof gname);
+    g2->glBindRenderbuffer(ka, GL_RENDERBUFFER, gname);
+    g2->glRenderbufferStorage(ka, GL_RENDERBUFFER, GL_STENCIL_INDEX8, 8, 8);
+    GLenum e3 = glGetError();
+    g2->glGenTextures(ka, 1, &ctex, sizeof ctex);
+    g2->glBindTexture(ka, GL_TEXTURE_2D, ctex);
+    g2->glTexImage2D(ka, GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL, 0);
+    g2->glGenFramebuffers(ka, 1, &cfb, sizeof cfb);
+    g2->glBindFramebuffer(ka, GL_FRAMEBUFFER, cfb);
+    g2->glFramebufferTexture2D(ka, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ctex, 0);
+    g2->glFramebufferRenderbuffer(ka, GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, gname);
+    uint32_t st = g2->glCheckFramebufferStatus(ka, GL_FRAMEBUFFER);
+    r |= (!e3 && st == GL_FRAMEBUFFER_COMPLETE) ? 1024u : 0;
+    g2->glBindFramebuffer(ka, GL_FRAMEBUFFER, 0);
+    applied = NULL;
     rc_MakeCurrent(ka, 0, 0, 0);
     rc_MakeCurrent(kb, 0, 0, 0);
     return r;
+}
+
+/* The vertex array object 0 of each context (B18). Two contexts (two streams, as two guest processes have) draw with
+ * VAO 0, as Skia and RenderEngine do on GLES. Context A sets up a full-surface quad (attribute 0 from its buffer) and
+ * draws it red; context B then points attribute 0 at a one-vertex buffer and enables attribute 1 on it; A draws again
+ * without setting its attributes (Skia keeps them cached), flushes and reads its colour buffer. With one VAO 0 shared
+ * by every context, A's second draw reads B's arrays (WebGL refuses it: the buffer is too short) and the surface keeps
+ * the clear colour. Also: the guest reads VAO 0 as its binding. Returns a bit per check (0xF when all hold). */
+static char selftest_stream_c, selftest_stream_d;
+
+static uint32_t st_program(void *k, const gl_host_t *h, const char *vs, const char *fs)
+{
+    const gles2_backend_t *g2 = h->gles2;
+    uint32_t v = g2->glCreateShader(k, GL_VERTEX_SHADER), f = g2->glCreateShader(k, GL_FRAGMENT_SHADER);
+    h->custom->glShaderString(k, v, vs, (uint32_t)strlen(vs));
+    h->custom->glShaderString(k, f, fs, (uint32_t)strlen(fs));
+    g2->glCompileShader(k, v);
+    g2->glCompileShader(k, f);
+    uint32_t p = g2->glCreateProgram(k);
+    g2->glAttachShader(k, p, v);
+    g2->glAttachShader(k, p, f);
+    g2->glBindAttribLocation(k, p, 0, "a_pos", 5);
+    g2->glLinkProgram(k, p);
+    return p;
+}
+
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_vao(void)
+{
+    const gl_host_t *h = gl_host_webgl();
+    if (!h)
+        return 0;
+    const gles2_backend_t *g2 = h->gles2;
+    void *ka = &selftest_stream_c, *kb = &selftest_stream_d;
+    static const char vs[] = "#version 300 es\nin vec2 a_pos;\nvoid main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+    static const char fs[] = "#version 300 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    static const float quad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    static const float one[2] = {0, 0};
+    uint32_t ca = rc_CreateContext(NULL, 0, 0, 0x30000), cx = rc_CreateContext(NULL, 0, 0, 0x30000);
+    uint32_t sa = rc_CreateWindowSurface(NULL, 0, 8, 8), sb = rc_CreateWindowSurface(NULL, 0, 8, 8);
+    uint32_t cba = rc_CreateColorBuffer(NULL, 8, 8, GL_RGBA), cbb = rc_CreateColorBuffer(NULL, 8, 8, GL_RGBA);
+    rc_SetWindowColorBuffer(NULL, sa, cba);
+    rc_SetWindowColorBuffer(NULL, sb, cbb);
+    uint32_t r = 0;
+    /* A: the quad's buffer on attribute 0, a red draw over the cleared surface. */
+    rc_MakeCurrent(ka, ca, sa, sa);
+    uint32_t pa = st_program(ka, h, vs, fs);
+    GLuint vbo = 0;
+    g2->glGenBuffers(ka, 1, &vbo, sizeof vbo);
+    g2->glBindBuffer(ka, GL_ARRAY_BUFFER, vbo);
+    g2->glBufferData(ka, GL_ARRAY_BUFFER, sizeof quad, quad, sizeof quad, GL_STATIC_DRAW);
+    h->custom->glVertexAttribPointerOffset(ka, 0, 2, GL_FLOAT, 0, 0, 0);
+    g2->glEnableVertexAttribArray(ka, 0);
+    g2->glUseProgram(ka, pa);
+    g2->glViewport(ka, 0, 0, 8, 8);
+    g2->glClearColor(ka, 0, 0, 1, 1);
+    g2->glClear(ka, GL_COLOR_BUFFER_BIT);
+    g2->glDrawArrays(ka, GL_TRIANGLE_STRIP, 0, 4);
+    /* B: attribute 0 on a one-vertex buffer, attribute 1 enabled on it too. */
+    rc_MakeCurrent(kb, cx, sb, sb);
+    uint32_t pb = st_program(kb, h, vs, fs);
+    GLuint small = 0;
+    g2->glGenBuffers(kb, 1, &small, sizeof small);
+    g2->glBindBuffer(kb, GL_ARRAY_BUFFER, small);
+    g2->glBufferData(kb, GL_ARRAY_BUFFER, sizeof one, one, sizeof one, GL_STATIC_DRAW);
+    h->custom->glVertexAttribPointerOffset(kb, 0, 2, GL_FLOAT, 0, 0, 0);
+    h->custom->glVertexAttribPointerOffset(kb, 1, 2, GL_FLOAT, 0, 0, 0);
+    g2->glEnableVertexAttribArray(kb, 0);
+    g2->glEnableVertexAttribArray(kb, 1);
+    g2->glUseProgram(kb, pb);
+    g2->glDrawArrays(kb, GL_POINTS, 0, 1);
+    /* A again: clear, and draw with the attributes it set before. */
+    g2->glClear(ka, GL_COLOR_BUFFER_BIT);
+    g2->glDrawArrays(ka, GL_TRIANGLE_STRIP, 0, 4);
+    GLint bound = -1;
+    g2->glGetIntegerv(ka, GL_VERTEX_ARRAY_BINDING, &bound, sizeof bound);
+    rc_FlushWindowColorBuffer(ka, sa);
+    uint8_t px[4] = {0, 0, 0, 0};
+    rc_ReadColorBuffer(NULL, cba, 4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px, sizeof px);
+    if (px[0] > 250 && px[2] < 5)
+        r |= 1;
+    if (bound == 0)
+        r |= 2;
+    /* B's own arrays are still its own: its attribute 1 is enabled, A's is not. */
+    GLint en = -1;
+    g2->glGetVertexAttribiv(kb, 1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en, sizeof en);
+    GLint ena = -1;
+    g2->glGetVertexAttribiv(ka, 1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &ena, sizeof ena);
+    if (en == 1 && ena == 0)
+        r |= 4;
+    /* B points attribute 0 at no buffer (offset 0: no array, which WebGL accepts), enabled; A draws again with its
+     * cached arrays. A client-side array emulation in the GL glue (emscripten's FULL_ES3), which keeps one flag per
+     * attribute index for every context and VAO, would feed A's draw from memory at address 0 instead (B18). */
+    g2->glBindBuffer(kb, GL_ARRAY_BUFFER, 0);
+    h->custom->glVertexAttribPointerOffset(kb, 0, 2, GL_FLOAT, 0, 0, 0);
+    g2->glEnableVertexAttribArray(kb, 0);
+    g2->glClear(ka, GL_COLOR_BUFFER_BIT);
+    g2->glDrawArrays(ka, GL_TRIANGLE_STRIP, 0, 4);
+    rc_FlushWindowColorBuffer(ka, sa);
+    px[0] = px[1] = px[2] = px[3] = 0;
+    rc_ReadColorBuffer(NULL, cba, 4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px, sizeof px);
+    if (px[0] > 250 && px[2] < 5)
+        r |= 8;
+    rc_MakeCurrent(ka, 0, 0, 0);
+    rc_MakeCurrent(kb, 0, 0, 0);
+    rc_DestroyContext(NULL, ca);
+    rc_DestroyContext(NULL, cx);
+    rc_DestroyWindowSurface(NULL, sa);
+    rc_DestroyWindowSurface(NULL, sb);
+    rc_CloseColorBuffer(NULL, cba);
+    rc_CloseColorBuffer(NULL, cbb);
+    return r;
+}
+
+/* A texture name that stands for a colour buffer (rcBindTexture, as glEGLImageTargetTexture2DOES on a gralloc buffer
+ * does), drawn through a guest FBO, and then re-specified by the guest as 1x1 (RenderEngine does this to its output
+ * texture each frame): the colour buffer keeps its size and its picture, the name has a 1x1 texture of its own, and a
+ * second rcBindTexture makes it stand for the colour buffer again (B18). Last, a glTexImage2D without data reads as zeros.
+ * Returns a bit per check (0xF when all hold). */
+static char selftest_stream_e;
+
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_respec(void)
+{
+    const gl_host_t *h = gl_host_webgl();
+    if (!h)
+        return 0;
+    const gles2_backend_t *g2 = h->gles2;
+    void *k = &selftest_stream_e;
+    uint32_t ctx = rc_CreateContext(NULL, 0, 0, 0x30000);
+    uint32_t surf = rc_CreateWindowSurface(NULL, 0, 1, 1);
+    uint32_t cb = rc_CreateColorBuffer(NULL, 4, 4, GL_RGBA);
+    rc_MakeCurrent(k, ctx, surf, surf);
+    GLuint tn = 0, fb = 0;
+    g2->glGenTextures(k, 1, &tn, sizeof tn);
+    g2->glBindTexture(k, GL_TEXTURE_2D, tn);
+    rc_BindTexture(k, cb);
+    g2->glGenFramebuffers(k, 1, &fb, sizeof fb);
+    g2->glBindFramebuffer(k, GL_FRAMEBUFFER, fb);
+    g2->glFramebufferTexture2D(k, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tn, 0);
+    g2->glClearColor(k, 1, 0, 0, 1);
+    g2->glClear(k, GL_COLOR_BUFFER_BIT);
+    static const uint8_t rgb[3] = {0, 0, 255};
+    g2->glTexImage2D(k, GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb, sizeof rgb);
+    uint32_t r = 0;
+    uint8_t px[4] = {0, 0, 0, 0};
+    rc_ReadColorBuffer(NULL, cb, 3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px, sizeof px);
+    if (px[0] > 250 && px[2] < 5)
+        r |= 1; /* the colour buffer is 4x4 and red still */
+    /* The name's own 1x1 blue texture, read through the guest FBO it is attached to again. */
+    g2->glFramebufferTexture2D(k, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tn, 0);
+    uint8_t q[4] = {0, 0, 0, 0};
+    g2->glReadPixels(k, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, q, sizeof q);
+    if (q[2] > 250 && q[0] < 5)
+        r |= 2;
+    /* Bound to the colour buffer again: a clear through the FBO reaches it. */
+    rc_BindTexture(k, cb);
+    g2->glFramebufferTexture2D(k, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tn, 0);
+    g2->glClearColor(k, 0, 1, 0, 1);
+    g2->glClear(k, GL_COLOR_BUFFER_BIT);
+    rc_ReadColorBuffer(NULL, cb, 3, 3, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px, sizeof px);
+    if (px[1] > 250 && px[0] < 5)
+        r |= 4;
+    /* A glTexImage2D with no data, as the decoder hands it on (a pointer into the packet, length 0): the texture
+     * reads as zeros, not as the bytes at that pointer. */
+    static const uint8_t junk[16] = {9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9};
+    GLuint tz = 0;
+    g2->glGenTextures(k, 1, &tz, sizeof tz);
+    g2->glBindTexture(k, GL_TEXTURE_2D, tz);
+    g2->glTexImage2D(k, GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, junk, 0);
+    g2->glFramebufferTexture2D(k, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tz, 0);
+    uint8_t z[16];
+    memset(z, 0xFF, sizeof z);
+    g2->glReadPixels(k, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, z, sizeof z);
+    int zero = 1;
+    for (int i = 0; i < 16; i++)
+        zero &= z[i] == 0;
+    if (zero)
+        r |= 8;
+    g2->glBindFramebuffer(k, GL_FRAMEBUFFER, 0);
+    rc_MakeCurrent(k, 0, 0, 0);
+    rc_DestroyContext(NULL, ctx);
+    rc_DestroyWindowSurface(NULL, surf);
+    rc_CloseColorBuffer(NULL, cb);
+    return r;
+}
+
+/* Float arguments through the wire decoder (B18): glClearColor(0.25, 0.5, 0.75, 1.0) sent as a packet and decoded,
+ * then a clear of a window surface. The decoder once converted each float's bit pattern as an integer (0.25 became
+ * 1048576000.0, clamped to 1). Returns the cleared pixel, RGB packed (0x4080BF when right). */
+static char selftest_stream_f;
+
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_wirefloat(void)
+{
+    if (!gl_host_webgl())
+        return 0;
+    void *k = &selftest_stream_f;
+    uint32_t ctx = rc_CreateContext(NULL, 0, 0, 0x30000);
+    uint32_t surf = rc_CreateWindowSurface(NULL, 0, 4, 4);
+    uint32_t cb = rc_CreateColorBuffer(NULL, 4, 4, GL_RGBA);
+    rc_SetWindowColorBuffer(NULL, surf, cb);
+    rc_MakeCurrent(k, ctx, surf, surf);
+    pkt_t p = {0};
+    gl_reply rep = {0};
+    static const float col[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    pk_begin(&p, OP_glClearColor);
+    for (int i = 0; i < 4; i++) {
+        uint32_t b;
+        memcpy(&b, &col[i], 4);
+        pk_u32(&p, b);
+    }
+    int ok = pk_send(k, &p, OP_glClearColor, &rep) == 0;
+    pk_begin(&p, OP_glClear);
+    pk_u32(&p, GL_COLOR_BUFFER_BIT);
+    ok = ok && pk_send(k, &p, OP_glClear, &rep) == 0;
+    free(rep.buf);
+    free(p.b);
+    rc_FlushWindowColorBuffer(k, surf);
+    uint8_t px[4] = {0, 0, 0, 0};
+    rc_ReadColorBuffer(NULL, cb, 1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px, sizeof px);
+    rc_MakeCurrent(k, 0, 0, 0);
+    rc_DestroyContext(NULL, ctx);
+    rc_DestroyWindowSurface(NULL, surf);
+    rc_CloseColorBuffer(NULL, cb);
+    return ok ? ((uint32_t)px[0] << 16 | (uint32_t)px[1] << 8 | px[2]) : 0xFFFFFFFFu;
 }
 
 uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_quad(void)
@@ -3075,6 +3944,7 @@ const gl_host_t *gl_host_webgl(void)
     gles2_table.glViewport = w_glViewport;
     gles2_table.glScissor = w_glScissor;
     gles2_table.glGetIntegerv = w_glGetIntegerv;
+    gles2_table.glGetVertexAttribiv = w_glGetVertexAttribiv;
     gles2_table.glGetFloatv = w_glGetFloatv;
     gles2_table.glGetBooleanv = w_glGetBooleanv;
     gles2_table.glGenBuffers = w_glGenBuffers;

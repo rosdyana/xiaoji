@@ -105,6 +105,12 @@ for (let i = 0; i < 5 * RING_CAP + 17; i++) {
 }
 check('wrap-around keeps order', bad, 0);
 
+// The screen takes the keyboard (B18): input.js focuses it on a press and listens for keys on it, which works only if
+// the canvas is focusable. Without a tabindex, focus() on a canvas does nothing and no key reached the guest.
+const html = readFileSync(join(root, 'web', 'index.html'), 'utf8');
+const screenTag = (html.match(/<canvas[^>]*id="android-screen"[^>]*>/) || [''])[0];
+check('the Android screen canvas is focusable (tabindex)', /\stabindex="-?\d+"/.test(screenTag), true);
+
 if (fails) {
   console.log(`input: ${fails} failed`);
   process.exit(1);

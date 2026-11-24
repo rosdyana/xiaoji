@@ -9,7 +9,7 @@ ORB   := /Applications/OrbStack.app/Contents/MacOS/bin/orb
 GUEST_FLAGS := -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -march=armv8-a -no-pie -mno-outline-atomics
 
 ENGINE_SRC := $(wildcard engine/*.c)
-ENGINE_HDR := $(wildcard engine/*.h)
+ENGINE_HDR := $(wildcard engine/*.h) $(wildcard engine/*.inc)
 # The block translator is wasm-only: the native build leaves engine/jit.c out.
 NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
 JIT_LIB := engine/jit_lib.js
@@ -45,7 +45,7 @@ wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 # filesystem built by the worker in MEMFS (createLazyFile over HTTP).
 build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMAX_WEBGL_VERSION=2 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
 	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
 	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)

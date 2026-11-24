@@ -302,7 +302,9 @@ async function runBoot(base, opts) {
   if (traceOn) trace = openTrace(Module.FS, fileSizes(manifest));
   post({ type: 'boot-tree', files, wall: now() - t0, packsWall, store: store ? store.stats : null });
 
-  const argv = ['--logcat', '--init', '/xiaoji.rc', '--root', '/rootfs', '--init-timeout', String(BOOT.timeoutS)];
+  // ?timeout=S (debugging, B18): the engine's wall-clock limit in seconds instead of BOOT.timeoutS, for slow machines.
+  const timeoutS = opts && Number(opts.timeoutS) > 0 ? Math.floor(Number(opts.timeoutS)) : BOOT.timeoutS;
+  const argv = ['--logcat', '--init', '/xiaoji.rc', '--root', '/rootfs', '--init-timeout', String(timeoutS)];
   if (opts && opts.lazy === false) argv.push('--no-lazy-mmap');
   if (opts && opts.lazyWindow) argv.push('--lazy-window', String(Number(opts.lazyWindow)));
   // ?statsat: the engine prints its instruction count and lazy reads at phase 100 (for the A/B runs).
@@ -343,7 +345,7 @@ async function glSelfTest(base, frameSab) {
   post({
     type: 'done', name: 'glselftest', exitCode: frames, alias: Module._xj_gl_selftest_alias(),
     quad: Module._xj_gl_selftest_quad(), life: Module._xj_gl_selftest_life(), state: Module._xj_gl_selftest_state(),
-    compose: Module._xj_gl_selftest_compose(),
+    compose: Module._xj_gl_selftest_compose(), vao: Module._xj_gl_selftest_vao(), respec: Module._xj_gl_selftest_respec(), wirefloat: Module._xj_gl_selftest_wirefloat(),
   });
 }
 
@@ -358,7 +360,7 @@ self.onmessage = async (ev) => {
       await runBoot(msg.base, {
         trace: msg.trace, mode: msg.mode, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
         statsAt: !!msg.statsAt, early: msg.early, gl: msg.gl, frameSab: msg.frameSab,
-        input: msg.input || null, debugFaults: !!msg.debugFaults, dumpAt: msg.dumpAt || 0,
+        input: msg.input || null, debugFaults: !!msg.debugFaults, dumpAt: msg.dumpAt || 0, timeoutS: msg.timeoutS || 0,
       });
     }
   } catch (e) {

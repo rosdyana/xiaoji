@@ -517,8 +517,12 @@ static int is_custom(uint32_t op)
            op == OP_glVertexAttribPointerOffset || op == OP_glDrawElementsData || op == OP_glDrawElementsOffset;
 }
 
+uint32_t gl_host_ops[GL_HOST_NOPS];
+uint32_t gl_host_nops;
+
 int gl_host_decode(const gl_host_t *h, void *ctx, uint32_t op, const uint8_t *pkt, size_t len, gl_reply *rep)
 {
+    gl_host_ops[gl_host_nops++ % GL_HOST_NOPS] = op;
     /* The custom calls first (the WebGL backend draws some of the not_api ones), then the rest of not_api. */
     if (is_custom(op))
         return custom_decode(h, ctx, op, pkt, len, rep);

@@ -453,7 +453,14 @@ def decoder_source(proto, cases):
                 nb = bits // 8
                 ct = C_TYPE.get(base, "uint32_t")
                 out.append("        if (gl_take(&q, &left, %d, &tp) != 0) return -1;" % nb)
-                out.append("        %s a_%s = (%s)(%s)gl_load(tp, %d);" % (ct, pname, ct, WIRE_UINT[bits], nb))
+                if ct in ("float", "double"):
+                    # The wire holds the value's bits (IEEE 754, little-endian): reinterpret them, do not convert the
+                    # integer (B18: a conversion made every float argument the integer value of its bit pattern).
+                    out.append("        %s a_%s;" % (ct, pname))
+                    out.append("        { %s b_ = (%s)gl_load(tp, %d); memcpy(&a_%s, &b_, %d); }"
+                               % (WIRE_UINT[bits], WIRE_UINT[bits], nb, pname, nb))
+                else:
+                    out.append("        %s a_%s = (%s)(%s)gl_load(tp, %d);" % (ct, pname, ct, WIRE_UINT[bits], nb))
                 vars_.append((pname, False, "in"))
         call_args = ["ctx"]
         for pname, is_ptr, direction in vars_:
