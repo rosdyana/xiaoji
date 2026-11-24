@@ -639,7 +639,7 @@ static int glob_apex(const char *file, char frags[][256], int *nfrag)
     while ((e = readdir(dir)) && nn < 64) {
         if (e->d_name[0] == '.' || strchr(e->d_name, '@'))
             continue;
-        snprintf(names[nn], sizeof names[nn], "%s", e->d_name);
+        snprintf(names[nn], sizeof names[nn], "%.63s", e->d_name); /* names[] holds 64 bytes: 63 and the NUL */
         nn++;
     }
     closedir(dir);
@@ -654,7 +654,8 @@ static int glob_apex(const char *file, char frags[][256], int *nfrag)
         memcpy(names[k + 1], t, sizeof t);
     }
     for (int i = 0; i < nn; i++) {
-        snprintf(canon, sizeof canon, "/apex/%s/etc/classpaths/%s", names[i], file);
+        if (snprintf(canon, sizeof canon, "/apex/%s/etc/classpaths/%s", names[i], file) >= (int)sizeof canon)
+            continue;
         uint8_t *d = NULL;
         size_t n = 0;
         if (read_file(canon, &d, &n) < 0)
@@ -665,7 +666,7 @@ static int glob_apex(const char *file, char frags[][256], int *nfrag)
             if (!strcmp(frags[k], canon))
                 dup = 1;
         if (!dup && *nfrag < INIT_MAX_FRAG)
-            snprintf(frags[(*nfrag)++], 256, "%s", canon);
+            snprintf(frags[(*nfrag)++], 256, "%.255s", canon); /* a fragment holds 255 bytes and the NUL */
     }
     return 0;
 }
@@ -796,7 +797,7 @@ static int svc_start(svc_t *s)
     proc_switch(self);
     for (int i = 0; i < s->nsocks; i++) {
         s->sockfd[i] = -1;
-        int fd;
+        int fd = -1;
         if (make_socket(&s->socks[i], &fd) < 0) {
             fprintf(stderr, "xiaoji: init: %s: cannot create socket %s\n", s->name, s->socks[i].name);
             for (int k = 0; k < i; k++)

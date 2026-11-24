@@ -2,13 +2,13 @@
 # Copy xiaoji's own AOSP build (xiaoji_arm64, see tools/remote-build.sh) from
 # the remote build machine into a plain rootfs directory on this machine:
 #   tools/fetch-remote-rootfs.sh [host] [dest]
-#   (defaults: build-host, build/rootfs-xiaoji)
+#   (defaults: $XIAOJI_REMOTE_HOST, build/rootfs-xiaoji)
 # The product's APEXes are flattened (plain directories in /system/apex), so
 # each one is copied to /apex/<name> as apexd would bind-mount it. Then the
 # same apex-info-list and linker config as tools/extract-rootfs.sh are added.
 set -eu
 cd "$(dirname "$0")/.."
-HOST=${1:-build-host}
+HOST=${1:-${XIAOJI_REMOTE_HOST:?pass the build host or set XIAOJI_REMOTE_HOST}}
 DEST=${2:-build/rootfs-xiaoji}
 OUT=xiaoji-aosp/out/target/product/xiaoji_arm64
 

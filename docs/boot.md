@@ -2647,7 +2647,7 @@ which SQLite needs (next blocker 2).**
 
 ### Protocols implemented (with the evidence from the sources)
 
-Sources are the remote tree `~/xiaoji-aosp` on `build-host`, read only. Functions are named rather than lines, so the
+Sources are the remote tree `~/xiaoji-aosp` on the build machine, read only. Functions are named rather than lines, so the
 references hold after an edit.
 
 **Sensors (goldfish qemud).**

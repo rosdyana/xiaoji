@@ -1,6 +1,6 @@
 set -eu
 cd "$(dirname "$0")/.."
-HOST=${1:-build-host}
+HOST=${1:-${XIAOJI_REMOTE_HOST:?pass the build host or set XIAOJI_REMOTE_HOST}}
 mkdir -p build/spec/ids
 rsync -a "$HOST:xiaoji-aosp/system/core/libcutils/include/private/android_filesystem_config.h" build/spec/ids/
 rsync -a "$HOST:xiaoji-aosp/bionic/libc/kernel/uapi/linux/capability.h" build/spec/ids/

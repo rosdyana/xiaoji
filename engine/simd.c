@@ -126,6 +126,41 @@ static uint64_t nan_pick(uint64_t a, uint64_t b, int dbl)
     return isqnan_b(a, dbl) ? a : b;
 }
 
+/* The NaN rules of a vector FP lane. Host arithmetic gives the x86 sign (negative) to a NaN made by an invalid
+ * operation; the Arm default NaN is positive. With no NaN operand, a NaN result is the default NaN. Otherwise a NaN
+ * operand propagates, quieted if it is signalling. The order: a signalling NaN outranks a quiet one; within a class
+ * the fused forms (nin 3) take the addend first, then the multiplicands x and y, and the other forms take x, then y.
+ * This is the order the arm64 hardware gives (checked with fmaf on an arm64 Mac). FMAXNM and FMINNM (nm) return the
+ * number when one operand is a NaN, unless that NaN is signalling. */
+static uint64_t fp_vec_nan(uint64_t res, int dbl, int nm, int nin, uint64_t x, uint64_t y, uint64_t acc)
+{
+    uint64_t v[3] = {x, y, acc}, ord[3] = {x, y, acc};
+    if (nin == 3) {
+        ord[0] = acc;
+        ord[1] = x;
+        ord[2] = y;
+    }
+    int any = 0;
+    for (int i = 0; i < nin; i++)
+        any |= isnan_b(v[i], dbl);
+    if (!any)
+        return isnan_b(res, dbl) ? (dbl ? FP_DEFAULT_NAN_D : FP_DEFAULT_NAN_S) : res;
+    if (nm && nin == 2 && isnan_b(x, dbl) != isnan_b(y, dbl)) {
+        int xn = isnan_b(x, dbl);
+        uint64_t nanv = xn ? x : y;
+        if (!isqnan_b(nanv, dbl))
+            return quiet_b(nanv, dbl);
+        return xn ? y : x;
+    }
+    for (int i = 0; i < nin; i++)
+        if (isnan_b(ord[i], dbl) && !isqnan_b(ord[i], dbl))
+            return quiet_b(ord[i], dbl);
+    for (int i = 0; i < nin; i++)
+        if (isqnan_b(ord[i], dbl))
+            return ord[i];
+    return res; /* not reached: some operand is a NaN */
+}
+
 /* FMAX/FMIN choice between two non-NaN values, returns 1 for b, 0 for a. Zeros
  * of either sign compare equal, so FMAX prefers +0 and FMIN prefers -0. */
 static int pick_minmax(double x, double y, int is_min)
@@ -1089,6 +1124,11 @@ static int fp_three_same_impl(cpu_t *c, uint32_t insn, int scalar)
                     out = (float)v;
                 res = f_bits(out);
             }
+            /* FMLS negates the product's first operand before a NaN is chosen, as fp_3src does */
+            int fused = op == OP_MLA || op == OP_MLS;
+            uint64_t sgn = sz ? (1ull << 63) : 0x80000000ull;
+            res = fp_vec_nan(res, (int)sz, op == OP_MAXNM || op == OP_MINNM, fused ? 3 : 2,
+                             op == OP_MLS ? x ^ sgn : x, y, acc);
         }
         el_wr(r, i * esz, esz, res);
     }
@@ -1494,7 +1534,7 @@ static int fp_two_misc(cpu_t *c, uint32_t insn)
         } else if (opc == 0x1D && a && !u) { /* FRECPE: the architecture's 8-bit estimate */
             out = recip_estimate(xb, (int)sz);
         } else if (opc == 0x1F && u && a) { /* FSQRT */
-            out = sz ? d_bits(sqrt(x)) : f_bits(sqrtf(as_f((uint32_t)xb)));
+            out = fp_vec_nan(sz ? d_bits(sqrt(x)) : f_bits(sqrtf(as_f((uint32_t)xb))), (int)sz, 0, 1, xb, 0, 0);
         } else if (opc == 0x1D && !a) { /* SCVTF (U=0), UCVTF (U=1) from an integer lane */
             if (sz)
                 out = d_bits(u ? (double)xb : (double)(int64_t)xb);
@@ -2414,11 +2454,11 @@ static int by_element(cpu_t *c, uint32_t insn)
             if (sz) {
                 double x = as_d(xb), y = as_d(eb), acc = as_d(db);
                 double res = opc == 1 ? fma(x, y, acc) : opc == 5 ? fma(-x, y, acc) : u ? fmulx_d(x, y) : x * y;
-                rb = d_bits(res);
+                rb = fp_vec_nan(d_bits(res), 1, 0, 3, opc == 5 ? xb ^ (1ull << 63) : xb, eb, db);
             } else {
                 float x = as_f((uint32_t)xb), y = as_f((uint32_t)eb), acc = as_f((uint32_t)db);
                 float res = opc == 1 ? fmaf(x, y, acc) : opc == 5 ? fmaf(-x, y, acc) : u ? fmulx_f(x, y) : x * y;
-                rb = f_bits(res);
+                rb = fp_vec_nan(f_bits(res), 0, 0, 3, opc == 5 ? xb ^ 0x80000000u : xb, eb, db);
             }
             el_wr(r, i * esz, esz, rb);
         }

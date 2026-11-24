@@ -5,7 +5,7 @@ The question comes from B4f (`docs/boot.md`, end): `DisplayManagerService` block
 `SurfaceControl.nativeGetCompositionDataspaces` because SurfaceFlinger is not running, and SurfaceFlinger
 needs an EGL/GLES implementation, a composer and an allocator.
 
-Sources. AOSP is `build-host:~/xiaoji-aosp` (android13-release), read only; paths below are relative to it.
+Sources. AOSP is the build machine's `~/xiaoji-aosp` (android13-release), read only; paths below are relative to it.
 "Local" paths are in this repo. Line numbers are from the files as read on 2026-11-23.
 
 ## Summary

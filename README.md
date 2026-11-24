@@ -5,37 +5,69 @@ Android in your browser. Nothing to install. (Work in progress; will live at and
 xiaoji (小机, "little phone", like 手机 shǒujī) is the Android sibling of [xiaonux](https://github.com/rosdyana/xiaonux), which runs Debian in a browser tab. The two projects take different approaches:
 
 - **xiaonux** emulates a whole RISC-V machine.
-- **xiaoji** does not emulate a machine. Its engine, written in C and compiled to WebAssembly, translates Android's ARM64 user-space code and provides the Linux kernel interface (syscalls, and later binder) itself. Guest threads become Web Workers, and OpenGL ES goes to WebGL2.
+- **xiaoji** does not emulate a machine. Its engine, written in C and compiled to WebAssembly, runs Android's ARM64 user-space code and provides the Linux kernel interface itself: syscalls, binder, futexes, files, cgroups, input devices and the emulator's graphics pipe. Android's OpenGL ES calls go to WebGL2.
 
-That model is what makes real arm64 APKs and a GPU-speed UI possible. xiaoji's distinguishing goal is delivery, borrowed from xiaonux: a booted snapshot, content-addressed chunks fetched on demand, and per-app packs. The aim is a small first download and a start measured in seconds, not a 1 GB download before the first boot.
+There is no guest kernel, MMU or virtual hardware to emulate, which is why xiaoji doesn't build on Cuttlefish or another full-system VM. xiaoji's distinguishing goal is delivery, borrowed from xiaonux: content-addressed chunks fetched on demand, boot packs, a booted snapshot (planned) and per-app packs. The aim is a small first download and a start measured in seconds, not a 1 GB download before the first boot.
 
 ## Status
 
-This is spike 0: running Android 13's own ART (`dalvikvm64`) on the engine. See [docs/spike-0.md](docs/spike-0.md).
+Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`, with Wi-Fi, Bluetooth, telephony, NFC and UWB off) boots in a browser tab to the launcher. You can open the app drawer, start Settings, and type into the launcher's search.
+
+| | Native engine (M2) | Browser (headless Chromium, M2) |
+|---|---|---|
+| `sys.boot_completed` | about 270 s | about 6 min |
+| Launcher on screen | about 285 s | about 6.5 min |
+
+The browser numbers were measured on an 8 GB machine that was swapping, on battery. The next step is a snapshot after boot, so that a visitor starts at the home screen instead of booting.
+
+Milestone notes:
+
+| Doc | What |
+|---|---|
+| [docs/spike-0.md](docs/spike-0.md) | the first question: ART (`dalvikvm64`) on the engine, natively and in wasm |
+| [docs/boot.md](docs/boot.md) | the boot, milestone by milestone (B1 to B18): init, binder, zygote, system_server, HALs, the product, the launcher |
+| [docs/graphics.md](docs/graphics.md) | the goldfish pipe, the gfxstream decoders, the null and WebGL2 backends (G1 to G4) |
+| [docs/input.md](docs/input.md) | the touchscreen and keyboard (evdev) and how the page feeds them |
+| [docs/loading.md](docs/loading.md) | chunks, boot packs, early start and caching |
+| [docs/web-preview.md](docs/web-preview.md) | the browser page and its boot screen |
+| [docs/testing.md](docs/testing.md) | the test suite, parallel runs, the remote runner |
+| [docs/features.md](docs/features.md) | draft: which Android features are base, add-on, engine-backed or never |
 
 ## Quick start (development)
 
-You need macOS (or Linux), clang, Python 3, a JDK (17+), [Emscripten](https://emscripten.org) in `~/emsdk`, and an arm64 Linux VM for the reference runs ([OrbStack](https://orbstack.dev) VM named `builder`).
+You need macOS (or Linux), clang, Python 3, Node, a JDK (17+), [Emscripten](https://emscripten.org) in `~/emsdk`, and an arm64 Linux VM for the reference runs (an [OrbStack](https://orbstack.dev) VM named `builder`).
 
 ```sh
 make                 # native engine -> build/xiaoji
-make wasm            # wasm engine -> build/wasm/
-make image           # download Google's AOSP 13 arm64 image, extract -> build/rootfs (~1.4 GB)
-make oracle          # run the guest's binaries natively in the VM -> build/oracle (expected outputs + strace)
+make wasm            # browser engine -> build/wasm/
+make wasm-node       # Node engine (reads host files directly)
+make image           # Google's AOSP 13 arm64 image, extracted -> build/rootfs (for the test suite)
+make oracle          # reference runs in the VM -> build/oracle
+make guest-tests     # the guest test programs, built in the VM
+make test            # the suite: every case natively and in Node, against the oracle
+make serve           # the page at http://127.0.0.1:8080/ (needs build/rootfs-xiaoji)
+make help            # every target
 ```
 
-Guest files come from Google's prebuilt AOSP image and are never committed. Later, a trimmed AOSP build will replace them (see `docs/spike-0.md`).
+The browser boot needs the product tree, `build/rootfs-xiaoji`, which is built from `aosp/device/xiaoji` on an x86_64 AOSP build machine (`tools/remote-build.sh`, then `tools/fetch-remote-rootfs.sh`). The test suite can run there too (`tools/remote-test.sh`, see `docs/testing.md`).
+
+Useful test switches: `XIAOJI_JOBS=4` runs cases in parallel, `XIAOJI_BOOT=1` adds the timed Android boot, and `XIAOJI_ROOT=build/rootfs-xiaoji` runs against the product tree. `make test-web` checks the page in headless Chromium; `XIAOJI_WEB_BOOT=1` and `XIAOJI_WEB_FRAMES=1` add the boot and the Android frame checks. On the page, `?debug=1` shows the engine's diagnostics.
+
+Guest files come from Google's AOSP image or from our AOSP build. They are never committed.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `engine/` | the C engine (ARM64 → host, Linux syscall layer) |
-| `tools/` | image download and extraction, linker config, reference runs |
-| `tests/` | guest test programs |
-| `web/` | browser harness (later) |
-| `docs/` | plans, findings, benchmarks |
+| `engine/` | the C engine: ARM64 interpreter and JIT, syscalls, binder, init, procfs and sysfs, cgroups, bpf maps, evdev, goldfish pipe, GL decoders and backends |
+| `aosp/device/xiaoji/` | the AOSP product: trimmed device config, netd stub, null audio HAL |
+| `image/` | the init config the engine boots (`xiaoji.rc`) |
+| `web/` | the page, its worker, the pack loader, the boot screen and its themes, input |
+| `tools/` | image fetch and extraction, AOSP build and fetch, manifests and packs, GL and kernel-config generators, remote runner |
+| `tests/` | guest test programs, init cases, expected outputs, suite and page tests |
+| `third_party/gfxstream/` | the GL protocol specs (Apache-2.0) the decoders are generated from |
+| `docs/` | milestone notes, plans, measurements |
 
 ## License
 
-Apache-2.0. Android components are under their own licenses (AOSP); they are downloaded, never redistributed from this repository.
+Apache-2.0. Android components are under their own licenses (AOSP); they are downloaded or built, never redistributed from this repository. See [NOTICE](NOTICE) for the vendored gfxstream specs.

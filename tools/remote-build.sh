@@ -1,11 +1,11 @@
 #!/bin/sh
 # Build xiaoji's trimmed AOSP product on the remote build machine.
-#   tools/remote-build.sh [host]     (default host: build-host)
+#   tools/remote-build.sh [host]     (default host: $XIAOJI_REMOTE_HOST)
 # Copies aosp/device/xiaoji into the remote tree (~/xiaoji-aosp) and starts
 # `m` for xiaoji_arm64-userdebug in the background; log: ~/xiaoji-aosp/xiaoji-build.log
 set -eu
 cd "$(dirname "$0")/.."
-HOST=${1:-build-host}
+HOST=${1:-${XIAOJI_REMOTE_HOST:?pass the build host or set XIAOJI_REMOTE_HOST}}
 TREE='~/xiaoji-aosp'
 rsync -a --delete aosp/device/xiaoji/ "$HOST:xiaoji-aosp/device/xiaoji/"
 ssh "$HOST" "cd $TREE && cat > xiaoji-build.sh <<'EOS'

@@ -90,7 +90,7 @@ Engine design notes:
 
 ## Parallel track: trimmed AOSP 13 build
 
-The build runs on the remote machine `build-host`: x86_64, i7-12700 with 20 threads, 64 GB RAM, Ubuntu 20.04, in `~/xiaoji-aosp`. It's a shallow, partial-clone sync of `android13-release`, followed by a baseline `sdk_phone64_arm64` build (the same product as the prebuilt guest, build `TE1A.220922.034`, `sdk_phone64_arm64-userdebug`) and then a trimmed `vendor/xiaoji` product. That product sets `low_ram`, flattens APEXes, and keeps only Launcher3, SystemUI, Settings, PackageInstaller and DocumentsUI.
+The build runs on a remote x86_64 machine: i7-12700 with 20 threads, 64 GB RAM, Ubuntu 20.04, in `~/xiaoji-aosp`. It's a shallow, partial-clone sync of `android13-release`, followed by a baseline `sdk_phone64_arm64` build (the same product as the prebuilt guest, build `TE1A.220922.034`, `sdk_phone64_arm64-userdebug`) and then a trimmed `vendor/xiaoji` product. That product sets `low_ram`, flattens APEXes, and keeps only Launcher3, SystemUI, Settings, PackageInstaller and DocumentsUI.
 
 ## M0 results
 
