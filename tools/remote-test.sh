@@ -71,7 +71,8 @@ do_sync() {
             echo "sync: build/$tree missing, skipped"
             continue
         }
-        rsync -a --include='data/' --include='data/hello.dex' --include='data/nativetest64/' \
+        # --delete removes the files of an older tree (the excluded data/ and sidecar are kept: rsync protects them).
+        rsync -a --delete --include='data/' --include='data/hello.dex' --include='data/nativetest64/' \
             --include='data/nativetest64/**' --exclude='data/*' \
             --exclude='.xiaoji-meta' --exclude='.xiaoji-meta.tmp' \
             "build/$tree/" "$HOST:$RDIR/build/$tree/"

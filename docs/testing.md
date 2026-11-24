@@ -118,7 +118,8 @@ XIAOJI_REMOTE_JOBS=12 tools/remote-test.sh run
 
 Measured on the Mac (M2, 8 GB) and on the remote (build-host, Ubuntu 20.04, gcc 9.4). The local serial and
 parallel runs were back to back, with no other engine process running before or after either one (checked with
-`ps`). The remote numbers are one run each.
+`ps`). The first remote sync (rsync over ssh, network-bound) was running during those two local runs. The remote
+numbers are one run each.
 
 | Run | Wall time | Result |
 |---|---|---|
