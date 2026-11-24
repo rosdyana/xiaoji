@@ -89,7 +89,7 @@ static evfd *opened[MAX_OPEN];
 static vdev devs[EVDEV_COUNT];
 static int devs_ready;
 static int origin_set;
-static uint64_t origin_ns;
+static uint64_t origin_ns __attribute__((unused)); /* read by the script only (the browser has none) */
 
 static void bit_set(uint8_t *b, unsigned n) { b[n >> 3] |= (uint8_t)(1u << (n & 7)); }
 static void bit_clear(uint8_t *b, unsigned n) { b[n >> 3] &= (uint8_t)~(1u << (n & 7)); }
@@ -231,6 +231,12 @@ int evdev_child(const char *dir, int idx, const char **name, int *is_dir)
  * when the ring is empty. */
 extern int xiaoji_input_pop(int32_t *out);
 static int source_next(int32_t *out) { return xiaoji_input_pop(out); }
+/* The browser has no test script: --input-script is refused (main.c reports the file as unreadable). */
+int evdev_script_load(const char *path)
+{
+    (void)path;
+    return -1;
+}
 #else
 typedef struct {
     uint64_t at_ns; /* from the origin */

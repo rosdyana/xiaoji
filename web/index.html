@@ -17,7 +17,12 @@
   }
 
   /* The boot screen: a phone frame, centred. On a narrow viewport it fills the screen. */
-  .shell { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; }
+  .shell { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+  /* The Android screen (web/input.js): the phone's display, 720 x 1280, shown only while the boot runs. */
+  .android-screen { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); height: 100%; max-width: 100%; aspect-ratio: 720 / 1280; background: #000; border-radius: 14px; outline: none; }
+  .android-screen[hidden] { display: none; }
+  .android-screen:focus-visible { box-shadow: 0 0 0 2px #8ab4ff; }
+  .nav { display: flex; gap: 12px; }
   .phone {
     position: relative; box-sizing: border-box; overflow: hidden;
     height: min(760px, 92vh); aspect-ratio: 9 / 19; max-width: 100vw;
@@ -113,6 +118,10 @@
       </div>
     </div>
   </div>
+  <nav class="nav" aria-label="Android buttons">
+    <button id="btn-back" type="button" disabled>Back</button>
+    <button id="btn-home" type="button" disabled>Home</button>
+  </nav>
 </main>
 
 <section class="dev" id="devlog" aria-label="Developer log" hidden>
