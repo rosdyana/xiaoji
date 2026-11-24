@@ -254,10 +254,13 @@ int vfs_resolve(int dirfd, const char *path, int follow, vfs_res *out)
         size_t cl = strlen(cur);
         if (cl + 1 + nl >= VFS_PATH_MAX)
             return -LE_NAMETOOLONG;
+        int cw; /* the length check above makes this fit; the result is checked so gcc does not guess */
         if (cl == 1 && cur[0] == '/')
-            snprintf(cand, sizeof cand, "/%s", name);
+            cw = snprintf(cand, sizeof cand, "/%s", name);
         else
-            snprintf(cand, sizeof cand, "%s/%s", cur, name);
+            cw = snprintf(cand, sizeof cand, "%s/%s", cur, name);
+        if (cw < 0 || (size_t)cw >= sizeof cand)
+            return -LE_NAMETOOLONG;
 
         /* A mount in the process's namespace covers cand: hp then holds its host path (the
          * synthetic names below are not looked at under a mount). */

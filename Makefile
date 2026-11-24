@@ -37,7 +37,7 @@ engine: build/xiaoji          ## native engine -> build/xiaoji
 
 build/xiaoji: $(NATIVE_SRC) $(GEN_SRC) $(ENGINE_HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(GEN_INC) -o $@ $(NATIVE_SRC) $(GEN_SRC)
+	$(CC) $(CFLAGS) $(GEN_INC) -o $@ $(NATIVE_SRC) $(GEN_SRC) -lm
 
 wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 
