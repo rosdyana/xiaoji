@@ -750,6 +750,11 @@ if [ -f "$NODE_JS" ]; then
 else
     echo "note: $NODE_JS not built, skipping Node runs (make wasm-node)" >"$RES/h0"
 fi
+# XIAOJI_SKIP: base names of guest programs left out (for a checkout whose path the expected output names, such as
+# exec: remote-test.sh uses it). Unset, nothing is skipped and the report has no line for it.
+if [ -n "${XIAOJI_SKIP:-}" ]; then
+    echo "note  guest programs skipped (XIAOJI_SKIP): $XIAOJI_SKIP" >>"$RES/h0"
+fi
 
 # The guest units, in the original order (all O0 binaries, then all O2): UNIT_NAME and UNIT_STRETCH.
 # Programs the guest cannot run as cases (prop-*, the futex hang, device probes) are skipped here, as before.
@@ -766,6 +771,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
     case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*) continue ;; esac
     cases=$((cases + 1))
+    case " ${XIAOJI_SKIP:-} " in *" ${name%-O?} "*) continue ;; esac
     UNIT_NAME+=("$name")
     UNIT_STRETCH+=("$stretch")
 done
