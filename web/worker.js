@@ -308,6 +308,10 @@ async function runBoot(base, opts) {
   // ?statsat: the engine prints its instruction count and lazy reads at phase 100 (for the A/B runs).
   if (opts && opts.statsAt) argv.push('--stats-at', 'Starting phase 100');
   if (webgl) argv.push('--gl', 'webgl');
+  // ?debug=1: the engine's fault reports (XIAOJI_DEBUG_FAULTS, which the page cannot set) go to the log.
+  if (opts && opts.debugFaults) argv.push('--debug-faults');
+  // ?dumpat=SECONDS: a dump of every guest thread at that time (the engine's --dump-at).
+  if (opts && opts.dumpAt) argv.push('--dump-at', String(opts.dumpAt).replace(/[^0-9,]/g, ''));
   let exitCode;
   try {
     exitCode = Module.callMain(argv);
@@ -338,7 +342,8 @@ async function glSelfTest(base, frameSab) {
   const frames = Module._xj_gl_selftest();
   post({
     type: 'done', name: 'glselftest', exitCode: frames, alias: Module._xj_gl_selftest_alias(),
-    quad: Module._xj_gl_selftest_quad(), life: Module._xj_gl_selftest_life(),
+    quad: Module._xj_gl_selftest_quad(), life: Module._xj_gl_selftest_life(), state: Module._xj_gl_selftest_state(),
+    compose: Module._xj_gl_selftest_compose(),
   });
 }
 
@@ -353,7 +358,7 @@ self.onmessage = async (ev) => {
       await runBoot(msg.base, {
         trace: msg.trace, mode: msg.mode, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
         statsAt: !!msg.statsAt, early: msg.early, gl: msg.gl, frameSab: msg.frameSab,
-        input: msg.input || null,
+        input: msg.input || null, debugFaults: !!msg.debugFaults, dumpAt: msg.dumpAt || 0,
       });
     }
   } catch (e) {

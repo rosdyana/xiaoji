@@ -18,7 +18,7 @@ export const DEFAULT_THEME = {
     { label: 'Loading framework', from: 'art' },
     { label: 'Starting system server', from: 'forked' },
     { label: 'Starting services', from: 'phase100' },
-    { label: 'Starting home', from: null },
+    { label: 'Starting home', from: 'completed' },
   ],
 };
 

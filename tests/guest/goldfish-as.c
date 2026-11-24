@@ -2,7 +2,9 @@
  * and HostComposer drive them (device/generic/goldfish-opengl: shared/GoldfishAddressSpace, system/egl/goldfish_sync.h).
  *
  *   1. PING sets the subdevice (HostMemoryAllocator, 5); the reply echoes it in metadata.
- *   2. ALLOCATE_BLOCK of 8192 bytes: the rounded size, an offset and phys_addr 0 come back.
+ *   2. ALLOCATE_BLOCK of 8192 bytes: the rounded size, an offset and a physical address come back. The device has one
+ *      window (B17): the physical address is a fixed base plus the offset, and a second open's block takes the next
+ *      offset, with the same base (gralloc_30.cpp computes a buffer's physical address that way).
  *   3. PING ALLOCATE_ID (metadata 1) for the block: the result is 0.
  *   4. mmap of the block twice (MAP_SHARED): a byte written through one view is seen through the other.
  *   5. PING UNALLOCATE_ID (2), then DEALLOCATE_BLOCK; an unknown ioctl is ENOTTY.
@@ -97,7 +99,7 @@ int main(int argc, char **argv)
     u64 size = get64(al), off = get64(al + 8), phys = get64(al + 16);
     line("block size", (i64)size);
     line("block offset", (i64)off);
-    line("block phys", (i64)phys);
+    line("block phys nonzero", phys != 0);
 
     /* 3. PING ALLOCATE_ID for the block. */
     r = ping(fd, off, size, 1, md);
@@ -113,6 +115,22 @@ int main(int argc, char **argv)
     a[size - 1] = 0xa5;
     line("second view reads last byte", (i64)b[size - 1]);
 
+    /* A second open shares the window: its block follows the first, with the same base, and a mapping of the first
+     * block's offset through it sees the first block's bytes. */
+    int fd2 = (int)sys_openat(as);
+    ping(fd2, 0, 0, 5, md);
+    u8 al2[24];
+    put64(al2, 4096);
+    put64(al2 + 8, 0);
+    put64(al2 + 16, 0);
+    line("second open allocate", sys_ioctl(fd2, ioc('G', 10, 24), al2));
+    u64 off2 = get64(al2 + 8), phys2 = get64(al2 + 16);
+    line("second block after the first", off2 >= off + size);
+    line("same base", phys2 - off2 == phys - off);
+    u8 *c = (u8 *)(uintptr_t)sys_mmap(0, size, PROT_RW, MAP_SHARED, fd2, (i64)off);
+    line("second open sees the first block", c != (u8 *)(uintptr_t)-1 ? (i64)c[100] : -1);
+    sys_close(fd2);
+
     /* 5. Free: UNALLOCATE_ID, then DEALLOCATE_BLOCK. An unknown ioctl is ENOTTY. */
     r = ping(fd, off, size, 2, md);
     line("unallocate id ping", r);
@@ -120,6 +138,16 @@ int main(int argc, char **argv)
     u8 dealloc[8];
     put64(dealloc, off);
     line("deallocate", sys_ioctl(fd, ioc('G', 11, 8), dealloc));
+    /* A block made again over the freed range reads as zeros (a fresh host allocation). */
+    put64(al, 8192);
+    put64(al + 8, 0);
+    put64(al + 16, 0);
+    line("allocate again", sys_ioctl(fd, ioc('G', 10, 24), al));
+    u8 *z = (u8 *)(uintptr_t)sys_mmap(0, 8192, PROT_RW, MAP_SHARED, fd, (i64)get64(al + 8));
+    line("same offset", get64(al + 8) == off);
+    line("new block reads zero", z != (u8 *)(uintptr_t)-1 ? (i64)(z[100] | z[8191]) : -1);
+    put64(dealloc, get64(al + 8));
+    line("deallocate again", sys_ioctl(fd, ioc('G', 11, 8), dealloc));
     line("unknown ioctl", sys_ioctl(fd, ioc('G', 99, 8), dealloc));
     sys_close(fd);
 

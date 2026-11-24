@@ -53,6 +53,9 @@ int64_t sched_futex_requeue(uint64_t from, uint64_t from_obj, uint64_t to, uint6
 void sched_set_name(const char *name);
 const char *sched_name(void);
 
+/* --dump-at: a dump of every live thread (stderr) this many seconds of host time from now (0: none). */
+void sched_dump_at(uint64_t seconds);
+
 /* Instructions executed by all threads. */
 uint64_t sched_icount(void);
 /* Instructions executed by the threads of process p (reaped threads included). */

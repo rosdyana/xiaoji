@@ -1,0 +1,22 @@
+glMapBufferRangeAEMU read 16 write 28 reply 16 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+glMapBufferRangeAEMU null write 28 reply -11
+glUnmapBufferAEMU write 40 reply 1 01
+glFlushMappedBufferRangeAEMU write 32 reply -11
+glUnmapBufferAsyncAEMU write 41 reply -11
+glBufferDataSyncAEMU write 32 reply 1 01
+glFenceSyncAEMU write 16 reply 8 01 00 00 00 00 00 00 00
+glGetSyncivAEMU status write 32 reply 8 01 00 00 00 19 91 00 00
+glGetSyncivAEMU type, no length write 32 reply 4 16 91 00 00
+glGetUniformIndicesAEMU write 32 reply 8 ff ff ff ff ff ff ff ff
+glGetCompressedTextureFormats write 16 reply 8 00 00 00 00 00 00 00 00
+glDrawElementsInstancedDataAEMU write 38 reply -11
+glDrawElementsInstancedOffsetAEMU write 28 reply -11
+glDrawRangeElementsDataAEMU write 42 reply -11
+glVertexAttribIPointerOffsetAEMU write 28 reply -11
+glTexImage2DOffsetAEMU write 44 reply -11
+rcCreateColorBuffer write 20 reply 4 01 00 00 00
+rcUpdateColorBufferDMA write 52 reply 4 00 00 00 00
+rcUpdateColorBufferDMA outside the window write 52 reply 4 ff ff ff ff
+rcReadColorBufferDMA write 52 reply 4 00 00 00 00
+rcGetRendererVersion write 8 reply 4 01 00 00 00
+done

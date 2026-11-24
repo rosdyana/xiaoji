@@ -337,7 +337,7 @@ $('boot').addEventListener('click', async () => {
     type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
     input: inputRing ? inputRing.buffer : null,
     lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'), statsAt: params.has('statsat'),
-    early: params.get('early'), gl: glBackend, frameSab,
+    early: params.get('early'), gl: glBackend, frameSab, debugFaults: params.get('debug') === '1', dumpAt: params.get('dumpat'),
   });
   if (mode === 'pack') {
     // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).

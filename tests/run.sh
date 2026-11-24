@@ -207,7 +207,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
     # bpfpin-* runs as the system user with the graphics group, as an init service (init-bpf, B15): not an oracle case.
-    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*|evdev-*) continue ;; esac
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-gl-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*|evdev-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -284,7 +284,7 @@ fi
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as sensors power-supply ashmem evdev"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-gl goldfish-as sensors power-supply ashmem evdev"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -294,6 +294,7 @@ prop_argv() {
     prop-wait) ARGV=(/data/local/tmp/prop-wait) ;;
     evt) ARGV=(/data/local/tmp/evt) ;;
     goldfish-pipe) ARGV=(/data/local/tmp/goldfish-pipe) ;;
+    goldfish-gl) ARGV=(/data/local/tmp/goldfish-gl) ;;
     goldfish-as) ARGV=(/data/local/tmp/goldfish-as) ;;
     sensors) ARGV=(/data/local/tmp/sensors) ;;
     ashmem) ARGV=(/data/local/tmp/ashmem) ;;
@@ -350,6 +351,11 @@ if [ -d build/rootfs/system/bin ]; then
     if [ -f build/tests/guest/goldfish-pipe-O0 ]; then
         mkdir -p "$RFS/data/local/tmp"
         cp build/tests/guest/goldfish-pipe-O0 "$RFS"/data/local/tmp/goldfish-pipe
+    fi
+    # The not_api GL calls with out-parameters and data (B17): tests/guest/goldfish-gl.c.
+    if [ -f build/tests/guest/goldfish-gl-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/goldfish-gl-O0 "$RFS"/data/local/tmp/goldfish-gl
     fi
     # The address space and the sync device (G1): tests/guest/goldfish-as.c.
     if [ -f build/tests/guest/goldfish-as-O0 ]; then

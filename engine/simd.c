@@ -243,13 +243,136 @@ static int fp_ccmp(cpu_t *c, uint32_t insn)
     return 0;
 }
 
-/* FP 1-source (opcode in bits 20:15): FMOV, FABS, FNEG, FSQRT, FCVT to single or
- * double (half precision is not implemented), and FRINTN/P/M/Z/A/X/I. */
+/* Half precision (IEEE binary16, FPCR.AHP 0): conversions as the architecture's FPConvert does them, rounding to
+ * nearest even. A NaN keeps the top of its payload and is made quiet. */
+static double half_to_d(uint32_t h)
+{
+    unsigned sign = (h >> 15) & 1, e = (h >> 10) & 31, f = h & 0x3FF;
+    double v;
+    if (e == 0)
+        v = ldexp((double)f, -24);
+    else if (e == 31)
+        v = f ? NAN : INFINITY;
+    else
+        v = ldexp((double)(f | 0x400), (int)e - 25);
+    return sign ? -v : v;
+}
+
+static uint64_t half_to_bits(uint32_t h, int dbl)
+{
+    unsigned sign = (h >> 15) & 1, e = (h >> 10) & 31, f = h & 0x3FF;
+    if (e == 31 && f) { /* NaN: the payload moves to the top of the wider fraction, quiet */
+        if (dbl)
+            return ((uint64_t)sign << 63) | (0x7FFull << 52) | ((uint64_t)f << 42) | FP_QUIET_D;
+        return ((uint64_t)sign << 31) | (0xFFull << 23) | ((uint64_t)f << 13) | FP_QUIET_S;
+    }
+    double v = half_to_d(h);
+    return dbl ? d_bits(v) : f_bits((float)v); /* exact */
+}
+
+/* A double (exact for single and half sources) to half, rounded to nearest even once. */
+static uint32_t d_to_half(uint64_t b)
+{
+    uint32_t sign = (uint32_t)(b >> 63) << 15;
+    unsigned e = (unsigned)(b >> 52) & 0x7FF;
+    uint64_t f = b & 0xFFFFFFFFFFFFFull;
+    if (e == 0x7FF) /* infinity, or NaN with the top payload bits, quiet */
+        return sign | 0x7C00 | (f ? (uint32_t)(f >> 42) | 0x200 : 0);
+    double a = fabs(as_d(b));
+    if (a == 0)
+        return sign;
+    int ex;
+    frexp(a, &ex); /* a = m * 2^ex, m in [0.5, 1) */
+    int qe = ex - 11 < -24 ? -24 : ex - 11; /* the weight of the half's last fraction bit */
+    double scaled = ldexp(a, -qe);           /* exact: a multiple of 2^-41 at most */
+    double r = rint(scaled);                 /* round to nearest even (the default rounding mode) */
+    uint64_t m = (uint64_t)r;
+    if (m >= 2048) { /* rounding carried into a new bit */
+        m >>= 1;
+        qe++;
+    }
+    if (m < 1024) /* a subnormal (qe is -24) or zero */
+        return sign | (uint32_t)m;
+    int he = qe + 25; /* the biased exponent of 1.f * 2^(qe + 10) */
+    if (he >= 31)
+        return sign | 0x7C00; /* overflow: infinity when rounding to nearest */
+    return sign | ((uint32_t)he << 10) | ((uint32_t)m & 0x3FF);
+}
+
+/* FRECPE (FPRecipEstimate): an 8-bit estimate of 1/x, as the architecture computes it (RecipEstimate), for a single
+ * (dbl 0) or a double. FPCR is the default (round to nearest, no flush). */
+static uint64_t recip_estimate(uint64_t x, int dbl)
+{
+    int ebits = dbl ? 11 : 8, fbits = dbl ? 52 : 23;
+    uint64_t sign = (x >> (ebits + fbits)) & 1;
+    int exp = (int)((x >> fbits) & ((1u << ebits) - 1));
+    uint64_t frac = x & ((1ull << fbits) - 1);
+    uint64_t sbit = sign << (ebits + fbits), emax = (uint64_t)((1u << ebits) - 1) << fbits;
+    if (exp == (1 << ebits) - 1) {
+        if (frac) /* NaN: quiet */
+            return x | (dbl ? FP_QUIET_D : FP_QUIET_S);
+        return sbit; /* 1/inf = 0 */
+    }
+    if (exp == 0 && frac == 0)
+        return sbit | emax; /* 1/0 = inf */
+    /* |x| below 2^-128 (single) or 2^-1024 (double): the result overflows (infinity when rounding to nearest) */
+    uint64_t f52 = dbl ? frac : frac << 29; /* the fraction as 52 bits */
+    if (exp == 0 && !(f52 >> 51) && !((f52 >> 50) & 1))
+        return sbit | emax;
+    if (exp == 0) {
+        if (!((f52 >> 51) & 1)) {
+            exp = -1;
+            f52 = (f52 << 2) & ((1ull << 52) - 1);
+        } else {
+            f52 = (f52 << 1) & ((1ull << 52) - 1);
+        }
+    }
+    unsigned scaled = 256 | (unsigned)(f52 >> 44);
+    int rexp = (dbl ? 2045 : 253) - exp;
+    unsigned a = scaled * 2 + 1, b = (1u << 19) / a, est = (b + 1) / 2;
+    uint64_t rf = (uint64_t)(est & 0xFF) << 44;
+    if (rexp == 0) {
+        rf = (1ull << 51) | (rf >> 1);
+    } else if (rexp == -1) {
+        rf = (1ull << 50) | (rf >> 2);
+        rexp = 0;
+    }
+    uint64_t out = sbit | ((uint64_t)rexp << fbits) | (dbl ? rf : rf >> 29);
+    return out;
+}
+
+/* FP 1-source (opcode in bits 20:15): FMOV, FABS, FNEG, FSQRT, FCVT between half, single and double (B17 added
+ * half precision), and FRINTN/P/M/Z/A/X/I. */
 static int fp_1src(cpu_t *c, uint32_t insn)
 {
     unsigned type = (insn >> 22) & 3, opcode = (insn >> 15) & 0x3F;
     unsigned rn = (insn >> 5) & 31, rd = insn & 31;
-    if (type > 1 || !fp_default(c))
+    if (!fp_default(c))
+        return -1;
+    if (opcode >= 4 && opcode <= 7 && (type == 3 || (opcode & 3) == 3) && type != 2 && (opcode & 3) != 2 &&
+        (unsigned)(opcode & 3) != type) {
+        /* FCVT to or from half precision: Hd (the low 16 bits, the rest of the register zero), Sd or Dd */
+        unsigned dst = opcode & 3;
+        uint64_t a = c->v[rn][0];
+        if (type == 3) { /* from half */
+            uint64_t r = half_to_bits((uint32_t)(a & 0xFFFF), dst == 1);
+            if (dst == 1)
+                put_fd(c, rd, r);
+            else
+                put_fs(c, rd, (uint32_t)r);
+        } else { /* to half, from a single (type 0) or a double (type 1) */
+            uint64_t d;
+            if (type == 0)
+                d = isnan_b(a, 0) ? ((((a >> 31) & 1) << 63) | (0x7FFull << 52) | ((a & 0x7FFFFFu) << 29))
+                                  : d_bits((double)as_f((uint32_t)a));
+            else
+                d = a;
+            c->v[rd][0] = d_to_half(d);
+            c->v[rd][1] = 0;
+        }
+        return 0;
+    }
+    if (type > 1)
         return -1;
     int dbl = type == 1;
     uint64_t a = c->v[rn][0];
@@ -705,7 +828,7 @@ static void narrow_right(cpu_t *c, unsigned q, unsigned rd, const uint8_t *n, un
     }
 }
 
-/* ---------- shift by immediate: SSHR, USHR, SHL, SHRN, SHRN2 ---------- */
+/* ---------- shift by immediate: SSHR, USHR, SSRA, USRA, the rounding forms, SRI, SHL, SLI, the narrows, SSHLL, USHLL ---------- */
 
 static int shift_imm(cpu_t *c, uint32_t insn)
 {
@@ -728,12 +851,15 @@ static int shift_imm(cpu_t *c, uint32_t insn)
         wr_v(c, rd, r, dsz);
         return 0;
     }
-    case 0x0A: { /* SHL (u=0) */
-        if (u)
-            return -1; /* SLI is not in M1 */
+    case 0x0A: { /* SHL (u=0); SLI (u=1): shift left and insert, the destination's low sh bits kept */
         unsigned sh = immhb - esz * 8;
-        for (unsigned i = 0; i < lanes; i++)
-            putel(r, esz, i, (getel(n, esz, i) << sh) & emask(esz));
+        uint8_t acc[16];
+        rd_v(c, rd, acc);
+        uint64_t m = (emask(esz) << sh) & emask(esz);
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t x = (getel(n, esz, i) << sh) & emask(esz);
+            putel(r, esz, i, u ? ((getel(acc, esz, i) & ~m & emask(esz)) | x) : x);
+        }
         wr_v(c, rd, r, dsz);
         return 0;
     }
@@ -975,6 +1101,23 @@ static int fp_three_same(cpu_t *c, uint32_t insn)
     return fp_three_same_impl(c, insn, 0);
 }
 
+/* SQDMULH and SQRDMULH of one element (esz 2 or 4): (2 * a * b [+ rounding]) >> (8 * esz), saturated (only the
+ * product of two minimum values overflows). */
+static uint64_t sqdmulh_el(uint64_t a, uint64_t b, unsigned esz, int round, int *sat)
+{
+    unsigned bits = 8 * esz;
+    int64_t x = sext_el(a, esz), y = sext_el(b, esz);
+    /* 2 * min * min is 2^63 for 32-bit elements: the product is formed in 128 bits */
+    __int128 p = (__int128)2 * x * y + (round ? (__int128)1 << (bits - 1) : 0);
+    int64_t v = (int64_t)(p >> bits) == (p >> bits) ? (int64_t)(p >> bits) : INT64_MAX;
+    int64_t hi = ((int64_t)1 << (bits - 1)) - 1;
+    if (v > hi) {
+        v = hi;
+        *sat = 1;
+    }
+    return (uint64_t)v & emask(esz);
+}
+
 static int three_same(cpu_t *c, uint32_t insn)
 {
     if (((insn >> 11) & 0x1F) >= 0x18) /* vector floating point */
@@ -1046,6 +1189,52 @@ static int three_same(cpu_t *c, uint32_t insn)
             return -1;
         for (unsigned i = 0; i < lanes; i++)
             putel(r, esz, i, (getel(n, esz, i) * getel(m, esz, i)) & emask(esz));
+        break;
+    case 0x16: /* SQDMULH (u=0), SQRDMULH (u=1): the high half of the doubled product, saturated */
+        if (size != 1 && size != 2)
+            return -1;
+        for (unsigned i = 0; i < lanes; i++) {
+            int sat = 0;
+            putel(r, esz, i, sqdmulh_el(getel(n, esz, i), getel(m, esz, i), esz, (int)u, &sat));
+            if (sat)
+                c->fpsr |= 1u << 27;
+        }
+        break;
+    case 0x01: /* SQADD (u=0), UQADD (u=1): saturating add */
+    case 0x05: /* SQSUB (u=0), UQSUB (u=1): saturating subtract */
+        if (size == 3 && !q)
+            return -1; /* the 64-bit element needs the 128-bit form */
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t a = getel(n, esz, i), b = getel(m, esz, i), res;
+            int sat = 0;
+            if (u) {
+                if (opc == 0x01) {
+                    res = (a + b) & emask(esz);
+                    sat = res < a; /* carry out of the element */
+                    if (sat)
+                        res = emask(esz);
+                } else {
+                    sat = b > a;
+                    res = sat ? 0 : a - b;
+                }
+            } else {
+                int64_t x = sext_el(a, esz), y = sext_el(b, esz);
+                int64_t hi = (int64_t)(emask(esz) >> 1), lo = -hi - 1, v;
+                if (esz == 8) {
+                    sat = opc == 0x01 ? __builtin_add_overflow(x, y, &v) : __builtin_sub_overflow(x, y, &v);
+                    if (sat)
+                        v = (opc == 0x01 ? y > 0 : y < 0) ? hi : lo;
+                } else {
+                    v = opc == 0x01 ? x + y : x - y;
+                    if (v > hi) { v = hi; sat = 1; }
+                    if (v < lo) { v = lo; sat = 1; }
+                }
+                res = (uint64_t)v & emask(esz);
+            }
+            if (sat)
+                c->fpsr |= 1u << 27; /* QC, the cumulative saturation bit */
+            putel(r, esz, i, res);
+        }
         break;
     case 0x00: /* SHADD (u=0), UHADD (u=1): halving add, rounding down */
     case 0x02: /* SRHADD (u=0), URHADD (u=1): halving add, rounding up */
@@ -1302,6 +1491,8 @@ static int fp_two_misc(cpu_t *c, uint32_t insn)
                 out = u ? xb ^ (1ull << 63) : xb & ~(1ull << 63);
             else
                 out = u ? (xb ^ 0x80000000u) : (xb & 0x7FFFFFFFu);
+        } else if (opc == 0x1D && a && !u) { /* FRECPE: the architecture's 8-bit estimate */
+            out = recip_estimate(xb, (int)sz);
         } else if (opc == 0x1F && u && a) { /* FSQRT */
             out = sz ? d_bits(sqrt(x)) : f_bits(sqrtf(as_f((uint32_t)xb)));
         } else if (opc == 0x1D && !a) { /* SCVTF (U=0), UCVTF (U=1) from an integer lane */
@@ -1345,17 +1536,43 @@ static int fp_two_misc(cpu_t *c, uint32_t insn)
 }
 
 /* FCVTN, FCVTN2 (opcode 10110, U=0, sz=1: two doubles to two singles; the 2 form fills the high half) and FCVTL,
- * FCVTL2 (opcode 10111, sz=1: two singles to two doubles, from the low half or, for the 2 form, the high half). Half
- * precision (sz=0) is not implemented. Rounding is the host's to-nearest, as for the scalar conversions. */
+ * FCVTL2 (opcode 10111, sz=1: two singles to two doubles, from the low half or, for the 2 form, the high half), and
+ * the half-precision forms (sz=0: four halves and four singles). Rounding is to nearest even. */
 static int fp_cvt_long(cpu_t *c, uint32_t insn)
 {
     unsigned q = (insn >> 30) & 1, sz = (insn >> 22) & 1, opc = (insn >> 12) & 0x1F;
     unsigned rn = (insn >> 5) & 31, rd = insn & 31;
-    if (!sz || !fp_default(c))
+    if (!fp_default(c))
         return -1;
     uint8_t n[16], r[16], d[16];
     rd_v(c, rn, n);
     memset(r, 0, sizeof r);
+    if (!sz) { /* half precision (B17): FCVTL widens four halves to singles, FCVTN narrows four singles to halves */
+        if (opc == 0x17) {
+            unsigned off = q ? 8 : 0;
+            for (unsigned i = 0; i < 4; i++)
+                el_wr(r, 4 * i, 4, half_to_bits((uint32_t)el_rd(n, off + 2 * i, 2), 0));
+            wr_v(c, rd, r, 16);
+            return 0;
+        }
+        uint8_t h[8];
+        for (unsigned i = 0; i < 4; i++) {
+            uint32_t fb = (uint32_t)el_rd(n, 4 * i, 4);
+            uint64_t dbits = isnan_b(fb, 0) ? ((((uint64_t)fb >> 31) << 63) | (0x7FFull << 52) | ((uint64_t)(fb & 0x7FFFFFu) << 29))
+                                            : d_bits((double)as_f(fb));
+            el_wr(h, 2 * i, 2, d_to_half(dbits));
+        }
+        if (q) {
+            rd_v(c, rd, d);
+            memcpy(r, d, 8);
+            memcpy(r + 8, h, 8);
+            wr_v(c, rd, r, 16);
+        } else {
+            memcpy(r, h, 8);
+            wr_v(c, rd, r, 8);
+        }
+        return 0;
+    }
     if (opc == 0x17) { /* FCVTL: the singles of the low (or high, q) half become doubles */
         unsigned off = q ? 8 : 0;
         for (unsigned i = 0; i < 2; i++) {
@@ -1612,15 +1829,15 @@ static int across_lanes(cpu_t *c, uint32_t insn)
         putel(r, rsz, 0, sum & emask(rsz));
         break;
     }
-    case 0x0A: /* UMAXV (u=1) */
-    case 0x1A: /* UMINV (u=1) */
+    case 0x0A: /* SMAXV (u=0), UMAXV (u=1) */
+    case 0x1A: /* SMINV (u=0), UMINV (u=1) */
     {
-        if (!u)
-            return -1;
         uint64_t best = getel(n, esz, 0);
         for (unsigned i = 1; i < lanes; i++) {
             uint64_t x = getel(n, esz, i);
-            if (opc == 0x0A ? x > best : x < best)
+            int more = u ? x > best : sext_el(x, esz) > sext_el(best, esz);
+            int less = u ? x < best : sext_el(x, esz) < sext_el(best, esz);
+            if (opc == 0x0A ? more : less)
                 best = x;
         }
         putel(r, esz, 0, best);
@@ -1896,74 +2113,78 @@ int simd_ldst_multi(cpu_t *c, uint32_t insn)
     return 0;
 }
 
-/* ---------- LD1/ST1 single structure and LD1R (replicate) ---------- */
+/* ---------- LD1-LD4/ST1-ST4 single structure and LD1R-LD4R (replicate) ----------
+ * opcode<2:1> is the element class (00 B, 01 H, 10 S or D, 11 replicate), and opcode<0>:R + 1 is the number of
+ * registers (selem). Lane forms move element `index` of Vt, Vt+1, ... (registers wrap at 31) to or from consecutive
+ * elements in memory; the other lanes of the registers are kept. Replicate forms load selem consecutive elements and
+ * fill all lanes of Vt+i with element i (Q 0 clears the high half). The post-index immediate is selem times the
+ * element size. */
 
 int simd_ldst_single(cpu_t *c, uint32_t insn)
 {
     unsigned q = (insn >> 30) & 1, post = (insn >> 23) & 1, L = (insn >> 22) & 1, R = (insn >> 21) & 1;
     unsigned rm = (insn >> 16) & 31, opc = (insn >> 13) & 7, S = (insn >> 12) & 1, size = (insn >> 10) & 3;
     unsigned rn = (insn >> 5) & 31, rt = insn & 31;
-    unsigned esz, index;
+    unsigned selem = (((opc & 1) << 1) | R) + 1, scale = opc >> 1;
+    unsigned esz, index = 0;
+    int replicate = 0;
     if (!post && rm)
         return -1; /* without post-index, Rm is not encoded */
-    if (!R && opc != 6) { /* one register, one lane */
-        if (opc == 0) {
-            esz = 1;
-            index = (q << 3) | (S << 2) | size;
-        } else if (opc == 2) {
-            if (size & 1)
-                return -1;
-            esz = 2;
-            index = (q << 2) | (S << 1) | (size >> 1);
-        } else if (opc == 4) {
-            if (size == 0) {
-                esz = 4;
-                index = (q << 1) | S;
-            } else if (size == 1 && !S) {
-                esz = 8;
-                index = q;
-            } else {
-                return -1;
-            }
+    switch (scale) {
+    case 0:
+        esz = 1;
+        index = (q << 3) | (S << 2) | size;
+        break;
+    case 1:
+        if (size & 1)
+            return -1;
+        esz = 2;
+        index = (q << 2) | (S << 1) | (size >> 1);
+        break;
+    case 2:
+        if (size & 2)
+            return -1;
+        if (size == 0) {
+            esz = 4;
+            index = (q << 1) | S;
         } else {
-            return -1; /* LD2 to LD4 lanes are not in M1 */
+            if (S)
+                return -1;
+            esz = 8;
+            index = q;
         }
-        uint64_t base = rn == 31 ? c->sp : c->x[rn];
-        uint8_t reg[16];
-        memcpy(reg, c->v[rt], 16);
-        if (L) { /* only the addressed lane changes */
-            for (unsigned i = 0; i < esz; i++)
-                reg[(size_t)index * esz + i] = mem_read8(base + i);
-            memcpy(c->v[rt], reg, 16);
-        } else {
-            for (unsigned i = 0; i < esz; i++)
-                mem_write8(base + i, reg[(size_t)index * esz + i]);
-        }
-        if (post) {
-            uint64_t inc = rm == 31 ? esz : c->x[rm];
-            if (rn == 31)
-                c->sp = base + inc;
-            else
-                c->x[rn] = base + inc;
-        }
-        return 0;
+        break;
+    default:
+        if (!L || S)
+            return -1; /* replicate: loads only, S must be zero */
+        esz = 1u << size;
+        replicate = 1;
+        break;
     }
-    /* LD1R (R clear, opcode 110): load one element and replicate it. R set with
-     * opcode 110 is LD2R and up, which are not in M1. */
-    if (!L || R || opc != 6)
-        return -1;
-    esz = 1u << size;
-    unsigned dsz = q ? 16 : 8;
     uint64_t base = rn == 31 ? c->sp : c->x[rn];
-    uint64_t val = 0;
-    for (unsigned i = 0; i < esz; i++)
-        val |= (uint64_t)mem_read8(base + i) << (8 * i);
-    uint8_t r[16];
-    for (unsigned i = 0; i < dsz / esz; i++)
-        memcpy(r + (size_t)i * esz, &val, esz);
-    wr_v(c, rt, r, dsz);
+    if (replicate) {
+        unsigned dsz = q ? 16 : 8;
+        uint64_t vals[4];
+        for (unsigned t = 0; t < selem; t++) /* all loads first: a fault leaves the registers as they were */
+            vals[t] = mem_rd_el(base + (uint64_t)t * esz, esz);
+        for (unsigned t = 0; t < selem; t++) {
+            uint8_t r[16];
+            for (unsigned i = 0; i < dsz / esz; i++)
+                memcpy(r + (size_t)i * esz, &vals[t], esz);
+            wr_v(c, (rt + t) & 31, r, dsz);
+        }
+    } else if (L) {
+        uint64_t vals[4];
+        for (unsigned t = 0; t < selem; t++)
+            vals[t] = mem_rd_el(base + (uint64_t)t * esz, esz);
+        for (unsigned t = 0; t < selem; t++) /* only the addressed lane changes */
+            putel((uint8_t *)c->v[(rt + t) & 31], esz, index, vals[t]);
+    } else {
+        for (unsigned t = 0; t < selem; t++)
+            mem_wr_el(base + (uint64_t)t * esz, esz, getel((const uint8_t *)c->v[(rt + t) & 31], esz, index));
+    }
     if (post) {
-        uint64_t inc = rm == 31 ? esz : c->x[rm];
+        uint64_t inc = rm == 31 ? (uint64_t)selem * esz : c->x[rm];
         if (rn == 31)
             c->sp = base + inc;
         else
@@ -2205,7 +2426,9 @@ static int by_element(cpu_t *c, uint32_t insn)
         return 0;
     }
     /* Integer forms: 16-bit lanes (size 1) or 32-bit lanes (size 2). */
-    if (!((u == 0 && opc == 8) || (u == 1 && (opc == 0 || opc == 4))) || (size != 1 && size != 2))
+    int longf = opc == 2 || opc == 6 || opc == 10; /* SMLAL, UMLAL; SMLSL, UMLSL; SMULL, UMULL (and their 2 forms) */
+    int dmulh = !u && (opc == 12 || opc == 13);     /* SQDMULH, SQRDMULH */
+    if (!((u == 0 && opc == 8) || (u == 1 && (opc == 0 || opc == 4)) || longf || dmulh) || (size != 1 && size != 2))
         return -1;
     unsigned esz = size == 1 ? 2 : 4, lanes = dsz / esz;
     unsigned idx = esz == 2 ? (h << 2) | (l << 1) | m : (h << 1) | l;
@@ -2213,6 +2436,27 @@ static int by_element(cpu_t *c, uint32_t insn)
     rd_v(c, rm, mv);
     uint64_t mask = esz == 2 ? 0xFFFFull : 0xFFFFFFFFull;
     uint64_t e = el_rd(mv, idx * esz, esz);
+    if (longf) { /* the low (or, Q 1, the high) half of Vn widened; the products are twice as wide, in all of Vd */
+        unsigned wsz = 2 * esz, half = 8 / esz, off = q ? 8 : 0;
+        for (unsigned i = 0; i < half; i++) {
+            uint64_t x = el_rd(n, off + i * esz, esz), acc = el_rd(d, i * wsz, wsz);
+            uint64_t prod = u ? x * e : (uint64_t)(sext_el(x, esz) * sext_el(e, esz));
+            uint64_t res = opc == 10 ? prod : opc == 2 ? acc + prod : acc - prod;
+            el_wr(r, i * wsz, wsz, res & emask(wsz));
+        }
+        wr_v(c, rd, r, 16);
+        return 0;
+    }
+    if (dmulh) {
+        for (unsigned i = 0; i < lanes; i++) {
+            int sat = 0;
+            el_wr(r, i * esz, esz, sqdmulh_el(el_rd(n, i * esz, esz), e, esz, opc == 13, &sat));
+            if (sat)
+                c->fpsr |= 1u << 27;
+        }
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
     for (unsigned i = 0; i < lanes; i++) {
         uint64_t x = el_rd(n, i * esz, esz), acc = el_rd(d, i * esz, esz), res;
         if (opc == 8)
@@ -2228,12 +2472,14 @@ static int by_element(cpu_t *c, uint32_t insn)
 }
 
 /* Scalar shift by immediate (01 U 111110 immh immb opcode 1 Rn Rd): the 64-bit element, which is the
- * vector form with Q=0 (the upper half of the register is zeroed). Only SSHR and USHR (opcode 00000),
- * and SHL (opcode 01010, U=0) are allocated here; immh must select the 64-bit element (1xxx). */
+ * vector form with Q=0 (the upper half of the register is zeroed). The forms done here: SSHR and USHR (opcode
+ * 00000), SSRA and USRA (00010), SRSHR and URSHR (00100), SRSRA and URSRA (00110), SRI (01000, U=1), SHL (01010,
+ * U=0) and SLI (01010, U=1); immh must select the 64-bit element (1xxx), as the architecture requires for them. */
 static int scalar_shift_imm(cpu_t *c, uint32_t insn)
 {
     unsigned immh = (insn >> 19) & 0xF, opc = (insn >> 11) & 0x1F, u = (insn >> 29) & 1;
-    if (!((insn >> 10) & 1) || !(immh & 8) || !(opc == 0x00 || (opc == 0x0A && !u)))
+    int ok = opc == 0x00 || opc == 0x02 || opc == 0x04 || opc == 0x06 || (opc == 0x08 && u) || opc == 0x0A;
+    if (!((insn >> 10) & 1) || !(immh & 8) || !ok)
         return -1;
     return shift_imm(c, insn & ~(1u << 30));
 }

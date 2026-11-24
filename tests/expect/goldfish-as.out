@@ -3,15 +3,23 @@ subdevice metadata 5
 allocate 0
 block size 8192
 block offset 0
-block phys 0
+block phys nonzero 1
 allocate id ping 0
 allocate id result 0
 mmap ok 1
 second view reads 90
 second view reads last byte 165
+second open allocate 0
+second block after the first 1
+same base 1
+second open sees the first block 90
 unallocate id ping 0
 unallocate id result 0
 deallocate 0
+allocate again 0
+same offset 1
+new block reads zero 0
+deallocate again 0
 unknown ioctl -25
 queue work 0
 fence is an fd 1

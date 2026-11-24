@@ -47,8 +47,10 @@ export const BOOT = {
   // browser boot (engine time, the milestones of the W2 check): ART 3.75 s, forked 39.77 s, phase 100 43.76 s.
   // So stage 1 (to ART) 4 s, stage 2 (to fork, with the preload) 36 s, stage 3 (to phase 100) 4 s. Stage 4 has no
   // measurement: the boot has not gone past phase 100 in any run here (a probe ran 140 s past it), so 90 s is a
-  // guess that keeps the bar well short of the top while the stage has no end. The bar only estimates.
-  stageSeconds: [4, 36, 4, 90],
+  // guess that keeps the bar well short of the top while the stage has no end. Stage 5 ("Starting home", from
+  // sys.boot_completed, B17) is a 30 s guess too; in B17's browser runs stage 4 took 180 to 345 s, so the bar sits near
+  // the end of stage 4 for most of it. The bar only estimates.
+  stageSeconds: [4, 36, 4, 90, 30],
   milestones: [
     { id: 'art', label: 'ART up: zygote runs ZygoteInit',
       re: /AndroidRuntime\(\d+\): >>>>>> START com\.android\.internal\.os\.ZygoteInit/ },
@@ -68,6 +70,10 @@ export const BOOT = {
       re: /SystemServiceManager\(\d+\): Starting phase 100/ },
     { id: 'battery', label: 'BatteryService: health update received',
       re: /BatteryService\(\d+\): health: Waited \d+ms and received the update/ },
+    { id: 'completed', label: 'sys.boot_completed=1',
+      re: /^xiaoji: sys\.boot_completed=1/ },
+    { id: 'home', label: 'launcher started as HOME',
+      re: /ActivityTaskManager\(\d+\): START u0 .*android\.intent\.category\.HOME.*cmp=com\.android\.launcher3\// },
     { id: 'fatal', label: 'system_server FATAL EXCEPTION (the next blocker, B7)',
       re: /FATAL EXCEPTION IN SYSTEM PROCESS/ },
   ],

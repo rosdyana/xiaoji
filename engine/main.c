@@ -92,6 +92,8 @@ static int usage(FILE *out)
           "  --stats      print the instruction count and rate on exit (as XIAOJI_STATS=1)\n"
           "  --logcat     print the guest's log messages (logd) to stderr (as XIAOJI_LOGCAT=1)\n"
           "  --no-lazy-mmap  fill file mappings at mmap time (as XIAOJI_LAZY=0); the default fills on first access\n"
+          "  --debug-faults  report faults, process ends and binder refusals on stderr (as XIAOJI_DEBUG_FAULTS=1)\n"
+          "  --dump-at S[,S]  dump every guest thread (pc, wait, frame chain) to stderr at these seconds (up to 8)\n"
           "  --lazy-window BYTES  the lazy fill window, a power of two from 4096 to 1 MiB (as XIAOJI_LAZY_WINDOW)\n"
           "  --stats-at TEXT  print the instructions and lazy reads at the first log line containing TEXT (as XIAOJI_STATS_AT)\n"
           "  --gl null|webgl  the GL backend for the guest's GLES calls (default null; webgl is the web build's, gl_webgl.c)\n"
@@ -106,6 +108,7 @@ int main(int argc, char **argv)
     const char *props[MAX_PROP];
     int nenv = 0, nprop = 0, trace = 0, stats = 0, logcat = 0, root_given = 0;
     int lazy_mmap = 1;
+    int debug_faults_arg = 0;
     const char *lazy_window_arg = NULL;
     const char *stats_at_arg = NULL;
     const char *init_config = NULL;
@@ -159,6 +162,20 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--no-lazy-mmap")) {
             lazy_mmap = 0;
+            continue;
+        }
+        if (!strcmp(a, "--dump-at")) { /* a dump of every guest thread at this many seconds (sched.c) */
+            if (i + 1 >= argc)
+                return usage(stderr);
+            for (const char *t = argv[++i]; *t;) { /* a comma-separated list of times */
+                char *end;
+                sched_dump_at(strtoull(t, &end, 10));
+                t = *end == ',' ? end + 1 : end + strlen(end);
+            }
+            continue;
+        }
+        if (!strcmp(a, "--debug-faults")) { /* as XIAOJI_DEBUG_FAULTS=1, for the page (?debug=1), which has no environment */
+            debug_faults_arg = 1;
             continue;
         }
         if (!strcmp(a, "--input-script")) { /* the test source of the input devices (evdev.c, docs/input.md) */
@@ -259,7 +276,7 @@ int main(int argc, char **argv)
     if (window_env && window_env[0])
         mem_set_lazy_window((size_t)strtoul(window_env, NULL, 0));
     const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
-    sig_set_debug_faults(faults_env && faults_env[0] == '1');
+    sig_set_debug_faults(debug_faults_arg || (faults_env && faults_env[0] == '1'));
     stats_t0 = host_monotonic_ns();
     stats_at = stats_at_arg ? stats_at_arg : getenv("XIAOJI_STATS_AT");
     if (stats_at && !stats_at[0])

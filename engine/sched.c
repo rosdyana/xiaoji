@@ -492,6 +492,80 @@ static void report_threads(void)
     }
 }
 
+/* A dump of every live thread at a slice boundary: its process, name, wait state and key, pc, x30, the syscall
+ * registers, and the return addresses of its frame-pointer chain, each with its mapping (file and file offset). A debug
+ * aid for hung guest threads (B17). It is asked for by a host SIGUSR1 (native builds, XIAOJI_DEBUG_FAULTS=1), or at a
+ * time (--dump-at SECONDS of host time since the start, every build, the page's ?dumpat=). */
+#include <signal.h>
+static volatile sig_atomic_t dump_req;
+static uint64_t dump_at_ns[8]; /* host times of the dumps asked for; 0: none */
+#ifndef __EMSCRIPTEN__
+static void on_dump_signal(int s)
+{
+    (void)s;
+    dump_req = 1;
+}
+#endif
+
+void sched_dump_at(uint64_t seconds)
+{
+    for (int i = 0; i < 8 && seconds; i++)
+        if (!dump_at_ns[i]) {
+            dump_at_ns[i] = host_monotonic_ns() + seconds * 1000000000ull;
+            break;
+        }
+}
+
+static void dump_addr(const char *what, uint64_t va)
+{
+    uint64_t rs = 0, re = 0, roff = 0;
+    const char *rpath = NULL;
+    if (mem_region_next(va, &rs, &re, &rpath, &roff) && rs <= va && va < re)
+        fprintf(stderr, "xiaoji: dump:     %s 0x%llx %s+0x%llx\n", what, (unsigned long long)va, rpath ? rpath : "(anon)",
+                (unsigned long long)(roff + va - rs));
+    else
+        fprintf(stderr, "xiaoji: dump:     %s 0x%llx (not mapped)\n", what, (unsigned long long)va);
+}
+
+static void dump_threads(void)
+{
+    static const char *st[] = {"runnable", "futex", "sleep", "sigwait", "restart", "vfork", "suspend"};
+    proc_t *was = proc_cur();
+    uint64_t now = host_monotonic_ns();
+    fprintf(stderr, "xiaoji: dump: begin (%d slots)\n", nslots);
+    for (int i = 0; i < nslots; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->cpu.exited)
+            continue;
+        if (t->proc != proc_cur())
+            proc_switch(t->proc);
+        const cpu_t *c = &t->cpu;
+        fprintf(stderr,
+                "xiaoji: dump: pid %d tid %llu (%s) %s key 0x%llx dl %lld ms pc 0x%llx x8 %llu x0 0x%llx x1 0x%llx x2 0x%llx\n",
+                t->proc->pid, (unsigned long long)c->tid, t->comm, st[t->state], (unsigned long long)t->key,
+                t->has_deadline ? (long long)((int64_t)(t->deadline - now) / 1000000) : -1LL, (unsigned long long)c->pc,
+                (unsigned long long)c->x[8], (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+                (unsigned long long)c->x[2]);
+        dump_addr("pc", c->pc);
+        dump_addr("x30", c->x[30]);
+        uint64_t fp = c->x[29];
+        for (int k = 0; k < 24 && fp && (fp & 7) == 0; k++) {
+            uint64_t rs = 0, re = 0, roff = 0;
+            const char *rpath = NULL;
+            if (!mem_region_next(fp, &rs, &re, &rpath, &roff) || rs > fp || fp + 16 > re)
+                break;
+            uint64_t next = mem_read64(fp);
+            dump_addr("lr", mem_read64(fp + 8));
+            if (next <= fp)
+                break;
+            fp = next;
+        }
+    }
+    if (proc_cur() != was)
+        proc_switch(was);
+    fprintf(stderr, "xiaoji: dump: end\n");
+}
+
 static void report_deadlock(void)
 {
     fflush(stdout);
@@ -579,8 +653,21 @@ static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(vo
     cur_slot = 0;
     init_proc = proc_cur();
     init_proc->exited = 0;
+#ifndef __EMSCRIPTEN__
+    if (sig_debug_faults())
+        signal(SIGUSR1, on_dump_signal);
+#endif
 
     while (!init_proc->exited) {
+        for (int i = 0; i < 8; i++)
+            if (dump_at_ns[i] && host_monotonic_ns() >= dump_at_ns[i]) {
+                dump_at_ns[i] = 0;
+                dump_req = 1;
+            }
+        if (dump_req) {
+            dump_req = 0;
+            dump_threads();
+        }
         expire_timers(host_monotonic_ns());
         if (tick) {
             tick();

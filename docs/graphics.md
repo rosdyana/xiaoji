@@ -824,3 +824,42 @@ screen), `build/web-shots/android-frame.png` (the boot screen when the boot fram
 8. **Surface depth and stencil** are not attached (above).
 9. **GLES 1, queries, program binaries, compute and image calls**: the null defaults.
 10. **Native GLES**: not built (the plan's optional step).
+
+## G3: the WebGL2 backend with the product boot: host composition, back buffers, per-context state (status, 2026-11-24)
+
+The details, with the boots and screenshots, are in docs/boot.md, B17. In short:
+
+- **Host composition** (`ANDROID_EMU_host_composition_v1`, `rcCompose`, `rcComposeWithoutPost`). The backend advertises it,
+  as the null backend did, and draws the layers itself: Device layers with a colour buffer and SolidColor layers, in order,
+  with crop, transform (FLIP_H, FLIP_V, ROT_90), blend mode (none, premultiplied, coverage) and plane alpha, into the target
+  colour buffer, which `rcCompose` posts. Without it the composer HAL's fallback crashed on a null client target at the first
+  present (docs/boot.md, B17). This replaces G2's frame path through RenderEngine's client composition for the common
+  case; client composition still works (the composer posts the client target when every layer is Client).
+- **Orientation.** A window surface now has a back buffer (RGBA8 texture, DEPTH24_STENCIL8 renderbuffer); framebuffer 0 is
+  the back buffer, and `rcFlushWindowColorBuffer` copies it into the colour buffer upright (`glBlitFramebuffer` with the rows
+  reversed), as gfxstream's window surfaces do. Every colour buffer therefore holds its top row first, like gralloc memory,
+  and `rcFBPost` posts the read-back as it is (G2 reversed the rows there). This closes G2 gap 8 (no depth or stencil on a
+  surface).
+- **Per-context state** (G2 gap 4): the enables, blend, colour and depth masks, clear values, depth and stencil state, cull
+  and front face, polygon offset, the array and pixel buffer bindings, pixel store, every used texture unit and its sampler,
+  and the read and draw framebuffers are switched with the context. The engine's own GL work unbinds the pixel buffers and
+  forces a re-apply of the guest's state after it.
+- **The skipped calls** (G2 gap 3): the not_api calls with data or out-parameters are decoded exactly in `gl_host.c` and
+  implemented here (buffer mapping through `getBufferSubData` and `bufferSubData`, instanced and range draws, integer
+  attribute pointers, pixel-buffer uploads and read-backs). Sync objects stay signalled when made: every call runs to
+  completion before the next, so a fence is signalled by the time anyone waits on it.
+- **DMA colour buffer updates** (`rcUpdateColorBufferDMA`, `rcReadColorBufferDMA`): the pixels are read from (or written to)
+  the address-space window by guest-physical address (`goldfish.c`); RGB565, RGB888 and BGRA8 are converted to RGBA8.
+- **Strings**: `GL_SHADING_LANGUAGE_VERSION` and the EGL vendor, version and client APIs, as the null backend answers them.
+- **More GLES 3 entries**: copies, precision formats, `glClearBuffer*`, instancing, draw and read buffers, blits, texture
+  layers, multisample renderbuffers, `glTexParameter*v`; invalidation is accepted as a hint.
+
+Self tests (`tests/web.mjs` with `XIAOJI_WEB_FRAMES=1`): the composition and orientation test (`xj_gl_selftest_compose`) and
+the per-context state test (`xj_gl_selftest_state`), next to G2's synthetic frame, which now flushes its surface before the
+read-back and post.
+
+Known gaps after G3: GL-drawn layers appear black in the product boot, through RenderEngine's client composition and
+possibly through host composition too; the cause is not found (docs/boot.md, B17 blocker 1); QC and the FP exception flags are not kept by the engine (not a GL matter); stream slots are still never
+released; share groups are still not mapped; `GL_OES_EGL_image_external_essl3` is still advertised without WebGL2
+support (external textures are read as 2D); renderbuffer aliases are still attachments only; GLES 1, queries, program
+binaries, compute and image calls still get the null answers.

@@ -255,6 +255,8 @@ async function runGlSelfTest(chromium, baseUrl) {
             got.alias = m.alias;
             got.quad = m.quad;
             got.life = m.life;
+            got.ctxState = m.state;
+            got.compose = m.compose;
             finish();
           } else if (m.type === 'error') {
             clearTimeout(timer);
@@ -289,6 +291,8 @@ async function runGlSelfTest(chromium, baseUrl) {
     check(near(unpack(got.quad), [0, 255, 0]), `selftest: the quad's pixel read back from the surface through the wire path (${unpack(got.quad)})`);
     check(near(unpack(got.alias), [230, 230, 26]), `selftest: a texture bound by name and attached to a guest FBO through rcBindTexture draws into the color buffer (${unpack(got.alias)})`);
     check(got.life === 1, 'selftest: color buffer references: open and close count, and the last close deletes');
+    check(got.compose === 0x3f, `selftest: host composition (rcCompose) draws a CPU-written buffer top row first, a solid color blended over it, a flushed GL window surface reads top row first, and the GLSL version and EGL vendor are advertised (${got.compose})`);
+    check(got.ctxState === 0xff, `selftest: each context's enables, blend func, unpack alignment and array buffer are switched with it (${got.ctxState})`);
     check(stopOnTop, 'selftest: Stop is still the element at its centre, over the Android canvas');
     check(pageErrors.length === 0, `selftest: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
     await page.locator('#phone').screenshot({ path: join(SHOTS, 'glselftest.png') });

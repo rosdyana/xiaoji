@@ -83,6 +83,15 @@ export function displayPoint(rect, clientX, clientY, w = DISPLAY_W, h = DISPLAY_
   return { x, y };
 }
 
+// The box the display occupies inside an element that letterboxes it (object-fit: contain, as the frame canvas does):
+// the largest w:h box centred in rect. With fit 'fill' (or anything else) the whole rect is the display.
+export function contentRect(rect, fit = 'fill', w = DISPLAY_W, h = DISPLAY_H) {
+  if (fit !== 'contain' || rect.width <= 0 || rect.height <= 0) return rect;
+  const s = Math.min(rect.width / w, rect.height / h);
+  const cw = w * s, ch = h * s;
+  return { left: rect.left + (rect.width - cw) / 2, top: rect.top + (rect.height - ch) / 2, width: cw, height: ch };
+}
+
 // The touchscreen's protocol B (the kernel's multitouch.rst): a contact has a slot, a change is sent for its slot, and
 // each frame ends with SYN_REPORT. push(dev, type, code, value) writes one event. A pointer (its pointerId) takes a free
 // slot while it is down, and BTN_TOUCH is down while any contact is. Points are display pixels (displayPoint).
@@ -150,17 +159,19 @@ export function attachInput({ ring, screen, back, home }) {
     push(DEV_KEYBOARD, EV_KEY, code, 0);
     push(DEV_KEYBOARD, EV_SYN, SYN_REPORT, 0);
   };
+  // The display's box on the page: the frame canvas letterboxes the 540 x 960 picture (object-fit: contain).
+  const box = () => contentRect(screen.getBoundingClientRect(), getComputedStyle(screen).objectFit);
   const onDown = (e) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return; // a mouse press is its left button
     e.preventDefault();
     screen.focus({ preventScroll: true });
     screen.setPointerCapture(e.pointerId);
-    const p = displayPoint(screen.getBoundingClientRect(), e.clientX, e.clientY);
+    const p = displayPoint(box(), e.clientX, e.clientY);
     touch.down(e.pointerId, p.x, p.y, e.pressure);
   };
   const onMove = (e) => {
     if (!touch.count) return;
-    const p = displayPoint(screen.getBoundingClientRect(), e.clientX, e.clientY);
+    const p = displayPoint(box(), e.clientX, e.clientY);
     touch.move(e.pointerId, p.x, p.y, e.pressure);
   };
   const onUp = (e) => {

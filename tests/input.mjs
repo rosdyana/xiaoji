@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  createRing, createTouch, displayPoint, keyCode, ringPush, RING_CAP, DISPLAY_W, DISPLAY_H,
+  contentRect, createRing, createTouch, displayPoint, keyCode, ringPush, RING_CAP, DISPLAY_W, DISPLAY_H,
 } from '../web/input.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -35,6 +35,14 @@ const rect = { left: 10, top: 20, width: 360, height: 640 };
 check('displayPoint centre', displayPoint(rect, 190, 340), { x: DISPLAY_W / 2, y: DISPLAY_H / 2 });
 check('displayPoint clamped', displayPoint(rect, 1000, -50), { x: DISPLAY_W - 1, y: 0 });
 check('displayPoint corner', displayPoint(rect, 370, 660), { x: DISPLAY_W - 1, y: DISPLAY_H - 1 });
+// The frame canvas letterboxes the display (object-fit: contain): a 9:19 phone holds a 9:16 picture centred.
+const tall = { left: 10, top: 20, width: 324, height: 684 };
+const fit = contentRect(tall, 'contain');
+check('contentRect contain keeps the display aspect', Math.round(fit.width / fit.height * 1000), Math.round(DISPLAY_W / DISPLAY_H * 1000));
+check('contentRect contain is centred', { x: Math.round(fit.left), y: Math.round(fit.top) }, { x: 10, y: Math.round(20 + (684 - 324 * DISPLAY_H / DISPLAY_W) / 2) });
+check('contentRect fill is the rect', contentRect(tall, 'fill'), tall);
+check('displayPoint through contentRect: the picture top is display row 0',
+  displayPoint(fit, 10 + 162, fit.top + 0.1), { x: DISPLAY_W / 2, y: 0 });
 check('displayPoint zero rect', displayPoint({ left: 0, top: 0, width: 0, height: 0 }, 5, 5), { x: 0, y: 0 });
 // The display's size is the engine's (engine/display.h); the page keeps its own copy, which must match.
 const displayH = readFileSync(join(root, 'engine/display.h'), 'utf8');

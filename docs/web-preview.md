@@ -1,7 +1,9 @@
 # Web preview: Boot Android in the browser (W1)
 
 The page runs the same engine as the native product boot, in a Web Worker, and shows what the boot prints.
-It is a preview: there is no screen yet, nothing leaves localhost, and a reload loses the guest's state.
+With the WebGL2 backend (the default) it also shows the frames SurfaceFlinger composes, and taps and keys on the phone
+go to Android (docs/graphics.md, G2 and G3; docs/input.md; docs/boot.md, B17). Nothing leaves localhost, and a reload
+loses the guest's state.
 
 ## Run it
 
@@ -35,6 +37,9 @@ progress bar, a detail line and a five-step strip. The ART cases are still on th
   class count from the preload's end), 3 "Starting system server" until phase 100, 4 "Starting services" from phase
   100 on. Stage 5 "Starting home" is reserved and stays pending: the boot does not reach it yet. Stage 4 has no end
   in the log, so its bar only estimates (its expected time is a guess, 90 s).
+- **Frames** (B17): once the first frame arrives, the Android picture covers the phone and the boot screen's logo and
+  progress are hidden; Stop and Show log stay above it. The fifth stage, "Starting home", starts at
+  `sys.boot_completed=1` (the milestone `completed`); the milestone `home` is the launcher started as HOME.
 - **Restart**: the log line `xiaoji: init: zygote exited` (init, when the framework's process exits) shows
   "Android stopped · Restarting…", and the screen keeps that state. In a browser boot without a fatal exception this
   line appeared after system_server was killed (signal 9), and init restarted the zygote.
@@ -144,15 +149,25 @@ worker was still running). Then it presses **Stop**, reloads the page (a warm vi
     it: `Module` has no `ENV` option in this emscripten, and I did not try an exported-`ENV` route. This is the
     one engine change the browser build needs that the native and Node builds do not have.
 
+## Debugging a browser boot
+
+- `?debug=1`: the engine's `--debug-faults` (as `XIAOJI_DEBUG_FAULTS=1` natively): faults, process ends, binder refusals,
+  the first 64 input events delivered (`xiaoji: evdev:`), and in the WebGL backend each composition whose layer set changed
+  (up to 200).
+- `?dumpat=S[,S]`: a dump of every guest thread (pc, wait, frame-pointer chain, with file offsets) at those seconds
+  (`--dump-at`). Symbolize the offsets with `llvm-symbolizer` against the remote tree's `out/target/product/xiaoji_arm64/symbols/`.
+- `?gl=null`: the null backend (no frames).
+
 ## Known limits
 
-- **No screen.** Graphics use the null backend (`engine/gl_null.c`).
+- **The screen** is the WebGL2 backend's composition (docs/graphics.md, G3); see docs/boot.md, B17 for what it shows.
 - **Everything is fetched over localhost**, from `build/rootfs-xiaoji` through `web/serve.mjs`. The default page
   now loads the tree from a chunk store and boot packs, with a per-chunk cache (`docs/loading.md`); `?boot=manifest`
   is the old lazy-file path, which has no caching (`Cache-Control: no-store`).
 - **State is lost on reload.** `/data`, `/cache`, `/metadata` and the rest of the writable state are in MEMFS, and
   the metadata sidecar is not kept. A new run always starts from an empty `/data`.
-- **No input.** The page sends nothing to the guest. It can start and stop a boot.
+- **Input** goes through the ring of docs/input.md. A tap sent before the boot completed was dropped by InputDispatcher
+  (`input dispatch is disabled`, seen once); whether a later tap acts on the screen is not established (docs/boot.md, B17).
 - **The engine runs synchronously** in the worker (docs/graphics.md, open items). The page sees the log lines as
   they are written, because `postMessage` from a busy worker is delivered to the page (the check above verifies
   this), but the page cannot pause or step the engine.

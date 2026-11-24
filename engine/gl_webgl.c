@@ -29,6 +29,7 @@
 
 #include "display.h"
 #include "gles2_opcodes.h"
+#include "signals.h"
 
 /* Constants the GLES 3 header does not give (EXT and OES names). */
 #define XJ_TEXTURE_EXTERNAL_OES 0x8D65
@@ -49,9 +50,13 @@
 static const char wgl_vendor[] = "xiaoji";
 static const char wgl_renderer[] = "xiaoji WebGL2";
 static const char wgl_version[] = "OpenGL ES 3.0 xiaoji-webgl2";
+/* GL_SHADING_LANGUAGE_VERSION (0x8B8C): Skia parses the GLSL version from it, and HWUI's GrDirectContext is not made
+ * without it ("Assertion failed: !grContext.get()" in RenderThread, B17; gl_null.c has had it since B16). */
+static const char wgl_shading_version[] = "OpenGL ES GLSL ES 3.00 xiaoji-webgl2";
 static const char wgl_extensions[] =
     "GL_OES_EGL_image_external_essl3 "
-    "ANDROID_EMU_gles_max_version_3_0 ANDROID_EMU_native_sync_v2 ANDROID_EMU_gles_no_host_error";
+    "ANDROID_EMU_gles_max_version_3_0 ANDROID_EMU_native_sync_v2 ANDROID_EMU_gles_no_host_error "
+    "ANDROID_EMU_host_composition_v1";
 static const char wgl_egl_extensions[] = "EGL_ANDROID_native_fence_sync";
 
 typedef struct gctx {
@@ -59,12 +64,33 @@ typedef struct gctx {
     int used;
     uint32_t share;
     uint32_t draw, read; /* window surface handles, 0: none */
-    GLuint fbo;          /* the guest's framebuffer binding: 0 is the draw surface's color buffer */
+    GLuint fbo;          /* the guest's draw framebuffer binding: 0 is the draw surface's back buffer */
+    GLuint rfbo;         /* the guest's read framebuffer binding: 0 is the read surface's back buffer */
     GLuint program, vao;
     GLuint rbo;          /* the guest's renderbuffer binding */
     GLuint unit;         /* the active texture unit */
     GLuint tex[32];      /* the guest's GL_TEXTURE_2D binding on each unit (a guest name; aliases map it) */
     GLint vp[4], sc[4];  /* viewport and scissor box */
+    /* The rest of the state a GLES context owns that the guest's libraries set and then assume kept (Skia caches it,
+     * RenderEngine sets it per layer), switched with the context (B17; G2 left it shared): */
+    uint32_t en;            /* the enables, one bit each (en_bit) */
+    GLenum beq[2];          /* blend equation, RGB and alpha */
+    GLenum bf[4];           /* blend func: src RGB, dst RGB, src alpha, dst alpha */
+    GLfloat bc[4], cc[4];   /* blend color, clear color */
+    GLboolean cm[4], dmask; /* color mask, depth mask */
+    GLenum dfunc, cull, front;
+    GLfloat cdepth;         /* clear depth */
+    GLint cstencil;         /* clear stencil */
+    GLenum sfunc[2];        /* stencil func, front and back */
+    GLint sref[2];
+    GLuint smask[2], swmask[2];
+    GLenum sop[2][3];       /* stencil op (fail, zfail, zpass), front and back */
+    GLfloat poff[2];        /* polygon offset factor and units */
+    GLuint abuf;            /* GL_ARRAY_BUFFER binding (context state, not VAO state) */
+    GLuint unpack_buf, pack_buf;
+    GLint unpack_align, pack_align, unpack_row, unpack_skip_rows, unpack_skip_px;
+    GLuint sampler[32];     /* sampler bindings per unit */
+    GLuint nunits;          /* units used so far: the ones apply rebinds */
 } gctx_t;
 
 typedef struct surf {
@@ -72,6 +98,12 @@ typedef struct surf {
     int used;
     uint32_t w, h;
     uint32_t cb; /* the color buffer (0 until one is set or needed) */
+    /* The back buffer (B17): the guest's framebuffer 0 draws here, in GL's orientation, with depth and stencil; a flush
+     * (eglSwapBuffers) copies it into the color buffer turned upright (row 0 the top), as gfxstream's window surfaces do.
+     * So every color buffer holds its image top row first, the way gralloc memory does, whoever wrote it (GL, the CPU
+     * through rcUpdateColorBuffer, RenderEngine through an EGLImage). */
+    GLuint btex, bds, bfbo;
+    uint32_t bw, bh;
 } surf_t;
 
 typedef struct cb {
@@ -108,7 +140,6 @@ static img_t imgs[NIMG];
 static alias_t tex_alias[NALIAS], rb_alias[NALIAS];
 static stream_t streams[NSTREAM];
 static gctx_t *dflt; /* the context for a stream with none made current */
-static gctx_t *applied;
 static GLuint scratch_vbo[NATTR], scratch_ebo;
 static uint32_t next_handle = 1;
 static int ready = -1; /* -1: not tried; 0: failed; 1: ready */
@@ -197,19 +228,27 @@ static void delete_from(void (*del)(GLsizei, const GLuint *), int32_t n, const v
 /* ---------- host state, saved and restored around the engine's own GL calls ---------- */
 
 typedef struct hstate {
-    GLint unit, tex2d, fbo, program, vao, abuf, ebuf, rbo;
+    GLint unit, tex2d, fbo, rfbo, program, vao, abuf, ebuf, rbo, unpack_buf, pack_buf;
 } hstate_t;
+
+static gctx_t *applied;
 
 static void save_host(hstate_t *s)
 {
     glGetIntegerv(GL_ACTIVE_TEXTURE, &s->unit);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &s->tex2d);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s->fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &s->fbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s->rfbo);
     glGetIntegerv(GL_CURRENT_PROGRAM, &s->program);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s->vao);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s->abuf);
     glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s->ebuf);
     glGetIntegerv(GL_RENDERBUFFER_BINDING, &s->rbo);
+    /* The engine's uploads and read-backs use client memory: no pixel buffer may be bound for them. */
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &s->unpack_buf);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &s->pack_buf);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
 
 static void restore_host(const hstate_t *s)
@@ -217,11 +256,20 @@ static void restore_host(const hstate_t *s)
     glBindVertexArray((GLuint)s->vao);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)s->ebuf);
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)s->abuf);
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)s->fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)s->fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)s->rfbo);
     glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)s->rbo);
     glUseProgram((GLuint)s->program);
     glActiveTexture((GLenum)s->unit);
     glBindTexture(GL_TEXTURE_2D, (GLuint)s->tex2d);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)s->unpack_buf);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)s->pack_buf);
+    /* The pixel store the engine's own calls set: the applied context's values come back (the GLES defaults if none). */
+    glPixelStorei(GL_UNPACK_ALIGNMENT, applied ? applied->unpack_align : 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, applied ? applied->pack_align : 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, applied ? applied->unpack_row : 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, applied ? applied->unpack_skip_rows : 0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, applied ? applied->unpack_skip_px : 0);
 }
 
 /* ---------- lookups ---------- */
@@ -304,13 +352,66 @@ static cb_t *surf_cb(surf_t *s)
     return cb_find(s->cb);
 }
 
-/* The host framebuffer a guest framebuffer name stands for. 0 is the draw surface's color buffer. */
+/* The surface's back buffer, made (or remade, when the size changes) the size of its color buffer, else of the surface. */
+static GLuint surf_back(surf_t *s)
+{
+    if (!s)
+        return 0;
+    cb_t *cb = s->cb ? cb_find(s->cb) : NULL;
+    uint32_t w = cb ? cb->w : (s->w ? s->w : XJ_DISPLAY_W), h = cb ? cb->h : (s->h ? s->h : XJ_DISPLAY_H);
+    if (s->bfbo && s->bw == w && s->bh == h)
+        return s->bfbo;
+    if (!w || !h || (uint64_t)w * h > (1u << 24))
+        return 0;
+    hstate_t hs;
+    save_host(&hs);
+    if (s->bfbo) {
+        glDeleteFramebuffers(1, &s->bfbo);
+        glDeleteTextures(1, &s->btex);
+        glDeleteRenderbuffers(1, &s->bds);
+    }
+    glGenTextures(1, &s->btex);
+    glBindTexture(GL_TEXTURE_2D, s->btex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenRenderbuffers(1, &s->bds);
+    glBindRenderbuffer(GL_RENDERBUFFER, s->bds);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)w, (GLsizei)h);
+    glGenFramebuffers(1, &s->bfbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, s->bfbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->btex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s->bds);
+    restore_host(&hs);
+    s->bw = w;
+    s->bh = h;
+    return s->bfbo;
+}
+
+static void surf_free_back(surf_t *s)
+{
+    if (!s->bfbo)
+        return;
+    glDeleteFramebuffers(1, &s->bfbo);
+    glDeleteTextures(1, &s->btex);
+    glDeleteRenderbuffers(1, &s->bds);
+    s->bfbo = s->btex = s->bds = 0;
+}
+
+/* The host framebuffer a guest framebuffer name stands for. 0 is the draw surface's back buffer. */
 static GLuint host_fbo(const gctx_t *c, GLuint guest)
 {
     if (guest)
         return guest;
-    cb_t *cb = surf_cb(surf_find(c->draw));
-    return cb ? cb->fbo : 0;
+    return surf_back(surf_find(c->draw));
+}
+
+/* The same for the read binding: 0 is the read surface's back buffer. */
+static GLuint host_rfbo(const gctx_t *c, GLuint guest)
+{
+    if (guest)
+        return guest;
+    return surf_back(surf_find(c->read ? c->read : c->draw));
 }
 
 /* The host texture a guest texture name stands for (through an EGLImage or rcBindTexture alias). */
@@ -356,6 +457,42 @@ static GLenum tgt(uint32_t t)
 
 /* ---------- context switching ---------- */
 
+/* The enables a context keeps (WebGL 2 has these; GL_PRIMITIVE_RESTART_FIXED_INDEX is always on there). */
+static const GLenum en_caps[] = {GL_BLEND, GL_CULL_FACE, GL_DEPTH_TEST, GL_DITHER, GL_POLYGON_OFFSET_FILL,
+                                 GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE, GL_SCISSOR_TEST, GL_STENCIL_TEST,
+                                 GL_RASTERIZER_DISCARD};
+#define NEN ((int)(sizeof en_caps / sizeof en_caps[0]))
+
+static int en_bit(GLenum cap)
+{
+    for (int i = 0; i < NEN; i++)
+        if (en_caps[i] == cap)
+            return i;
+    return -1;
+}
+
+/* The GLES defaults of a new context (the spec's initial state). */
+static void ctx_defaults(gctx_t *c)
+{
+    c->en = 1u << en_bit(GL_DITHER);
+    c->beq[0] = c->beq[1] = GL_FUNC_ADD;
+    c->bf[0] = c->bf[2] = GL_ONE;
+    c->bf[1] = c->bf[3] = GL_ZERO;
+    c->cm[0] = c->cm[1] = c->cm[2] = c->cm[3] = GL_TRUE;
+    c->dmask = GL_TRUE;
+    c->dfunc = GL_LESS;
+    c->cull = GL_BACK;
+    c->front = GL_CCW;
+    c->cdepth = 1.0f;
+    for (int f = 0; f < 2; f++) {
+        c->sfunc[f] = GL_ALWAYS;
+        c->smask[f] = c->swmask[f] = 0xFFFFFFFFu;
+        c->sop[f][0] = c->sop[f][1] = c->sop[f][2] = GL_KEEP;
+    }
+    c->unpack_align = c->pack_align = 4;
+    c->nunits = 1;
+}
+
 static void apply(gctx_t *c)
 {
     if (c == applied)
@@ -363,13 +500,51 @@ static void apply(gctx_t *c)
     applied = c;
     if (!c)
         return;
-    glBindFramebuffer(GL_FRAMEBUFFER, host_fbo(c, c->fbo));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, host_fbo(c, c->fbo));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, host_rfbo(c, c->rfbo));
     glUseProgram(c->program);
     glBindVertexArray(c->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, c->abuf);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, c->unpack_buf);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, c->pack_buf);
+    for (GLuint u = 0; u < c->nunits; u++) {
+        glActiveTexture(GL_TEXTURE0 + u);
+        glBindTexture(GL_TEXTURE_2D, host_tex(c->tex[u]));
+        glBindSampler(u, c->sampler[u]);
+    }
     glActiveTexture(GL_TEXTURE0 + c->unit);
     glBindTexture(GL_TEXTURE_2D, host_tex(c->tex[c->unit]));
     glViewport(c->vp[0], c->vp[1], c->vp[2], c->vp[3]);
     glScissor(c->sc[0], c->sc[1], c->sc[2], c->sc[3]);
+    for (int i = 0; i < NEN; i++) {
+        if (c->en & (1u << i))
+            glEnable(en_caps[i]);
+        else
+            glDisable(en_caps[i]);
+    }
+    glBlendEquationSeparate(c->beq[0], c->beq[1]);
+    glBlendFuncSeparate(c->bf[0], c->bf[1], c->bf[2], c->bf[3]);
+    glBlendColor(c->bc[0], c->bc[1], c->bc[2], c->bc[3]);
+    glClearColor(c->cc[0], c->cc[1], c->cc[2], c->cc[3]);
+    glColorMask(c->cm[0], c->cm[1], c->cm[2], c->cm[3]);
+    glDepthMask(c->dmask);
+    glDepthFunc(c->dfunc);
+    glCullFace(c->cull);
+    glFrontFace(c->front);
+    glClearDepthf(c->cdepth);
+    glClearStencil(c->cstencil);
+    for (int f = 0; f < 2; f++) {
+        GLenum face = f ? GL_BACK : GL_FRONT;
+        glStencilFuncSeparate(face, c->sfunc[f], c->sref[f], c->smask[f]);
+        glStencilMaskSeparate(face, c->swmask[f]);
+        glStencilOpSeparate(face, c->sop[f][0], c->sop[f][1], c->sop[f][2]);
+    }
+    glPolygonOffset(c->poff[0], c->poff[1]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, c->unpack_align);
+    glPixelStorei(GL_PACK_ALIGNMENT, c->pack_align);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, c->unpack_row);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, c->unpack_skip_rows);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, c->unpack_skip_px);
 }
 
 /* The stream's slot: the one for its decoder context, or a new one. NULL when all are taken. */
@@ -490,6 +665,7 @@ static uint32_t rc_CreateContext(void *ctx, uint32_t config, uint32_t share, uin
     c->vp[3] = XJ_DISPLAY_H;
     c->sc[2] = XJ_DISPLAY_W;
     c->sc[3] = XJ_DISPLAY_H;
+    ctx_defaults(c);
     return c->handle;
 }
 
@@ -526,8 +702,11 @@ static void rc_DestroyWindowSurface(void *ctx, uint32_t windowSurface)
 {
     (void)ctx;
     surf_t *s = surf_find(windowSurface);
-    if (s)
+    if (s) {
+        surf_free_back(s);
         s->used = 0;
+        applied = NULL; /* a context drawing to it rebinds on its next call */
+    }
 }
 
 static void rc_SetWindowColorBuffer(void *ctx, uint32_t windowSurface, uint32_t colorBuffer)
@@ -540,10 +719,30 @@ static void rc_SetWindowColorBuffer(void *ctx, uint32_t windowSurface, uint32_t 
         applied = NULL; /* the draw FBO may be another color buffer now: rebind on the next call */
 }
 
+/* eglSwapBuffers: the back buffer goes into the surface's color buffer, turned upright (gfxstream's
+ * WindowSurface::flushColorBuffer). The blit is not clipped by the guest's scissor or masked by its color mask. */
 static int32_t rc_FlushWindowColorBuffer(void *ctx, uint32_t windowSurface)
 {
-    (void)ctx; (void)windowSurface;
-    glFlush();
+    (void)ctx;
+    surf_t *s = surf_find(windowSurface);
+    cb_t *cb = s ? surf_cb(s) : NULL;
+    if (!cb || !s->bfbo || s->bw != cb->w || s->bh != cb->h) {
+        static int skipped;
+        if (sig_debug_faults() && skipped++ < 20)
+            fprintf(stderr, "xiaoji: gl(webgl): flush of surface %u skipped (cb %s, back %ux%u)\n", (unsigned)windowSurface,
+                    cb ? "set" : "none", s ? (unsigned)s->bw : 0, s ? (unsigned)s->bh : 0);
+        return 0;
+    }
+    hstate_t hs;
+    save_host(&hs);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_RASTERIZER_DISCARD);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, s->bfbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, cb->fbo);
+    glBlitFramebuffer(0, 0, (GLint)cb->w, (GLint)cb->h, 0, (GLint)cb->h, (GLint)cb->w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    restore_host(&hs);
+    applied = NULL; /* the enables and the mask come back from the context on its next call */
     return 0;
 }
 
@@ -630,14 +829,57 @@ static void rc_ReadColorBuffer(void *ctx, uint32_t colorbuffer, int32_t x, int32
     restore_host(&hs);
 }
 
+/* The pixels of an update as RGBA8 (the color buffers' format): RGBA8 as it is; RGB565, RGB888 and BGRA8 (the gralloc
+ * formats a CPU-drawn buffer can have, gralloc_30.cpp's glFormat and glType) converted, with alpha 255 for the RGB
+ * forms. Returns the RGBA8 bytes (pixels itself, or *tmp to free), or NULL for a format it does not take or a short
+ * buffer. */
+static const void *as_rgba8(uint32_t format, uint32_t type, const void *pixels, uint32_t pixels_len, int32_t width,
+                            int32_t height, uint8_t **tmp)
+{
+    uint64_t n = (uint64_t)width * (uint64_t)height;
+    *tmp = NULL;
+    if (format == GL_RGBA && type == GL_UNSIGNED_BYTE)
+        return n * 4 <= pixels_len ? pixels : NULL;
+    unsigned bpp = (format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) ? 2
+                   : (format == GL_RGB && type == GL_UNSIGNED_BYTE) ? 3
+                   : (format == 0x80E1 /* GL_BGRA_EXT */ && type == GL_UNSIGNED_BYTE) ? 4 : 0;
+    if (!bpp || n * bpp > pixels_len || !(*tmp = malloc(n * 4 ? n * 4 : 1)))
+        return NULL;
+    const uint8_t *s = pixels;
+    uint8_t *d = *tmp;
+    for (uint64_t i = 0; i < n; i++, s += bpp, d += 4) {
+        if (bpp == 2) {
+            unsigned v = s[0] | (unsigned)s[1] << 8;
+            unsigned r = v >> 11, g = (v >> 5) & 63, b = v & 31;
+            d[0] = (uint8_t)((r << 3) | (r >> 2));
+            d[1] = (uint8_t)((g << 2) | (g >> 4));
+            d[2] = (uint8_t)((b << 3) | (b >> 2));
+            d[3] = 255;
+        } else if (bpp == 3) {
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+            d[3] = 255;
+        } else {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = s[3];
+        }
+    }
+    return *tmp;
+}
+
 static int32_t rc_UpdateColorBuffer(void *ctx, uint32_t colorbuffer, int32_t x, int32_t y, int32_t width, int32_t height,
                                     uint32_t format, uint32_t type, const void *pixels, uint32_t pixels_len)
 {
     (void)ctx;
     cb_t *c = cb_find(colorbuffer);
-    if (!c || format != GL_RGBA || type != GL_UNSIGNED_BYTE || !cb_rect_ok(c, x, y, width, height))
+    if (!c || !cb_rect_ok(c, x, y, width, height))
         return -1;
-    if ((uint64_t)width * 4 * (uint64_t)height > pixels_len)
+    uint8_t *tmp;
+    const void *rgba = as_rgba8(format, type, pixels, pixels_len, width, height, &tmp);
+    if (!rgba)
         return -1;
     hstate_t hs;
     save_host(&hs);
@@ -646,8 +888,9 @@ static int32_t rc_UpdateColorBuffer(void *ctx, uint32_t colorbuffer, int32_t x, 
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
     glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     restore_host(&hs);
+    free(tmp);
     return 0;
 }
 
@@ -702,8 +945,8 @@ static int32_t rc_DestroyClientImage(void *ctx, uint32_t image)
     return 0;
 }
 
-/* The composed frame (rcFBPost): read back, row order flipped to top-first, alpha set to 255, and posted if the page
- * has consumed the last frame. Dropped frames cost nothing (no read). */
+/* The composed frame (rcFBPost): read back (a color buffer holds its top row first, see surf_t), alpha set to 255, and
+ * posted if the page has consumed the last frame. Dropped frames cost nothing (no read). */
 static void rc_FBPost(void *ctx, uint32_t colorBuffer)
 {
     (void)ctx;
@@ -726,15 +969,6 @@ static void rc_FBPost(void *ctx, uint32_t colorBuffer)
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
     restore_host(&hs);
-    size_t row = (size_t)w * 4;
-    for (uint32_t y = 0; y < h / 2; y++) {
-        uint8_t *a = px + y * row, *b = px + (size_t)(h - 1 - y) * row;
-        for (size_t k = 0; k < row; k++) {
-            uint8_t t = a[k];
-            a[k] = b[k];
-            b[k] = t;
-        }
-    }
     for (size_t i = 3; i < (size_t)w * h * 4; i += 4)
         px[i] = 255;
     frames_posted++;
@@ -742,6 +976,227 @@ static void rc_FBPost(void *ctx, uint32_t colorBuffer)
     if (frames_posted <= 3)
         fprintf(stderr, "xiaoji: gl(webgl): frame %u posted (%ux%u)\n", (unsigned)frames_posted, (unsigned)w, (unsigned)h);
     free(px);
+}
+
+/* ---------- host composition (ANDROID_EMU_host_composition_v1) ----------
+ * The composer (hwc2 HostComposer.cpp) sends the layers of a frame as a ComposeDevice (v1: version, targetHandle,
+ * numLayers; v2 adds displayId after the version) followed by ComposeLayer records of 56 bytes: cbHandle, composeMode
+ * (2 Device, 3 SolidColor), displayFrame (int left, top, right, bottom), crop (float left, top, right, bottom), blendMode
+ * (1 none, 2 premultiplied, 3 coverage), alpha (float), color (r, g, b, a bytes) and transform (1 FLIP_H, 2 FLIP_V,
+ * 4 ROT_90). The host draws them in order into the target color buffer, then posts it (rcCompose) or not
+ * (rcComposeWithoutPost). Every color buffer holds its top row first, so display and buffer coordinates map onto
+ * texture coordinates without a flip. */
+#define COMPOSE_LAYER_SIZE 56
+
+static GLuint comp_prog, comp_vao, comp_vbo;
+static GLint comp_u_tex, comp_u_color, comp_u_mode, comp_u_alpha;
+
+static GLuint comp_shader(GLenum type, const char *src)
+{
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok)
+        fprintf(stderr, "xiaoji: gl(webgl): the composition shader does not compile\n");
+    return sh;
+}
+
+static int comp_init(void)
+{
+    if (comp_prog)
+        return 1;
+    static const char vs[] = "#version 300 es\nlayout(location = 0) in vec2 a_pos;\nlayout(location = 1) in vec2 a_uv;\n"
+                             "out vec2 v_uv;\nvoid main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+    static const char fs[] = "#version 300 es\nprecision mediump float;\nin vec2 v_uv;\nuniform sampler2D u_tex;\n"
+                             "uniform vec4 u_color;\nuniform int u_mode;\nuniform float u_alpha;\nout vec4 o;\n"
+                             "void main() {\n"
+                             "  vec4 c = u_mode == 1 ? u_color : texture(u_tex, v_uv);\n"
+                             "  if (u_mode == 2) c.a = 1.0;\n" /* blend none: the layer is opaque */
+                             "  o = u_mode == 3 ? vec4(c.rgb, c.a * u_alpha) : c * u_alpha;\n"
+                             "}\n";
+    GLuint v = comp_shader(GL_VERTEX_SHADER, vs), f = comp_shader(GL_FRAGMENT_SHADER, fs);
+    comp_prog = glCreateProgram();
+    glAttachShader(comp_prog, v);
+    glAttachShader(comp_prog, f);
+    glLinkProgram(comp_prog);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    GLint ok = 0;
+    glGetProgramiv(comp_prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        fprintf(stderr, "xiaoji: gl(webgl): the composition program does not link\n");
+        glDeleteProgram(comp_prog);
+        comp_prog = 0;
+        return 0;
+    }
+    comp_u_tex = glGetUniformLocation(comp_prog, "u_tex");
+    comp_u_color = glGetUniformLocation(comp_prog, "u_color");
+    comp_u_mode = glGetUniformLocation(comp_prog, "u_mode");
+    comp_u_alpha = glGetUniformLocation(comp_prog, "u_alpha");
+    glGenVertexArrays(1, &comp_vao);
+    glGenBuffers(1, &comp_vbo);
+    glBindVertexArray(comp_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, comp_vbo);
+    glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(float), NULL, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)(2 * sizeof(float)));
+    return 1;
+}
+
+static uint32_t rd_u32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static float rd_f32(const uint8_t *p)
+{
+    float v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static int32_t compose(const void *buffer, uint32_t buffer_len, int post)
+{
+    const uint8_t *b = buffer;
+    if (buffer_len < 12)
+        return -1;
+    uint32_t version = rd_u32(b);
+    uint32_t hdr = version == 2 ? 16 : 12;
+    if (buffer_len < hdr)
+        return -1;
+    uint32_t target = rd_u32(b + hdr - 8), n = rd_u32(b + hdr - 4);
+    if ((uint64_t)n * COMPOSE_LAYER_SIZE > buffer_len - hdr)
+        return -1;
+    cb_t *t = cb_find(target);
+    /* --debug-faults (XIAOJI_DEBUG_FAULTS): the first compositions' layers on stderr, to see what SurfaceFlinger sends. */
+    static int logged;
+    static uint64_t last_sig;
+    uint64_t sig = n;
+    for (uint32_t i = 0; i < n; i++) /* the layer set: a composition is logged when it changes */
+        sig = sig * 1000003u + rd_u32(b + hdr + (size_t)i * COMPOSE_LAYER_SIZE) * 31u + rd_u32(b + hdr + (size_t)i * COMPOSE_LAYER_SIZE + 4);
+    int dbg = sig_debug_faults() && logged < 200 && sig != last_sig;
+    if (dbg) {
+        logged++;
+        last_sig = sig;
+        fprintf(stderr, "xiaoji: gl(webgl): compose v%u target %u (%s) %u layers%s\n", (unsigned)version, (unsigned)target,
+                t ? "found" : "missing", (unsigned)n, post ? ", post" : "");
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t *l = b + hdr + (size_t)i * COMPOSE_LAYER_SIZE;
+            cb_t *lc = cb_find(rd_u32(l));
+            fprintf(stderr, "xiaoji: gl(webgl):   layer %u cb %u (%ux%u) mode %u frame %d,%d-%d,%d crop %.0f,%.0f-%.0f,%.0f "
+                            "blend %u alpha %.2f color %02x%02x%02x%02x transform %u\n",
+                    (unsigned)i, (unsigned)rd_u32(l), lc ? (unsigned)lc->w : 0, lc ? (unsigned)lc->h : 0, (unsigned)rd_u32(l + 4),
+                    (int)rd_u32(l + 8), (int)rd_u32(l + 12), (int)rd_u32(l + 16), (int)rd_u32(l + 20), rd_f32(l + 24),
+                    rd_f32(l + 28), rd_f32(l + 32), rd_f32(l + 36), (unsigned)rd_u32(l + 40), rd_f32(l + 44), l[48], l[49],
+                    l[50], l[51], (unsigned)rd_u32(l + 52));
+        }
+    }
+    if (!t || !comp_init())
+        return -1;
+    hstate_t hs;
+    save_host(&hs);
+    glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+    glViewport(0, 0, (GLsizei)t->w, (GLsizei)t->h);
+    for (int i = 0; i < NEN; i++)
+        glDisable(en_caps[i]);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(comp_prog);
+    glBindVertexArray(comp_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, comp_vbo);
+    glActiveTexture(GL_TEXTURE0);
+    glBindSampler(0, 0);
+    glUniform1i(comp_u_tex, 0);
+    glBlendEquation(GL_FUNC_ADD);
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *l = b + hdr + (size_t)i * COMPOSE_LAYER_SIZE;
+        uint32_t cbh = rd_u32(l), mode = rd_u32(l + 4);
+        int32_t dl = (int32_t)rd_u32(l + 8), dt = (int32_t)rd_u32(l + 12), dr = (int32_t)rd_u32(l + 16),
+                db = (int32_t)rd_u32(l + 20);
+        float cl = rd_f32(l + 24), ct = rd_f32(l + 28), cr = rd_f32(l + 32), cbm = rd_f32(l + 36);
+        uint32_t blend = rd_u32(l + 40);
+        float alpha = rd_f32(l + 44);
+        const uint8_t *col = l + 48;
+        uint32_t xf = rd_u32(l + 52);
+        if (dr <= dl || db <= dt)
+            continue;
+        cb_t *src = NULL;
+        if (mode == 2) { /* Device: a buffer */
+            src = cb_find(cbh);
+            if (!src)
+                continue;
+        } else if (mode != 3) { /* only SolidColor otherwise */
+            continue;
+        }
+        /* The destination in normalised device coordinates: display row 0 is texture row 0 of the target. */
+        float x0 = 2.0f * (float)dl / (float)t->w - 1.0f, x1 = 2.0f * (float)dr / (float)t->w - 1.0f;
+        float y0 = 2.0f * (float)dt / (float)t->h - 1.0f, y1 = 2.0f * (float)db / (float)t->h - 1.0f;
+        /* The source corners for the destination's top-left, top-right, bottom-left and bottom-right. */
+        float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+        if (src) {
+            u0 = cl / (float)src->w;
+            u1 = cr / (float)src->w;
+            v0 = ct / (float)src->h;
+            v1 = cbm / (float)src->h;
+        }
+        float uv[4][2] = {{u0, v0}, {u1, v0}, {u0, v1}, {u1, v1}};
+        if (xf & 1) /* FLIP_H */
+            for (int k = 0; k < 4; k++)
+                uv[k][0] = u0 + u1 - uv[k][0];
+        if (xf & 2) /* FLIP_V */
+            for (int k = 0; k < 4; k++)
+                uv[k][1] = v0 + v1 - uv[k][1];
+        if (xf & 4) { /* ROT_90 (clockwise): the destination's top-left shows the source's bottom-left */
+            float r[4][2] = {{uv[2][0], uv[2][1]}, {uv[0][0], uv[0][1]}, {uv[3][0], uv[3][1]}, {uv[1][0], uv[1][1]}};
+            memcpy(uv, r, sizeof uv);
+        }
+        float vtx[16] = {x0, y0, uv[0][0], uv[0][1], x1, y0, uv[1][0], uv[1][1],
+                         x0, y1, uv[2][0], uv[2][1], x1, y1, uv[3][0], uv[3][1]};
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof vtx, vtx);
+        if (src)
+            glBindTexture(GL_TEXTURE_2D, src->tex);
+        glUniform1i(comp_u_mode, src ? (blend == 1 ? 2 : blend == 3 ? 3 : 0) : 1);
+        /* A solid color is not premultiplied: it is premultiplied here, so all modes blend as premultiplied. */
+        float ca = col[3] / 255.0f;
+        glUniform4f(comp_u_color, col[0] / 255.0f * ca, col[1] / 255.0f * ca, col[2] / 255.0f * ca, ca);
+        if (blend == 1 && src) {
+            glDisable(GL_BLEND);
+            glUniform1f(comp_u_alpha, 1.0f);
+        } else {
+            glEnable(GL_BLEND);
+            if (blend == 3) /* coverage: the buffer is not premultiplied */
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            else
+                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            glUniform1f(comp_u_alpha, alpha);
+        }
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    glDisable(GL_BLEND);
+    restore_host(&hs);
+    applied = NULL; /* the guest context's enables, blend, viewport and units come back on its next call */
+    if (post)
+        rc_FBPost(NULL, target);
+    return 0;
+}
+
+static int32_t rc_Compose(void *ctx, uint32_t bufferSize, const void *buffer, uint32_t buffer_len)
+{
+    (void)ctx;
+    return compose(buffer, bufferSize < buffer_len ? bufferSize : buffer_len, 1);
+}
+
+static int32_t rc_ComposeWithoutPost(void *ctx, uint32_t bufferSize, const void *buffer, uint32_t buffer_len)
+{
+    (void)ctx;
+    return compose(buffer, bufferSize < buffer_len ? bufferSize : buffer_len, 0);
 }
 
 /* The renderControl calls that take a color buffer through their *Async variants, as the sync ones. */
@@ -768,6 +1223,7 @@ static int32_t rc_GetGLString(void *ctx, uint32_t name, void *buffer, uint32_t b
     case GL_VENDOR: return put_string(wgl_vendor, buffer, buffer_len, bufferSize);
     case GL_RENDERER: return put_string(wgl_renderer, buffer, buffer_len, bufferSize);
     case GL_VERSION: return put_string(wgl_version, buffer, buffer_len, bufferSize);
+    case GL_SHADING_LANGUAGE_VERSION: return put_string(wgl_shading_version, buffer, buffer_len, bufferSize);
     case GL_EXTENSIONS: return put_string(wgl_extensions, buffer, buffer_len, bufferSize);
     default: return 0;
     }
@@ -777,7 +1233,12 @@ static int32_t rc_QueryEGLString(void *ctx, uint32_t name, void *buffer, uint32_
 {
     (void)ctx;
     switch (name) {
+    /* EGL_VENDOR and EGL_VERSION as gl_null.c answers them. Without a vendor the guest's eglDisplay keeps a static
+     * string and frees it in eglTerminate (eglDisplay.cpp), which killed system_server in the browser (B17). */
+    case 0x3053: return put_string("xiaoji", buffer, buffer_len, bufferSize);          /* EGL_VENDOR */
+    case 0x3054: return put_string("1.4 xiaoji-webgl2", buffer, buffer_len, bufferSize); /* EGL_VERSION */
     case 0x3055: return put_string(wgl_egl_extensions, buffer, buffer_len, bufferSize); /* EGL_EXTENSIONS */
+    case 0x308D: return put_string("OpenGL_ES", buffer, buffer_len, bufferSize);       /* EGL_CLIENT_APIS */
     default: return 0;
     }
 }
@@ -786,35 +1247,171 @@ static int32_t rc_QueryEGLString(void *ctx, uint32_t name, void *buffer, uint32_
 
 /* State and binding calls: the guest's names, with the tracked state updated. */
 
-static void w_glEnable(void *ctx, uint32_t cap) { enter(ctx); glEnable(cap); }
-static void w_glDisable(void *ctx, uint32_t cap) { enter(ctx); glDisable(cap); }
+static void w_glEnable(void *ctx, uint32_t cap)
+{
+    gctx_t *c = enter(ctx);
+    int b = en_bit(cap);
+    if (c && b >= 0)
+        c->en |= 1u << b;
+    glEnable(cap);
+}
+static void w_glDisable(void *ctx, uint32_t cap)
+{
+    gctx_t *c = enter(ctx);
+    int b = en_bit(cap);
+    if (c && b >= 0)
+        c->en &= ~(1u << b);
+    glDisable(cap);
+}
 static uint8_t w_glIsEnabled(void *ctx, uint32_t cap) { enter(ctx); return (uint8_t)glIsEnabled(cap); }
-static void w_glBlendColor(void *ctx, float r, float g, float b, float a) { enter(ctx); glBlendColor(r, g, b, a); }
-static void w_glBlendEquation(void *ctx, uint32_t mode) { enter(ctx); glBlendEquation(mode); }
-static void w_glBlendEquationSeparate(void *ctx, uint32_t m0, uint32_t m1) { enter(ctx); glBlendEquationSeparate(m0, m1); }
-static void w_glBlendFunc(void *ctx, uint32_t s, uint32_t d) { enter(ctx); glBlendFunc(s, d); }
-static void w_glBlendFuncSeparate(void *ctx, uint32_t a, uint32_t b, uint32_t c2, uint32_t d) { enter(ctx); glBlendFuncSeparate(a, b, c2, d); }
-static void w_glClearColor(void *ctx, float r, float g, float b, float a) { enter(ctx); glClearColor(r, g, b, a); }
-static void w_glClearDepthf(void *ctx, float d) { enter(ctx); glClearDepthf(d); }
-static void w_glClearStencil(void *ctx, int32_t s) { enter(ctx); glClearStencil(s); }
+static void w_glBlendColor(void *ctx, float r, float g, float b, float a)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->bc[0] = r; c->bc[1] = g; c->bc[2] = b; c->bc[3] = a; }
+    glBlendColor(r, g, b, a);
+}
+static void w_glBlendEquation(void *ctx, uint32_t mode)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->beq[0] = c->beq[1] = mode;
+    glBlendEquation(mode);
+}
+static void w_glBlendEquationSeparate(void *ctx, uint32_t m0, uint32_t m1)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->beq[0] = m0; c->beq[1] = m1; }
+    glBlendEquationSeparate(m0, m1);
+}
+static void w_glBlendFunc(void *ctx, uint32_t s, uint32_t d)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->bf[0] = c->bf[2] = s; c->bf[1] = c->bf[3] = d; }
+    glBlendFunc(s, d);
+}
+static void w_glBlendFuncSeparate(void *ctx, uint32_t a, uint32_t b, uint32_t c2, uint32_t d)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->bf[0] = a; c->bf[1] = b; c->bf[2] = c2; c->bf[3] = d; }
+    glBlendFuncSeparate(a, b, c2, d);
+}
+static void w_glClearColor(void *ctx, float r, float g, float b, float a)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->cc[0] = r; c->cc[1] = g; c->cc[2] = b; c->cc[3] = a; }
+    glClearColor(r, g, b, a);
+}
+static void w_glClearDepthf(void *ctx, float d)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->cdepth = d;
+    glClearDepthf(d);
+}
+static void w_glClearStencil(void *ctx, int32_t s)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->cstencil = s;
+    glClearStencil(s);
+}
 static void w_glClear(void *ctx, uint32_t mask) { enter(ctx); glClear(mask); }
-static void w_glColorMask(void *ctx, uint8_t r, uint8_t g, uint8_t b, uint8_t a) { enter(ctx); glColorMask(r, g, b, a); }
-static void w_glCullFace(void *ctx, uint32_t m) { enter(ctx); glCullFace(m); }
-static void w_glDepthFunc(void *ctx, uint32_t f) { enter(ctx); glDepthFunc(f); }
-static void w_glDepthMask(void *ctx, uint8_t f) { enter(ctx); glDepthMask(f); }
+static void w_glColorMask(void *ctx, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->cm[0] = r; c->cm[1] = g; c->cm[2] = b; c->cm[3] = a; }
+    glColorMask(r, g, b, a);
+}
+static void w_glCullFace(void *ctx, uint32_t m)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->cull = m;
+    glCullFace(m);
+}
+static void w_glDepthFunc(void *ctx, uint32_t f)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->dfunc = f;
+    glDepthFunc(f);
+}
+static void w_glDepthMask(void *ctx, uint8_t f)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->dmask = f;
+    glDepthMask(f);
+}
 static void w_glDepthRangef(void *ctx, float n, float f) { enter(ctx); glDepthRangef(n, f); }
-static void w_glFrontFace(void *ctx, uint32_t m) { enter(ctx); glFrontFace(m); }
+static void w_glFrontFace(void *ctx, uint32_t m)
+{
+    gctx_t *c = enter(ctx);
+    if (c) c->front = m;
+    glFrontFace(m);
+}
 static void w_glHint(void *ctx, uint32_t t, uint32_t m) { enter(ctx); glHint(t, m); }
 static void w_glLineWidth(void *ctx, float w) { enter(ctx); glLineWidth(w); }
-static void w_glPolygonOffset(void *ctx, float f, float u) { enter(ctx); glPolygonOffset(f, u); }
+static void w_glPolygonOffset(void *ctx, float f, float u)
+{
+    gctx_t *c = enter(ctx);
+    if (c) { c->poff[0] = f; c->poff[1] = u; }
+    glPolygonOffset(f, u);
+}
 static void w_glSampleCoverage(void *ctx, float v, uint8_t inv) { enter(ctx); glSampleCoverage(v, inv); }
-static void w_glStencilFunc(void *ctx, uint32_t f, int32_t r, uint32_t m) { enter(ctx); glStencilFunc(f, r, m); }
-static void w_glStencilFuncSeparate(void *ctx, uint32_t face, uint32_t f, int32_t r, uint32_t m) { enter(ctx); glStencilFuncSeparate(face, f, r, m); }
-static void w_glStencilMask(void *ctx, uint32_t m) { enter(ctx); glStencilMask(m); }
-static void w_glStencilMaskSeparate(void *ctx, uint32_t face, uint32_t m) { enter(ctx); glStencilMaskSeparate(face, m); }
-static void w_glStencilOp(void *ctx, uint32_t a, uint32_t b, uint32_t c2) { enter(ctx); glStencilOp(a, b, c2); }
-static void w_glStencilOpSeparate(void *ctx, uint32_t face, uint32_t a, uint32_t b, uint32_t c2) { enter(ctx); glStencilOpSeparate(face, a, b, c2); }
-static void w_glPixelStorei(void *ctx, uint32_t pname, int32_t param) { enter(ctx); glPixelStorei(pname, param); }
+static void stencil_set(gctx_t *c, uint32_t face, int what, uint32_t a, uint32_t b, uint32_t d)
+{
+    for (int f = 0; f < 2; f++) {
+        if (!(face == GL_FRONT_AND_BACK || (f == 0 && face == GL_FRONT) || (f == 1 && face == GL_BACK)))
+            continue;
+        if (what == 0) { c->sfunc[f] = a; c->sref[f] = (GLint)b; c->smask[f] = d; }
+        else if (what == 1) c->swmask[f] = a;
+        else { c->sop[f][0] = a; c->sop[f][1] = b; c->sop[f][2] = d; }
+    }
+}
+
+static void w_glStencilFunc(void *ctx, uint32_t f, int32_t r, uint32_t m)
+{
+    gctx_t *c = enter(ctx);
+    if (c) stencil_set(c, GL_FRONT_AND_BACK, 0, f, (uint32_t)r, m);
+    glStencilFunc(f, r, m);
+}
+static void w_glStencilFuncSeparate(void *ctx, uint32_t face, uint32_t f, int32_t r, uint32_t m)
+{
+    gctx_t *c = enter(ctx);
+    if (c) stencil_set(c, face, 0, f, (uint32_t)r, m);
+    glStencilFuncSeparate(face, f, r, m);
+}
+static void w_glStencilMask(void *ctx, uint32_t m)
+{
+    gctx_t *c = enter(ctx);
+    if (c) stencil_set(c, GL_FRONT_AND_BACK, 1, m, 0, 0);
+    glStencilMask(m);
+}
+static void w_glStencilMaskSeparate(void *ctx, uint32_t face, uint32_t m)
+{
+    gctx_t *c = enter(ctx);
+    if (c) stencil_set(c, face, 1, m, 0, 0);
+    glStencilMaskSeparate(face, m);
+}
+static void w_glStencilOp(void *ctx, uint32_t a, uint32_t b, uint32_t c2)
+{
+    gctx_t *c = enter(ctx);
+    if (c) stencil_set(c, GL_FRONT_AND_BACK, 2, a, b, c2);
+    glStencilOp(a, b, c2);
+}
+static void w_glStencilOpSeparate(void *ctx, uint32_t face, uint32_t a, uint32_t b, uint32_t c2)
+{
+    gctx_t *c = enter(ctx);
+    if (c) stencil_set(c, face, 2, a, b, c2);
+    glStencilOpSeparate(face, a, b, c2);
+}
+static void w_glPixelStorei(void *ctx, uint32_t pname, int32_t param)
+{
+    gctx_t *c = enter(ctx);
+    if (c) {
+        if (pname == GL_UNPACK_ALIGNMENT) c->unpack_align = param;
+        else if (pname == GL_PACK_ALIGNMENT) c->pack_align = param;
+        else if (pname == GL_UNPACK_ROW_LENGTH) c->unpack_row = param;
+        else if (pname == GL_UNPACK_SKIP_ROWS) c->unpack_skip_rows = param;
+        else if (pname == GL_UNPACK_SKIP_PIXELS) c->unpack_skip_px = param;
+    }
+    glPixelStorei(pname, param);
+}
 static void w_glFlush(void *ctx) { enter(ctx); glFlush(); }
 static void w_glFinish(void *ctx) { enter(ctx); glFinish(); }
 static uint32_t w_glGetError(void *ctx) { enter(ctx); return glGetError(); }
@@ -914,7 +1511,12 @@ static void w_glDeleteSamplers(void *ctx, int32_t n, const void *samplers, uint3
 
 static void w_glBindSampler(void *ctx, uint32_t unit, uint32_t sampler)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
+    if (c && unit < 32) {
+        c->sampler[unit] = sampler;
+        if (unit + 1 > c->nunits)
+            c->nunits = unit + 1;
+    }
     glBindSampler(unit, sampler);
 }
 
@@ -946,7 +1548,12 @@ static void w_glDeleteBuffers(void *ctx, int32_t n, const void *buffers, uint32_
 
 static void w_glBindBuffer(void *ctx, uint32_t target, uint32_t buffer)
 {
-    enter(ctx);
+    gctx_t *c = enter(ctx);
+    if (c) {
+        if (target == GL_ARRAY_BUFFER) c->abuf = buffer;
+        else if (target == GL_PIXEL_UNPACK_BUFFER) c->unpack_buf = buffer;
+        else if (target == GL_PIXEL_PACK_BUFFER) c->pack_buf = buffer;
+    }
     glBindBuffer(target, buffer);
 }
 
@@ -993,6 +1600,8 @@ static void w_glActiveTexture(void *ctx, uint32_t texture)
     if (texture < GL_TEXTURE0 || texture - GL_TEXTURE0 >= 32)
         return;
     c->unit = texture - GL_TEXTURE0;
+    if (c->unit + 1 > c->nunits)
+        c->nunits = c->unit + 1;
     glActiveTexture(texture);
 }
 
@@ -1086,8 +1695,160 @@ static void w_glDeleteFramebuffers(void *ctx, int32_t n, const void *fbs, uint32
 static void w_glBindFramebuffer(void *ctx, uint32_t target, uint32_t framebuffer)
 {
     gctx_t *c = enter(ctx);
-    c->fbo = framebuffer;
-    glBindFramebuffer(target, host_fbo(c, framebuffer));
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+        c->fbo = framebuffer;
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, host_fbo(c, framebuffer));
+    }
+    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+        c->rfbo = framebuffer;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, host_rfbo(c, framebuffer));
+    }
+}
+
+/* The calls G2 left to the null defaults that HWUI, Skia and RenderEngine use (B17). */
+
+static void w_glCopyTexSubImage2D(void *ctx, uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t x,
+                                  int32_t y, int32_t width, int32_t height)
+{
+    enter(ctx);
+    glCopyTexSubImage2D(tgt(target), level, xoffset, yoffset, x, y, width, height);
+}
+
+static void w_glCopyTexImage2D(void *ctx, uint32_t target, int32_t level, uint32_t internalformat, int32_t x, int32_t y,
+                               int32_t width, int32_t height, int32_t border)
+{
+    enter(ctx);
+    glCopyTexImage2D(tgt(target), level, internalformat, x, y, width, height, border);
+}
+
+static void w_glGetShaderPrecisionFormat(void *ctx, uint32_t shadertype, uint32_t precisiontype, void *range,
+                                         uint32_t range_len, void *precision, uint32_t precision_len)
+{
+    enter(ctx);
+    GLint r[2] = {0, 0}, p = 0;
+    glGetShaderPrecisionFormat(shadertype, precisiontype, r, &p);
+    if (range && range_len >= sizeof r)
+        memcpy(range, r, sizeof r);
+    if (precision && precision_len >= sizeof p)
+        memcpy(precision, &p, sizeof p);
+}
+
+static void w_glClearBufferfv(void *ctx, uint32_t buffer, int32_t drawbuffer, const void *value, uint32_t value_len)
+{
+    enter(ctx);
+    GLfloat v[4] = {0, 0, 0, 0};
+    memcpy(v, value, value_len < sizeof v ? value_len : sizeof v);
+    glClearBufferfv(buffer, drawbuffer, v);
+}
+
+static void w_glClearBufferiv(void *ctx, uint32_t buffer, int32_t drawbuffer, const void *value, uint32_t value_len)
+{
+    enter(ctx);
+    GLint v[4] = {0, 0, 0, 0};
+    memcpy(v, value, value_len < sizeof v ? value_len : sizeof v);
+    glClearBufferiv(buffer, drawbuffer, v);
+}
+
+static void w_glClearBufferuiv(void *ctx, uint32_t buffer, int32_t drawbuffer, const void *value, uint32_t value_len)
+{
+    enter(ctx);
+    GLuint v[4] = {0, 0, 0, 0};
+    memcpy(v, value, value_len < sizeof v ? value_len : sizeof v);
+    glClearBufferuiv(buffer, drawbuffer, v);
+}
+
+static void w_glClearBufferfi(void *ctx, uint32_t buffer, int32_t drawbuffer, float depth, int32_t stencil)
+{
+    enter(ctx);
+    glClearBufferfi(buffer, drawbuffer, depth, stencil);
+}
+
+static void w_glVertexAttribDivisor(void *ctx, uint32_t index, uint32_t divisor)
+{
+    enter(ctx);
+    glVertexAttribDivisor(index, divisor);
+}
+
+static void w_glDrawArraysInstanced(void *ctx, uint32_t mode, int32_t first, int32_t count, int32_t primcount)
+{
+    enter(ctx);
+    glDrawArraysInstanced(mode, first, count, primcount);
+}
+
+/* The guest's framebuffer 0 is a real framebuffer here (the back buffer), so GL_BACK names its attachment 0. */
+static GLenum fb_buffer(GLuint guest_fbo, GLenum b)
+{
+    return (!guest_fbo && b == GL_BACK) ? GL_COLOR_ATTACHMENT0 : b;
+}
+
+static void w_glDrawBuffers(void *ctx, int32_t n, const void *bufs, uint32_t bufs_len)
+{
+    gctx_t *c = enter(ctx);
+    if (n <= 0 || n > 8 || (uint64_t)n * 4 > bufs_len)
+        return;
+    GLenum b[8];
+    memcpy(b, bufs, (size_t)n * 4);
+    for (int i = 0; i < n; i++)
+        b[i] = fb_buffer(c ? c->fbo : 0, b[i]);
+    glDrawBuffers(n, b);
+}
+
+static void w_glReadBuffer(void *ctx, uint32_t src)
+{
+    gctx_t *c = enter(ctx);
+    glReadBuffer(fb_buffer(c ? c->rfbo : 0, src));
+}
+
+static void w_glBlitFramebuffer(void *ctx, int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1, int32_t dx0, int32_t dy0,
+                                int32_t dx1, int32_t dy1, uint32_t mask, uint32_t filter)
+{
+    enter(ctx);
+    glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+}
+
+/* Invalidation is a hint: the contents may be kept. Dropping it is correct (and avoids translating the default
+ * framebuffer's GL_COLOR, GL_DEPTH and GL_STENCIL names). */
+static void w_glInvalidateFramebuffer(void *ctx, uint32_t target, int32_t n, const void *att, uint32_t att_len)
+{
+    (void)target; (void)n; (void)att; (void)att_len;
+    enter(ctx);
+}
+
+static void w_glInvalidateSubFramebuffer(void *ctx, uint32_t target, int32_t n, const void *att, uint32_t att_len,
+                                         int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    (void)target; (void)n; (void)att; (void)att_len; (void)x; (void)y; (void)w; (void)h;
+    enter(ctx);
+}
+
+static void w_glFramebufferTextureLayer(void *ctx, uint32_t target, uint32_t attachment, uint32_t texture, int32_t level,
+                                        int32_t layer)
+{
+    enter(ctx);
+    glFramebufferTextureLayer(target, attachment, host_tex(texture), level, layer);
+}
+
+static void w_glRenderbufferStorageMultisample(void *ctx, uint32_t target, int32_t samples, uint32_t internalformat,
+                                               int32_t width, int32_t height)
+{
+    enter(ctx);
+    glRenderbufferStorageMultisample(target, samples, internalformat, width, height);
+}
+
+static void w_glTexParameterfv(void *ctx, uint32_t target, uint32_t pname, const void *params, uint32_t params_len)
+{
+    enter(ctx);
+    GLfloat v[4] = {0, 0, 0, 0};
+    memcpy(v, params, params_len < sizeof v ? params_len : sizeof v);
+    glTexParameterfv(tgt(target), pname, v);
+}
+
+static void w_glTexParameteriv(void *ctx, uint32_t target, uint32_t pname, const void *params, uint32_t params_len)
+{
+    enter(ctx);
+    GLint v[4] = {0, 0, 0, 0};
+    memcpy(v, params, params_len < sizeof v ? params_len : sizeof v);
+    glTexParameteriv(tgt(target), pname, v);
 }
 
 static uint32_t w_glCheckFramebufferStatus(void *ctx, uint32_t target)
@@ -1606,6 +2367,191 @@ static void w_glDrawElementsOffset(void *ctx, uint32_t mode, int32_t count, uint
     glDrawElements(mode, count, type, (const void *)(uintptr_t)offset);
 }
 
+/* The not_api calls with data or out-parameters (gl_host.c, not_api_data), as gfxstream's GLESv2Decoder does them. */
+
+/* emscripten's WebGL 2 library has it (getBufferSubData); the GLES 3 header does not declare it. */
+extern void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data);
+
+/* A map copies the range out for a read, or for a write that keeps the old contents (GLESv2Decoder::s_glMapBufferRangeAEMU). */
+static void w_glMapBufferRangeAEMU(void *ctx, uint32_t target, uint32_t offset, uint32_t length, uint32_t access,
+                                   void *mapped)
+{
+    enter(ctx);
+    if ((access & GL_MAP_READ_BIT) ||
+        ((access & GL_MAP_WRITE_BIT) && !(access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT))))
+        glGetBufferSubData(target, offset, length, mapped);
+}
+
+/* An unmap of a write mapping writes the guest's copy of the range back (s_glUnmapBufferAEMU). */
+static uint8_t w_glUnmapBufferAEMU(void *ctx, uint32_t target, uint32_t offset, uint32_t length, uint32_t access,
+                                   const void *guest_buffer)
+{
+    enter(ctx);
+    if ((access & GL_MAP_WRITE_BIT) && guest_buffer && length)
+        glBufferSubData(target, offset, length, guest_buffer);
+    return 1;
+}
+
+/* An explicit flush writes the flushed range; offset is absolute in the buffer (s_glFlushMappedBufferRangeAEMU). */
+static void w_glFlushMappedBufferRangeAEMU(void *ctx, uint32_t target, uint32_t offset, uint32_t length, uint32_t access,
+                                           const void *guest_buffer)
+{
+    (void)access;
+    enter(ctx);
+    if (length)
+        glBufferSubData(target, offset, length, guest_buffer);
+}
+
+static uint8_t w_glBufferDataSyncAEMU(void *ctx, uint32_t target, uint32_t size, const void *data, uint32_t usage)
+{
+    enter(ctx);
+    glBufferData(target, size, data, usage);
+    return 1;
+}
+
+/* The names are packed as "name;name;..." (the guest's packVarNames). */
+static void w_glGetUniformIndicesAEMU(void *ctx, uint32_t program, uint32_t count, const char *names, uint32_t packed_len,
+                                      uint8_t *indices)
+{
+    enter(ctx);
+    if (!count || count > 4096)
+        return;
+    char *buf = malloc((size_t)packed_len + 1);
+    const char **v = calloc(count, sizeof *v);
+    GLuint *out = malloc((size_t)count * sizeof *out);
+    if (buf && v && out) {
+        memcpy(buf, names, packed_len);
+        buf[packed_len] = 0;
+        uint32_t n = 0;
+        char *p = buf;
+        while (n < count && *p) {
+            char *e = strchr(p, ';');
+            if (e)
+                *e = 0;
+            v[n++] = p;
+            if (!e)
+                break;
+            p = e + 1;
+        }
+        if (n == count) {
+            glGetUniformIndices(program, (GLsizei)count, v, out);
+            for (uint32_t i = 0; i < count; i++)
+                for (int b = 0; b < 4; b++)
+                    indices[i * 4 + b] = (uint8_t)(out[i] >> (8 * b));
+        }
+    }
+    free(buf);
+    free(v);
+    free(out);
+}
+
+/* The client-index forms put the indices in the scratch element buffer, as glDrawElementsData does. */
+static void draw_with_indices(const void *data, uint32_t datalen, void (*draw)(const void *arg), const void *arg)
+{
+    hstate_t hs;
+    save_host(&hs);
+    if (!scratch_ebo)
+        glGenBuffers(1, &scratch_ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scratch_ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, datalen, data, GL_STREAM_DRAW);
+    draw(arg);
+    restore_host(&hs);
+}
+
+typedef struct {
+    uint32_t mode, type, start, end;
+    int32_t count, prim;
+} drawargs_t;
+
+static void draw_instanced0(const void *a)
+{
+    const drawargs_t *d = a;
+    glDrawElementsInstanced(d->mode, d->count, d->type, NULL, d->prim);
+}
+
+static void draw_range0(const void *a)
+{
+    const drawargs_t *d = a;
+    glDrawRangeElements(d->mode, d->start, d->end, d->count, d->type, NULL);
+}
+
+static void w_glDrawElementsInstancedDataAEMU(void *ctx, uint32_t mode, int32_t count, uint32_t type, const void *data,
+                                              uint32_t datalen, int32_t primcount)
+{
+    enter(ctx);
+    drawargs_t d = {mode, type, 0, 0, count, primcount};
+    draw_with_indices(data, datalen, draw_instanced0, &d);
+}
+
+static void w_glDrawElementsInstancedOffsetAEMU(void *ctx, uint32_t mode, int32_t count, uint32_t type, uint32_t offset,
+                                                int32_t primcount)
+{
+    enter(ctx);
+    glDrawElementsInstanced(mode, count, type, (const void *)(uintptr_t)offset, primcount);
+}
+
+static void w_glDrawRangeElementsDataAEMU(void *ctx, uint32_t mode, uint32_t start, uint32_t end, int32_t count,
+                                          uint32_t type, const void *data, uint32_t datalen)
+{
+    enter(ctx);
+    drawargs_t d = {mode, type, start, end, count, 0};
+    draw_with_indices(data, datalen, draw_range0, &d);
+}
+
+static void w_glDrawRangeElementsOffsetAEMU(void *ctx, uint32_t mode, uint32_t start, uint32_t end, int32_t count,
+                                            uint32_t type, uint32_t offset)
+{
+    enter(ctx);
+    glDrawRangeElements(mode, start, end, count, type, (const void *)(uintptr_t)offset);
+}
+
+static void w_glVertexAttribIPointerDataAEMU(void *ctx, uint32_t index, int32_t size, uint32_t type, int32_t stride,
+                                             const void *data, uint32_t datalen)
+{
+    (void)stride;
+    enter(ctx);
+    if (index >= NATTR)
+        return;
+    hstate_t hs;
+    save_host(&hs);
+    if (!scratch_vbo[index])
+        glGenBuffers(1, &scratch_vbo[index]);
+    glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo[index]);
+    glBufferData(GL_ARRAY_BUFFER, datalen, data, GL_STREAM_DRAW);
+    glVertexAttribIPointer(index, size, type, 0, NULL);
+    restore_host(&hs);
+}
+
+static void w_glVertexAttribIPointerOffsetAEMU(void *ctx, uint32_t index, int32_t size, uint32_t type, int32_t stride,
+                                               uint32_t offset)
+{
+    enter(ctx);
+    glVertexAttribIPointer(index, size, type, stride, (const void *)(uintptr_t)offset);
+}
+
+/* The pixel-buffer forms: the offset is into the bound GL_PIXEL_UNPACK_BUFFER (or GL_PIXEL_PACK_BUFFER), which emscripten
+ * passes to WebGL as an offset when such a buffer is bound. */
+static void w_glTexImage2DOffsetAEMU(void *ctx, uint32_t target, int32_t level, int32_t internalformat, int32_t width,
+                                     int32_t height, int32_t border, uint32_t format, uint32_t type, uint32_t offset)
+{
+    enter(ctx);
+    glTexImage2D(tgt(target), level, internalformat, width, height, border, format, type, (const void *)(uintptr_t)offset);
+}
+
+static void w_glTexSubImage2DOffsetAEMU(void *ctx, uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset,
+                                        int32_t width, int32_t height, uint32_t format, uint32_t type, uint32_t offset)
+{
+    enter(ctx);
+    glTexSubImage2D(tgt(target), level, xoffset, yoffset, width, height, format, type, (const void *)(uintptr_t)offset);
+}
+
+static void w_glReadPixelsOffsetAEMU(void *ctx, int32_t x, int32_t y, int32_t width, int32_t height, uint32_t format,
+                                     uint32_t type, uint32_t offset)
+{
+    enter(ctx);
+    glReadPixels(x, y, width, height, format, type, (void *)(uintptr_t)offset);
+}
+
 /* glShaderString: the source as the guest sent it, translated (translate_shader), replacing the shader's source. */
 static void w_glShaderString(void *ctx, uint32_t shader, const void *string, uint32_t len)
 {
@@ -1816,7 +2762,9 @@ int EMSCRIPTEN_KEEPALIVE xj_gl_selftest(void)
     glDisable(GL_SCISSOR_TEST);
     /* A quad through the wire path: two shaders, a link, a client array, a matrix uniform, a draw. */
     selftest_quad_px = ~0u;
-    if (selftest_quad(k)) {
+    int quad_ok = selftest_quad(k);
+    rc_FlushWindowColorBuffer(k, surf); /* eglSwapBuffers: the back buffer into the color buffer */
+    if (quad_ok) {
         uint8_t q[4] = {0, 0, 0, 0};
         rc_ReadColorBuffer(k, cb, XJ_DISPLAY_W / 2, XJ_DISPLAY_H / 2 - 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, q, sizeof q);
         selftest_quad_px = (uint32_t)q[0] << 16 | (uint32_t)q[1] << 8 | q[2];
@@ -1849,6 +2797,137 @@ int EMSCRIPTEN_KEEPALIVE xj_gl_selftest(void)
     rc_FBPost(NULL, cb);
     rc_MakeCurrent(k, 0, 0, 0);
     return (int)frames_posted;
+}
+
+/* Host composition and the orientation of color buffers (B17). A 4x4 source written by the CPU (rcUpdateColorBuffer, top
+ * row first: two red rows, then two blue ones) is composed onto an 8x8 target over its whole frame, opaque, then a
+ * solid green layer over the target's right half, premultiplied at half alpha. The target must show red on top, blue
+ * below, and the right half mixed with green. Then a window surface drawn by GL: blue, and red in GL's upper half
+ * (y 4 to 7, the top of the picture); after the flush (eglSwapBuffers) the color buffer's row 0 must be red. Last, the
+ * GLSL version string and the EGL vendor are advertised. Returns a bit per check (0x3F when all hold). */
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_compose(void)
+{
+    if (!gl_host_webgl())
+        return 0;
+    uint32_t src = rc_CreateColorBuffer(NULL, 4, 4, GL_RGBA), dst = rc_CreateColorBuffer(NULL, 8, 8, GL_RGBA);
+    uint8_t px[64];
+    for (int i = 0; i < 16; i++) {
+        px[i * 4 + 0] = i < 8 ? 255 : 0;
+        px[i * 4 + 1] = 0;
+        px[i * 4 + 2] = i < 8 ? 0 : 255;
+        px[i * 4 + 3] = 255;
+    }
+    rc_UpdateColorBuffer(NULL, src, 0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, px, sizeof px);
+    uint8_t msg[12 + 2 * COMPOSE_LAYER_SIZE];
+    memset(msg, 0, sizeof msg);
+    uint32_t hdr[3] = {1, dst, 2};
+    memcpy(msg, hdr, sizeof hdr);
+    uint8_t *l = msg + 12;
+    int32_t li[] = {(int32_t)src, 2, 0, 0, 8, 8};
+    memcpy(l, li, sizeof li);
+    float crop[4] = {0, 0, 4, 4};
+    memcpy(l + 24, crop, sizeof crop);
+    int32_t blend = 1;
+    float alpha = 1.0f;
+    memcpy(l + 40, &blend, 4);
+    memcpy(l + 44, &alpha, 4);
+    l += COMPOSE_LAYER_SIZE;
+    int32_t li2[] = {0, 3, 4, 0, 8, 8};
+    memcpy(l, li2, sizeof li2);
+    blend = 2;
+    alpha = 0.5f;
+    memcpy(l + 40, &blend, 4);
+    memcpy(l + 44, &alpha, 4);
+    uint8_t green[4] = {0, 255, 0, 255};
+    memcpy(l + 48, green, 4);
+    uint32_t r = 0;
+    if (rc_ComposeWithoutPost(NULL, sizeof msg, msg, sizeof msg) == 0)
+        r |= 1;
+    uint8_t top[4], bot[4], right[4];
+    rc_ReadColorBuffer(NULL, dst, 1, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, top, 4);
+    rc_ReadColorBuffer(NULL, dst, 1, 7, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bot, 4);
+    rc_ReadColorBuffer(NULL, dst, 6, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, right, 4);
+    if (top[0] > 250 && top[2] < 5)
+        r |= 2;
+    if (bot[2] > 250 && bot[0] < 5)
+        r |= 4;
+    if (right[1] > 120 && right[1] < 135 && right[0] > 120 && right[0] < 135)
+        r |= 8;
+    /* A GL window surface: a scissored clear of the top half of the picture (GL's upper half), then the flush. */
+    static char k;
+    uint32_t ctx = rc_CreateContext(NULL, 0, 0, 0x30000);
+    uint32_t surf = rc_CreateWindowSurface(NULL, 0, 8, 8);
+    uint32_t cb = rc_CreateColorBuffer(NULL, 8, 8, GL_RGBA);
+    rc_SetWindowColorBuffer(NULL, surf, cb);
+    rc_MakeCurrent(&k, ctx, surf, surf);
+    const gles2_backend_t *g2 = gl_host_webgl()->gles2;
+    g2->glClearColor(&k, 0, 0, 1, 1);
+    g2->glClear(&k, GL_COLOR_BUFFER_BIT);
+    g2->glEnable(&k, GL_SCISSOR_TEST);
+    g2->glScissor(&k, 0, 4, 8, 4);
+    g2->glClearColor(&k, 1, 0, 0, 1);
+    g2->glClear(&k, GL_COLOR_BUFFER_BIT);
+    rc_FlushWindowColorBuffer(&k, surf);
+    uint8_t wtop[4];
+    rc_ReadColorBuffer(NULL, cb, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, wtop, 4);
+    if (wtop[0] > 250 && wtop[2] < 5)
+        r |= 16;
+    rc_MakeCurrent(&k, 0, 0, 0);
+    rc_CloseColorBuffer(NULL, src);
+    rc_CloseColorBuffer(NULL, dst);
+    /* The GLSL version string, which Skia needs to make its context. */
+    char glsl[64] = {0};
+    char vendor[16] = {0};
+    if (rc_GetGLString(NULL, GL_SHADING_LANGUAGE_VERSION, glsl, sizeof glsl - 1, sizeof glsl - 1) > 0 &&
+        !strncmp(glsl, "OpenGL ES GLSL ES 3.00", 22) &&
+        rc_QueryEGLString(NULL, 0x3053, vendor, sizeof vendor - 1, sizeof vendor - 1) > 0 && !strcmp(vendor, "xiaoji"))
+        r |= 32;
+    return r;
+}
+
+/* Per-context state (B17): two contexts on two streams. Context A enables blending with ONE, ONE, sets an unpack
+ * alignment of 1 and binds an array buffer; context B keeps the defaults. Each switch must give the WebGL2 context the
+ * state of the context made current on the stream. Returns a bit per check (0xFF when all hold). */
+static char selftest_stream_a, selftest_stream_b;
+
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_state(void)
+{
+    const gl_host_t *h = gl_host_webgl();
+    if (!h)
+        return 0;
+    const gles2_backend_t *g2 = h->gles2;
+    void *ka = &selftest_stream_a, *kb = &selftest_stream_b;
+    uint32_t ca = rc_CreateContext(NULL, 0, 0, 0x30000), cbx = rc_CreateContext(NULL, 0, 0, 0x30000);
+    uint32_t sa = rc_CreateWindowSurface(NULL, 0, 4, 4), sb = rc_CreateWindowSurface(NULL, 0, 4, 4);
+    rc_MakeCurrent(ka, ca, sa, sa);
+    GLuint buf = 0;
+    g2->glGenBuffers(ka, 1, &buf, sizeof buf);
+    g2->glEnable(ka, GL_BLEND);
+    g2->glBlendFunc(ka, GL_ONE, GL_ONE);
+    g2->glPixelStorei(ka, GL_UNPACK_ALIGNMENT, 1);
+    g2->glBindBuffer(ka, GL_ARRAY_BUFFER, buf);
+    rc_MakeCurrent(kb, cbx, sb, sb);
+    g2->glClearColor(kb, 0, 0, 0, 1); /* a call on stream B: context B is applied */
+    GLint v = 0;
+    uint32_t r = 0;
+    r |= glIsEnabled(GL_BLEND) ? 0 : 1u;
+    glGetIntegerv(GL_BLEND_DST_RGB, &v);
+    r |= v == GL_ZERO ? 2u : 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &v);
+    r |= v == 4 ? 4u : 0;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &v);
+    r |= v == 0 ? 8u : 0;
+    g2->glClearColor(ka, 0, 0, 0, 1); /* back on stream A */
+    r |= glIsEnabled(GL_BLEND) ? 16u : 0;
+    glGetIntegerv(GL_BLEND_DST_RGB, &v);
+    r |= v == GL_ONE ? 32u : 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &v);
+    r |= v == 1 ? 64u : 0;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &v);
+    r |= (GLuint)v == buf ? 128u : 0;
+    rc_MakeCurrent(ka, 0, 0, 0);
+    rc_MakeCurrent(kb, 0, 0, 0);
+    return r;
 }
 
 uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_quad(void)
@@ -1897,6 +2976,7 @@ static int init_gl(void)
             ctxs[i].vp[3] = XJ_DISPLAY_H;
             ctxs[i].sc[2] = XJ_DISPLAY_W;
             ctxs[i].sc[3] = XJ_DISPLAY_H;
+            ctx_defaults(&ctxs[i]);
             dflt = &ctxs[i];
         }
     ready = 1;
@@ -1937,6 +3017,8 @@ const gl_host_t *gl_host_webgl(void)
     rc_table.rcCreateClientImage = rc_CreateClientImage;
     rc_table.rcDestroyClientImage = rc_DestroyClientImage;
     rc_table.rcFBPost = rc_FBPost;
+    rc_table.rcCompose = rc_Compose;
+    rc_table.rcComposeWithoutPost = rc_ComposeWithoutPost;
     rc_table.rcGetGLString = rc_GetGLString;
     rc_table.rcQueryEGLString = rc_QueryEGLString;
 
@@ -1969,6 +3051,24 @@ const gl_host_t *gl_host_webgl(void)
     gles2_table.glStencilOp = w_glStencilOp;
     gles2_table.glStencilOpSeparate = w_glStencilOpSeparate;
     gles2_table.glPixelStorei = w_glPixelStorei;
+    gles2_table.glCopyTexSubImage2D = w_glCopyTexSubImage2D;
+    gles2_table.glCopyTexImage2D = w_glCopyTexImage2D;
+    gles2_table.glGetShaderPrecisionFormat = w_glGetShaderPrecisionFormat;
+    gles2_table.glClearBufferfv = w_glClearBufferfv;
+    gles2_table.glClearBufferiv = w_glClearBufferiv;
+    gles2_table.glClearBufferuiv = w_glClearBufferuiv;
+    gles2_table.glClearBufferfi = w_glClearBufferfi;
+    gles2_table.glVertexAttribDivisor = w_glVertexAttribDivisor;
+    gles2_table.glDrawArraysInstanced = w_glDrawArraysInstanced;
+    gles2_table.glDrawBuffers = w_glDrawBuffers;
+    gles2_table.glReadBuffer = w_glReadBuffer;
+    gles2_table.glBlitFramebuffer = w_glBlitFramebuffer;
+    gles2_table.glInvalidateFramebuffer = w_glInvalidateFramebuffer;
+    gles2_table.glInvalidateSubFramebuffer = w_glInvalidateSubFramebuffer;
+    gles2_table.glFramebufferTextureLayer = w_glFramebufferTextureLayer;
+    gles2_table.glRenderbufferStorageMultisample = w_glRenderbufferStorageMultisample;
+    gles2_table.glTexParameterfv = w_glTexParameterfv;
+    gles2_table.glTexParameteriv = w_glTexParameteriv;
     gles2_table.glFlush = w_glFlush;
     gles2_table.glFinish = w_glFinish;
     gles2_table.glGetError = w_glGetError;
@@ -2066,6 +3166,20 @@ const gl_host_t *gl_host_webgl(void)
     custom_table.glVertexAttribPointerOffset = w_glVertexAttribPointerOffset;
     custom_table.glDrawElementsData = w_glDrawElementsData;
     custom_table.glDrawElementsOffset = w_glDrawElementsOffset;
+    custom_table.glMapBufferRangeAEMU = w_glMapBufferRangeAEMU;
+    custom_table.glUnmapBufferAEMU = w_glUnmapBufferAEMU;
+    custom_table.glFlushMappedBufferRangeAEMU = w_glFlushMappedBufferRangeAEMU;
+    custom_table.glBufferDataSyncAEMU = w_glBufferDataSyncAEMU;
+    custom_table.glGetUniformIndicesAEMU = w_glGetUniformIndicesAEMU;
+    custom_table.glDrawElementsInstancedDataAEMU = w_glDrawElementsInstancedDataAEMU;
+    custom_table.glDrawElementsInstancedOffsetAEMU = w_glDrawElementsInstancedOffsetAEMU;
+    custom_table.glDrawRangeElementsDataAEMU = w_glDrawRangeElementsDataAEMU;
+    custom_table.glDrawRangeElementsOffsetAEMU = w_glDrawRangeElementsOffsetAEMU;
+    custom_table.glVertexAttribIPointerDataAEMU = w_glVertexAttribIPointerDataAEMU;
+    custom_table.glVertexAttribIPointerOffsetAEMU = w_glVertexAttribIPointerOffsetAEMU;
+    custom_table.glTexImage2DOffsetAEMU = w_glTexImage2DOffsetAEMU;
+    custom_table.glTexSubImage2DOffsetAEMU = w_glTexSubImage2DOffsetAEMU;
+    custom_table.glReadPixelsOffsetAEMU = w_glReadPixelsOffsetAEMU;
 
     host_table.rc = &rc_table;
     host_table.gles2 = &gles2_table;

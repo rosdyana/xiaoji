@@ -4326,6 +4326,7 @@ Final sources. The suites ran after the last code change (`bpfpin` excluded from
 | `XIAOJI_BOOT=1 tests/run.sh` (Google image) | **235 passed, 0 failed, 0 xfail** |
 | `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product) | **200 passed, 1 failed**: the zygote boot check. Its one failing condition is the new `! grep 'Fatal signal'`, and the log has the SIGILL in `android.display` (below). Every other condition of the check matched. |
 | `make test-web` | all web checks passed, exit 0 |
+| `XIAOJI_WEB_BOOT=1 make test-web` (the boot page to phase 100, the warm visit, the download screen; after the last engine change) | all 60 checks passed, exit 0 (the chunk store check: 10,806 of 10,806 chunks) |
 | `clang -std=c11 -Wall -Wextra -fsyntax-only` and `emcc -std=c11 -Wall -Wextra -fsyntax-only` on `engine/bpf.c`, `vfs.c`, `sysfs.c`, `syscall.c`, `init.c` | 0 warnings each |
 | `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | no process of this checkout. Two processes of another checkout (`/Users/rosdyanakusuma/Ross/projects/xiaoji-w1`) are listed; they were not touched |
 
@@ -4510,6 +4511,7 @@ appear. The 60 s window is 269 to 329 s.
 | `XIAOJI_BOOT=1 tests/run.sh` (Google image) | **251 passed, 0 failed, 0 xfail** |
 | `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product) | **215 passed, 2 failed: NOT green.** The zygote boot check passes (the boot conditions, no `Fatal signal`, no undecoded GL request, the launcher as HOME, `sys.boot_completed=1`, and `boot_alive_60s`). The two failures are `prop-list node` and `binder-sm node`: each exits with status 1 after printing the expected output, from a wasm `RuntimeError: memory access out of bounds` in the exit path (`exitRuntime` to `quit`). They failed in all four product runs made since the boot became reachable. They passed when run alone with the harness's environment and file output (four runs), and under a native build of the engine with AddressSanitizer (four runs, no report). The cause is open |
 | `make test-web` | all web checks passed, exit 0 |
+| `XIAOJI_WEB_BOOT=1 make test-web` (the boot page to phase 100, the warm visit, the download screen; after the last engine change) | all 60 checks passed, exit 0 (the chunk store check: 10,806 of 10,806 chunks) |
 | `clang -std=c11 -Wall -Wextra -fsyntax-only` and `emcc -std=c11 -Wall -Wextra -fsyntax-only` on the 17 changed engine files (`binder.c gl_host.c gl_null.c poll.c powersupply.c proc.c procfs.c sched.c selinuxfs.c signals.c simd.c sock.c syscall.c timers.c vfs.c logd.c props.c`) | 0 warnings, 0 errors |
 | The native oracle for `binder-death-batch` (builder VM, `sudo -n`, O0 and O2, three runs each) | identical output; the engine matches it |
 | `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | nothing of this work. Leftover `threads-many-O0` oracle processes (root, from an earlier hung run) were killed in the builder VM |
@@ -4527,3 +4529,226 @@ they were; the real WebGL2 backend is separate), `image/xiaoji.rc` (keystore, ga
 `aosp/device/xiaoji/` (`xiaoji_arm64.mk`, `xiaoji_vendor.mk`, `xiaoji_system.mk`, `xiaoji_handheld_system.mk`,
 `permissions/handheld_core_hardware.xml`). `tools/remote-build.sh` synced that tree to the remote, and `tools/fetch-remote-rootfs.sh`
 refreshed `build/rootfs-xiaoji` (it regenerates the apex-info list and linker config).
+
+## B17: the product boot in the browser with the WebGL backend, the frames on the page, and input
+
+Status: **partial.** The product tree boots in the browser page with the WebGL2 backend, and SurfaceFlinger's frames
+reach `#android-screen`. Over nine runs (b2 to b10) the first frame came at 202 to 353 s of wall time, `sys.boot_completed=1`
+at 221 to 384 s, and the launcher as HOME at 246 to 415 s; the slower half ran while the machine was swapping (see the
+runs below). **A tap on the screen reaches the guest's touchscreen; its effect on Android is not established.** In b10 the
+engine logged the touch delivered to the device's one open reader (EventHub) at display (435, 605), after the boot
+completed (the demo script mapped the page point through the element's box, not the letterboxed picture's, hence 605 for an
+aimed 585). The "Android System" dialog was on screen before the tap and gone 20 s after it in b6 to b10, but in b5 it
+was gone before the tap, in b10 SurfaceFlinger still composed it after the touch was delivered, and in every run it went in
+the window where the launcher became HOME and the screen went black: so the screenshots do not show that the tap
+dismissed it. **No launcher or SystemUI picture appears:** after the dialog the screen stays black (in one run with a band
+of noise at the top), although the launcher draws (its `eglSwapBuffers` statistics are logged). From about 409 s of
+engine time the composer posts the client target (Blocker 1). Typing was sent, but no text field could be seen, so its
+effect was not observed. The
+work fixed two engine hangs and four engine crashes met on the way (and 58 SIMD and FP forms a probe of libhwui found
+missing), each with a guest test against the native oracle (or an expectation where the builder VM has no such device),
+and three crashes the WebGL backend caused, with page self tests.
+
+Screenshots (headless Chromium, `build/web-shots/`, not committed): `b10-dialog.png` (an Android frame: the "Android
+System" dialog over the dimmed screen), `b10-dialog-after-tap.png` (20 s after the tap on OK: black, the dialog no longer shown; see above for why that does not
+show the tap's effect),
+`b10-home.png` (90 s after the launcher became HOME: black), `b9-home.png` (the same point in another run: a band of noise
+at the top), `b2-first-frame.png` (the first frame before the page fix below: the boot screen still drawn over it), and
+`glselftest.png` (the synthetic frame).
+
+### How the page runs the product tree
+
+The page already boots `build/rootfs-xiaoji` (W1, `web/cases.js` `BOOT`); nothing selects a tree. Its files come from the
+chunk store, which `make serve` and `make test-web` (with `XIAOJI_WEB_BOOT=1` or `XIAOJI_WEB_FRAMES=1`) build:
+`tools/mkmanifest.py --product build/rootfs-xiaoji build/web/manifest-xiaoji.json`, then `tools/pack.py build/rootfs-xiaoji
+build/web/xj --order image/boot-order.json --chunk-size 131072` (docs/loading.md). The B16 tree had no store yet; it now packs
+to 3,453 files, 10,806 chunks (455.2 MiB as zlib) and 7 boot packs (97.7 MiB). The manifest targets do not depend on the
+tree, so after the tree changes the two manifests must be deleted to rebuild them (as before). `image/boot-order.json` covers the boot to
+phase 100; everything read later comes through the synchronous chunk fallback (docs/loading.md, 2), which on localhost is
+fast enough not to matter.
+
+### Engine fixes (each with its test; native oracle unless noted)
+
+1. **AdvSIMD load and store, single structure** (`engine/simd.c`, `simd_ldst_single`). Unmodified `main` died at 242 s in the
+   native product boot: system_server's `android.ui` thread hit `st4 {v0.s-v3.s}[0], [x8]` (0x0d20a100, libhwui), which the
+   engine did not decode (it had LD1/ST1 lanes and LD1R only). System_server died, init restarted the zygote, and the boot
+   never reached `sys.boot_completed` in that run. Now LD1 to LD4 and ST1 to ST4 lanes for every element size and LD1R to
+   LD4R, with both post-index forms. Test: `tests/guest/simd-lanes.c`.
+2. **A PROT_WRITE mapping is readable** (`engine/mem.c`, `page_lookup`). arm64 has no write-only pages, so Linux maps
+   PROT_WRITE as read-write (`protection_map`). System_server's `android.ui` read a gralloc buffer that the mapper mapped
+   PROT_WRITE and died with SIGSEGV (SEGV_ACCERR). `/proc/<pid>/maps` still shows the requested protection. Test:
+   `tests/guest/prot-write.c` (anonymous, mprotect, and a shared memfd mapping, and a `write(2)` from such a page). A first
+   version broke the lookups that ask for `PTE_MAPPED` only (`mem_poke`); the `signals` and `memfd` oracle cases caught it.
+3. **The GL calls with out-parameters** (`engine/gl_host.c`, `not_api_data`). The B16 table answered the `not_api` calls with
+   the return type only. The guest's encoder (`gl2_enc.cpp`, checked on the remote tree) reads back every out-parameter,
+   so `glMapBufferRangeAEMU` (the mapped bytes), `glUnmapBufferAEMU` (`out_res`, 1 byte), `glGetSyncivAEMU`,
+   `glGetUniformIndicesAEMU` and `glGetCompressedTextureFormats` left the calling thread blocked in its read for good. The
+   decoder now parses each of these calls exactly (in-pointers as size and bytes, out-pointers as a size), replies with
+   each out-parameter, and passes the data calls (map, unmap, flush, `glBufferDataSyncAEMU`, the instanced and range draws,
+   the integer attribute pointers, the pixel-buffer uploads) to the backend. In the boots since, `glUnmapBufferAEMU` arrives
+   at about 245 to 263 s (the sender was not identified), and no thread hung on it. Whether this was B16's SystemUI hang is likely but
+   not proven: no boot of this tree re-ran B16's exact conditions (B16 blocker 2 below). Test: `tests/guest/goldfish-gl.c`
+   with `tests/expect/goldfish-gl.out` (no goldfish device in the builder VM; the layouts follow the product's
+   `gl2_enc.cpp`).
+4. **rcUpdateColorBufferDMA and rcReadColorBufferDMA, and the address space as one window** (`engine/goldfish.c`,
+   `engine/gl_host.c`). The product's mapper (`gralloc_30.cpp`) sends `rcUpdateColorBufferDMA` (10034) on every unlock of a
+   buffer the CPU wrote, naming the pixels by their guest-physical address (the address-space block's `phys_addr`, plus
+   the buffer's offset). The engine returned `phys_addr` 0 and had no decoder for 10034, so the pipe was marked broken and
+   system_server's `android.ui` blocked forever (`lockAndWriteDma: ERROR: No DMA context bound!`, then `opcode 10034 is not
+   decoded`). The address space now has one window that every open shares, as the device does: a block's offset is global
+   and its physical address is a fixed base plus the offset; blocks are freed by DEALLOCATE_BLOCK or when their open is
+   released. The host reads (or, for the read form, writes) the window by physical address. Tests:
+   `tests/guest/goldfish-as.c` (a second open's block follows the first with the same base and maps its bytes) and the DMA
+   cases of `tests/guest/goldfish-gl.c` (an address outside the window is refused with -1).
+5. **SLI and the scalar shift forms** (`engine/simd.c`). The launcher's `launcher-loader` thread died with SIGILL on
+   `sli v0.2d, v1.2d, #32` (0x6f605420, libhwui) in the native boot, after the fixes above let it run that far; it died on
+   each restart. Now SLI in every element size, and the scalar SRI, SLI, SSRA, USRA, SRSHR, URSHR, SRSRA and URSRA. Test:
+   `tests/guest/simd-insert.c`.
+6. **SQADD, UQADD, SQSUB and UQSUB** (vector, `engine/simd.c`, with FPSR.QC). The same thread then died in the browser on
+   `uqsub v0.8b, v0.8b, v1.8b` (0x2e212c00). Test: `tests/guest/simd-sat.c`.
+7. **The rest of libhwui's SIMD and FP forms.** A probe (`build/b17/probe`, not committed) ran every distinct SIMD and FP
+   data-processing encoding of the product's `libhwui.so` (3,694 classes, Rd and Rn fixed) natively and on the engine, and
+   compared the registers, NZCV and QC. 58 classes were unimplemented: half-precision FCVTN, FCVTL and scalar FCVT, FRECPE,
+   UMULL, UMLAL and SMULL by element (and the 2 forms), SQDMULH and SQRDMULH (vector and by element), SMAXV and SMINV. All
+   are done; the probe now differs only in QC for 13 saturating narrows (SQXTUN, UQXTN, SQRSHRN, SQSHRUN, SQRSHRUN), whose
+   values match (the engine does not keep QC for them, a known gap). Test: `tests/guest/simd-hwui.c` (with the special
+   values: infinities, NaNs, subnormals, ties, the saturating minimum products).
+
+### WebGL backend (`engine/gl_webgl.c`; tests are the page's self tests, `XIAOJI_WEB_FRAMES=1`)
+
+- **Host composition.** The first browser boot with frames lost SurfaceFlinger at its first present: the composer HAL
+  (`HostComposer.cpp`) takes its no-host-composition fallback when the host does not advertise
+  `ANDROID_EMU_host_composition_v1`, and that path posts the client target without checking it, which was null (SIGSEGV
+  at 0x14 in `android.hardware.graphics.composer@2.4-service`; SurfaceFlinger then aborted). The null backend advertised
+  the extension; the WebGL one did not. It now does, and implements `rcCompose` and `rcComposeWithoutPost`: the layers
+  (Device with a buffer, SolidColor) are drawn in order into the target colour buffer with their crop, transform and
+  blending (none, premultiplied, coverage) and plane alpha, and `rcCompose` posts the target.
+- **Window surfaces have back buffers.** The guest's framebuffer 0 draws into a texture with a depth and stencil buffer
+  (G2 had none), and `rcFlushWindowColorBuffer` (eglSwapBuffers) copies it into the colour buffer turned upright, as
+  gfxstream's window surfaces do. So every colour buffer holds its top row first, whoever wrote it (GL, the CPU through
+  `rcUpdateColorBuffer`, RenderEngine through an EGLImage), and `rcFBPost` reads the frame without the G2 row flip.
+- **Per-context state.** Each guest context's enables, blend equation and functions, blend and clear colours, colour and
+  depth masks, depth function, cull face and front face, stencil state per face, polygon offset, array and pixel buffer
+  bindings, pixel store, every used texture unit and its sampler, and the read framebuffer are switched with the context.
+  G2 shared them, so SurfaceFlinger's and an app's Skia state leaked into each other.
+- **The engine's own pixel work** (colour buffer uploads, read-backs, the flush blit, composition) unbinds the guest's pixel
+  buffers and restores the guest's pixel store after.
+- **Strings.** `GL_SHADING_LANGUAGE_VERSION` (the null backend has had it since B16; without it HWUI aborted with
+  `Assertion failed: !grContext.get()` in every app's RenderThread) and the EGL vendor, version and client APIs (without a
+  vendor the guest's `eglDisplay` frees a static string in `eglTerminate`, which killed system_server at about 253 s).
+- **GLES entries** G2 left to the null defaults: `glCopyTexSubImage2D`, `glCopyTexImage2D`, `glGetShaderPrecisionFormat`,
+  `glClearBuffer*`, `glVertexAttribDivisor`, `glDrawArraysInstanced`, `glDrawBuffers` and `glReadBuffer` (GL_BACK is
+  attachment 0 of the back buffer), `glBlitFramebuffer`, `glFramebufferTextureLayer`, `glRenderbufferStorageMultisample`,
+  `glTexParameterfv` and `iv`; `glInvalidate*Framebuffer` are accepted as the hints they are. The not_api data calls of
+  fix 3 are real here: map reads with `getBufferSubData`, unmap and flush write with `bufferSubData`.
+- **CPU uploads** in RGB565, RGB888 and BGRA8 are converted to the colour buffers' RGBA8.
+- Self tests (`xj_gl_selftest_compose`, `xj_gl_selftest_state`, run by `tests/web.mjs`): a CPU-written buffer composed top
+  row first with a solid colour blended over it, a flushed GL window surface read top row first, the GLSL and EGL vendor
+  strings; and two contexts on two streams keeping their own enables, blend function, unpack alignment and array buffer.
+
+### The page
+
+- `#android-screen` is both the frame canvas (G2) and the touch screen (I1). The G2 stylesheet gave it
+  `pointer-events: none` and left the boot screen above it, so no tap could reach it after the merge. Now the canvas takes
+  the pointer, and once frames arrive the boot screen's logo and progress are hidden; Stop and Show log stay above it.
+- The canvas letterboxes the 540x960 picture in the 9:19 phone (`object-fit: contain`); `web/input.js` maps a pointer
+  through the picture's box (`contentRect`), not the element's. Test: `tests/input.mjs` (the box keeps the aspect, is
+  centred, and the picture's top maps to row 0).
+- Milestones `completed` (`sys.boot_completed=1`) and `home` (the launcher as HOME); the boot screen's fifth stage,
+  "Starting home", now starts at `completed`.
+- `?debug=1` passes the new `--debug-faults` (as `XIAOJI_DEBUG_FAULTS=1`, which the page cannot set): fault reports,
+  process ends, and, in the WebGL backend, the first compositions' layers.
+
+### Debug aids added
+
+- Native, with `XIAOJI_DEBUG_FAULTS=1`: `kill -USR1 <engine pid>` dumps every live guest thread at the next slice
+  (`sched.c`, `dump_threads`): process, name, wait state and key, pc, x30, the syscall registers, and the frame-pointer
+  chain, each with its file and offset, for `llvm-symbolizer` against the remote tree's `symbols/`.
+- A signal frame that cannot be written is reported with the frame, sp and alternate stack (`signals.c`).
+- Each not_api GL call is noted once (`xiaoji: gl: not_api call ...`).
+- `--dump-at S[,S]` (every build; the page's `?dumpat=`): the thread dump at those seconds.
+- Under `--debug-faults`: the first 64 input events delivered (`evdev.c`), and in the WebGL backend each composition whose
+  layer set changed and each skipped surface flush.
+
+### Browser runs (headless Chromium, `build/b17/demo.mjs`, not committed)
+
+The page with `?boot=pack&gl=webgl&debug=1`, a fresh profile per run, AC power with Low Power Mode off. The times are the
+page's wall clock from the press (the milestone rows; the first frame is the page's `firstMs`), with the engine's stamp in
+brackets. **The machine swapped heavily during b7 to b10** (6.3 GB of swap in use, other applications open), and those runs are
+about 100 s slower; the numbers compare nothing and are not a benchmark.
+
+| Run | Engine change since the last run | First frame | `sys.boot_completed=1` | Launcher as HOME | What the screen shows after HOME |
+|---|---|---|---|---|---|
+| b1 | none of the WebGL fixes | none: the composer HAL crashed at the first present | not reached in 455 s | | the boot screen |
+| b2 | host composition, back buffers, state | 204.9 s | 273.6 s (271.0 s) | 302.4 s (299.8 s) | black with noise bands; every app RenderThread aborted (`!grContext.get()`) |
+| b3 | the GLSL version string | 201.7 s | about 221 s (218.4 s) | about 246 s | black; system_server died at 260 s (SIGSEGV at address 0; in b4 the same death symbolized as `eglTerminate` freeing a static string) |
+| b5 | EGL strings, GLES entries, read framebuffer | about 246 s | 267.6 s (265.0 s) | 287.1 s (284.5 s) | black; the launcher's loader died on `uqsub` |
+| b6 | SQADD and the rest | about 260 s | 288.3 s (285.7 s) | 319.0 s (316.4 s) | black; no crash in the run |
+| b10 | the probe's SIMD forms, the debug notes | 352.8 s | 384.4 s (379.6 s) | 415.1 s (410.3 s) | black |
+
+### Native runs (the null backend, `build/xiaoji`, `XIAOJI_DEBUG_FAULTS=1 XIAOJI_STAMP=1`, after `make reset-data`)
+
+- boot1, unmodified `main`: system_server's SIGILL (fix 1) at 242 s; init restarted the zygote; no `sys.boot_completed` in 400 s.
+- boot2: system_server's SIGSEGV (fix 2) at 241 s.
+- boot5: system_server's `android.ui` blocked after `opcode 10034 is not decoded` (fix 4); no `sys.boot_completed` in 324 s.
+- boot6 (fixes 1 to 4): `sys.boot_completed=1` at 258.0 s, the launcher as HOME at 272.0 s, `Displayed
+  com.android.launcher3/.uioverrides.QuickstepLauncher: +24s706ms` at 298.0 s, then the launcher's loader SIGILL (fix 5).
+  SystemUI's first instance (pid 1251, started at 214.2 s) logged to 418.7 s and was never ANR'd in the 420 s run
+  (B16: its last line at 274.8 s and the ANR at 344.7 s). `glUnmapBufferAEMU` arrived at about 263 s, and no thread hung on it.
+- No native boot reached HOME with fixes 5 to 7: boot6 died on SLI after HOME, and the product check's boot (below, every
+  fix) was cut at 480 s, 24 s after `sys.boot_completed`, before the launcher became HOME. In the browser, b6 to b10 (every
+  fix) had no fatal signal in the launcher.
+
+### Blockers, with the evidence
+
+1. **Open: GL-drawn layers appear black; cause not found.** Two observations, two candidate causes:
+   - From about 409 s (b10; b9 the same from 384 s) the composer HAL logs `presentDisplay display has no layers to compose,
+     flushing client target buffer` (117 times in each run): every layer is Client, and the frames are RenderEngine's
+     client composition, posted with `rcFBPost`. They are black. Why the composer falls back to client composition is
+     not established; `HostComposer::validateDisplay` does it for every layer when the display has a colour transform,
+     and ColorDisplayService starts at that time (an inference). RenderEngine's Skia path through EGLImages
+     (`rcBindTexture`, `rcBindRenderbuffer`, external textures read as 2D) has never produced a correct frame here.
+   - Before that, under host composition, the dialog's frames (b3, b9: the same 20,729-byte screenshot) are pure black
+     around the dialog, although b9's layer list had an opaque full-screen GL-drawn layer (colour buffer 24, blend none)
+     under the 0.6 dim. A non-black wallpaper would show through. So GL-drawn colour buffers may be black under host
+     composition too; the only correct pixels seen so far (the dialog, drawn by system_server's software path) came
+     through the CPU and DMA path.
+   The next step is to sample pixels of a window's back buffer at `rcFlushWindowColorBuffer` and of each Device layer in
+   `compose()`, which separates "the GL draws produce nothing" from "the composition loses it". The noise band of one
+   run may be stale data in a reused address-space range: freed ranges were handed out again without clearing, where the
+   per-open window of B16 always read zeros. A new block now reads as zeros (`as_zero`, tested in `goldfish-as`); no
+   browser run was made after that change.
+2. **Open: the first boot's "Android System" dialog** (`Build.isBuildConsistent()` false): `VintfObject.verifyBuildAtBoot`
+   fails because the engine reports kernel 6.1, and the framework compatibility matrix for the product's kernel FCM level
+   (5) lists 4.14, 4.19 and 5.4; libvintf also finds no `/proc/config.gz` and cannot read `/proc/cpuinfo`. The fix is in
+   what the engine reports as its kernel (a matching version and a configuration file), a policy decision; not done.
+3. **B16 blocker 2 (SystemUI's first instance hung): not seen since fix 3.** See the native runs above. Fix 3 removed a
+   certain hang (a reply the guest always waits for); that this was the B16 hang is likely, not proven.
+4. **B16 blocker 3 (`txn_build` refusal)** and **B16 blocker 5 (`IStoraged`)**: not worked on.
+5. **QC** is not kept for the saturating narrows (values are right; the probe shows QC only).
+6. **The launcher has no "Displayed" line in the browser** (it has one natively). Its threads were idle in their loopers in a
+   dump 115 s after HOME (b9, `?dumpat=430,500`), and its `eglSwapBuffers` statistics are logged; why ActivityManager does
+   not see its first frame drawn was not found. The `E/Fence` lines (`sync_merge` on the goldfish sync's eventfds:
+   `Inappropriate ioctl for device`) are in both the native and the browser runs.
+
+### Verification (B17, final sources)
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` (after touching every engine source) | exit 0; no warning in the log |
+| `XIAOJI_JOBS=4 tests/run.sh` | **280 passed, 0 failed, 0 xfail** (with `simd-lanes`, `simd-insert`, `simd-sat`, `simd-hwui` and `prot-write` on engine and Node, O0 and O2, against the native oracle, and the `goldfish-gl` and `goldfish-as` expectations) |
+| `make test-web` | all web checks passed, exit 0 |
+| `XIAOJI_WEB_BOOT=1 make test-web` (the boot page to phase 100, the warm visit, the download screen; after the last engine change) | all 60 checks passed, exit 0 (the chunk store check: 10,806 of 10,806 chunks) |
+| `node tests/input.mjs` | all passed (with the letterbox checks) |
+| `XIAOJI_WEB_FRAMES=1 XN_FRAME_TIMEOUT_MS=3000 node tests/web.mjs hello-jit` (the self tests; the frame wait cut to 3 s, so the boot frame check fails by design) | all 14 self-test checks pass, including the composition (63) and per-context state (255) checks; the three boot frame checks fail at 3 s. The full `XIAOJI_WEB_FRAMES=1 make test-web` was not run; the demo runs above show frames from 202 s |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product, after `make reset-data`) | **246 passed, 1 failed: NOT green.** The failure is the zygote boot check, on time: the boot reached `sys.boot_completed=1` at 456.2 s and the engine's 480 s limit ended it before the launcher became HOME and before the 60 s window. Its log has no `Fatal signal` and no `is not decoded`. The machine had 5.2 to 6.3 GB of swap in use during the run (B16's run reached the marker at 268.9 s). `prop-list node` and `binder-sm node`, the two wasm exit traps of B16, passed in this run (one run; not investigated) |
+| `pgrep -fl "build/xiaoji|wasm-node/xiaoji|headless_shell"` at the end | nothing of this work |
+
+Files changed (all under the repo): `engine/simd.c`, `engine/mem.c`, `engine/gl_host.c`, `engine/gl_host.h`,
+`engine/gl_webgl.c`, `engine/goldfish.c`, `engine/goldfish.h`, `engine/sched.c`, `engine/sched.h`, `engine/signals.c`,
+`engine/main.c`, `engine/evdev.c`; `tests/guest/simd-lanes.c`, `prot-write.c`, `goldfish-gl.c`, `simd-insert.c`,
+`simd-sat.c`, `simd-hwui.c`, `goldfish-as.c`; `tests/expect/goldfish-gl.out`, `tests/expect/goldfish-as.out`;
+`tests/run.sh`, `tests/web.mjs`, `tests/input.mjs`; `web/index.html`, `web/input.js`, `web/main.js`, `web/worker.js`,
+`web/cases.js`, `web/theme.js`, `web/theme.json`, `web/theme-pink.json`; `docs/boot.md`, `docs/graphics.md`,
+`docs/web-preview.md`, `docs/input.md`. `docs/testing.md` and `tools/remote-test.sh`, which the brief names, are not in this
+repository; every check ran locally.

@@ -648,7 +648,10 @@ static uint8_t *page_lookup(uint64_t vpn, unsigned need)
     if (!slot)
         return NULL;
     uint64_t e = *slot;
-    if (!(e & PTE_MAPPED) || !(e & need))
+    /* arm64 has no write-only pages: Linux maps PROT_WRITE (without PROT_READ) as readable and writable
+     * (protection_map), so a read of a writable page succeeds. /proc/<pid>/maps still shows "-w-". */
+    uint64_t have = (e & PTE_W) ? (e | PTE_R) : e;
+    if (!(e & PTE_MAPPED) || !(have & need))
         return NULL;
     if ((need & PTE_W) && (e & PTE_COW)) {
         cow_break(vpn, slot);

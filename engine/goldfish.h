@@ -37,7 +37,11 @@ uint64_t goldfish_key(void *o);
 int64_t goldfish_ioctl(void *o, uint32_t cmd, uint64_t arg);
 
 /* mmap of an address space: the memfd that backs its blocks (one reference for the caller's description;
- * the caller maps it at the block's offset). */
+ * the caller maps it at the block's offset). Every open shares it (the device's one window). */
 memfd_t *goldfish_as_memfd(void *o);
+
+/* The host's access to the window by guest-physical address (rcUpdateColorBufferDMA and rcReadColorBufferDMA, gl_host.c):
+ * copies n bytes at phys out of the window (write 0) or into it (write 1). 0, or -1 when the range is outside it. */
+int goldfish_as_dma(uint64_t phys, void *buf, size_t n, int write);
 
 #endif

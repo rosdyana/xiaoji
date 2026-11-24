@@ -74,10 +74,11 @@ typedef struct {
 
 /* ---------- the address space ---------- */
 
-#define GF_AS_WINDOW (256ULL << 20) /* the sparse memfd every block is carved from */
+#define GF_AS_WINDOW (1024ULL << 20) /* the sparse memfd every block is carved from: the device's one window */
+#define GF_AS_PHYS_BASE (1ULL << 36) /* the window's guest-physical address (a BAR on the emulator); phys = base + offset */
 #define GF_AS_PAGE 4096ULL
 #define GF_AS_MAX_BLOCKS 4096
-#define GF_AS_MAX_FREE 1024
+#define GF_AS_MAX_FREE 4096
 
 /* The subdevice command numbers (ALLOCATE_ID, UNALLOCATE_ID) and the ioctl numbers: goldfish_address_space_android.impl. */
 #define GF_AS_ALLOCATE_ID 1
@@ -93,16 +94,24 @@ typedef struct {
     uint64_t off, size;
 } gf_range;
 
+/* The device's memory, as on the emulator: one window that every open shares (blocks have global offsets, and the
+ * guest-physical address of a block is GF_AS_PHYS_BASE plus its offset). The gralloc mapper relies on that: it takes
+ * the physical address of a buffer from its own small block (phys - offset) plus the buffer's offset in the allocator's
+ * open, and passes it to the host for rcUpdateColorBufferDMA. Blocks are freed by DEALLOCATE_BLOCK or when the open
+ * that allocated them is closed (the driver's release). */
+static memfd_t *as_window;
+static uint64_t as_top; /* the first byte past the blocks carved so far */
+static int as_nfree;
+static gf_range as_freeq[GF_AS_MAX_FREE]; /* freed ranges, reused first-fit */
+
 typedef struct {
     int kind; /* GF_ADDRESS_SPACE */
     int64_t subdev; /* -1 until the first ping sets the subdevice type */
-    memfd_t *mem;   /* the window; the object holds one reference */
-    uint64_t top;   /* the first byte past the blocks carved so far */
     int nblocks;
-    gf_range blocks[GF_AS_MAX_BLOCKS]; /* the live blocks (offset, size) */
-    int nfree;
-    gf_range freeq[GF_AS_MAX_FREE];    /* freed ranges, reused first-fit */
+    gf_range blocks[GF_AS_MAX_BLOCKS]; /* this open's live blocks (offset, size) */
 } gfas_t;
+
+static void as_release(gfas_t *a, int i);
 
 /* ---------- common ---------- */
 
@@ -132,18 +141,20 @@ void *goldfish_open(gf_kind kind)
         return s;
     }
     if (kind == GF_ADDRESS_SPACE) {
+        if (!as_window) {
+            as_window = memfd_new("goldfish-address-space");
+            if (!as_window || memfd_truncate(as_window, GF_AS_WINDOW) != 0) {
+                if (as_window)
+                    memfd_unref(as_window);
+                as_window = NULL;
+                return NULL;
+            }
+        }
         gfas_t *a = calloc(1, sizeof *a);
         if (!a)
             return NULL;
         a->kind = GF_ADDRESS_SPACE;
         a->subdev = -1;
-        a->mem = memfd_new("goldfish-address-space");
-        if (!a->mem || memfd_truncate(a->mem, GF_AS_WINDOW) != 0) {
-            if (a->mem)
-                memfd_unref(a->mem);
-            free(a);
-            return NULL;
-        }
         return a;
     }
     return NULL;
@@ -166,7 +177,8 @@ void goldfish_free(void *o)
         free(p);
     } else if (kind == GF_ADDRESS_SPACE) {
         gfas_t *a = o;
-        memfd_unref(a->mem);
+        while (a->nblocks) /* the driver's release frees the blocks of this open */
+            as_release(a, a->nblocks - 1);
         free(a);
     } else {
         free(o);
@@ -406,23 +418,47 @@ int64_t goldfish_write(void *o, const void *buf, size_t n)
 
 /* ---------- the address space: blocks and ioctls ---------- */
 
-static int as_alloc(gfas_t *a, uint64_t size, uint64_t *off)
+/* A new block reads as zeros, as a fresh host allocation does: the pages a freed block left behind are cleared. */
+static void as_zero(uint64_t off, uint64_t size)
 {
-    for (int i = 0; i < a->nfree; i++) {
-        if (a->freeq[i].size >= size) {
-            *off = a->freeq[i].off;
-            a->freeq[i].off += size;
-            a->freeq[i].size -= size;
-            if (a->freeq[i].size == 0)
-                a->freeq[i] = a->freeq[--a->nfree];
+    for (uint64_t p = off / GF_AS_PAGE; p < (off + size) / GF_AS_PAGE; p++)
+        if (memfd_materialized(as_window, p)) {
+            uint8_t *pg = memfd_page(as_window, p);
+            if (pg)
+                memset(pg, 0, GF_AS_PAGE);
+        }
+}
+
+static int as_alloc(uint64_t size, uint64_t *off)
+{
+    for (int i = 0; i < as_nfree; i++) {
+        if (as_freeq[i].size >= size) {
+            *off = as_freeq[i].off;
+            as_freeq[i].off += size;
+            as_freeq[i].size -= size;
+            if (as_freeq[i].size == 0)
+                as_freeq[i] = as_freeq[--as_nfree];
+            as_zero(*off, size);
             return 0;
         }
     }
-    if (a->top + size > GF_AS_WINDOW)
+    if (as_top + size > GF_AS_WINDOW)
         return -1;
-    *off = a->top;
-    a->top += size;
+    *off = as_top;
+    as_top += size;
+    as_zero(*off, size); /* the top may have come down over a freed block */
     return 0;
+}
+
+/* Frees block i of open a: its range goes back to the window (the last block lowers the top). */
+static void as_release(gfas_t *a, int i)
+{
+    gf_range r = a->blocks[i];
+    a->blocks[i] = a->blocks[--a->nblocks];
+    if (r.off + r.size == as_top)
+        as_top = r.off;
+    else if (as_nfree < GF_AS_MAX_FREE)
+        as_freeq[as_nfree++] = r;
 }
 
 static int as_find(gfas_t *a, uint64_t off)
@@ -456,15 +492,15 @@ static int64_t as_allocate(gfas_t *a, uint64_t arg)
     if (!size || a->nblocks >= GF_AS_MAX_BLOCKS)
         return -LE_INVAL;
     uint64_t off;
-    if (as_alloc(a, size, &off) != 0)
+    if (as_alloc(size, &off) != 0)
         return -LE_NOMEM;
     a->blocks[a->nblocks].off = off;
     a->blocks[a->nblocks].size = size;
     a->nblocks++;
-    /* The kernel fills in the rounded size, the offset and the physical address (none here). */
+    /* The kernel fills in the rounded size, the offset and the physical address (the window's base plus the offset). */
     put_le(b, size, 8);
     put_le(b + 8, off, 8);
-    put_le(b + 16, 0, 8);
+    put_le(b + 16, GF_AS_PHYS_BASE + off, 8);
     return mem_copy_in(arg, b, sizeof b) < 0 ? -LE_FAULT : 0;
 }
 
@@ -476,9 +512,7 @@ static int64_t as_deallocate(gfas_t *a, uint64_t arg)
     int i = as_find(a, get_le(b, 8));
     if (i < 0)
         return -LE_INVAL;
-    if (a->nfree < GF_AS_MAX_FREE)
-        a->freeq[a->nfree++] = a->blocks[i];
-    a->blocks[i] = a->blocks[--a->nblocks];
+    as_release(a, i);
     return 0;
 }
 
@@ -558,9 +592,18 @@ int64_t goldfish_ioctl(void *o, uint32_t cmd, uint64_t arg)
 
 memfd_t *goldfish_as_memfd(void *o)
 {
-    if (*(int *)o != GF_ADDRESS_SPACE)
+    if (*(int *)o != GF_ADDRESS_SPACE || !as_window)
         return NULL;
-    gfas_t *a = o;
-    memfd_ref(a->mem);
-    return a->mem;
+    memfd_ref(as_window);
+    return as_window;
+}
+
+int goldfish_as_dma(uint64_t phys, void *buf, size_t n, int write)
+{
+    if (!as_window || phys < GF_AS_PHYS_BASE || phys - GF_AS_PHYS_BASE > GF_AS_WINDOW ||
+        n > GF_AS_WINDOW - (phys - GF_AS_PHYS_BASE))
+        return -1;
+    uint64_t off = phys - GF_AS_PHYS_BASE;
+    int64_t r = write ? memfd_pwrite(as_window, buf, n, off) : memfd_pread(as_window, buf, n, off);
+    return r == (int64_t)n ? 0 : -1;
 }

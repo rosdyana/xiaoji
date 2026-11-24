@@ -8,7 +8,7 @@ EventHub, getevent and the input stack read them with their own ioctls and reads
 
 | Node | Name (EVIOCGNAME) | Bus, vendor, product, version | What it has |
 |---|---|---|---|
-| `/dev/input/event0` | `xiaoji_touchscreen` | 0x06 (virtual), 0x0001, 0x0001, 0x0001 | `INPUT_PROP_DIRECT`; EV_KEY `BTN_TOUCH`; EV_ABS `ABS_MT_SLOT` (0..9), `ABS_MT_TRACKING_ID` (0..65535), `ABS_MT_POSITION_X` (0..719), `ABS_MT_POSITION_Y` (0..1279), `ABS_MT_PRESSURE` (0..255) |
+| `/dev/input/event0` | `xiaoji_touchscreen` | 0x06 (virtual), 0x0001, 0x0001, 0x0001 | `INPUT_PROP_DIRECT`; EV_KEY `BTN_TOUCH`; EV_ABS `ABS_MT_SLOT` (0..9), `ABS_MT_TRACKING_ID` (0..65535), `ABS_MT_POSITION_X` (0..539), `ABS_MT_POSITION_Y` (0..959), `ABS_MT_PRESSURE` (0..255) |
 | `/dev/input/event1` | `xiaoji_keyboard` | 0x06, 0x0001, 0x0002, 0x0001 | EV_KEY: Esc, 1..0, `- =`, Backspace, Tab, Q..P, `[ ]`, Enter, LCtrl, A..L, `; ' \``, LShift, `\`, Z..M, `, . /`, RShift, LAlt, Space, CapsLock, RCtrl, RAlt, Home, arrows, PgUp, PgDn, End, Delete, LMeta, Menu, Back, Homepage. EV_REP (REP_DELAY, REP_PERIOD) |
 
 The ranges come from `engine/display.h` (`XJ_DISPLAY_W` and `XJ_DISPLAY_H`, 540 by 960). `rcGetFBParam` reads the same
@@ -95,10 +95,11 @@ that is not cross-origin isolated has no `SharedArrayBuffer`, so it gets no ring
 
 ## The page
 
-- **The screen:** `#android-screen`, a 9:16 element inside `#phone`. `web/input.js` creates it when the page has none (the
-  graphics canvas takes this element when it lands; the code finds it by id). It is shown only while the boot runs. It is
-  transparent and under the boot's controls (`web/index.html` raises the other children of `#phone`), so the Stop button and
-  the progress bar keep their clicks.
+- **The screen:** `#android-screen`, the frame canvas of G2 inside `#phone` (`web/input.js` creates an element of its own only
+  when the page has none). It takes the pointer (B17: the merged G2 stylesheet had `pointer-events: none` on it, so no tap
+  reached it), and once frames arrive the boot screen's decorations are hidden while Stop and Show log stay above it. The
+  canvas letterboxes the 540 by 960 picture (`object-fit: contain`), so a pointer is mapped through the picture's box
+  (`contentRect`), not the element's.
 - **The display size on the page:** `web/input.js` keeps its own 540 by 960 (`DISPLAY_W`, `DISPLAY_H`), because the page does
   not read the engine's header. `tests/input.mjs` fails if it differs from `engine/display.h`.
 - **Pointers:** `pointerdown`, `pointermove`, `pointerup` and `pointercancel` on the screen become protocol B
@@ -123,8 +124,12 @@ that is not cross-origin isolated has no `SharedArrayBuffer`, so it gets no ring
   oracle for these devices).
 - `tests/init/evdev.rc` with `tests/expect/init-evdev.out`: `getevent -lp` under init as `system:input`, which lists both
   devices (the names, the ranges, the props, the keys and REP). getevent exits after the scan with `-p`.
-- `tests/input.mjs` (in `make test-web`): the key map, the display mapping, the frames of a two-finger touch, and the ring
-  round trip through the engine's own `xiaoji_input_pop`, loaded from `engine/jit_lib.js`.
+- `tests/input.mjs` (in `make test-web`): the key map, the display mapping (and the letterboxed box, B17), the frames of a
+  two-finger touch, and the ring round trip through the engine's own `xiaoji_input_pop`, loaded from `engine/jit_lib.js`.
+- In a browser boot (B17, with `?debug=1`): a tap on the phone, sent after `sys.boot_completed`, was delivered to the
+  touchscreen's one open reader (EventHub) with its slot, position, pressure and `BTN_TOUCH` (the engine's
+  `xiaoji: evdev:` lines). What Android did with it was not established (docs/boot.md, B17). A tap sent before the boot
+  completed was dropped (`InputDispatcher: Dropped event because input dispatch is disabled`, one line in one run).
 
 ## Not done
 

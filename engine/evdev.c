@@ -1,6 +1,7 @@
 /* Virtual evdev devices (evdev.h). The codes, the ioctl numbers and the struct layouts are the uapi's
  * (linux/input.h, linux/input-event-codes.h; arm64 uses the asm-generic ioctl encoding). */
 #include "evdev.h"
+#include "signals.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -357,6 +358,7 @@ void evdev_pump(void)
             bit_clear(d->keystate, (unsigned)s[2]);
         /* EV_KEY value 2 is a repeat: the state is unchanged. */
         uint64_t mono = host_monotonic_ns(), real = host_realtime_ns();
+        int nopen = 0;
         for (int i = 0; i < MAX_OPEN; i++) {
             evfd *e = opened[i];
             if (!e || e->dev != s[0])
@@ -364,6 +366,13 @@ void evdev_pump(void)
             if (d->grab && d->grab != e)
                 continue;
             deliver(e, (uint16_t)s[1], (uint16_t)s[2], s[3], mono, real);
+            nopen++;
+        }
+        /* --debug-faults: the first events from the source, and how many open fds took each (B17). */
+        static int noted;
+        if (sig_debug_faults() && noted < 64) {
+            noted++;
+            fprintf(stderr, "xiaoji: evdev: event%d type %d code %d value %d to %d open fd(s)\n", s[0], s[1], s[2], s[3], nopen);
         }
     }
 }

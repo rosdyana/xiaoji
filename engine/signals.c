@@ -245,8 +245,20 @@ static int setup_frame(cpu_t *c, int sig, int code, int sync, uint64_t addr, uin
         put64(f + RES_OFF + 16 + 16 * n, c->v[n][0]);
         put64(f + RES_OFF + 24 + 16 * n, c->v[n][1]);
     }
-    if (mem_copy_in(frame, f, sizeof f) < 0)
+    if (mem_copy_in(frame, f, sizeof f) < 0) {
+        if (sig_debug_faults()) {
+            uint64_t rs = 0, re = 0, roff = 0;
+            const char *rpath = NULL;
+            int in = mem_region_next(frame, &rs, &re, &rpath, &roff) && rs <= frame && frame < re;
+            fprintf(stderr, "xiaoji: signal %d: frame at 0x%llx not writable (sp 0x%llx, altstack 0x%llx+0x%llx flags %u, "
+                            "SA_ONSTACK %d): %s prot %u region 0x%llx-0x%llx %s\n",
+                    sig, (unsigned long long)frame, (unsigned long long)c->sp, (unsigned long long)c->alt_sp,
+                    (unsigned long long)c->alt_size, (unsigned)c->alt_flags, (sa->flags & SA_ONSTACK) != 0,
+                    in ? "mapped" : "not mapped", in ? mem_prot_at(frame) : 0u, (unsigned long long)rs,
+                    (unsigned long long)re, in && rpath ? rpath : "(anon)");
+        }
         return -1;
+    }
 
     /* The handler's view: the signal number, then (with SA_SIGINFO) the siginfo and
      * ucontext pointers, the frame as sp, and the restorer as the return address. */
