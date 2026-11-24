@@ -11,6 +11,7 @@ import { newFrameView } from './frame.js';
 import {
   newScreen, startRun, onDownload, onBootTree, onMilestone, onRestart, onError, onEnd, onStop, render as renderScreen,
 } from './bootscreen.js';
+import { createRing, attachInput, ensureScreen } from './input.js';
 
 const $ = (id) => document.getElementById(id);
 const base = new URL('./', location.href).href;
@@ -97,6 +98,7 @@ const LOG_LINES = 20000;
 window.xb = { status: 'idle', lines: 0, milestones: {}, fetch: null, done: null, error: null, screen: null };
 let bootWorker = null;
 let bootPacker = null; // the pack downloader (web/packloader.js), pack mode
+let detachInput = null; // the page's input to the guest (web/input.js), attached while the boot runs
 let bootTimer = null;
 let scr = null; // the screen's state (bootscreen.js)
 let theme = DEFAULT_THEME;
@@ -155,6 +157,10 @@ function render() {
 // Start and Stop: Start when no worker runs, Stop while one does.
 function setControls() {
   const running = bootWorker !== null;
+  const screenEl = $('android-screen'); // the Android screen (web/input.js): shown while the boot runs
+  if (screenEl) screenEl.hidden = !running;
+  $('btn-back').disabled = !running;
+  $('btn-home').disabled = !running;
   $('boot').hidden = running;
   $('stop').hidden = !running;
   $('boot').disabled = running;
@@ -188,6 +194,8 @@ function appendLog(text) {
 function stopBoot(status) {
   if (bootWorker) bootWorker.terminate();
   bootWorker = null;
+  if (detachInput) detachInput();
+  detachInput = null;
   if (bootPacker) bootPacker.terminate();
   bootPacker = null;
   if (bootTimer) clearInterval(bootTimer);
@@ -209,6 +217,9 @@ $('boot').addEventListener('click', async () => {
   startRun(scr);
   bootTimer = setInterval(render, 250);
 
+  // The input ring (web/input.js) is shared with the engine's worker, which drains it (docs/input.md); off without SharedArrayBuffer.
+  const inputRing = createRing();
+  if (inputRing) detachInput = attachInput({ ring: inputRing, screen: ensureScreen($('phone')), back: $('btn-back'), home: $('btn-home') });
   const worker = new Worker(new URL('./worker.js', location.href), { type: 'module' });
   bootWorker = worker;
   // The Android screen (G2): the frame counters are shared with the engine's worker, which needs cross-origin
@@ -324,6 +335,7 @@ $('boot').addEventListener('click', async () => {
   // engine's lazy fill window (a power of two from 4096 to 1 MiB). Both are engine arguments.
   worker.postMessage({
     type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
+    input: inputRing ? inputRing.buffer : null,
     lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'), statsAt: params.has('statsat'),
     early: params.get('early'), gl: glBackend, frameSab,
   });

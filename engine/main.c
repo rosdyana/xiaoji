@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "cpu_a64.h"
+#include "evdev.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include "jit.h"
@@ -86,6 +87,7 @@ static int usage(FILE *out)
           "  --root DIR   guest root directory (default: the host root /)\n"
           "  --env K=V    add a guest environment variable\n"
           "  --prop K=V   set a system property (after the guest's build.prop files)\n"
+          "  --input-script FILE  the input devices' test source: timed events, one per line (\"ms dev type code value\"; docs/input.md)\n"
           "  --trace      print each syscall and its result to stderr\n"
           "  --stats      print the instruction count and rate on exit (as XIAOJI_STATS=1)\n"
           "  --logcat     print the guest's log messages (logd) to stderr (as XIAOJI_LOGCAT=1)\n"
@@ -157,6 +159,15 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--no-lazy-mmap")) {
             lazy_mmap = 0;
+            continue;
+        }
+        if (!strcmp(a, "--input-script")) { /* the test source of the input devices (evdev.c, docs/input.md) */
+            if (i + 1 >= argc)
+                return usage(stderr);
+            if (evdev_script_load(argv[++i]) < 0) {
+                fprintf(stderr, "xiaoji: --input-script: cannot read %s\n", argv[i]);
+                return 2;
+            }
             continue;
         }
         if (!strcmp(a, "--lazy-window")) {

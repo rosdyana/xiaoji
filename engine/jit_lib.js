@@ -36,4 +36,18 @@ addToLibrary({
   }
     return 0;
   },
+  // The input ring (web/input.js, docs/input.md): the page's events for /dev/input (engine/evdev.c, XIAOJI_WEB). Copies
+  // the next event (dev, type, code, value) to out and returns 1, or returns 0 when the ring is empty or the page gave none.
+  // The ring is Module.inputRing (web/worker.js): word 0 the head, word 1 the tail, then the entries (4 words each).
+  xiaoji_input_pop: function (out) {
+    var r = Module['inputRing'];
+    if (!r) return 0;
+    var head = Atomics.load(r, 0), tail = Atomics.load(r, 1);
+    if (((head - tail) & 0x7fffffff) === 0) return 0;
+    var cap = (r.length - 2) >> 2;
+    var at = 2 + 4 * (tail % cap);
+    for (var i = 0; i < 4; i++) HEAP32[(out >> 2) + i] = r[at + i];
+    Atomics.store(r, 1, (tail + 1) & 0x7fffffff);
+    return 1;
+  },
 });

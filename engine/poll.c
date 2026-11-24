@@ -6,7 +6,9 @@
 
 #include "binder.h"
 #include "fdobj.h"
+#include "evdev.h"
 #include "goldfish.h"
+#include "host.h"
 #include "linux.h"
 #include "mem.h"
 #include "pipe.h"
@@ -94,6 +96,11 @@ uint32_t poll_revents(vfs_fd *f, uint32_t events)
             r |= PX_IN;
         r |= PX_OUT;
         break;
+    case VFS_EVDEV: /* readable once a complete packet (SYN_REPORT) is queued (evdev.c) */
+        if (evdev_readable(f->obj))
+            r |= PX_IN;
+        r |= PX_OUT;
+        break;
     case VFS_TIMERFD:
         if (tfd_readable(f->obj))
             r |= PX_IN;
@@ -131,6 +138,8 @@ uint64_t poll_timer_deadline(const vfs_fd *f)
         return dl;
     if (f && f->kind == VFS_GOLDFISH && goldfish_deadline(f->obj, &dl))
         return dl;
+    if (f && f->kind == VFS_EVDEV) /* an input device: look again after an interval (evdev.c) */
+        return host_monotonic_ns() + evdev_recheck_interval_ns();
     return 0;
 }
 

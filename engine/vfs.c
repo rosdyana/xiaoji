@@ -23,6 +23,7 @@
 #include "bpf.h"
 #include "cgroupfs.h"
 #include "goldfish.h"
+#include "evdev.h"
 #include "fdobj.h"
 #include "inotify.h"
 #include "pipe.h"
@@ -157,6 +158,10 @@ static vfs_syn syn_of(const char *p)
     }
     if (binder_device(p) >= 0) return SYN_BINDER;
     if (goldfish_device(p)) return SYN_GOLDFISH;
+    if (evdev_is_dir(p)) return SYN_DIR; /* /dev/input (evdev.c, B16) */
+    if (evdev_index(p) == EVDEV_TOUCH) return SYN_EVDEV0;
+    if (evdev_index(p) == EVDEV_KEYBOARD) return SYN_EVDEV1;
+    if (evdev_file(p)) return SYN_DATA; /* the touchscreen's idc (evdev.c) */
     if (!strcmp(p, "/dev/ashmem")) return SYN_ASHMEM;
     if (bpffs_under(p)) { /* the bpffs at /sys/fs/bpf (B15) */
         switch (bpffs_lookup(p)) {
@@ -517,6 +522,8 @@ static void desc_unref(vfs_fd *f)
         binder_release(f->binder); /* the last description of a proc: its death */
     if (f->kind == VFS_GOLDFISH)
         goldfish_free(f->obj);
+    if (f->kind == VFS_EVDEV)
+        evdev_free(f->obj);
     if (f->kind == VFS_BPF)
         bpf_map_unref(f->obj);
     if (f->kind == VFS_EVENTFD)
@@ -706,6 +713,12 @@ int vfs_pipe_block(int fd)
             sched_block_restart_until(goldfish_key(f->obj), 1, dl);
         else
             sched_block_restart(goldfish_key(f->obj));
+        return 1;
+    }
+    if (f->kind == VFS_EVDEV) {
+        /* An input device has no deadline of its own: the source may have an event at any time, so the reader
+         * waits an interval and looks again (evdev.c). */
+        sched_block_restart_until((uint64_t)(uintptr_t)f->obj, 1, host_monotonic_ns() + evdev_recheck_interval_ns());
         return 1;
     }
     if (f->kind == VFS_TIMERFD) {
@@ -943,6 +956,21 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
+    if (r.syn == SYN_EVDEV0 || r.syn == SYN_EVDEV1) {
+        /* /dev/input/eventN: an open of the device (evdev.c). The reads come as whole struct input_event records. */
+        if (lflags & LO_DIRECTORY)
+            return -LE_NOTDIR;
+        void *o = evdev_open(r.syn == SYN_EVDEV1 ? EVDEV_KEYBOARD : EVDEV_TOUCH);
+        if (!o)
+            return -LE_NOMEM;
+        vfs_fd *f = desc_new();
+        f->kind = VFS_EVDEV;
+        f->obj = o;
+        f->lflags = lflags & ~(uint32_t)LO_CLOEXEC;
+        f->guest = xstrdup(r.guest);
+        slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
+        return slot;
+    }
     if (r.syn == SYN_GOLDFISH) {
         /* /dev/goldfish_pipe: a new pipe (goldfish.c). The name is written by the guest. */
         if (lflags & LO_DIRECTORY)
@@ -1012,6 +1040,8 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
             return -LE_NOMEM;
         if (r.syn == SYN_DATA && powersupply_kind(r.guest) == PSFS_FILE &&
             powersupply_read(r.guest, &gen, &glen) < 0)
+            return -LE_NOMEM;
+        if (r.syn == SYN_DATA && evdev_file(r.guest) && evdev_file_read(r.guest, &gen, &glen) < 0)
             return -LE_NOMEM;
         vfs_fd *f = desc_new();
         f->kind = VFS_SYN;
@@ -1187,6 +1217,7 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     case VFS_BINDER: return -LE_INVAL; /* binder fds have no read: work comes through BINDER_WRITE_READ */
     case VFS_EVENTFD: return efd_read(f->obj, buf, n);
     case VFS_GOLDFISH: return goldfish_read(f->obj, buf, n);
+    case VFS_EVDEV: return evdev_read(f->obj, buf, n);
     case VFS_TIMERFD: return tfd_read(f->obj, buf, n);
     case VFS_INOTIFY: return -LE_AGAIN; /* no event is ever queued (inotify.c) */
     case VFS_BPF: return -LE_INVAL;     /* a map fd has no read (bpf.c) */
@@ -1216,6 +1247,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_SOCK: return -LE_SPIPE;
     case VFS_BINDER: return -LE_INVAL;
     case VFS_GOLDFISH:
+    case VFS_EVDEV:
     case VFS_EVENTFD:
     case VFS_TIMERFD:
     case VFS_INOTIFY:
@@ -1273,6 +1305,7 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     case VFS_BINDER: return -LE_INVAL;
     case VFS_EVENTFD: return efd_write(f->obj, buf, n);
     case VFS_GOLDFISH: return goldfish_write(f->obj, buf, n);
+    case VFS_EVDEV: return (int64_t)n; /* writes are accepted and ignored (no output side: docs/input.md) */
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_BPF: return -LE_INVAL;
@@ -1329,6 +1362,7 @@ int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
     case VFS_BINDER:
     case VFS_EVENTFD:
     case VFS_GOLDFISH:
+    case VFS_EVDEV:
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
@@ -1366,6 +1400,7 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_GOLDFISH:
+    case VFS_EVDEV:
     case VFS_BPF:
     case VFS_EPOLL:
         return -LE_SPIPE;
@@ -1466,6 +1501,7 @@ static int64_t syn_getdents(vfs_fd *f, uint8_t *buf, size_t cap)
                    !powersupply_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
                    !procfs_task_child(f->guest, (int)(f->dpos - 2), &name) &&
                    !cgroupfs_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
+                   !evdev_child(f->guest, (int)(f->dpos - 2), &name, &is_dir) &&
                    !fd_child(f->guest, (int)(f->dpos - 2), &name)) {
             break;
         }
@@ -1603,6 +1639,8 @@ static void synthetic_stat(vfs_syn s, uint64_t size, host_stat *out)
     case SYN_CGROUP_RC: out->mode = LS_IFREG | 0444; out->ino = 0x1007; break;
     case SYN_ZERO: out->mode = LS_IFCHR | 0666; out->rdev = 0x105; out->ino = 0x1002; break;
     case SYN_RANDOM: out->mode = LS_IFCHR | 0666; out->rdev = 0x109; out->ino = 0x1003; break;
+    case SYN_EVDEV0: out->mode = LS_IFCHR | 0660; out->rdev = (13u << 8) | 64u; out->ino = 0x1008; out->gid = 1004; /* group input, as ids_gen.h */ break;
+    case SYN_EVDEV1: out->mode = LS_IFCHR | 0660; out->rdev = (13u << 8) | 65u; out->ino = 0x1009; out->gid = 1004; break;
     default: out->mode = LS_IFREG | 0444; out->ino = 0x1004; break;
     }
 }
@@ -1684,6 +1722,17 @@ int vfs_stat_fd(int fd, host_stat *out)
         out->size = memfd_size(f->mfd);
         out->blksize = 4096;
         out->blocks = (out->size + 511) / 512;
+        return 0;
+    }
+    if (f->kind == VFS_EVDEV) { /* an input device node: a character device, 13:(64 + index) (evdev.c) */
+        memset(out, 0, sizeof *out);
+        out->dev = 0x0b;
+        out->ino = 0x4000 + (uint64_t)evdev_index(f->guest);
+        out->mode = 0020000u | 0660u;
+        out->rdev = (13u << 8) | (64u + (uint32_t)evdev_index(f->guest));
+        out->gid = 1004; /* group input (ids_gen.h) */
+        out->nlink = 1;
+        out->blksize = 4096;
         return 0;
     }
     if (f->kind == VFS_BPF) { /* a map: an anonymous inode, S_IFREG 0600 (anon_inode_mkinode) (B15) */

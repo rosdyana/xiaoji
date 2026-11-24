@@ -207,7 +207,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
     # bpfpin-* runs as the system user with the graphics group, as an init service (init-bpf, B15): not an oracle case.
-    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*) continue ;; esac
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*|evdev-*) continue ;; esac
     cases=$((cases + 1))
     run_case "$name" "$stretch"
 done
@@ -284,7 +284,7 @@ fi
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as sensors power-supply ashmem"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-as sensors power-supply ashmem evdev"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -297,6 +297,7 @@ prop_argv() {
     goldfish-as) ARGV=(/data/local/tmp/goldfish-as) ;;
     sensors) ARGV=(/data/local/tmp/sensors) ;;
     ashmem) ARGV=(/data/local/tmp/ashmem) ;;
+    evdev) ARGV=(/data/local/tmp/evdev) ;;
     power-supply) ARGV=(/system/bin/sh -c 'for d in /sys/class/power_supply/*; do echo "dir ${d##*/}"; for f in $d/*; do echo "${f##*/} $(cat $f)"; done; done') ;;
     binder-sm) ARGV=(/system/bin/sh -c "/system/bin/servicemanager & $SM_WAIT; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0") ;;
     esac
@@ -313,10 +314,14 @@ check_expect() {
         fail=$((fail + 1))
         return 1
     fi
+    # The input devices' test source (evdev.c): the evdev case reads its scripted events from the environment.
+    # (An empty value is no script: the engine reads the variable only when it is set.)
+    local input_script=""
+    [ "$name" = evdev ] && input_script="$ROOT/tests/input/evdev.script"
     if [ "$runner" = engine ]; then
-        "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        XIAOJI_INPUT_SCRIPT="$input_script" "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        XIAOJI_INPUT_SCRIPT="$input_script" node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect" && [ "$rc" = 0 ]; then
@@ -360,6 +365,11 @@ if [ -d build/rootfs/system/bin ]; then
     if [ -f build/tests/guest/ashmem-O0 ]; then
         mkdir -p "$RFS/data/local/tmp"
         cp build/tests/guest/ashmem-O0 "$RFS"/data/local/tmp/ashmem
+    fi
+    # /dev/input (B16): tests/guest/evdev.c, the input devices of evdev.c; its scripted events come from the environment.
+    if [ -f build/tests/guest/evdev-O0 ]; then
+        mkdir -p "$RFS/data/local/tmp"
+        cp build/tests/guest/evdev-O0 "$RFS"/data/local/tmp/evdev
     fi
     for name in $PROP_CASES; do
         prop_argv "$name"
@@ -488,6 +498,28 @@ if [ -d build/rootfs/system/bin ]; then
         else
             echo "FAIL  init-cgroups $runner (exit $rc)"
             diff tests/expect/init-cgroups.out "$OUT/init-cgroups.$runner.out" | head -n 6 | sed 's/^/        /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
+# Input devices (B16): getevent -lp under init lists both virtual devices (tests/init/evdev.rc, tests/expect/init-evdev.out).
+if [ -d build/rootfs/system/bin ]; then
+    for runner in engine node; do
+        if [ "$runner" = engine ]; then
+            "$ENGINE" --init tests/init/evdev.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-evdev.$runner.out" 2>"$OUT/init-evdev.$runner.err"
+        elif [ -f "$NODE_JS" ]; then
+            node "$NODE_JS" --init tests/init/evdev.rc --root "$RFS" --init-timeout 60 --init-stdio host >"$OUT/init-evdev.$runner.out" 2>"$OUT/init-evdev.$runner.err"
+        else
+            continue
+        fi
+        rc=$?
+        if [ "$rc" = 0 ] && cmp -s "$OUT/init-evdev.$runner.out" tests/expect/init-evdev.out; then
+            echo "PASS  init-evdev $runner"
+            pass=$((pass + 1))
+        else
+            echo "FAIL  init-evdev $runner (exit $rc)"
+            diff tests/expect/init-evdev.out "$OUT/init-evdev.$runner.out" | head -n 6 | sed 's/^/        /'
             fail=$((fail + 1))
         fi
     done
@@ -789,6 +821,53 @@ elif [ -f "build/rootfs$BL_TEST" ]; then
             else o++
          }
          END { printf "INFO  binderLibTest (report only): %d cases: %d passed, %d failed, %d skipped, %d body ok but no summary (hung after the body), %d no result\n", t, p, f, k, h, o }' "$OUT/binderlib.txt"
+fi
+
+# Input devices (B16), opt-in: XIAOJI_INPUT_BOOT=1 boots the zygote of image/xiaoji.rc on the tree in XIAOJI_ROOT (or
+# build/rootfs) and requires EventHub to log both virtual devices as added, the touchscreen with its idc file
+# (engine/evdev.c, docs/input.md). The boot is stopped by --init-timeout, and by a watchdog when the engine's resident
+# memory passes XIAOJI_INPUT_BOOT_MAX_KIB (default 4 GiB): the host is an 8 GB machine. Not in the default run.
+# It is for the product tree (XIAOJI_ROOT=build/rootfs-xiaoji): on the Google-image tree system_server stops in
+# DisplayManagerService (no SurfaceFlinger, no composer), before InputManagerService is created (docs/input.md).
+if [ "${XIAOJI_INPUT_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
+    max_kib=${XIAOJI_INPUT_BOOT_MAX_KIB:-4194304}
+    # The init timeout (90 s) normally ends the run first. The watchdog stops the engine at 150 s of wall time, or when
+    # its resident memory (ps, KiB) passes the limit; it checks every 2 s.
+    "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 90 >"$OUT/input-boot.out" 2>"$OUT/input-boot.err" &
+    eng=$!
+    ( elapsed=0
+      while kill -0 "$eng" 2>/dev/null; do
+        rss=$(ps -o rss= -p "$eng" 2>/dev/null | tr -d ' ')
+        if [ -n "$rss" ] && [ "$rss" -gt "$max_kib" ]; then
+            echo "watchdog: engine RSS ${rss} KiB over ${max_kib} KiB" >>"$OUT/input-boot.err"
+            kill "$eng" 2>/dev/null
+            break
+        fi
+        if [ "$elapsed" -ge 150 ]; then
+            echo "watchdog: 150 s of wall time" >>"$OUT/input-boot.err"
+            kill "$eng" 2>/dev/null
+            break
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+      done ) &
+    dog=$!
+    wait "$eng"
+    rc=$?
+    kill "$dog" 2>/dev/null
+    wait "$dog" 2>/dev/null
+    err="$OUT/input-boot.err"
+    ok0=0; ok1=0; okidc=0
+    grep -q "New device: id=[0-9]*, fd=[0-9]*, path='/dev/input/event0', name='xiaoji_touchscreen'" "$err" && ok0=1
+    grep -q "New device: id=[0-9]*, fd=[0-9]*, path='/dev/input/event1', name='xiaoji_keyboard'" "$err" && ok1=1
+    grep -q "path='/dev/input/event0'.*configuration='/vendor/usr/idc/xiaoji_touchscreen.idc'" "$err" && okidc=1
+    if [ "$ok0" = 1 ] && [ "$ok1" = 1 ] && [ "$okidc" = 1 ]; then
+        echo "PASS  input boot (B16): EventHub adds event0 (xiaoji_touchscreen, its idc) and event1 (xiaoji_keyboard) (exit $rc)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  input boot (B16): event0 $ok0, event1 $ok1, idc $okidc (exit $rc; $err)"
+        fail=$((fail + 1))
+    fi
 fi
 
 echo

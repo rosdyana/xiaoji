@@ -272,6 +272,8 @@ async function runBoot(base, opts) {
     print: (line) => post({ type: 'out', text: line }),
     printErr: onLine,
   });
+  // The page's input ring (web/input.js): the engine drains it through xiaoji_input_pop (engine/jit_lib.js, docs/input.md).
+  if (opts && opts.input) Module.inputRing = new Int32Array(opts.input);
   let files;
   if (packMode) {
     // The packs come from the downloader while the module loads. The engine starts once the first pack (or the
@@ -351,6 +353,7 @@ self.onmessage = async (ev) => {
       await runBoot(msg.base, {
         trace: msg.trace, mode: msg.mode, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
         statsAt: !!msg.statsAt, early: msg.early, gl: msg.gl, frameSab: msg.frameSab,
+        input: msg.input || null,
       });
     }
   } catch (e) {

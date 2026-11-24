@@ -1,0 +1,24 @@
+# The input test script for tests/guest/evdev.c (engine/evdev.c, --input-script). "ms dev type code value":
+# the time in ms from the first open of a device, dev 0 the touchscreen and dev 1 the keyboard.
+# At 0 ms: one touch (slot 0 down at 360,640 with pressure 80, then the frame's SYN_REPORT), and a key A tap.
+0 0 3 47 0
+0 0 3 57 7
+0 0 3 53 360
+0 0 3 54 640
+0 0 3 58 80
+0 0 1 330 1
+0 0 0 0 0
+0 1 1 30 1
+0 1 0 0 0
+0 1 1 30 0
+0 1 0 0 0
+# At 300 ms: the Back key on the keyboard (the page's Escape), for the epoll wait.
+300 1 1 158 1
+300 1 0 0 0
+300 1 1 158 0
+300 1 0 0 0
+# At 600 ms: the Menu key, for the epoll wait that follows the Back key's read.
+600 1 1 139 1
+600 1 0 0 0
+600 1 1 139 0
+600 1 0 0 0

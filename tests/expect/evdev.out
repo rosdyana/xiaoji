@@ -1,0 +1,95 @@
+open touch 1
+open keyboard 1
+entry event0
+entry event1
+inotify watch /dev/input 1
+touch is chr 1
+touch major 13
+touch minor 64
+version ret 0
+version 65537
+id ret 0
+id bus 6
+id vendor 1
+id product 1
+id version 1
+name touch ret 19
+name touch xiaoji_touchscreen
+name keyboard ret 8
+name keyboard xiaoji_k
+phys touch ret 14
+phys touch xiaoji/input0
+uniq touch -2
+prop touch ret 4
+prop touch direct 2
+prop keyboard 4
+prop keyboard byte 0
+types touch ret 4
+touch has abs 1
+touch has rep 0
+types keyboard ret 4
+keyboard has abs 0
+keyboard has rep 1
+touch abs slot 1
+touch abs pressure 1
+touch abs x (ABS_X) 0
+touch btn_touch 1
+touch key a 0
+keyboard key a 1
+keyboard key back 1
+keyboard key f1 0
+keyboard btn_touch 0
+abs x ret 0
+abs x max 539
+abs x min 0
+abs y max 959
+abs slot max 9
+abs x of keyboard -22
+abs not set (ABS_X) -22
+srep ret 0
+grep ret 0
+grep delay 100
+grep period 50
+sclockid 5 -22
+sclockid monotonic 0
+read touch bytes 168
+touch type=3 code=47 value=0
+touch type=3 code=57 value=7
+touch type=3 code=53 value=360
+touch type=3 code=54 value=640
+touch type=3 code=58 value=80
+touch type=1 code=330 value=1
+touch type=0 code=0 value=0
+touch stamp in window 1
+abs x value 360
+read short buffer -22
+read drained -11
+read keyboard bytes 96
+keyboard type=1 code=30 value=1
+keyboard type=0 code=0 value=0
+keyboard type=1 code=30 value=0
+keyboard type=0 code=0 value=0
+key state a 0
+blocking read bytes 96
+blocking type=1 code=158 value=1
+blocking type=0 code=0 value=0
+blocking type=1 code=158 value=0
+blocking type=0 code=0 value=0
+grab 0
+grab by second fd -16
+ungrab 0
+read back bytes 96
+back type=1 code=158 value=1
+back type=0 code=0 value=0
+back type=1 code=158 value=0
+back type=0 code=0 value=0
+epoll_ctl 0
+epoll_pwait 1
+epoll events 1
+read menu bytes 96
+menu type=1 code=139 value=1
+menu type=0 code=0 value=0
+menu type=1 code=139 value=0
+menu type=0 code=0 value=0
+ppoll timeout 0
+ppoll revents 0

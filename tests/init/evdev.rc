@@ -1,0 +1,8 @@
+# The input devices as Android sees them (B16): getevent -lp lists /dev/input/event0 (the touchscreen) and event1 (the
+# keyboard) with their capabilities, through EventHub's own ioctls (tests/expect/init-evdev.out is its text). The service
+# runs as system with the input group (the nodes are root:input, 0660, as on a phone; system_server's EventHub does the
+# same), and the run ends when it sets xiaoji.exit.
+service evdev /system/bin/sh -c "/system/bin/getevent -lp; /system/bin/setprop xiaoji.exit 1"
+    user system
+    group system input
+    oneshot
