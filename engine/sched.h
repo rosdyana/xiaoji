@@ -63,7 +63,6 @@ void sched_exec_threads(cpu_t *self);
 /* Signal waits. A thread in rt_sigtimedwait blocks as SW_SIGWAIT. sched_wake ends
  * any wait with the given x0 (a no-op for a runnable thread). sched_threads lists
  * the live threads in slot order. */
-#define SCHED_MAX_THREADS 256
 typedef enum { SW_NONE, SW_FUTEX, SW_SLEEP, SW_SIGWAIT, SW_RESTART, SW_SUSPEND } sched_wait_t;
 /* rt_sigsuspend: the thread waits until a signal is raised for it (sched_wake gives -EINTR). */
 void sched_block_suspend(void);

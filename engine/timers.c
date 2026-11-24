@@ -312,8 +312,8 @@ int64_t timers_create(uint64_t clk, uint64_t sevp, uint64_t idp)
                 return -LE_INVAL;
         }
         if (notify == SIGEV_THREAD_ID_N) {
-            cpu_t *list[SCHED_MAX_THREADS];
-            int n = sched_threads_of(p, list, SCHED_MAX_THREADS), found = 0;
+            cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+            int n = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1), found = 0;
             for (int i = 0; i < n; i++)
                 if ((int)list[i]->tid == tid)
                     found = 1;

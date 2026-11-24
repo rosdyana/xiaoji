@@ -93,7 +93,8 @@ typedef struct {
     uint64_t deadline;
     int active;
 } tmo_t;
-static tmo_t tmos[SCHED_MAX_THREADS];
+static tmo_t *tmos; /* one entry per thread in a timed wait; grows as needed (no fixed cap) */
+static int ntmos;
 
 /* The credentials SCM_CREDENTIALS carries when the sender gives none: the real ids (net/core/scm.c,
  * scm_set_cred with current_uid and current_gid). SO_PEERCRED is cur_cred (the effective ids). */
@@ -132,7 +133,7 @@ static void wake(const sock_t *s)
 
 static tmo_t *tmo_find(uint64_t tid)
 {
-    for (int i = 0; i < SCHED_MAX_THREADS; i++)
+    for (int i = 0; i < ntmos; i++)
         if (tmos[i].active && tmos[i].tid == tid)
             return &tmos[i];
     return NULL;
@@ -163,15 +164,25 @@ int sock_block(const sock_t *key, uint64_t tmo_ns, int nonblock)
         w = NULL;
     }
     if (!w) {
-        for (int i = 0; i < SCHED_MAX_THREADS && !w; i++)
-            if (!tmos[i].active) {
+        for (int i = 0; i < ntmos && !w; i++)
+            if (!tmos[i].active)
                 w = &tmos[i];
-                w->active = 1;
-                w->tid = tid;
-                w->key = key;
-                w->deadline = now + tmo_ns;
+        if (!w) { /* the table is full: grow it (host memory allowing) */
+            int want = ntmos ? ntmos * 2 : 256;
+            tmo_t *nt = realloc(tmos, (size_t)want * sizeof *nt);
+            if (nt) {
+                memset(nt + ntmos, 0, (size_t)(want - ntmos) * sizeof *nt);
+                tmos = nt;
+                w = &tmos[ntmos];
+                ntmos = want;
             }
-        if (!w) { /* no slot: wait without a deadline */
+        }
+        if (w) {
+            w->active = 1;
+            w->tid = tid;
+            w->key = key;
+            w->deadline = now + tmo_ns;
+        } else { /* host out of memory: wait without a deadline */
             sched_block_restart((uint64_t)(uintptr_t)key);
             return 1;
         }

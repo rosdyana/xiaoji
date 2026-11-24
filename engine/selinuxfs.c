@@ -44,6 +44,29 @@ static const struct {
     {"/sys/fs/selinux/class/hwservice_manager/perms/add", SELFS_FILE, "1\n"},
     {"/sys/fs/selinux/class/hwservice_manager/perms/find", SELFS_FILE, "2\n"},
     {"/sys/fs/selinux/class/hwservice_manager/perms/list", SELFS_FILE, "3\n"},
+    /* keystore2 (B16): keystore2 checks its permissions against this class (the AOSP policy's class keystore2, index
+     * 62 here). libselinux reads each perms file as the permission's number plus one (1..32: discover_class rejects 0
+     * and stores value-1), not a mask, so the first permission is 1. The access decisions are all allowed
+     * (selinuxfs_access). */
+    {"/sys/fs/selinux/class/keystore2", SELFS_DIR, NULL},
+    {"/sys/fs/selinux/class/keystore2/index", SELFS_FILE, "62\n"},
+    {"/sys/fs/selinux/class/keystore2/perms", SELFS_DIR, NULL},
+    {"/sys/fs/selinux/class/keystore2/perms/add_auth", SELFS_FILE, "1\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/change_password", SELFS_FILE, "2\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/change_user", SELFS_FILE, "3\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/clear_ns", SELFS_FILE, "4\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/clear_uid", SELFS_FILE, "5\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/delete_all_keys", SELFS_FILE, "6\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/early_boot_ended", SELFS_FILE, "7\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/get_attestation_key", SELFS_FILE, "8\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/get_auth_token", SELFS_FILE, "9\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/get_state", SELFS_FILE, "10\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/list", SELFS_FILE, "11\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/lock", SELFS_FILE, "12\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/pull_metrics", SELFS_FILE, "13\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/report_off_body", SELFS_FILE, "14\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/reset", SELFS_FILE, "15\n"},
+    {"/sys/fs/selinux/class/keystore2/perms/unlock", SELFS_FILE, "16\n"},
 };
 
 #define NTREE (sizeof tree / sizeof tree[0])

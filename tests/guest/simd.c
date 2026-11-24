@@ -8,7 +8,9 @@
  * general), MOVI/MVNI/ORR/BIC (immediate), CMEQ/CMGT/CMGE/CMHI/CMHS/CMTST (register
  * and zero), AND/BIC/ORR/ORN/EOR/BSL/BIT/BIF, ADD/SUB, ADDP/UMAXP/UMINP,
  * ADDV/UMAXV/UMINV/UADDLV, SHRN/SHRN2, USHR/SSHR/SHL, XTN/XTN2, UZP/TRN/ZIP,
- * EXT, TBL/TBX, REV64, CNT, NOT, INS/UMOV/SMOV, FMOV (general and vector lanes). */
+ * EXT, TBL/TBX, REV64, CNT, NOT, INS/UMOV/SMOV, FMOV (general and vector lanes), the right-shift group (SSRA/USRA,
+ * SRSHR/URSHR, SRSRA/URSRA, SRI) and the narrowing right shifts (RSHRN, SQSHRUN, SQSHRN, UQSHRN and their rounding
+ * forms, with the 2 forms), RADDHN. */
 #include "sys.h"
 
 #define NSETS 2
@@ -305,6 +307,83 @@ int main(int argc, char **argv)
     CASE("shrn2-8h", "shrn2 v0.8h, v1.4s, #16");
     CASE("shrn-2s", "shrn v0.2s, v1.2d, #20");
     CASE("shrn2-4s", "shrn2 v0.4s, v1.2d, #32");
+    CASE("ssra-16b", "ssra v0.16b, v1.16b, #3");
+    CASE("usra-8b", "usra v0.8b, v1.8b, #8");
+    CASE("ssra-8h", "ssra v0.8h, v1.8h, #15");
+    CASE("usra-4s", "usra v0.4s, v1.4s, #31");
+    CASE("usra-2d", "usra v0.2d, v1.2d, #64");
+    CASE("ssra-2d", "ssra v0.2d, v1.2d, #1");
+    CASE("srshr-16b", "srshr v0.16b, v1.16b, #3");
+    CASE("urshr-8b", "urshr v0.8b, v1.8b, #8");
+    CASE("urshr-8h", "urshr v0.8h, v1.8h, #8");
+    CASE("urshr-8h-15", "urshr v0.8h, v1.8h, #15");
+    CASE("srshr-4s", "srshr v0.4s, v1.4s, #32");
+    CASE("urshr-2d", "urshr v0.2d, v1.2d, #64");
+    CASE("srshr-2d", "srshr v0.2d, v1.2d, #1");
+    CASE("srsra-8h", "srsra v0.8h, v1.8h, #7");
+    CASE("ursra-4s", "ursra v0.4s, v1.4s, #16");
+    CASE("ursra-2d", "ursra v0.2d, v1.2d, #64");
+    CASE("sri-16b", "sri v0.16b, v1.16b, #3");
+    CASE("sri-8h", "sri v0.8h, v1.8h, #16");
+    CASE("sri-2d", "sri v0.2d, v1.2d, #64");
+    CASE("rshrn-8b", "rshrn v0.8b, v1.8h, #3");
+    CASE("rshrn2-16b", "rshrn2 v0.16b, v1.8h, #8");
+    CASE("rshrn-4h", "rshrn v0.4h, v1.4s, #16");
+    CASE("rshrn2-8h", "rshrn2 v0.8h, v1.4s, #1");
+    CASE("rshrn-2s", "rshrn v0.2s, v1.2d, #32");
+    CASE("sqshrun-8b", "sqshrun v0.8b, v1.8h, #3");
+    CASE("sqshrun2-16b", "sqshrun2 v0.16b, v1.8h, #5");
+    CASE("sqshrun-4h", "sqshrun v0.4h, v1.4s, #7");
+    CASE("sqrshrun-8b", "sqrshrun v0.8b, v1.8h, #4");
+    CASE("sqrshrun2-8h", "sqrshrun2 v0.8h, v1.4s, #9");
+    CASE("sqshrn-8b", "sqshrn v0.8b, v1.8h, #2");
+    CASE("sqshrn2-16b", "sqshrn2 v0.16b, v1.8h, #6");
+    CASE("sqshrn-2s", "sqshrn v0.2s, v1.2d, #20");
+    CASE("uqshrn-8b", "uqshrn v0.8b, v1.8h, #3");
+    CASE("uqshrn2-8h", "uqshrn2 v0.8h, v1.4s, #12");
+    CASE("sqrshrn-4h", "sqrshrn v0.4h, v1.4s, #9");
+    CASE("sqrshrn2-4s", "sqrshrn2 v0.4s, v1.2d, #31");
+    CASE("uqrshrn-8b", "uqrshrn v0.8b, v1.8h, #1");
+    CASE("uqrshrn2-4s", "uqrshrn2 v0.4s, v1.2d, #32");
+    CASE("raddhn-8b", "raddhn v0.8b, v1.8h, v2.8h");
+    CASE("raddhn2-16b", "raddhn2 v0.16b, v1.8h, v2.8h");
+    CASE("raddhn-2s", "raddhn v0.2s, v1.2d, v2.2d");
+    FPS("fcmeq-zero-4s", "fcmeq v0.4s, v1.4s, #0.0");
+    FPS("fcmgt-zero-4s", "fcmgt v0.4s, v1.4s, #0.0");
+    FPS("fcmge-zero-4s", "fcmge v0.4s, v1.4s, #0.0");
+    FPS("fcmlt-zero-4s", "fcmlt v0.4s, v1.4s, #0.0");
+    FPS("fcmle-zero-4s", "fcmle v0.4s, v1.4s, #0.0");
+    FPD("fcmeq-zero-2d", "fcmeq v0.2d, v1.2d, #0.0");
+    FPD("fcmgt-zero-2d", "fcmgt v0.2d, v1.2d, #0.0");
+    FPD("fcmge-zero-2d", "fcmge v0.2d, v1.2d, #0.0");
+    FPD("fcmlt-zero-2d", "fcmlt v0.2d, v1.2d, #0.0");
+    FPD("fcmle-zero-2d", "fcmle v0.2d, v1.2d, #0.0");
+    FPS("fcmeq-zero-2s", "fcmeq v0.2s, v1.2s, #0.0");
+    FPS("fcmlt-zero-2s", "fcmlt v0.2s, v1.2s, #0.0");
+    FPS("fcvtl-2d", "fcvtl v0.2d, v1.2s");
+    FPS("fcvtl2-2d", "fcvtl2 v0.2d, v1.4s");
+    FPD("fcvtn-2s", "fcvtn v0.2s, v1.2d");
+    FPD("fcvtn2-4s", "fcvtn2 v0.4s, v1.2d");
+    FPS("fcvtzs-fx-2s", "fcvtzs v0.2s, v1.2s, #2");
+    FPS("fcvtzs-fx-4s", "fcvtzs v0.4s, v1.4s, #1");
+    FPS("fcvtzs-fx-4s-32", "fcvtzs v0.4s, v1.4s, #32");
+    FPS("fcvtzu-fx-4s", "fcvtzu v0.4s, v1.4s, #3");
+    FPD("fcvtzs-fx-2d", "fcvtzs v0.2d, v1.2d, #10");
+    FPD("fcvtzs-fx-2d-64", "fcvtzs v0.2d, v1.2d, #64");
+    FPD("fcvtzu-fx-2d", "fcvtzu v0.2d, v1.2d, #1");
+    CASE("scvtf-fx-4s", "scvtf v0.4s, v1.4s, #2");
+    CASE("ucvtf-fx-2s", "ucvtf v0.2s, v1.2s, #5");
+    CASE("scvtf-fx-2d", "scvtf v0.2d, v1.2d, #40");
+    CASE("ucvtf-fx-2d", "ucvtf v0.2d, v1.2d, #1");
+    FPS("fmul-sc-s1", "fmul s0, s1, v2.s[1]");
+    FPS("fmul-sc-s3", "fmul s0, s1, v2.s[3]");
+    FPD("fmul-sc-d1", "fmul d0, d1, v2.d[1]");
+    FPS("fmulx-sc-s2", "fmulx s0, s1, v2.s[2]");
+    FPD("fmulx-sc-d0", "fmulx d0, d1, v2.d[0]");
+    FPS("fmla-sc-s1", "fmla s0, s1, v2.s[1]");
+    FPD("fmla-sc-d1", "fmla d0, d1, v2.d[1]");
+    FPS("fmls-sc-s0", "fmls s0, s1, v2.s[0]");
+    FPD("fmls-sc-d0", "fmls d0, d1, v2.d[0]");
     CASE("xtn-8b", "xtn v0.8b, v1.8h");
     CASE("xtn2-16b", "xtn2 v0.16b, v1.8h");
     CASE("xtn-4h", "xtn v0.4h, v1.4s");

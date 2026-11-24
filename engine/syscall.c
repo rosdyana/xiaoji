@@ -605,6 +605,21 @@ static int64_t sys_getrandom(uint64_t buf, uint64_t len)
     return (int64_t)len;
 }
 
+/* pidfd_open(2): a descriptor for a process, close-on-exec. It polls readable once the process has ended (poll.c)
+ * and finish_process wakes the pollers. The engine never reuses a pid, so the pid names the process for good.
+ * Only PIDFD_NONBLOCK (O_NONBLOCK) is accepted in flags, as Linux does. */
+static int64_t sys_pidfd_open(uint64_t pid, uint64_t flags)
+{
+    if (flags & ~(uint64_t)LO_NONBLOCK)
+        return -LE_INVAL;
+    if ((int64_t)pid <= 0 || pid > 0x7fffffffu)
+        return -LE_INVAL;
+    if (!proc_find((int)pid))
+        return -LE_SRCH;
+    /* O_RDWR, as Linux opens it: a write reaches the (absent) write op and gets EINVAL. */
+    return vfs_obj_new(VFS_PIDFD, (void *)(uintptr_t)pid, 1, LO_RDWR | (uint32_t)(flags & LO_NONBLOCK));
+}
+
 /* prlimit64 and its getrlimit and setrlimit forms, on the calling process's limits (proc.c has the
  * defaults). The old limit is read before the new one is applied and written after, as Linux does.
  * Raising the hard limit needs an effective uid of 0. pid other than the caller's is ESRCH, or EPERM
@@ -1405,6 +1420,9 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         return;
     case 280: /* bpf(2): the maps-only subset (bpf.c, B15) */
         *ret = bpf_syscall(a[0], a[1], a[2]);
+        return;
+    case 434: /* pidfd_open (B16) */
+        *ret = sys_pidfd_open(a[0], a[1]);
         return;
     default:
         if (nr < 1024) {

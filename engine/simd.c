@@ -656,6 +656,55 @@ static int modified_imm(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* A rounding right shift of element raw (1 <= sh <= 64): (x + 2^(sh-1)) >> sh with the sum kept in 128 bits, so
+ * the rounding cannot overflow. */
+static uint64_t rshr_el(uint64_t raw, unsigned esz, unsigned sh, int is_signed)
+{
+    __int128 v = is_signed ? (__int128)sext_el(raw, esz) : (__int128)raw;
+    v = (v + ((__int128)1 << (sh - 1))) >> sh;
+    return (uint64_t)v & emask(esz);
+}
+
+/* The narrowing right shifts (SHRN, RSHRN, SQSHRUN, SQRSHRUN, SQSHRN, UQSHRN, SQRSHRN, UQRSHRN): each element of the
+ * 2*esz-byte source is shifted right by sh (rounded when round), then truncated to esz bytes, or saturated when sat:
+ * to the signed range when dst_signed, else to the unsigned range. The 2 forms fill the high half when q. Saturation
+ * computes the value only; QC is not kept (see the note at the by-element forms). */
+static void narrow_right(cpu_t *c, unsigned q, unsigned rd, const uint8_t *n, unsigned esz, unsigned sh, int round,
+                         int src_signed, int sat, int dst_signed)
+{
+    unsigned src_esz = 2 * esz;
+    unsigned src_lanes = 16 / src_esz;
+    unsigned bits = 8 * esz;
+    uint8_t half[8], r[16], d[16];
+    memset(half, 0, sizeof half);
+    for (unsigned i = 0; i < src_lanes; i++) {
+        uint64_t raw = getel(n, src_esz, i);
+        __int128 v = src_signed ? (__int128)sext_el(raw, src_esz) : (__int128)raw;
+        if (round)
+            v += (__int128)1 << (sh - 1);
+        v >>= sh;
+        if (sat) {
+            __int128 lo = dst_signed ? -((__int128)1 << (bits - 1)) : 0;
+            __int128 hi = dst_signed ? (((__int128)1 << (bits - 1)) - 1) : (((__int128)1 << bits) - 1);
+            if (v < lo)
+                v = lo;
+            else if (v > hi)
+                v = hi;
+        }
+        putel(half, esz, i, (uint64_t)v & emask(esz));
+    }
+    if (q) {
+        rd_v(c, rd, d);
+        memcpy(r, d, 8);
+        memcpy(r + 8, half, 8);
+        wr_v(c, rd, r, 16);
+    } else {
+        memset(r, 0, sizeof r);
+        memcpy(r, half, 8);
+        wr_v(c, rd, r, 8);
+    }
+}
+
 /* ---------- shift by immediate: SSHR, USHR, SHL, SHRN, SHRN2 ---------- */
 
 static int shift_imm(cpu_t *c, uint32_t insn)
@@ -669,7 +718,7 @@ static int shift_imm(cpu_t *c, uint32_t insn)
     unsigned esz = 1u << hb;                          /* element size in bytes */
     unsigned dsz = q ? 16 : 8;
     unsigned lanes = dsz / esz;
-    uint8_t n[16], r[16], d[16];
+    uint8_t n[16], r[16];
     rd_v(c, rn, n);
     switch (opc) {
     case 0x00: { /* SSHR (u=0), USHR (u=1) */
@@ -688,26 +737,69 @@ static int shift_imm(cpu_t *c, uint32_t insn)
         wr_v(c, rd, r, dsz);
         return 0;
     }
-    case 0x10: { /* SHRN (u=0): narrow the 128-bit source into 64 bits */
-        if (u || esz > 4)
-            return -1;
-        unsigned src_esz = 2 * esz;
+    case 0x02: { /* SSRA (u=0), USRA (u=1): the shifted value is added to the destination */
+        uint8_t acc[16];
         unsigned sh = 2 * esz * 8 - immhb;
-        unsigned src_lanes = 16 / src_esz;
-        uint8_t half[8];
-        memset(half, 0, sizeof half);
-        for (unsigned i = 0; i < src_lanes; i++)
-            putel(half, esz, i, shr_el(getel(n, src_esz, i), src_esz, sh, 0) & emask(esz));
-        if (q) {
-            rd_v(c, rd, d);
-            memcpy(r, d, 8);
-            memcpy(r + 8, half, 8);
-            wr_v(c, rd, r, 16);
-        } else {
-            memset(r, 0, sizeof r);
-            memcpy(r, half, 8);
-            wr_v(c, rd, r, 8);
+        if (sh < 1 || sh > 8 * esz)
+            return -1;
+        rd_v(c, rd, acc);
+        for (unsigned i = 0; i < lanes; i++)
+            putel(r, esz, i, (getel(acc, esz, i) + shr_el(getel(n, esz, i), esz, sh, !u)) & emask(esz));
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
+    case 0x04: { /* SRSHR (u=0), URSHR (u=1): rounding right shift */
+        unsigned sh = 2 * esz * 8 - immhb;
+        if (sh < 1 || sh > 8 * esz)
+            return -1;
+        for (unsigned i = 0; i < lanes; i++)
+            putel(r, esz, i, rshr_el(getel(n, esz, i), esz, sh, !u));
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
+    case 0x06: { /* SRSRA (u=0), URSRA (u=1): rounding right shift, added to the destination */
+        uint8_t acc[16];
+        unsigned sh = 2 * esz * 8 - immhb;
+        if (sh < 1 || sh > 8 * esz)
+            return -1;
+        rd_v(c, rd, acc);
+        for (unsigned i = 0; i < lanes; i++)
+            putel(r, esz, i, (getel(acc, esz, i) + rshr_el(getel(n, esz, i), esz, sh, !u)) & emask(esz));
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
+    case 0x08: { /* SRI (u=1): shift right and insert, the destination's top bits kept */
+        if (!u)
+            return -1;
+        uint8_t acc[16];
+        unsigned sh = 2 * esz * 8 - immhb;
+        if (sh < 1 || sh > 8 * esz)
+            return -1;
+        uint64_t m = sh >= 64 ? 0 : emask(esz) >> sh;
+        rd_v(c, rd, acc);
+        for (unsigned i = 0; i < lanes; i++) {
+            uint64_t x = sh >= 64 ? 0 : getel(n, esz, i) >> sh;
+            putel(r, esz, i, (getel(acc, esz, i) & ~m & emask(esz)) | (x & m));
         }
+        wr_v(c, rd, r, dsz);
+        return 0;
+    }
+    case 0x10: /* SHRN (u=0), SQSHRUN (u=1): narrow the source, the signed one saturated to unsigned */
+    case 0x11: /* RSHRN (u=0), SQRSHRUN (u=1) */
+    case 0x12: /* SQSHRN (u=0), UQSHRN (u=1) */
+    case 0x13: { /* SQRSHRN (u=0), UQRSHRN (u=1) */
+        if (esz > 4)
+            return -1;
+        unsigned sh = 2 * esz * 8 - immhb;
+        int round = (opc == 0x11 || opc == 0x13);
+        /* 0x10, 0x11: SHRN, RSHRN (truncating) or SQSHRUN, SQRSHRUN (signed source, unsigned result).
+         * 0x12, 0x13: the signed forms (u=0) or the unsigned ones (u=1), saturated to their own range. */
+        int src_signed = (opc < 0x12) ? (int)u : (int)!u;
+        int sat = (opc < 0x12) ? (int)u : 1;
+        int dst_signed = (opc < 0x12) ? 0 : (int)!u;
+        if (sh < 1 || sh > 8 * esz)
+            return -1;
+        narrow_right(c, q, rd, n, esz, sh, round, src_signed, sat, dst_signed);
         return 0;
     }
     case 0x14: { /* SSHLL (u=0), USHLL (u=1); shift 0 is SXTL and UXTL */
@@ -1143,13 +1235,55 @@ static int three_diff(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* Vector conversions between floating point and fixed point (shift by immediate): SCVTF and UCVTF (opcode 11100)
+ * and FCVTZS and FCVTZU (opcode 11111). The element is 2S or 4S (immh 0100, esz 4) or 2D (immh 1xxx, esz 8), and
+ * fbits = 2*esz*8 - immhb, 1..esz*8. FCVTZS multiplies by 2^fbits, truncates and saturates, as the scalar form
+ * (fp_fixed); SCVTF divides the integer by 2^fbits, rounded once. */
+static int vec_fp_fixed(cpu_t *c, uint32_t insn)
+{
+    unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+    unsigned immh = (insn >> 19) & 0xF, immhb = (insn >> 16) & 0x7F;
+    unsigned opc = (insn >> 11) & 0x1F, rn = (insn >> 5) & 31, rd = insn & 31;
+    if (!fp_default(c) || immh < 4)
+        return -1; /* immh 0xxx below 01xx: 8- and 16-bit elements, which are not floating point here */
+    unsigned esz = immh >= 8 ? 8 : 4;
+    if (esz == 8 && !q)
+        return -1;
+    unsigned fbits = 2 * esz * 8 - immhb;
+    if (fbits < 1 || fbits > esz * 8)
+        return -1;
+    unsigned dsz = q ? 16 : 8, lanes = dsz / esz;
+    uint8_t n[16], r[16];
+    rd_v(c, rn, n);
+    memset(r, 0, sizeof r);
+    for (unsigned i = 0; i < lanes; i++) {
+        uint64_t xb = el_rd(n, i * esz, esz), out;
+        if (opc == 0x1F) { /* FCVTZS (u=0), FCVTZU (u=1) */
+            double x = esz == 8 ? as_d(xb) : (double)as_f((uint32_t)xb);
+            double rv = trunc(ldexp(x, (int)fbits));
+            out = fp_sat_int(x, rv, esz == 8 ? 1u : 0u, u);
+        } else if (opc == 0x1C) { /* SCVTF (u=0), UCVTF (u=1) */
+            if (esz == 8)
+                out = d_bits(ldexp(u ? (double)xb : (double)(int64_t)xb, -(int)fbits));
+            else
+                out = f_bits(ldexpf(u ? (float)(uint32_t)xb : (float)(int32_t)(uint32_t)xb, -(int)fbits));
+        } else {
+            return -1;
+        }
+        el_wr(r, i * esz, esz, esz == 8 ? out : (out & 0xFFFFFFFFu));
+    }
+    wr_v(c, rd, r, dsz);
+    return 0;
+}
+
 /* ---------- two registers, miscellaneous ---------- */
 
 static uint64_t to_int_sat(double x, unsigned mode, unsigned bits, int uns);
 
 /* Vector floating-point two-register miscellaneous (0 Q U 01110 a 10000 opcode 10): FABS and FNEG
  * (opcode 01111, a=1), FRINT (11000, 11001), FCVT to integer (11010, 11011, 11100) and SCVTF and
- * UCVTF (11101, a=0), FSQRT (11111, U=1, a=1). Single (sz=0, 2S or 4S) and double (sz=1, 2D). */
+ * UCVTF (11101, a=0), FSQRT (11111, U=1, a=1), and the compares with zero (a=1): FCMGT (01100, U=0), FCMGE (01100,
+ * U=1), FCMEQ (01101, U=0), FCMLE (01101, U=1), FCMLT (01110, U=0). Single (sz=0, 2S or 4S) and double (sz=1, 2D). */
 static int fp_two_misc(cpu_t *c, uint32_t insn)
 {
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, a = (insn >> 23) & 1, sz = (insn >> 22) & 1;
@@ -1185,6 +1319,17 @@ static int fp_two_misc(cpu_t *c, uint32_t insn)
             else if (opc == 0x19 && u) v = rint(x);         /* FRINTX, FRINTI */
             else return -1;
             out = sz ? d_bits(v) : f_bits((float)v);
+        } else if (a && (opc == 0x0C || opc == 0x0D || opc == 0x0E)) { /* compares with zero: all ones or zero per lane */
+            int t;
+            if (opc == 0x0C)
+                t = u ? (x >= 0) : (x > 0);
+            else if (opc == 0x0D)
+                t = u ? (x <= 0) : (x == 0);
+            else if (u)
+                return -1;
+            else
+                t = x < 0;
+            out = t ? (sz ? ~0ull : 0xFFFFFFFFull) : 0;
         } else if (opc == 0x1A || opc == 0x1B || opc == 0x1C) { /* FCVT{N,P}, FCVT{M,Z}, FCVTA{S,U} */
             unsigned mode = opc == 0x1A ? (a ? 2 : 0) : opc == 0x1B ? (a ? 3 : 1) : 4;
             if (opc == 0x1C && a)
@@ -1199,11 +1344,54 @@ static int fp_two_misc(cpu_t *c, uint32_t insn)
     return 0;
 }
 
+/* FCVTN, FCVTN2 (opcode 10110, U=0, sz=1: two doubles to two singles; the 2 form fills the high half) and FCVTL,
+ * FCVTL2 (opcode 10111, sz=1: two singles to two doubles, from the low half or, for the 2 form, the high half). Half
+ * precision (sz=0) is not implemented. Rounding is the host's to-nearest, as for the scalar conversions. */
+static int fp_cvt_long(cpu_t *c, uint32_t insn)
+{
+    unsigned q = (insn >> 30) & 1, sz = (insn >> 22) & 1, opc = (insn >> 12) & 0x1F;
+    unsigned rn = (insn >> 5) & 31, rd = insn & 31;
+    if (!sz || !fp_default(c))
+        return -1;
+    uint8_t n[16], r[16], d[16];
+    rd_v(c, rn, n);
+    memset(r, 0, sizeof r);
+    if (opc == 0x17) { /* FCVTL: the singles of the low (or high, q) half become doubles */
+        unsigned off = q ? 8 : 0;
+        for (unsigned i = 0; i < 2; i++) {
+            float f = as_f((uint32_t)el_rd(n, off + 4 * i, 4));
+            el_wr(r, 8 * i, 8, d_bits((double)f));
+        }
+        wr_v(c, rd, r, 16);
+        return 0;
+    }
+    /* FCVTN: the doubles become singles in the low half; FCVTN2 keeps the low half and fills the high one */
+    uint8_t h[8];
+    for (unsigned i = 0; i < 2; i++) {
+        float f = (float)as_d(el_rd(n, 8 * i, 8));
+        uint32_t bits = f_bits(f);
+        memcpy(h + 4 * i, &bits, 4);
+    }
+    if (q) {
+        rd_v(c, rd, d);
+        memcpy(r, d, 8);
+        memcpy(r + 8, h, 8);
+        wr_v(c, rd, r, 16);
+    } else {
+        memcpy(r, h, 8);
+        wr_v(c, rd, r, 8);
+    }
+    return 0;
+}
+
 static int two_misc(cpu_t *c, uint32_t insn)
 {
     {
         unsigned fopc = (insn >> 12) & 0x1F;
-        if (fopc >= 0x18 || (fopc == 0x0F && ((insn >> 23) & 1)))
+        if ((fopc == 0x16 || fopc == 0x17) && !((insn >> 23) & 1) && !((insn >> 29) & 1))
+            return fp_cvt_long(c, insn);
+        if (fopc >= 0x18 || (fopc == 0x0F && ((insn >> 23) & 1)) ||
+            (((insn >> 23) & 1) && (fopc == 0x0C || fopc == 0x0D || fopc == 0x0E)))
             return fp_two_misc(c, insn);
     }
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
@@ -1948,6 +2136,38 @@ static int scalar_simd(cpu_t *c, uint32_t insn)
  * bits). FP (opcode 1, 5 and 9, with size bit 1 set): FMLA (u=0, opcode 1), FMLS (u=0, opcode 5),
  * FMUL (u=0, opcode 9) and FMULX (u=1, opcode 9). Integer: MUL (u=0, opcode 8), MLA (u=1,
  * opcode 0) and MLS (u=1, opcode 4), on 16- and 32-bit lanes. */
+/* Scalar floating point by element (01 U 11111 size L M Rm opcode H 0 Rn Rd): FMLA (opcode 0001, U=0), FMLS (0101,
+ * U=0), FMUL (1001, U=0) and FMULX (1001, U=1) of lane 0 of Vn by the indexed element of Vm (the same index and
+ * register rule as the vector forms). The result is the scalar, and the rest of Vd is zeroed. */
+static int scalar_fp_by_element(cpu_t *c, uint32_t insn)
+{
+    unsigned u = (insn >> 29) & 1, size = (insn >> 22) & 3, l = (insn >> 21) & 1, m = (insn >> 20) & 1, h = (insn >> 11) & 1;
+    unsigned rmlo = (insn >> 16) & 15, opc = (insn >> 12) & 0xF, rn = (insn >> 5) & 31, rd = insn & 31;
+    int fp_op = (u == 0 && (opc == 1 || opc == 5 || opc == 9)) || (u == 1 && opc == 9);
+    if (!(size & 2) || !fp_op || !fp_default(c))
+        return -1;
+    unsigned sz = size & 1, esz = sz ? 8 : 4;
+    unsigned idx = sz ? h : (h << 1) | l;
+    uint8_t n[16], d[16], mv[16], r[16];
+    rd_v(c, rn, n);
+    rd_v(c, rd, d);
+    rd_v(c, (m << 4) | rmlo, mv);
+    uint64_t xb = el_rd(n, 0, esz), eb = el_rd(mv, idx * esz, esz), db = el_rd(d, 0, esz), rb;
+    if (sz) {
+        double x = as_d(xb), y = as_d(eb), acc = as_d(db);
+        double res = opc == 1 ? fma(x, y, acc) : opc == 5 ? fma(-x, y, acc) : u ? fmulx_d(x, y) : x * y;
+        rb = d_bits(res);
+    } else {
+        float x = as_f((uint32_t)xb), y = as_f((uint32_t)eb), acc = as_f((uint32_t)db);
+        float res = opc == 1 ? fmaf(x, y, acc) : opc == 5 ? fmaf(-x, y, acc) : u ? fmulx_f(x, y) : x * y;
+        rb = f_bits(res);
+    }
+    memset(r, 0, sizeof r);
+    el_wr(r, 0, esz, rb);
+    wr_v(c, rd, r, 16);
+    return 0;
+}
+
 static int by_element(cpu_t *c, uint32_t insn)
 {
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1, size = (insn >> 22) & 3;
@@ -2056,6 +2276,8 @@ int simd_exec(cpu_t *c, uint32_t insn)
             return fp_cmp(c, insn);
         return -1;
     }
+    if (top == 0x1F && !(insn >> 31) && ((insn >> 30) & 1) && !((insn >> 10) & 1)) /* scalar by element: 01 U 11111 */
+        return scalar_fp_by_element(c, insn);
     if (top == 0x1F && !(insn >> 31) && ((insn >> 30) & 1)) /* scalar shift by immediate: 01 U 111110 */
         return scalar_shift_imm(c, insn);
     if (top == 0x1F) { /* FP 3-source: FMADD and relatives, bit 31 and bits 30:29 zero */
@@ -2112,6 +2334,8 @@ int simd_exec(cpu_t *c, uint32_t insn)
             return -1;
         if (((insn >> 19) & 0xF) == 0)
             return modified_imm(c, insn);
+        if (((insn >> 11) & 0x1F) == 0x1C || ((insn >> 11) & 0x1F) == 0x1F)
+            return vec_fp_fixed(c, insn);
         return shift_imm(c, insn);
     }
     return -1;

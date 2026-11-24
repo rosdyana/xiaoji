@@ -103,6 +103,7 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     memcpy(c->cg, parent->cg, sizeof c->cg); /* a child starts in its parent's cgroups */
     memcpy(c->rlim, parent->rlim, sizeof c->rlim);
     memcpy(c->attr_current, parent->attr_current, sizeof c->attr_current);
+    memcpy(c->attr_create, parent->attr_create, sizeof c->attr_create);
     c->dumpable = parent->dumpable;
     c->keepcaps = parent->keepcaps;
     c->no_new_privs = parent->no_new_privs;

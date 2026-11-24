@@ -26,6 +26,7 @@
 #include "poll.h"
 #include "proc.h"
 #include "sched.h"
+#include "signals.h"
 #include "vfs.h"
 
 #define MAP_CAP (4u << 20)
@@ -1219,8 +1220,16 @@ static btxn_t *txn_build(bproc_t *src, bproc_t *dst, const btd_t *d, int secctx,
     x.offs = offs;
     for (uint32_t i = 0; i < x.nobj; i++) {
         *err = xl_object(&x, i, offs[i]);
-        if (*err)
+        if (*err) {
+            if (sig_debug_faults()) { /* XIAOJI_DEBUG_FAULTS: the object that did not translate (B16) */
+                uint32_t ty = 0;
+                if (offs[i] + 4 <= x.dsize)
+                    memcpy(&ty, x.data + offs[i], 4);
+                fprintf(stderr, "xiaoji: binder: pid %d -> pid %d: object %u at data offset %llu (type 0x%x) of %llu: %d\n",
+                        proc_cur()->pid, dst->pid, i, (unsigned long long)offs[i], ty, (unsigned long long)x.dsize, *err);
+            }
             goto out;
+        }
     }
     uint64_t secctx_at = 0, total = x.sg_lim;
     if (secctx) {
@@ -1516,8 +1525,11 @@ static int64_t bread(bproc_t *b, bthread_t *t, uint64_t buf, uint64_t size, uint
         q_pop(q);
         /* A transaction or a reply ends the read (the driver's binder_thread_read breaks out of
          * its loop there), so one request is delivered per read and each BC_REPLY pairs with the
-         * request the thread is serving. Other work keeps batching. */
-        int ends = w->kind == WK_TXN || w->kind == WK_REPLY;
+         * request the thread is serving. A death notification ends it too: its handler can start a
+         * transaction, and libbinder's talkWithDriver does not read while commands are unread, so
+         * the commands after it would answer the handler's call (linux-6.12 binder_thread_read,
+         * "goto done" after BR_DEAD_BINDER; B16). Other work keeps batching. */
+        int ends = w->kind == WK_TXN || w->kind == WK_REPLY || w->kind == WK_DEAD_BINDER;
         int rc = emit(b, t, w, buf + cur);
         free(w);
         if (rc)
@@ -1665,6 +1677,9 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
                 else
                     txn_free(rep);
             } else {
+                if (sig_debug_faults()) /* XIAOJI_DEBUG_FAULTS: a reply that could not be built for the waiting sender (B16) */
+                    fprintf(stderr, "xiaoji: binder: reply from pid %d to pid %d not built (mapped %d, err %d, data %llu)\n",
+                            b->pid, s->proc->pid, s->proc->mapped, err, (unsigned long long)d->data_size);
                 queue_failed(s, BR_FAILED_REPLY);
             }
         }
@@ -1680,6 +1695,9 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     if (BT_ON)
         bt_send(b, t, d, h, node, txid);
     if (!node) {
+        if (sig_debug_faults() && h == 0) /* XIAOJI_DEBUG_FAULTS: handle 0 with no context manager (B16) */
+            fprintf(stderr, "xiaoji: binder: pid %d: transaction to handle 0 has no context manager (mgr %s)\n",
+                    b->pid, b->ctx->mgr ? "set" : "NULL");
         queue_failed(t, h == 0 ? BR_DEAD_REPLY : BR_FAILED_REPLY);
         return;
     }
@@ -1689,6 +1707,8 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     }
     bproc_t *dst = node->proc;
     if (!dst->mapped) {
+        if (sig_debug_faults()) /* XIAOJI_DEBUG_FAULTS: a failed send to an unmapped process (B16) */
+            fprintf(stderr, "xiaoji: binder: pid %d -> pid %d: target not mapped (handle %u)\n", b->pid, dst->pid, h);
         queue_failed(t, BR_FAILED_REPLY);
         return;
     }
@@ -1700,6 +1720,9 @@ static void cmd_send(bproc_t *b, bthread_t *t, const btd_t *d, int reply)
     btxn_t *x = txn_build(b, dst, d, secctx, &err);
     xl_sender = NULL;
     if (!x) {
+        if (sig_debug_faults()) /* XIAOJI_DEBUG_FAULTS: the target buffer could not be built (B16) */
+            fprintf(stderr, "xiaoji: binder: pid %d -> pid %d: txn_build failed (err %d, handle %u, data %llu)\n",
+                    b->pid, dst->pid, err, h, (unsigned long long)d->data_size);
         queue_failed(t, BR_FAILED_REPLY);
         return;
     }
@@ -2038,8 +2061,11 @@ void binder_release(binder_proc_t *b)
 {
     bctx_t *c = b->ctx;
     b->closing = 1;
-    if (c->mgr && c->mgr->proc == b)
+    if (c->mgr && c->mgr->proc == b) {
         c->mgr = NULL;
+        if (sig_debug_faults()) /* XIAOJI_DEBUG_FAULTS: the context manager's proc is gone (B16) */
+            fprintf(stderr, "xiaoji: binder: pid %d released; the context manager is cleared\n", b->pid);
+    }
     for (bthread_t *t = b->threads; t; t = t->next) {
         while (t->recv) {
             btxn_t *x = t->recv;

@@ -10,6 +10,7 @@
 #include "linux.h"
 #include "mem.h"
 #include "pipe.h"
+#include "proc.h"
 #include "sched.h"
 
 #define MAX_POLL_FDS 1024
@@ -54,6 +55,13 @@ uint32_t poll_revents(vfs_fd *f, uint32_t events)
 {
     uint32_t r = 0;
     switch (f->kind) {
+    case VFS_PIDFD: {
+        /* readable once the process has ended: a zombie, or reaped (its pid is never reused) */
+        proc_t *p = proc_find((int)(uintptr_t)f->obj);
+        if (!p || p->zombie || p->exited)
+            r |= PX_IN;
+        break;
+    }
     case VFS_PIPE: {
         int readable, writable, readers, writers;
         pipe_state(f->pipe, &readable, &writable, &readers, &writers);
@@ -136,11 +144,13 @@ typedef struct {
     int active;
 } waiter_t;
 
-static waiter_t waiters[SCHED_MAX_THREADS];
+/* One entry per thread that waits with a deadline. The table grows as threads need entries (no fixed cap). */
+static waiter_t *waiters;
+static int nwaiters;
 
 static waiter_t *waiter_find(uint64_t tid)
 {
-    for (int i = 0; i < SCHED_MAX_THREADS; i++)
+    for (int i = 0; i < nwaiters; i++)
         if (waiters[i].active && waiters[i].tid == tid)
             return &waiters[i];
     return NULL;
@@ -148,14 +158,24 @@ static waiter_t *waiter_find(uint64_t tid)
 
 static waiter_t *waiter_new(uint64_t tid, uint64_t deadline)
 {
-    for (int i = 0; i < SCHED_MAX_THREADS; i++)
-        if (!waiters[i].active) {
-            waiters[i].active = 1;
-            waiters[i].tid = tid;
-            waiters[i].deadline = deadline;
-            return &waiters[i];
-        }
-    return NULL;
+    waiter_t *w = NULL;
+    for (int i = 0; i < nwaiters && !w; i++)
+        if (!waiters[i].active)
+            w = &waiters[i];
+    if (!w) {
+        int want = nwaiters ? nwaiters * 2 : 256;
+        waiter_t *nw = realloc(waiters, (size_t)want * sizeof *nw);
+        if (!nw)
+            return NULL; /* host out of memory */
+        memset(nw + nwaiters, 0, (size_t)(want - nwaiters) * sizeof *nw);
+        waiters = nw;
+        w = &waiters[nwaiters];
+        nwaiters = want;
+    }
+    w->active = 1;
+    w->tid = tid;
+    w->deadline = deadline;
+    return w;
 }
 
 /* The end of a poll-like call that found ready fds. Returns 1 when the thread must wait:

@@ -54,6 +54,7 @@ typedef struct proc {
     char dbg_comm[16]; /* the name of the last thread that ended (XIAOJI_DEBUG_FAULTS exit lines) */
     uint64_t rlim[PROC_RLIM_N][2]; /* soft and hard limit per resource (prlimit64, setrlimit) */
     char attr_current[PROC_ATTR_MAX]; /* attr/current: the context, which setcon writes */
+    char attr_create[4][PROC_ATTR_MAX]; /* attr/fscreate, sockcreate, keycreate, exec (procfs.c, B16); empty: none */
     /* Accounting for getrusage. Instructions and syscalls are this process's own;
      * the cu_ fields are the totals of its reaped children (and their children). */
     uint64_t dead_icount; /* instructions of its threads already reaped */

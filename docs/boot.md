@@ -4347,3 +4347,183 @@ has no time stamps, since `XIAOJI_STAMP` was not set).
 - The bpffs cannot be listed (`getdents` on `/sys/fs/bpf` is not built), and the pins' open returns EIO for the non-BTF path only.
 - `bpf.progs_loaded` is not set. Whether a caller waits on it was not checked.
 - The guest test and the init case use the engine's own uid and group checks for the gpu_mem pin; the oracle cannot check them.
+
+## B16: the clone limit, the networks off, and the boot to `sys.boot_completed=1` with the launcher home
+
+Status: **partial.** On the product tree (`build/rootfs-xiaoji`, boot13) the boot reaches `sys.boot_completed=1` at 268.9 s
+(31.3 G instructions), the launcher is the HOME activity at 285.0 s, and the launcher, SystemUI and system_server are alive for
+the 60 s after the marker (`boot_alive_60s` in `tests/run.sh`, window 269 to 329 s). **SystemUI's first instance is still hung.** It
+logs its last line at 274.8 s (after its first `eglMakeCurrent`), then nothing, and its service ANR kills it at 344.7 s, after the
+window. The restarted instance lives to the end of the run. The demo's timing rule holds; the hang is open (Blocker 2). The product
+check is not green (see the verification table).
+
+### Goal 1: `clone` EAGAIN and RLIMIT_NPROC
+
+- **Root cause.** `engine/sched.c` kept a fixed table of `SCHED_MAX_THREADS` (256) thread slots and refused `clone` with EAGAIN
+  once `live_count()` reached 256, for the whole machine. The Wi-Fi HAL's lazy start (hwservicemanager's `pthread_create`) hit
+  that limit. `poll.c` (deadline waiters) and `sock.c` (timed socket waits) had fixed tables of the same size.
+- **Fix.** The thread table starts at 256 slots and doubles (`free_slot`); the waiter and timed-wait tables grow the same way.
+  The limit is Linux's `RLIMIT_NPROC` (`copy_process`; `nproc_refused` in `sched.c`): a new task is refused with EAGAIN when the
+  tasks of the caller's real uid reach the soft limit. The tasks are its live threads plus one for each unreaped zombie process of
+  that uid. Uid 0, a process with CAP_SYS_RESOURCE or CAP_SYS_ADMIN, and an infinite limit are not refused. The engine's default
+  limit is infinite (`proc.c`), as before.
+- **Also from the inherited work:** `pidfd_open` (434; `VFS_PIDFD`, readable when the process ends), the `attr` files that
+  libselinux opens (`procfs.c`, `attr_names`), and the keystore2 selinuxfs class (below).
+- **Tests** (engine and node, O0 and O2, against the native oracle): `tests/guest/threads-many.c` (three rounds of 600 threads
+  alive at once, 2000 create/join pairs, and an RLIMIT_NPROC of 20 for uid 31337: 19 threads, then 19 more after the join),
+  `nproc-root.c` (uid 0 is not refused), `pidfd.c`, `attrs.c`. The RLIMIT tests run as root in the builder VM (`sudo -n`).
+
+### Goal 2: networks off (the Android way)
+
+The framework's start condition is taken from `SystemServer.startOtherServices` (the remote AOSP tree, read only) and the
+connectivity and permission modules. "Boot evidence" is what the boot11 log shows.
+
+| Stack | Start condition in the framework | Product change | Boot evidence |
+|---|---|---|---|
+| Wi-Fi | `FEATURE_WIFI` (StartWifi, StartWifiScanning); `FEATURE_WIFI_RTT`, `FEATURE_WIFI_AWARE`, `FEATURE_WIFI_DIRECT` (SystemServer around line 1954) | the `android.hardware.wifi*.xml` feature files are not copied (`xiaoji_vendor.mk`); the `android.hardware.wifi@1.0-service` HAL package is removed from `xiaoji_vendor.mk` | no `StartWifi` line; the HAL binary is not in `vendor/bin/hw` |
+| Bluetooth / BLE | `FEATURE_BLUETOOTH` (SystemServer line 1630: "No Bluetooth Service" path) | the bluetooth feature XMLs are not copied; `bt_vhci_forwarder`, `android.hardware.bluetooth@1.1-service.btlinux` and `android.hardware.bluetooth.audio@2.1-impl` are removed from `xiaoji_vendor.mk` | no `StartBluetoothService` line |
+| Ethernet | `FEATURE_ETHERNET` (read by AdbService; no ethernet service in SystemServer) | not declared | no ethernet service starts. NetworkStack looks up `ethernet` and gets "No service published" (harmless) |
+| UWB | `FEATURE_UWB` (SystemServer line 2749) | not declared | no `UwbService` line; the `com.android.uwb` APEX is still installed |
+| NFC | `FEATURE_NFC` | not declared; NfcNci is removed by the handheld fork | **not off:** `com.android.se` (the SecureElement app, `system/app`) starts. Recommendation below |
+| Telephony | `FEATURE_TELEPHONY` (SystemServer lines 2615 and 3012); `FEATURE_MICROPHONE`, `FEATURE_TELECOM` or `FEATURE_TELEPHONY` start TelecomLoaderService (line 1492) | `android.hardware.telephony*` and `android.software.telecom` are not declared. `telephony_system.mk` is no longer inherited (ONS, CarrierDefaultApp, CallLogBackup, CellBroadcastLegacyApp; the cell broadcast APEX is still installed by another makefile), and `TeleService` (process `com.android.phone`) is removed from `xiaoji_handheld_system.mk` | boot6 had the `com.android.phone` process restarting in a loop with no radio (330 `IRadioModem` waits, "crashed too many times"); boot10 and boot11 have none. `Telecom` stays (the mic feature starts its loader) |
+| Location network | `FEATURE_LOCATION_NETWORK` has no consumer in `services/`; `config_networkLocationProviderPackageName` is `@null` | `android.hardware.location.network` is not declared | none |
+
+Kept, as the framework requires: `xiaoji_netd`, ConnectivityService (`StartConnectivityService` completes at 197.8 s in boot11),
+NetworkStack, NetworkPolicy and NetworkStats. TelephonyRegistry starts unconditionally in SystemServer, so no feature turns it off.
+
+Not done, with reasons:
+
+- **A `PRODUCT_PACKAGES` filter does not remove inherited packages.** The first attempt (`filter-out` in `xiaoji_arm64.mk`) left
+  every package installed: the build collects each inherited file's words, so `base_system.mk` (`com.android.wifi`,
+  `wificond`, `com.android.btservices`) and the goldfish `vendor.mk` (`wpa_supplicant`, `hostapd`, `libgoldfish-rild`) still
+  install. They are not started. Removing them needs the inherit lines changed; left for a follow-up.
+- **`ro.radio.noril=yes`** is set as requested, but no framework reader was found in `frameworks/base`,
+  `frameworks/opt/telephony` or `packages/services/Telephony`, so it has no effect.
+- **`config_voice_capable`** stays `true` (no overlay was built; the boot does not need it).
+- **Provision stays.** Its HOME activity writes `DEVICE_PROVISIONED` and `USER_SETUP_COMPLETE`, then disables itself. Removing it
+  leaves the device unprovisioned. An attempt to drop it from the system_ext list was reverted for that reason.
+
+### Lean list for the demo (started processes, boot11, with a recommendation; none removed unilaterally)
+
+| Process | Why it runs | Recommendation |
+|---|---|---|
+| `com.android.se` | SecureElement app (`system/app`), no SE HAL | remove: NFC and SE are off |
+| `com.android.cellbroadcastreceiver.module` | cell broadcast APEX (`com.android.cellbroadcast`), started by a broadcast | remove the APEX (features.md: "never") |
+| `com.android.emulator.multidisplay` | the goldfish MultiDisplayProvider (emulator multi-display) | remove: a tab has one display |
+| `com.android.dynsystem` (and `:dynsystem`) | DynamicSystem installer, started by a boot broadcast | remove (features.md: not in the base) |
+| `com.android.localtransport` | backup transport (features.md: backup "never") | remove |
+| `com.android.sdksetup` | the emulator's setup wizard; it held the HOME fallback at first | remove after a clean boot shows the launcher as the only HOME app |
+| `com.android.providers.calendar` | calendar provider, started by an upgrade broadcast (Calendar is an add-on) | move to the add-on pack |
+| `WebViewLoader-arm64-v8a` | WebView's relro creation (it fails: no relro file) | keep lazy (features.md: base-lazy), and fix the relro file |
+| `com.android.keychain`, `android.ext.services`, `com.android.remoteprovisioner`, `com.android.packageinstaller`, `com.android.provision`, `com.android.externalstorage`, `com.android.documentsui`, `android.process.media`, `android.process.acore`, `com.android.providers.media.module`, `com.android.settings`, `com.android.permissioncontroller`, `com.android.networkstack.process`, `com.android.launcher3`, `com.android.systemui` | base services (features.md) | keep |
+
+### Other changes in this section
+
+- **Binder: a read ends after `BR_DEAD_BINDER`** (`engine/binder.c`, `bread`). The kernel's `binder_thread_read` ends the read
+  after a death notification ("DEAD_BINDER notifications can cause transactions"). The engine batched it. libbinder's handler for
+  the first death made a sync call, and `talkWithDriver` does not read while commands are unread, so the next command answered
+  that call. Boot traces showed `BR_REPLY` reaching a looper (`*** BAD COMMAND`, value 0x80407203; boot4), and the aborts that
+  followed are the system_server SIGABRTs of the earlier boots. Oracle test: `tests/guest/binder-death-batch.c`. Each node is sent
+  by its own child (one request per sender), the parent replies, takes both handles and requests both deaths; the output is the
+  commands per read and the sorted cookies. The kernel and the engine print the same lines for O0 and O2, three runs each. An
+  earlier version of the test (the children sent their requests from one thread) returned both deaths in one read on the engine,
+  and it hung on the native oracle; that version is not the test.
+- **The GL requests the generator skips** (`engine/gl_host.c`, `not_api_decode`). The generator marks 66 calls (58 void) of
+  the GLES1 and GLES2 protocols `not_api` and leaves their decoders out. An undecoded request sets the pipe's `broken`
+  flag (`goldfish.c`), and the pipe stops answering, so the guest's thread waits for its reply. Boot12 shows it: the first
+  such call, `glDrawElementsInstancedOffsetAEMU` (2315), arrived at 263.0 s, the same moment SystemUI's log stopped. The
+  table decodes all 66 by their fixed sizes (`gen_report.txt`) and answers with the return type's size: zero, except the sync
+  handles (nonzero), GL_TRUE for the two boolean sync calls, and GL_CONDITION_SATISFIED for the wait. Boot13 has no undecoded
+  request. It did not stop SystemUI's hang (Blocker 2).
+- **keystore2's selinux class** (`engine/selinuxfs.c`): libselinux's `discover_class` rejects a perm value of 0 and stores
+  `value - 1`, so the permissions run 1 to 16. The inherited table had 0 to 15, so every keystore2 check failed with "Unknown
+  class keystore2" and `KeyStore.state` returned SYSTEM_ERROR, which aborted LockSettingsService.
+- **gatekeeperd and its software HAL** (`image/xiaoji.rc`, with `mkdir /data/misc/gatekeeper`). LockSettingsService calls
+  `IGateKeeperService.reportDeviceSetupComplete` when `DEVICE_PROVISIONED` changes (the Provision app sets it). With no service
+  the call is a NullPointerException in system_server (boot5, 293 s).
+- **`/mnt/installer/0`** (`image/xiaoji.rc`). Zygote specializes an installer app by mounting `/mnt/installer/0` on `/storage`.
+  The directory is made by vold on a device; the engine has no vold, and the product rc did not make it. The mount failed with
+  "Failed to mount /mnt/installer/0 to /storage" (`JNI FatalError` in `Zygote.cpp`) and aborted `com.android.packageinstaller`
+  each time its `TemporaryFileManager` broadcast started (four aborts in boot9 and boot10). The rc now makes it as a bind of user
+  0's view. boot11 has no such abort.
+- **`ro.hw_timeout_multiplier=4`** (`xiaoji_arm64.mk`). `ActiveServices.SERVICE_TIMEOUT` is 20 s times
+  `Build.HW_TIMEOUT_MULTIPLIER`, read from this property. The reason is restarted SystemUI instances: their `SystemUIService` onCreate
+  ran past 20 s (boot6 and boot7: ANR about 20.7 s after the restart). The multiplier does **not** fix the first instance's hang: its
+  ANR fires at 4 x 20 s after its service started (76 s after the marker in boot10 and boot11, against 16.7 s with no multiplier).
+  It only moves the kill out of the 60 s window. The engine runs guest code at about 110 million instructions a second on the host.
+- **Diagnostics under `XIAOJI_DEBUG_FAULTS=1`:** each `BR_FAILED_REPLY` branch in `binder.c` prints its cause (target not mapped,
+  a request buffer not built, the object that did not translate, a reply not built), and selinuxfs opens are logged (`vfs.c`).
+  The end of a boot is marked by `xiaoji: sys.boot_completed=1` (`logd.c` `logd_note`, called from `props.c`), stamped like the
+  logcat lines under `XIAOJI_STAMP=1`.
+- **`tests/run.sh`, the product check:** the timeout is 540 s (480 s for the engine), which covers the marker at about 261 s plus 60 s.
+  `boot_alive_60s` requires the marker, the latest launcher, SystemUI and system_server started before it, and no exit line of any of
+  them within 60 s after it (exit lines carry no time, so the last stamped line before them gives the time). The check also requires
+  `START u0 ... HOME ... cmp=com.android.launcher3/` and no `Unknown class`. It was tested on synthetic logs (pass, exit inside the
+  window, exit after it, short log, restart before the marker) and on boot10 and boot11 (pass).
+
+### Milestones (product tree, `build/rootfs-xiaoji`, boot13; guest time and instructions)
+
+Run: `XIAOJI_DEBUG_FAULTS=1 XIAOJI_STAMP=1 build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs-xiaoji --init-timeout 600`
+after `make reset-data`. `pmset -g` before and after: `lowpowermode 0`, `Now drawing from 'AC Power'`.
+
+| Milestone | time | instructions |
+|---|---|---|
+| `Registered android.hardware.thermal@2.0::IThermal/default` | 3.2 s | 0.38 G |
+| `System server process 1076 has been created` | 44.1 s | 4.60 G |
+| `InitBeforeStartServices took to complete` | 47.1 s | 4.91 G |
+| `StartLockSettingsService took to complete` | 193.9 s | 22.56 G |
+| `StartConnectivityService took to complete` | 198.4 s | 23.11 G |
+| `StartAudioService took to complete` | 209.3 s | 24.78 G |
+| `ActivityManager: System now ready` | 214.7 s | 25.40 G |
+| `xiaoji: sys.boot_completed=1` | 268.9 s | 31.30 G |
+| `START u0 ... HOME ... cmp=com.android.launcher3/.uioverrides.QuickstepLauncher` | 285.0 s | 32.94 G |
+| `ActivityManager: ANR in com.android.systemui` (first instance, `SystemUIAuxiliaryDumpService`; killed; the restart, pid 1816, lives) | 344.7 s | 39.73 G |
+
+`StartVibratorManagerService` completes at 65.0 s (6.74 G). `StartWifi`, `StartBluetoothService` and `StartUwbService` do not
+appear. The 60 s window is 269 to 329 s.
+
+### Blockers, with the evidence
+
+1. **Fixed (boot11):** the installer's `/mnt/installer/0` abort (above).
+2. **Open: SystemUI's first instance hangs after its first EGL context.** Its last log line is `eglMakeCurrent` at 262 s (boot10,
+   pid 1250) and 274.8 s (boot13), and nothing else until its ANR. The GL pipe was broken by undecoded requests until the table
+   (above); that is fixed, and the hang remains, so it has another cause. The DropBox entries for the ANRs are 0 bytes, so the
+   stack is not known. What is known: the goldfish sync device answers `QUEUE_WORK` with a signalled eventfd (`goldfish.c`), so
+   a fence wait returns; SurfaceFlinger's `sync_file_info returned NULL` lines (`E/Fence`, pid 1007) are its reads of those fds
+   as sync files, and they recur in the boots that run fine. The next step is a stack of the first instance's main thread: the
+   engine has no way yet to dump a blocked guest thread's stack on SIGQUIT in this case (the ANR dump is written to DropBox).
+3. **Open: the `txn_build` refusal.** At 210 s (boot10) `SdkSandboxManagerService` sends a `BINDER` object to servicemanager, and
+   `xiaoji: binder: pid 1076 -> pid 1001: object 0 at data offset 100 (type 0x73622a85) of 136: -22` refuses it: the engine's
+   node at that address has a different cookie (`xl_binder`, the kernel's cookie check in `binder_translate_binder`). So the old
+   node is still referenced by servicemanager: a reference-lifetime gap (the `binder-node-reuse` case of B4e covers the simple
+   version). Its effect here is that `sdk_sandbox` is not published; system_server is not aborted.
+4. **Open: the wasm exit trap in the product check** (`prop-list node` and `binder-sm node`): see the verification table.
+5. **Open: `StorageManagerService`**: `IStoraged.onUserStarted` is a null call (`storaged` is not in the product; boot8, 268 s).
+
+### Verification (B16, final sources)
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` | exit 0; no warning in the log |
+| `tests/run.sh` (default) | **250 passed, 0 failed, 0 xfail** (includes `binder-death-batch`, `threads-many`, `nproc-root`, `pidfd` and `attrs` on engine and node, O0 and O2) |
+| `XIAOJI_JIT=0 tests/run.sh` | **250 passed, 0 failed, 0 xfail** |
+| `XIAOJI_BOOT=1 tests/run.sh` (Google image) | **251 passed, 0 failed, 0 xfail** |
+| `XIAOJI_ROOT=build/rootfs-xiaoji XIAOJI_BOOT=1 tests/run.sh` (product) | **215 passed, 2 failed: NOT green.** The zygote boot check passes (the boot conditions, no `Fatal signal`, no undecoded GL request, the launcher as HOME, `sys.boot_completed=1`, and `boot_alive_60s`). The two failures are `prop-list node` and `binder-sm node`: each exits with status 1 after printing the expected output, from a wasm `RuntimeError: memory access out of bounds` in the exit path (`exitRuntime` to `quit`). They failed in all four product runs made since the boot became reachable. They passed when run alone with the harness's environment and file output (four runs), and under a native build of the engine with AddressSanitizer (four runs, no report). The cause is open |
+| `make test-web` | all web checks passed, exit 0 |
+| `clang -std=c11 -Wall -Wextra -fsyntax-only` and `emcc -std=c11 -Wall -Wextra -fsyntax-only` on the 17 changed engine files (`binder.c gl_host.c gl_null.c poll.c powersupply.c proc.c procfs.c sched.c selinuxfs.c signals.c simd.c sock.c syscall.c timers.c vfs.c logd.c props.c`) | 0 warnings, 0 errors |
+| The native oracle for `binder-death-batch` (builder VM, `sudo -n`, O0 and O2, three runs each) | identical output; the engine matches it |
+| `pgrep -fl "build/xiaoji|wasm-node/xiaoji"` at the end | nothing of this work. Leftover `threads-many-O0` oracle processes (root, from an earlier hung run) were killed in the builder VM |
+
+Remaining, in order of importance: SystemUI's first instance hangs after its first EGL context (Blocker 2); the two wasm exit traps
+of the product check (above); the `txn_build` refusal (Blocker 3); `StorageManagerService`'s null `IStoraged` (Blocker 5); and the
+inherited Wi-Fi, Bluetooth and telephony packages that the image still carries (not started).
+
+Files changed in this section (all under the repo): `engine/binder.c`, `engine/vfs.c`, `engine/selinuxfs.c`, `engine/logd.c`,
+`engine/logd.h`, `engine/props.c`, `engine/sched.c`, `engine/poll.c`, `engine/sock.c`, `engine/procfs.c`, `engine/syscall.c`,
+`engine/signals.c`, `engine/simd.c`, `engine/gl_host.c` (the `not_api` table), `engine/gl_null.c` (the inherited changes only, as
+they were; the real WebGL2 backend is separate), `image/xiaoji.rc` (keystore, gatekeeper, `/data/misc/gatekeeper`, `/mnt/installer/0`,
+`/data/media`), `tests/run.sh` (the product check's conditions, the timeout, the sudo list), `tests/guest/binder-death-batch.c`,
+`tests/guest/threads-many.c`, `tests/guest/nproc-root.c`, `tests/guest/pidfd.c`, `tests/guest/attrs.c`, and the product under
+`aosp/device/xiaoji/` (`xiaoji_arm64.mk`, `xiaoji_vendor.mk`, `xiaoji_system.mk`, `xiaoji_handheld_system.mk`,
+`permissions/handheld_core_hardware.xml`). `tools/remote-build.sh` synced that tree to the remote, and `tools/fetch-remote-rootfs.sh`
+refreshed `build/rootfs-xiaoji` (it regenerates the apex-info list and linker config).

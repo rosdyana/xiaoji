@@ -24,7 +24,7 @@ int procfs_task_dir(const char *guest);
 int procfs_read(const char *guest, uint8_t **data, size_t *len);
 /* attr/current of the caller (self and thread-self) or of a live process: its context is what setcon
  * writes. procfs_attr_write stores a context (the n bytes, its NUL dropped) and returns n, or -LE_*. */
-int procfs_is_attr_current(const char *guest);
+int procfs_is_attr(const char *guest);
 int64_t procfs_attr_write(const char *guest, const uint8_t *buf, size_t n);
 /* Writes to the generated files that take one: /proc/pressure/<memory|cpu|io> (a PSI trigger, B9) and
  * /proc/<pid>/oom_score_adj. Returns n, or a negative errno. procfs_writable says whether guest takes writes. */

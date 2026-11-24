@@ -120,10 +120,45 @@ static proc_t *oom_target(const char *guest)
     return p && !strcmp(rest, "/oom_score_adj") ? p : NULL;
 }
 
-/* The security context of the process (attr/current): the same for every process. */
-static int is_self_attr(const char *guest)
+/* The attributes under attr/ (B16): current (the context setcon writes) and the create contexts that libselinux's
+ * setfscreatecon, setsockcreatecon and setkeycreatecon write, and exec. The engine applies no label to what it
+ * creates; it keeps the values, so the writes and the reads behave as on Linux. attr_create[i] is the i+1 entry. */
+static const char *const attr_names[] = {"current", "fscreate", "sockcreate", "keycreate", "exec"};
+#define NATTR ((int)(sizeof attr_names / sizeof attr_names[0]))
+
+/* The index of an attribute name, or -1. */
+static int attr_index_of(const char *name)
 {
-    return !strcmp(guest, "/proc/self/attr/current") || !strcmp(guest, "/proc/thread-self/attr/current");
+    for (int i = 0; i < NATTR; i++)
+        if (!strcmp(name, attr_names[i]))
+            return i;
+    return -1;
+}
+
+/* A /proc/self or /proc/thread-self attribute path: sets *name to the attribute's name. */
+static int self_attr(const char *guest, const char **name)
+{
+    static const char *const prefixes[] = {"/proc/self/attr/", "/proc/thread-self/attr/"};
+    for (size_t k = 0; k < 2; k++) {
+        size_t n = strlen(prefixes[k]);
+        if (!strncmp(guest, prefixes[k], n) && attr_index_of(guest + n) >= 0) {
+            *name = guest + n;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int self_attr_p(const char *guest)
+{
+    const char *name;
+    return self_attr(guest, &name);
+}
+
+/* The value of attribute index idx of p. */
+static char *attr_slot(proc_t *p, int idx)
+{
+    return idx == 0 ? p->attr_current : p->attr_create[idx - 1];
 }
 
 #define BOOT_ID_PATH "/proc/sys/kernel/random/boot_id"
@@ -134,14 +169,14 @@ int procfs_known(const char *guest)
         return 1;
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/status") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
-        is_self_attr(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
+        self_attr_p(guest) || !strcmp(guest, "/proc/mounts") || !strcmp(guest, "/proc/self/mounts") ||
         !strcmp(guest, "/proc/self/mountinfo") || !strcmp(guest, "/proc/meminfo") || pressure_file(guest) ||
         !strcmp(guest, "/proc/self/oom_score_adj") || !strcmp(guest, "/proc/self/cgroup"))
         return 1;
     const char *rest;
     if (live_proc(guest, &rest))
         return !strcmp(rest, "/stat") || !strcmp(rest, "/status") || !strcmp(rest, "/cmdline") ||
-               !strcmp(rest, "/attr/current") || !strcmp(rest, "/mounts") || !strcmp(rest, "/mountinfo") ||
+               (!strncmp(rest, "/attr/", 6) && attr_index_of(rest + 6) >= 0) || !strcmp(rest, "/mounts") || !strcmp(rest, "/mountinfo") ||
                !strcmp(rest, "/oom_score_adj") || !strcmp(rest, "/cgroup");
     return 0;
 }
@@ -260,8 +295,8 @@ int procfs_task_child(const char *guest, int index, const char **name)
         p = proc_find(pid);
     if (!p || index < 0)
         return 0;
-    cpu_t *ts[SCHED_MAX_THREADS];
-    int n = sched_threads_of(p, ts, SCHED_MAX_THREADS);
+    cpu_t *ts[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+    int n = sched_threads_of(p, ts, p->nthreads ? p->nthreads : 1);
     if (index >= n)
         return 0;
     snprintf(buf, sizeof buf, "%llu", (unsigned long long)ts[index]->tid);
@@ -297,8 +332,8 @@ static void build_status(sbuf *b, const proc_t *p)
 static void build_stat(sbuf *b, const proc_t *p)
 {
     long long f[49] = {0};
-    cpu_t *list[SCHED_MAX_THREADS];
-    int live = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+    int live = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1);
     /* The address space is the running one's: for another process the sizes are zero. */
     int self = p == proc_cur();
     uint64_t vsize = 0, va = 0, s, e, off;
@@ -375,8 +410,8 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
             size_t n = 0;
             const uint8_t *bytes = vfs_cmdline_bytes(target->fds, &n);
             sb_add(&b, (const char *)bytes, n);
-        } else if (!strcmp(rest, "/attr/current")) {
-            sb_fmt(&b, "%s", target->attr_current);
+        } else if (!strncmp(rest, "/attr/", 6) && attr_index_of(rest + 6) >= 0) {
+            sb_fmt(&b, "%s", attr_slot(target, attr_index_of(rest + 6)));
         } else if (!strcmp(rest, "/oom_score_adj")) {
             sb_fmt(&b, "%d\n", target->oom_score_adj);
         } else if (!strcmp(rest, "/cgroup")) {
@@ -441,8 +476,10 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
                    "Unevictable:           0 kB\n"
                    "SwapTotal:             0 kB\n"
                    "SwapFree:              0 kB\n");
-    } else if (is_self_attr(guest)) {
-        sb_fmt(&b, "%s", proc_cur()->attr_current);
+    } else if (self_attr_p(guest)) {
+        const char *nm = NULL;
+        (void)self_attr(guest, &nm);
+        sb_fmt(&b, "%s", attr_slot(proc_cur(), attr_index_of(nm)));
     } else {
         return -1;
     }
@@ -461,28 +498,40 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
     return 0;
 }
 
-/* The process whose attr/current a guest path names, or NULL. */
-static proc_t *attr_owner(const char *guest)
+/* The process and the attribute index (attr_names) a guest attr path names, or NULL. */
+static proc_t *attr_owner(const char *guest, int *idx)
 {
-    if (!strcmp(guest, "/proc/self/attr/current") || !strcmp(guest, "/proc/thread-self/attr/current"))
+    const char *name = NULL;
+    if (self_attr(guest, &name)) {
+        *idx = attr_index_of(name);
         return proc_cur();
+    }
     const char *rest;
     proc_t *p = live_proc(guest, &rest);
-    return p && rest && !strcmp(rest, "/attr/current") ? p : NULL;
+    if (!p || !rest || strncmp(rest, "/attr/", 6) || attr_index_of(rest + 6) < 0)
+        return NULL;
+    *idx = attr_index_of(rest + 6);
+    return p;
 }
 
-int procfs_is_attr_current(const char *guest) { return attr_owner(guest) != NULL; }
+int procfs_is_attr(const char *guest)
+{
+    int idx = -1;
+    return attr_owner(guest, &idx) != NULL;
+}
 
 int64_t procfs_attr_write(const char *guest, const uint8_t *buf, size_t n)
 {
-    proc_t *p = attr_owner(guest);
+    int idx = -1;
+    proc_t *p = attr_owner(guest, &idx);
     if (!p)
         return -LE_BADF;
     while (n > 0 && buf[n - 1] == 0)
         n--; /* the NUL that libselinux writes with the context */
-    if (n == 0 || n >= PROC_ATTR_MAX)
+    if (n >= PROC_ATTR_MAX)
         return -LE_INVAL;
-    memcpy(p->attr_current, buf, n);
-    p->attr_current[n] = 0;
+    char *slot = attr_slot(p, idx);
+    memcpy(slot, buf, n); /* an empty write clears the attribute (the create contexts' reset) */
+    slot[n] = 0;
     return (int64_t)n;
 }

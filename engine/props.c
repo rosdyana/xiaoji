@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "init.h"
+#include "logd.h"
 #include "memfd.h"
 #include "props.h"
 #include "sched.h"
@@ -477,6 +478,9 @@ uint32_t props_set(const char *name, size_t n, const char *value, size_t vlen)
         bump_area_serial();
     }
     area_flush();
+    /* The end of a boot: system_server sets it when the framework has booted (B16; tests/run.sh reads the line). */
+    if (n == 18 && !memcmp(name, "sys.boot_completed", 18) && vlen == 1 && value[0] == '1')
+        logd_note("sys.boot_completed=1");
     init_prop_changed(name, n, value, vlen);
     return PROP_SUCCESS;
 }

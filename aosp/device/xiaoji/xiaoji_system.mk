@@ -21,7 +21,9 @@
 
 # This makefile is the basis of a generic system image for a handheld device.
 $(call inherit-product, device/xiaoji/xiaoji_handheld_system.mk)
-$(call inherit-product, $(SRC_TARGET_DIR)/product/telephony_system.mk)
+# telephony_system.mk is not inherited (B16): no telephony. It brings ONS, which runs in the com.android.phone process
+# and restarted in a loop with no radio (boot9: "has crashed too many times"), CarrierDefaultApp, CallLogBackup, the
+# cell broadcast APEX and CellBroadcastLegacyApp.
 $(call inherit-product, $(SRC_TARGET_DIR)/product/languages_default.mk)
 # Add adb keys to debuggable AOSP builds (if they exist)
 $(call inherit-product-if-exists, vendor/google/security/adb/vendor_key.mk)

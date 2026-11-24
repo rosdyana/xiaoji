@@ -61,7 +61,6 @@ PRODUCT_PACKAGES += \
     android.hardware.graphics.mapper@3.0-impl-ranchu \
     hwcomposer.ranchu \
     toybox_vendor \
-    android.hardware.wifi@1.0-service \
     android.hardware.media.c2@1.0-service-goldfish \
     libcodec2_goldfish_vp8dec \
     libcodec2_goldfish_vp9dec \
@@ -96,11 +95,8 @@ PRODUCT_PACKAGES += \
     libGLESv2_angle
 endif
 
-# Enable bluetooth
-PRODUCT_PACKAGES += \
-    bt_vhci_forwarder \
-    android.hardware.bluetooth@1.1-service.btlinux \
-    android.hardware.bluetooth.audio@2.1-impl
+# Bluetooth is off (B16, docs/boot.md): no feature is declared, so no Bluetooth service starts. The HAL and its
+# packages are not listed here (the goldfish vendor.mk, if inherited, still adds them; they are never started).
  #
 # Bluetooth se policies
 BOARD_SEPOLICY_DIRS += system/bt/vendor_libs/linux/sepolicy
@@ -317,12 +313,7 @@ PRODUCT_COPY_FILES += \
     device/generic/goldfish/data/etc/config.ini:config.ini \
     device/generic/goldfish/wifi/simulated_hostapd.conf:$(TARGET_COPY_OUT_VENDOR)/etc/simulated_hostapd.conf \
     device/generic/goldfish/wifi/wpa_supplicant.conf:$(TARGET_COPY_OUT_VENDOR)/etc/wifi/wpa_supplicant.conf \
-    frameworks/native/data/etc/android.hardware.bluetooth_le.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.bluetooth_le.xml \
-    frameworks/native/data/etc/android.hardware.bluetooth.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.bluetooth.xml \
-    frameworks/native/data/etc/android.hardware.wifi.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.wifi.xml \
-    frameworks/native/data/etc/android.hardware.wifi.passpoint.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.wifi.passpoint.xml \
-    frameworks/native/data/etc/android.hardware.wifi.direct.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.wifi.direct.xml \
-    device/generic/goldfish/data/etc/handheld_core_hardware.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/handheld_core_hardware.xml \
+    device/xiaoji/permissions/handheld_core_hardware.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/handheld_core_hardware.xml \
     device/generic/goldfish/camera/media_profiles.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_profiles_V1_0.xml \
     frameworks/av/media/libstagefright/data/media_codecs_google_audio.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_audio.xml \
     frameworks/av/media/libstagefright/data/media_codecs_google_telephony.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_telephony.xml \

@@ -54,6 +54,17 @@ on early-init
     mkdir /data/misc
     mkdir /data/misc/user
     mkdir /data/misc/installd
+    # keystore's directory (stock init.rc: mkdir /data/misc/keystore 0700 keystore keystore), for keystore2 below.
+    mkdir /data/misc/keystore
+    # gatekeeperd's directory (stock: mkdir /data/misc/gatekeeper 0700 system system). The engine's mkdir takes the path
+    # only, so the owner is the engine's default (B16).
+    mkdir /data/misc/gatekeeper
+    # /data/media (stock init.rc, post-fs-data: mkdir /data/media 0770 media_rw media_rw) and user 0's emulated
+    # storage under it. The stock path makes /data/media/0 when vold mounts the emulated volume, which needs an
+    # fstab this engine does not have; without it vold fails the unlock (chmod /data/media/0) and system_server
+    # aborts on the failed user data (B16).
+    mkdir /data/media
+    mkdir /data/media/0
     # ART's profile directories (init.rc's block for profiles, and cur/0 from vold): installd fails to prepare a
     # package's profile without them (B7).
     mkdir /data/misc/profiles 0771
@@ -117,6 +128,12 @@ on early-init
     # is made as a directory above, never as the symlink that line removes.
     mount none /mnt/user/0 /storage bind rec
     mount none none /storage slave rec
+    # The installer's view of the emulated storage (B16): zygote specializes an installer app by mounting /mnt/installer/0
+    # on /storage (Zygote.cpp, "Failed to mount /mnt/installer/0 to /storage" aborted the PackageInstaller's process). vold
+    # makes /mnt/installer/<user> on a device; here it is a bind of user 0's view, as the emulated volume's.
+    mkdir /mnt/installer
+    mkdir /mnt/installer/0
+    mount none /mnt/user/0 /mnt/installer/0 bind rec
     symlink /storage/self/primary /mnt/sdcard
     symlink /mnt/user/0/primary /mnt/runtime/default/self/primary
     # The VNDK APEX under its versioned name (B14): nativeloader reads /apex/com.android.vndk.v<ro.vndk.version>/etc/
@@ -336,6 +353,33 @@ service vold /system/bin/vold --blkid_context=u:r:blkid:s0 --blkid_untrusted_con
 # netd (B12): xiaoji_netd (device/xiaoji/xiaoji_netd), not the stock netd, which needs bpf(2) and NETLINK_ROUTE. The
 # stock capabilities and group, and the same "netd" binder service. The stock sockets (dnsproxyd, fwmarkd, mdns) are
 # left out: nothing listens on them yet. NetworkManagementService.create waits for this service.
+# KeyMint, the software implementation (AOSP's hardware/interfaces/security/keymint/aidl/default; its package is in
+# xiaoji_vendor.mk and its rc is in vendor/etc/init, which this init does not import). keystore2 below needs it (B16).
+service vendor.keymint-default /vendor/bin/hw/android.hardware.security.keymint-service
+    class early_hal
+    user nobody
+
+# keystore2 (the stock keystore2.rc, system/etc/init, B16): LockSettingsService and the legacy KeyStore call it when user 0
+# unlocks. Without it the binder answers with a system error and LockSettingsService asserts (KeyStore.state).
+service keystore2 /system/bin/keystore2 /data/misc/keystore
+    class core
+    user keystore
+    group keystore readproc log
+    task_profiles ProcessCapacityHigh
+
+# gatekeeper (B16): LockSettingsService calls IGateKeeperService.reportDeviceSetupComplete when DEVICE_PROVISIONED changes
+# (the Provision app's HOME activity sets it), and that call dies with a NullPointerException in system_server while the
+# service is missing. The stock gatekeeperd (class late_start) and its software HAL (class hal) are started here.
+service vendor.gatekeeper-1-0 /vendor/bin/hw/android.hardware.gatekeeper@1.0-service.software
+    class early_hal
+    user system
+    group system
+
+service gatekeeperd /system/bin/gatekeeperd /data/misc/gatekeeper
+    class core
+    user system
+    task_profiles ServiceCapacityLow
+
 service netd /system/bin/xiaoji_netd
     class main
     capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID

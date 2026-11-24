@@ -314,9 +314,20 @@ int sig_fault(cpu_t *c, int sig, int code, uint64_t addr)
 {
     if (!catchable_now(c, sig))
         return 0;
-    if (sig_debug_faults())
+    if (sig_debug_faults()) {
         fprintf(stderr, "xiaoji: deliver signal %d (si_code %d) to guest handler: addr 0x%llx pc 0x%llx\n",
                 sig, code, (unsigned long long)addr, (unsigned long long)c->pc);
+        if (sig == 11 && code == 2) { /* SEGV_ACCERR: the mapping and its protection at the address (B16) */
+            uint64_t rs = 0, re = 0, roff = 0;
+            const char *rpath = NULL;
+            if (mem_region_next(addr, &rs, &re, &rpath, &roff) && rs <= addr && addr < re)
+                fprintf(stderr, "xiaoji:   data 0x%llx: prot %u, region 0x%llx-0x%llx %s off 0x%llx\n",
+                        (unsigned long long)addr, mem_prot_at(addr), (unsigned long long)rs,
+                        (unsigned long long)re, rpath ? rpath : "(anon)", (unsigned long long)roff);
+            else
+                fprintf(stderr, "xiaoji:   data 0x%llx: not mapped\n", (unsigned long long)addr);
+        }
+    }
     if (setup_frame(c, sig, code, 1, addr, 0) < 0)
         sig_segv_fatal(c->sp, c->pc);
     return 1;
@@ -476,8 +487,8 @@ static void raise_for(cpu_t *t, int sig, int code, uint32_t pid, uint64_t value)
  * else the first that does not block it, else the first thread (where it stays pending). */
 static cpu_t *process_target(proc_t *p, int sig)
 {
-    cpu_t *list[SCHED_MAX_THREADS];
-    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+    int n = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1);
     uint64_t b = bit(sig);
     for (int i = 0; i < n; i++)
         if (sched_wait_kind(list[i]) == SW_SIGWAIT && (list[i]->sig_wait_set & b))
@@ -492,8 +503,8 @@ static cpu_t *process_target(proc_t *p, int sig)
 static void signal_process(proc_t *p, int sig, int code, uint32_t sender, uint64_t value)
 {
     if (sig == SIGKILL_N) {
-        cpu_t *list[SCHED_MAX_THREADS];
-        int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+        cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+        int n = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1);
         for (int i = 0; i < n; i++)
             raise_for(list[i], sig, code, sender, value);
         return;
@@ -570,8 +581,8 @@ int sig_timer_raise(proc_t *p, int tid, int sig, int code, uint32_t id, uint64_t
         signal_process(p, sig, code, id, value);
         return 0;
     }
-    cpu_t *list[SCHED_MAX_THREADS];
-    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+    int n = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1);
     for (int i = 0; i < n; i++)
         if ((int)list[i]->tid == tid) {
             raise_for(list[i], sig, code, id, value);
@@ -583,8 +594,8 @@ int sig_timer_raise(proc_t *p, int tid, int sig, int code, uint32_t id, uint64_t
 /* Whether sig is pending for the target of a timer (the same target as sig_timer_raise). */
 int sig_timer_pending(proc_t *p, int tid, int sig)
 {
-    cpu_t *list[SCHED_MAX_THREADS];
-    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+    int n = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1);
     for (int i = 0; i < n; i++) {
         if (tid && (int)list[i]->tid != tid)
             continue;
@@ -662,8 +673,8 @@ int64_t sig_rt_tgsigqueueinfo(uint64_t tgid, uint64_t tid, uint64_t sig, uint64_
     if (!p || p->zombie || p->exited)
         return -LE_SRCH;
     cpu_t *want = sched_find_thread((uint32_t)tid);
-    cpu_t *list[SCHED_MAX_THREADS];
-    int n = sched_threads_of(p, list, SCHED_MAX_THREADS);
+    cpu_t *list[p->nthreads ? p->nthreads : 1]; /* every thread of the process: no fixed cap (B16) */
+    int n = sched_threads_of(p, list, p->nthreads ? p->nthreads : 1);
     int member = 0;
     for (int i = 0; i < n && want; i++)
         if (list[i] == want)

@@ -49,9 +49,13 @@ extern const gles1_backend_t gles1_null_defaults;
 static const char gl_vendor[] = "xiaoji";
 static const char gl_renderer[] = "xiaoji null GLES";
 static const char gl_version[] = "OpenGL ES 3.0 xiaoji-null";
+/* GL_SHADING_LANGUAGE_VERSION: Skia reads the GLSL version from it and fails to make a GL context without one (B16). */
+static const char gl_shading_version[] = "OpenGL ES GLSL ES 3.00 xiaoji-null";
+#define GL_SHADING_LANGUAGE_VERSION_NAME 0x8B8C
 static const char gl_extensions[] =
     "GL_OES_EGL_image_external_essl3 "
-    "ANDROID_EMU_gles_max_version_3_0 ANDROID_EMU_native_sync_v2 ANDROID_EMU_gles_no_host_error";
+    "ANDROID_EMU_gles_max_version_3_0 ANDROID_EMU_native_sync_v2 ANDROID_EMU_gles_no_host_error "
+    "ANDROID_EMU_host_composition_v1";
 static const char egl_vendor[] = "xiaoji";
 static const char egl_version[] = "1.4 xiaoji-null";
 static const char egl_extensions[] = "EGL_ANDROID_native_fence_sync";
@@ -202,6 +206,7 @@ static int32_t rc_GetGLString(void *ctx, uint32_t name, void *buffer, uint32_t b
     case GL_VENDOR: return put_string(gl_vendor, buffer, buffer_len, bufferSize);
     case GL_RENDERER: return put_string(gl_renderer, buffer, buffer_len, bufferSize);
     case GL_VERSION: return put_string(gl_version, buffer, buffer_len, bufferSize);
+    case GL_SHADING_LANGUAGE_VERSION_NAME: return put_string(gl_shading_version, buffer, buffer_len, bufferSize);
     case GL_EXTENSIONS: return put_string(gl_extensions, buffer, buffer_len, bufferSize);
     default: return 0;
     }
@@ -382,6 +387,22 @@ static uint32_t rc_CreateClientImage(void *ctx, uint32_t context, uint32_t targe
 {
     (void)ctx; (void)context; (void)target; (void)buffer;
     return next_handle++;
+}
+
+/* Host composition v1 (ANDROID_EMU_host_composition_v1, advertised above). The composer (hwc2 HostComposer) sends its
+ * layers here when it has no client target to post; this backend draws nothing, so the compose calls succeed and the
+ * retire fence is an EGL sync from rcCreateSyncKHR. Without the extension the composer's fallback posts a client
+ * target that SurfaceFlinger did not send, and hwcomposer segfaults (B16). */
+static int32_t rc_Compose(void *ctx, uint32_t bufferSize, const void *buffer, uint32_t buffer_len)
+{
+    (void)ctx; (void)bufferSize; (void)buffer; (void)buffer_len;
+    return 0;
+}
+
+static int32_t rc_ComposeWithoutPost(void *ctx, uint32_t bufferSize, const void *buffer, uint32_t buffer_len)
+{
+    (void)ctx; (void)bufferSize; (void)buffer; (void)buffer_len;
+    return 0;
 }
 
 static void rc_FBPost(void *ctx, uint32_t colorBuffer)
@@ -579,6 +600,8 @@ const gl_host_t *gl_host_null(void)
         rc_table.rcUpdateColorBuffer = rc_UpdateColorBuffer;
         rc_table.rcCreateClientImage = rc_CreateClientImage;
         rc_table.rcFBPost = rc_FBPost;
+        rc_table.rcCompose = rc_Compose;
+        rc_table.rcComposeWithoutPost = rc_ComposeWithoutPost;
         rc_table.rcCreateSyncKHR = rc_CreateSyncKHR;
         rc_table.rcIsSyncSignaled = rc_IsSyncSignaled;
         rc_table.rcClientWaitSyncKHR = rc_ClientWaitSyncKHR;

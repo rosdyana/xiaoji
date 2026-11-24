@@ -53,23 +53,15 @@ static size_t find_nul(const uint8_t *buf, size_t from, size_t n)
     return i;
 }
 
-static void print_datagram(const uint8_t *buf, size_t n)
+/* XIAOJI_STAMP=1: each line starts with the time since the first line and the instructions run so far, so a
+ * milestone's cost can be read from the log. The browser build always stamps: the page's milestone strip reads the
+ * counts (W1). The engine's own note lines (logd_note) take the same prefix. */
+static void stamp_prefix(void)
 {
-    if (n < LOGD_HDR_LEN + 1 || !text_id(buf[0]))
-        return;
-    unsigned prio = buf[LOGD_HDR_LEN];
-    size_t tag_end = find_nul(buf, LOGD_HDR_LEN + 1, n);
-    size_t msg_start = tag_end < n ? tag_end + 1 : n;
-    size_t msg_end = find_nul(buf, msg_start, n);
-    /* The sender is the calling process: the datagram carries no pid. */
-    proc_t *p = proc_cur();
-    /* XIAOJI_STAMP=1: each line starts with the time since the first line and the instructions run
-     * so far, so a milestone's cost can be read from the log. */
     static int stamp = -1;
     static uint64_t t0;
     if (stamp < 0) {
 #ifdef XIAOJI_WEB
-        /* The browser build always stamps: the page's milestone strip reads the counts (W1). */
         stamp = 1;
 #else
         const char *e = getenv("XIAOJI_STAMP");
@@ -80,6 +72,26 @@ static void print_datagram(const uint8_t *buf, size_t n)
     if (stamp)
         fprintf(stderr, "[%llu ms %llu insn] ", (unsigned long long)((host_monotonic_ns() - t0) / 1000000ull),
                 (unsigned long long)sched_icount());
+}
+
+/* A line the engine prints about itself, with the stamp: "xiaoji: <msg>" (B16: the end-of-boot marker for tests/run.sh). */
+void logd_note(const char *msg)
+{
+    stamp_prefix();
+    fprintf(stderr, "xiaoji: %s\n", msg);
+}
+
+static void print_datagram(const uint8_t *buf, size_t n)
+{
+    if (n < LOGD_HDR_LEN + 1 || !text_id(buf[0]))
+        return;
+    unsigned prio = buf[LOGD_HDR_LEN];
+    size_t tag_end = find_nul(buf, LOGD_HDR_LEN + 1, n);
+    size_t msg_start = tag_end < n ? tag_end + 1 : n;
+    size_t msg_end = find_nul(buf, msg_start, n);
+    /* The sender is the calling process: the datagram carries no pid. */
+    proc_t *p = proc_cur();
+    stamp_prefix();
     fprintf(stderr, "%c/%.*s(%d): %.*s\n", prio_letter(prio), (int)(tag_end - (LOGD_HDR_LEN + 1)),
             (const char *)buf + LOGD_HDR_LEN + 1, p ? p->pid : 0, (int)(msg_end - msg_start),
             (const char *)buf + msg_start);

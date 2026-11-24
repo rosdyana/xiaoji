@@ -11,6 +11,7 @@
 
 /* Turns the stderr output on or off. Off by default. */
 void logd_set_print(int on);
+void logd_note(const char *msg);
 /* Called with each printed log message (main.c: XIAOJI_STATS_AT). */
 void stats_log_hook(const char *msg);
 

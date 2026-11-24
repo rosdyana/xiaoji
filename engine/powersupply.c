@@ -1,4 +1,4 @@
-/* The synthetic /sys/class/power_supply tree (powersupply.h). */
+/* The synthetic /sys tree: /sys/class/power_supply (powersupply.h), and the empty fusectl directories (B16). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +12,11 @@ static const struct {
     psfs_kind kind;
     const char *text; /* PSFS_FILE contents */
 } tree[] = {
+    /* fusectl's mount point (the stock init.rc mounts it): vold lists /sys/fs/fuse/connections when it resets, and a
+     * missing directory aborts it (B16). Empty: the engine has no fuse. */
+    {"/sys/fs", PSFS_DIR, NULL},
+    {"/sys/fs/fuse", PSFS_DIR, NULL},
+    {"/sys/fs/fuse/connections", PSFS_DIR, NULL},
     {"/sys/class", PSFS_DIR, NULL},
     {"/sys/class/power_supply", PSFS_DIR, NULL},
     {"/sys/class/power_supply/battery", PSFS_DIR, NULL},

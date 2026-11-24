@@ -1,5 +1,5 @@
 # xiaoji: forked from build/make/target/product/handheld_system.mk (android13-release).
-# Removed packages: BasicDreams, BluetoothMidiService, BookmarkProvider, BuiltInPrintService, CameraExtensionsProxy, EasterEgg, ManagedProvisioning, MmsService, MusicFX, NfcNci, PrintRecommendationService, PrintSpooler, SecureElement, SimAppDialog, Traceur, screenrecord, vr.
+# Removed packages (B16: TeleService, the com.android.phone process, loops on the absent radio HAL and ANRs): BasicDreams, BluetoothMidiService, BookmarkProvider, BuiltInPrintService, CameraExtensionsProxy, EasterEgg, ManagedProvisioning, MmsService, MusicFX, NfcNci, PrintRecommendationService, PrintSpooler, SecureElement, SimAppDialog, Traceur, screenrecord, vr.
 # They run persistent processes or features a browser tab has no use for
 # (NFC, SIM toolkit, secure element, printing, dreams, VR, ...).
 
@@ -55,7 +55,6 @@ PRODUCT_PACKAGES += \
     SharedStorageBackup \
     Telecom \
     TelephonyProvider \
-    TeleService \
     UserDictionaryProvider \
     VpnDialogs \
 

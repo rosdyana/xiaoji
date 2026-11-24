@@ -19,7 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cred.h"
 #include "host.h"
+#include "poll.h"
 #include "linux.h"
 #include "mem.h"
 #include "prof.h"
@@ -27,7 +29,10 @@
 #include "timers.h"
 #include "signals.h"
 
-#define MAX_THREADS SCHED_MAX_THREADS
+/* The thread table starts with this many slots and doubles as threads are made (Linux has no fixed cap:
+ * the limits are RLIMIT_NPROC per uid and the host memory). */
+#define SLOTS_FIRST 256
+#define RLIMIT_NPROC_IDX 6 /* RLIMIT_NPROC on Linux arm64 */
 #define TID_MAIN 1000u
 #define TID_FIRST_NEW 1001u
 #define DEADLOCK_STATUS 134
@@ -68,47 +73,80 @@ typedef struct thread {
 /* sched_wait_kind and sched_wake take a cpu_t pointer and cast it to thread_t. */
 _Static_assert(offsetof(thread_t, cpu) == 0, "thread_t must start with its cpu_t");
 
-static thread_t *threads[MAX_THREADS];
+static thread_t **threads; /* the slot table: slot i is NULL or a live thread */
+static int nslots;         /* slots allocated in threads[] */
 static int cur_slot;          /* slot of the running thread */
 static proc_t *init_proc;     /* the initial process: its exit ends the engine */
 static uint64_t next_tid = TID_FIRST_NEW; /* tids and pids share one number space */
 static uint64_t dead_icount;  /* instructions of threads already reaped */
 static char init_name[16] = "xiaoji";
 
-static thread_t *cur(void) { return threads[cur_slot]; }
+static thread_t *cur(void) { return cur_slot < nslots ? threads[cur_slot] : NULL; }
 
-static int live_count(void)
+/* RLIMIT_NPROC, as Linux copy_process checks it: a new task is refused with EAGAIN when the tasks of its
+ * real uid already reach the caller's soft limit, unless the real uid is 0 or the caller has CAP_SYS_RESOURCE or
+ * CAP_SYS_ADMIN.
+ * The tasks are every live thread of a process with that ruid, plus one for each zombie process with that
+ * ruid (Linux keeps an unreaped zombie's task until wait reaps it: the NPROC test in
+ * tests/guest/threads-many.c shows it). They are counted by scanning, so a reaped thread, a reaped zombie
+ * and a setuid need no bookkeeping of their own. */
+static int nproc_refused(const proc_t *p)
 {
-    int n = 0;
-    for (int i = 0; i < MAX_THREADS; i++)
-        if (threads[i])
+    uint64_t lim = p->rlim[RLIMIT_NPROC_IDX][0];
+    /* The root user is exempt whatever its capabilities (Linux: real_cred->user != INIT_USER; tests/guest/nproc-root.c). */
+    if (p->cred.ruid == 0 || lim == ~0ull || cred_has_cap(p, LCAP_SYS_RESOURCE) || cred_has_cap(p, LCAP_SYS_ADMIN))
+        return 0;
+    uint32_t uid = p->cred.ruid;
+    uint64_t n = 0;
+    for (int i = 0; i < nslots; i++)
+        if (threads[i] && threads[i]->proc->cred.ruid == uid)
             n++;
-    return n;
+    for (const proc_t *z = proc_first(); z; z = proc_next((proc_t *)z))
+        if (z->zombie && z->cred.ruid == uid)
+            n++;
+    return n >= lim;
+}
+
+/* A free slot in the table; the table doubles when it is full. -1 when the host is out of memory. */
+static int free_slot(void)
+{
+    for (int i = 0; i < nslots; i++)
+        if (!threads[i])
+            return i;
+    int want = nslots ? nslots * 2 : SLOTS_FIRST;
+    thread_t **nt = realloc(threads, (size_t)want * sizeof *nt);
+    if (!nt)
+        return -1;
+    memset(nt + nslots, 0, (size_t)(want - nslots) * sizeof *nt);
+    threads = nt;
+    int first = nslots;
+    nslots = want;
+    if (sig_debug_faults())
+        fprintf(stderr, "xiaoji: thread table: %d slots\n", nslots);
+    return first;
 }
 
 static thread_t *add_thread(const cpu_t *from, uint64_t tid, proc_t *p)
 {
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (threads[i])
-            continue;
-        thread_t *t = calloc(1, sizeof *t);
-        if (!t)
-            return NULL;
-        t->cpu = *from;
-        t->cpu.tid = tid;
-        t->cpu.stop = 0;
-        t->cpu.blocked = 0;
-        t->cpu.exited = 0;
-        t->cpu.icount = 0; /* the copy is the parent: a new thread counts its own instructions */
-        t->cpu.excl_valid = 0; /* a new thread never inherits the exclusive monitor */
-        t->cpu.io_done = 0;
-        t->state = TS_RUNNABLE;
-        t->proc = p;
-        p->nthreads++;
-        threads[i] = t;
-        return t;
-    }
-    return NULL;
+    int i = free_slot();
+    if (i < 0)
+        return NULL;
+    thread_t *t = calloc(1, sizeof *t);
+    if (!t)
+        return NULL;
+    t->cpu = *from;
+    t->cpu.tid = tid;
+    t->cpu.stop = 0;
+    t->cpu.blocked = 0;
+    t->cpu.exited = 0;
+    t->cpu.icount = 0; /* the copy is the parent: a new thread counts its own instructions */
+    t->cpu.excl_valid = 0; /* a new thread never inherits the exclusive monitor */
+    t->cpu.io_done = 0;
+    t->state = TS_RUNNABLE;
+    t->proc = p;
+    p->nthreads++;
+    threads[i] = t;
+    return t;
 }
 
 static void reap(int slot)
@@ -209,7 +247,7 @@ void sched_block_vfork(uint64_t key, int64_t ret)
 void sched_wake_key(uint64_t key)
 {
     key &= KEY_MASK;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < nslots; i++) {
         thread_t *t = threads[i];
         if (!t || t->key != key)
             continue;
@@ -261,7 +299,7 @@ void sched_wake(cpu_t *c, int64_t ret)
 int sched_threads(cpu_t **out, int max)
 {
     int n = 0;
-    for (int i = 0; i < MAX_THREADS && n < max; i++)
+    for (int i = 0; i < nslots && n < max; i++)
         if (threads[i])
             out[n++] = &threads[i]->cpu;
     return n;
@@ -270,7 +308,7 @@ int sched_threads(cpu_t **out, int max)
 int sched_threads_of(const proc_t *p, cpu_t **out, int max)
 {
     int n = 0;
-    for (int i = 0; i < MAX_THREADS && n < max; i++)
+    for (int i = 0; i < nslots && n < max; i++)
         if (threads[i] && threads[i]->proc == p)
             out[n++] = &threads[i]->cpu;
     return n;
@@ -278,7 +316,7 @@ int sched_threads_of(const proc_t *p, cpu_t **out, int max)
 
 cpu_t *sched_find_thread(uint64_t tid)
 {
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < nslots; i++)
         if (threads[i] && threads[i]->cpu.tid == tid)
             return &threads[i]->cpu;
     return NULL;
@@ -317,7 +355,7 @@ int64_t sched_futex_wake(uint64_t key, uint64_t obj, uint64_t count, uint32_t bi
 {
     int64_t n = 0;
     key &= KEY_MASK;
-    for (int i = 0; i < MAX_THREADS && (uint64_t)n < count; i++) {
+    for (int i = 0; i < nslots && (uint64_t)n < count; i++) {
         thread_t *t = threads[i];
         if (t && t->state == TS_FUTEX && t->key == key && t->key_obj == obj && (t->bitset & bitset)) {
             wake(t, 0);
@@ -334,7 +372,7 @@ int64_t sched_futex_requeue(uint64_t from, uint64_t from_obj, uint64_t to, uint6
     uint64_t moved = 0;
     from &= KEY_MASK;
     to &= KEY_MASK;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < nslots; i++) {
         thread_t *t = threads[i];
         if (!t || t->state != TS_FUTEX || t->key != from || t->key_obj != from_obj)
             continue;
@@ -353,7 +391,7 @@ int64_t sched_futex_requeue(uint64_t from, uint64_t from_obj, uint64_t to, uint6
 static void expire_timers(uint64_t now)
 {
     timers_expire(); /* ITIMER_REAL and POSIX timers: their signals (timers.c) */
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < nslots; i++) {
         thread_t *t = threads[i];
         if (!t || t->state == TS_RUNNABLE || !t->has_deadline || t->deadline > now)
             continue;
@@ -374,8 +412,8 @@ static void expire_timers(uint64_t now)
 /* The next runnable thread after the current one (round robin). */
 static thread_t *pick(void)
 {
-    for (int k = 1; k <= MAX_THREADS; k++) {
-        int i = (cur_slot + k) % MAX_THREADS;
+    for (int k = 1; k <= nslots; k++) {
+        int i = (cur_slot + k) % nslots;
         thread_t *t = threads[i];
         if (t && t->state == TS_RUNNABLE) {
             cur_slot = i; /* now the candidate; the caller runs it */
@@ -390,7 +428,7 @@ static int wait_for_timers(void)
 {
     int any = 0;
     uint64_t earliest = 0;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < nslots; i++) {
         thread_t *t = threads[i];
         if (!t || t->state == TS_RUNNABLE || !t->has_deadline)
             continue;
@@ -419,7 +457,7 @@ static int wait_for_timers(void)
 static int pending_deadlines(uint64_t *earliest)
 {
     int n = 0;
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < nslots; i++) {
         thread_t *t = threads[i];
         if (!t || t->state == TS_RUNNABLE || !t->has_deadline)
             continue;
@@ -438,7 +476,7 @@ static int pending_deadlines(uint64_t *earliest)
 
 static void report_threads(void)
 {
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < nslots; i++) {
         thread_t *t = threads[i];
         if (!t)
             continue;
@@ -470,7 +508,7 @@ static void finish_process(proc_t *p)
     if (sig_debug_faults()) {
         /* XIAOJI_DEBUG_FAULTS=1: every process end, with the name of its first thread and how it ended. */
         const char *comm = p->dbg_comm;
-        for (int i = 0; i < MAX_THREADS; i++)
+        for (int i = 0; i < nslots; i++)
             if (threads[i] && threads[i]->proc == p) {
                 comm = threads[i]->comm;
                 break;
@@ -480,7 +518,7 @@ static void finish_process(proc_t *p)
         else
             fprintf(stderr, "xiaoji: exit: pid %d (%s) status %d\n", p->pid, comm, p->exit_code);
     }
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < nslots; i++)
         if (threads[i] && threads[i]->proc == p)
             reap(i);
     if (p == init_proc && p->fds)
@@ -497,6 +535,7 @@ static void finish_process(proc_t *p)
         sched_wake_key((uint64_t)(uintptr_t)p->parent); /* wait4 and waitid waiters */
     }
     sched_wake_key((uint64_t)(uintptr_t)p); /* a vfork parent waiting for this process */
+    poll_notify(); /* a pidfd of this process is readable now (poll.c) */
 }
 
 /* Idle in init mode: sleep until init's next deadline, or at most IDLE_POLL_NS, so that init
@@ -736,7 +775,7 @@ void sched_thread_exit(cpu_t *c, uint64_t code)
 static int64_t clone_thread(cpu_t *parent, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid)
 {
     thread_t *me = cur();
-    if (live_count() >= MAX_THREADS)
+    if (nproc_refused(me->proc))
         return -LE_AGAIN;
     uint64_t tid = next_tid;
     uint32_t tid32 = (uint32_t)tid;
@@ -782,7 +821,7 @@ static int64_t clone_process(cpu_t *parent, uint64_t flags, uint64_t newsp, uint
                              uint64_t ctid)
 {
     thread_t *me = cur();
-    if (live_count() >= MAX_THREADS)
+    if (nproc_refused(me->proc))
         return -LE_AGAIN;
     int vfork = (flags & CLONE_VM) != 0;
     uint64_t pid = next_tid;
@@ -797,7 +836,7 @@ static int64_t clone_process(cpu_t *parent, uint64_t flags, uint64_t newsp, uint
     if (flags & CLONE_NEWNS) /* the child gets a copy of the mount namespace */
         vfs_fdtab_copy_ns(child->fds);
     thread_t *t = add_thread(parent, pid, child);
-    if (!t) /* not reached: live_count left a free slot */
+    if (!t) /* host memory ran out */
         return -LE_NOMEM;
     inherit_sched(t, parent);
     next_tid++;
@@ -873,13 +912,13 @@ const char *sched_name(void)
 void sched_exec_threads(cpu_t *self)
 {
     thread_t *me = NULL;
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < nslots; i++)
         if (threads[i] && &threads[i]->cpu == self)
             me = threads[i];
     if (!me)
         return;
     proc_t *p = me->proc;
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < nslots; i++)
         if (threads[i] && threads[i] != me && threads[i]->proc == p)
             reap(i);
     me->clear_child_tid = 0; /* the new image's exit must not clear the old word */
@@ -892,7 +931,7 @@ void sched_exec_threads(cpu_t *self)
 uint64_t sched_icount_of(const proc_t *p)
 {
     uint64_t n = p->dead_icount;
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < nslots; i++)
         if (threads[i] && threads[i]->proc == p)
             n += threads[i]->cpu.icount;
     return n;
@@ -901,7 +940,7 @@ uint64_t sched_icount_of(const proc_t *p)
 uint64_t sched_icount(void)
 {
     uint64_t n = dead_icount;
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < nslots; i++)
         if (threads[i])
             n += threads[i]->cpu.icount;
     return n;

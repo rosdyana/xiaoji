@@ -33,6 +33,7 @@
 #include "selinuxfs.h"
 #include "proc.h"
 #include "sched.h"
+#include "signals.h"
 
 /* Readlink text of a description (defined with desc_new below). */
 static const char *fd_link_text(const vfs_fd *f, char *buf, size_t n);
@@ -601,7 +602,8 @@ int vfs_obj_new(vfs_kind kind, void *obj, int cloexec, uint32_t lflags)
     d->guest = xstrdup(kind == VFS_EVENTFD ? "anon_inode:[eventfd]"
                        : kind == VFS_TIMERFD ? "anon_inode:[timerfd]"
                        : kind == VFS_INOTIFY ? "anon_inode:[inotify]"
-                       : kind == VFS_BPF ? "anon_inode:bpf-map" : "anon_inode:[eventpoll]");
+                       : kind == VFS_BPF ? "anon_inode:bpf-map"
+                       : kind == VFS_PIDFD ? "anon_inode:[pidfd]" : "anon_inode:[eventpoll]");
     slot_install(slot, d, cloexec != 0);
     return slot;
 }
@@ -894,6 +896,9 @@ int vfs_open(int dirfd, const char *path, uint32_t lflags, uint32_t mode)
         slot_install(slot, f, (lflags & LO_CLOEXEC) != 0);
         return slot;
     }
+    if (sig_debug_faults() && !strncmp(path, "/sys/fs/selinux/", 16)) /* XIAOJI_DEBUG_FAULTS: selinuxfs opens (B16) */
+        fprintf(stderr, "xiaoji: selinuxfs open pid %d tid %llu %s flags 0x%x\n", proc_cur()->pid,
+                (unsigned long long)sched_tid(), path, lflags);
     int rc = vfs_resolve(dirfd, path, !(lflags & LO_NOFOLLOW), &r);
     if (rc)
         return rc;
@@ -1185,6 +1190,7 @@ int64_t vfs_read(int fd, void *buf, size_t n)
     case VFS_TIMERFD: return tfd_read(f->obj, buf, n);
     case VFS_INOTIFY: return -LE_AGAIN; /* no event is ever queued (inotify.c) */
     case VFS_BPF: return -LE_INVAL;     /* a map fd has no read (bpf.c) */
+    case VFS_PIDFD: return -LE_INVAL;   /* a pidfd has no read: it is polled (poll.c) */
     case VFS_EPOLL: return -LE_INVAL;
     default: break;
     }
@@ -1214,6 +1220,7 @@ int64_t vfs_pread(int fd, void *buf, size_t n, uint64_t off)
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
+    case VFS_PIDFD: return -LE_INVAL; /* no read or write op: EINVAL, as on Linux (pidfd_fops) */
     case VFS_BPF: return -LE_INVAL; /* a map fd has no read or write (bpf.c) */
     default: break;
     }
@@ -1231,6 +1238,7 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
     if (!f)
         return -LE_BADF;
     switch (f->kind) {
+    case VFS_PIDFD: return -LE_INVAL; /* no write op (pidfd_fops): EINVAL, as on Linux */
     case VFS_PATH: return -LE_BADF;
     case VFS_DIR: return -LE_ISDIR;
     case VFS_SYN:
@@ -1254,7 +1262,7 @@ int64_t vfs_write(int fd, const void *buf, size_t n)
             return cgroupfs_write(f->guest, buf, n);
         if (f->syn == SYN_DATA) {
             /* attr/current takes a new context (setcon writes it); the other generated files are read-only. */
-            if (procfs_is_attr_current(f->guest))
+            if (procfs_is_attr(f->guest))
                 return procfs_attr_write(f->guest, buf, n);
             if (procfs_writable(f->guest))
                 return procfs_write(f->guest, buf, n);
@@ -1324,6 +1332,7 @@ int64_t vfs_pwrite(int fd, const void *buf, size_t n, uint64_t off)
     case VFS_TIMERFD:
     case VFS_INOTIFY:
     case VFS_EPOLL: return -LE_SPIPE;
+    case VFS_PIDFD: return -LE_INVAL; /* no read or write op: EINVAL, as on Linux (pidfd_fops) */
     case VFS_BPF: return -LE_INVAL; /* a map fd has no read or write (bpf.c) */
     default: break;
     }

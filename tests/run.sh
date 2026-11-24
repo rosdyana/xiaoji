@@ -98,9 +98,10 @@ make_oracle() {
         return 0
     fi
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
-    # oracles run as root (passwordless sudo in the builder VM).
+    # oracles run as root (passwordless sudo in the builder VM). threads-many needs root to start its NPROC child as
+    # another uid (setuid from 0), as the engine does; nproc-root drops capabilities as root (B16).
     local runas=""
-    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | creds-* | fmeta-* | bpfmap-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | binder-death-batch-* | creds-* | fmeta-* | bpfmap-* | threads-many-* | nproc-root-*) runas="sudo -n" ;; esac
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1
     [ -f "$rc" ]
@@ -669,6 +670,31 @@ fi
 # On the product tree B7 adds the health and sensors HALs: the sensors HAL reports the goldfish qemud mask (6f,
 # docs/boot.md B7), both HALs register, and BatteryService receives the health HAL's first update. These are
 # the furthest deterministic points (3 of 3 runs); system_server then dies in SettingsProvider (B7, next blocker).
+# B16: the boot completed, and the home app, SystemUI and system_server were alive for 60 s after it. The engine's note
+# "xiaoji: sys.boot_completed=1" marks the boot's end (props.c), and XIAOJI_STAMP=1 times each logcat line. The processes
+# are the latest launcher, SystemUI and system_server started before the note (their "Start proc" and "System server
+# process N has been created" lines). The check fails if the log ends less than 60 s after the note, if one of them was
+# not started, or if its "xiaoji: exit: pid N " line comes within 60 s after the note (the exit lines carry no time, so
+# the time is the last stamped line before them). A later death or restart is allowed.
+boot_alive_60s() {
+    awk '
+        function ms(s) { return substr(s, 2, index(s, " ms") - 2) + 0 }
+        function pid_after(s, key,   t) { t = s; sub(".*" key, "", t); sub(/[^0-9].*/, "", t); return t }
+        /^\[[0-9]+ ms/ { last = ms($0) }
+        !marked && /Start proc [0-9]+:com\.android\.launcher3\// { lpid = pid_after($0, "Start proc ") }
+        !marked && /Start proc [0-9]+:com\.android\.systemui\// { spid = pid_after($0, "Start proc ") }
+        !marked && /System server process [0-9]+ has been created/ { sspid = pid_after($0, "System server process ") }
+        /xiaoji: sys\.boot_completed=1/ && !marked { marked = 1; mt = last; fl = lpid; fs = spid; fss = sspid }
+        marked && /xiaoji: exit: pid [0-9]+ / {
+            p = $0; sub(/.*xiaoji: exit: pid /, "", p); sub(/[^0-9].*/, "", p)
+            if ((p == fl || p == fs || p == fss) && last <= mt + 60000) dead = 1
+        }
+        END {
+            if (!marked || fl == "" || fs == "" || fss == "" || last - mt < 60000 || dead) exit 1
+            exit 0
+        }' "$1"
+}
+
 if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
     # The product tree starts from a cleared /data and no /data records (B8, tools/reset-data.py), so its boot is
     # deterministic. The Google-image tree keeps its /data: the other cases read files that a reset would remove
@@ -676,9 +702,11 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
     case "$RFS" in
     *-xiaoji) python3 -I tools/reset-data.py "$RFS" >/dev/null || { echo "FAIL  reset-data $RFS"; fail=$((fail + 1)); } ;;
     esac
-    # The limit is 300 s (B11): the milestones are fixed in guest instructions, but the boot waits on the clock too, and at
-    # Low Power Mode or on a busy host the lmkd and vibrator lines came after 150 s. The wrapper timeout is above the limit.
-    XIAOJI_STAMP=1 timeout 360 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 300 \
+    # The limit is 480 s (B16): the sys.boot_completed time is set by the boot, not by the limit, and the check needs 60 s
+    # after it (boot_alive_60s); 480 s covers a boot that completes by 420 s. The milestones are fixed in guest
+    # instructions, but the boot waits on the clock too, and at Low Power Mode or on a busy host the lmkd and vibrator lines
+    # came after 150 s (B11). The wrapper timeout is above the limit.
+    XIAOJI_STAMP=1 timeout 540 "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 480 \
         >"$OUT/boot.out" 2>"$OUT/boot.err"
     if grep -q '\.\.\.preloaded [0-9][0-9]* classes' "$OUT/boot.err" &&
         grep -q 'System server process [0-9][0-9]* has been created' "$OUT/boot.err" &&
@@ -723,11 +751,17 @@ if [ "${XIAOJI_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
             grep -q 'Registered android.hardware.authsecret@1.0::IAuthSecret/default' "$OUT/boot.err" &&
             grep -q 'ActivityManager([0-9]*): System now ready' "$OUT/boot.err" &&
             grep -q '^bpfloader: [0-9][0-9]* maps pinned under /sys/fs/bpf$' "$OUT/boot.err" &&
-            ! grep -q 'Fatal signal' "$OUT/boot.err"; }; }; then
-        echo "PASS  cgroups (B11) and xiaoji_netd (B12): no cgroup.rc or cgroup v2 root error, no cpuset open error, xiaoji_netd registers netd and dnsresolver, no null INetd, StartNetworkManagementService and StartConnectivityService complete, no netd exit; the audio HAL (device/xiaoji/audio) registers, audioserver loads the primary module, StartAudioService completes, and ActivityManager reports System now ready (B13); zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9)"
+            ! grep -q 'Fatal signal' "$OUT/boot.err" &&
+            ! grep -q 'FATAL EXCEPTION IN SYSTEM PROCESS' "$OUT/boot.err" &&
+            grep -qE 'ActivityManager\([0-9]*\): Start proc [0-9]*:com\.android\.launcher3/' "$OUT/boot.err" &&
+            ! grep -q 'Unknown class' "$OUT/boot.err" &&
+            grep -qE 'ActivityTaskManager\([0-9]*\): START u0 .*cat=\[android\.intent\.category\.HOME\].*cmp=com\.android\.launcher3/' "$OUT/boot.err" &&
+            grep -q 'xiaoji: sys.boot_completed=1' "$OUT/boot.err" &&
+            boot_alive_60s "$OUT/boot.err"; }; }; then
+        echo "PASS  cgroups (B11) and xiaoji_netd (B12): no cgroup.rc or cgroup v2 root error, no cpuset open error, xiaoji_netd registers netd and dnsresolver, no null INetd, StartNetworkManagementService and StartConnectivityService complete, no netd exit; the audio HAL (device/xiaoji/audio) registers, audioserver loads the primary module, StartAudioService completes, and ActivityManager reports System now ready (B13); zygote preload, system_server fork, its entry, StartPowerManager, InitPowerManagement, StartDisplayManager, the allocator, SurfaceFlinger's start and RenderEngine, and no undecoded GL request (XIAOJI_BOOT, B4f, G1); on the product tree also the sensors, health, BatteryService and SettingsProvider's ANDROID_ID (B8), ActivityManager's lmkd connection and VibratorManagerService's start (B9); no Fatal signal, no system_server FATAL EXCEPTION, the launcher's process starts, and sys.boot_completed=1 with the launcher, SystemUI and system_server alive 60 s after it (B16)"
         pass=$((pass + 1))
     else
-        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded') in $OUT/boot.err"
+        echo "FAIL  zygote boot (XIAOJI_BOOT): a preload, fork, entry, StartPowerManager, InitPowerManagement, StartDisplayManager, graphics line, or an undecoded GL request ('is not decoded'), a Fatal signal, a system_server FATAL EXCEPTION, no launcher process start, or no sys.boot_completed with the launcher, SystemUI and system_server alive 60 s after it, in $OUT/boot.err"
         fail=$((fail + 1))
     fi
 fi
