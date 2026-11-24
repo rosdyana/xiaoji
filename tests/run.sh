@@ -230,13 +230,10 @@ check_rootfs() {
     fi
     local expect_rc
     expect_rc=$(cat "$expect_rc_file")
-    # The input devices' test source (evdev.c): the evdev case reads its scripted events from the environment.
-    local input_env=()
-    [ "$name" = evdev ] && input_env=(XIAOJI_INPUT_SCRIPT="$ROOT/tests/input/evdev.script")
     if [ "$runner" = engine ]; then
-        env "${input_env[@]}" "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        env "${input_env[@]}" node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect_out" && [ "$rc" = "$expect_rc" ]; then
@@ -316,10 +313,14 @@ check_expect() {
         fail=$((fail + 1))
         return 1
     fi
+    # The input devices' test source (evdev.c): the evdev case reads its scripted events from the environment.
+    # (An empty value is no script: the engine reads the variable only when it is set.)
+    local input_script=""
+    [ "$name" = evdev ] && input_script="$ROOT/tests/input/evdev.script"
     if [ "$runner" = engine ]; then
-        "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        XIAOJI_INPUT_SCRIPT="$input_script" "$ENGINE" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     else
-        node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
+        XIAOJI_INPUT_SCRIPT="$input_script" node "$NODE_JS" --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- "${ARGV[@]}" >"$out" 2>"$err"
     fi
     local rc=$?
     if cmp -s "$out" "$expect" && [ "$rc" = 0 ]; then
@@ -786,6 +787,53 @@ elif [ -f "build/rootfs$BL_TEST" ]; then
             else o++
          }
          END { printf "INFO  binderLibTest (report only): %d cases: %d passed, %d failed, %d skipped, %d body ok but no summary (hung after the body), %d no result\n", t, p, f, k, h, o }' "$OUT/binderlib.txt"
+fi
+
+# Input devices (B16), opt-in: XIAOJI_INPUT_BOOT=1 boots the zygote of image/xiaoji.rc on the tree in XIAOJI_ROOT (or
+# build/rootfs) and requires EventHub to log both virtual devices as added, the touchscreen with its idc file
+# (engine/evdev.c, docs/input.md). The boot is stopped by --init-timeout, and by a watchdog when the engine's resident
+# memory passes XIAOJI_INPUT_BOOT_MAX_KIB (default 4 GiB): the host is an 8 GB machine. Not in the default run.
+# It is for the product tree (XIAOJI_ROOT=build/rootfs-xiaoji): on the Google-image tree system_server stops in
+# DisplayManagerService (no SurfaceFlinger, no composer), before InputManagerService is created (docs/input.md).
+if [ "${XIAOJI_INPUT_BOOT:-0}" = 1 ] && [ -d "$RFS/system/bin" ]; then
+    max_kib=${XIAOJI_INPUT_BOOT_MAX_KIB:-4194304}
+    # The init timeout (90 s) normally ends the run first. The watchdog stops the engine at 150 s of wall time, or when
+    # its resident memory (ps, KiB) passes the limit; it checks every 2 s.
+    "$ENGINE" --logcat --init image/xiaoji.rc --root "$RFS" --init-timeout 90 >"$OUT/input-boot.out" 2>"$OUT/input-boot.err" &
+    eng=$!
+    ( elapsed=0
+      while kill -0 "$eng" 2>/dev/null; do
+        rss=$(ps -o rss= -p "$eng" 2>/dev/null | tr -d ' ')
+        if [ -n "$rss" ] && [ "$rss" -gt "$max_kib" ]; then
+            echo "watchdog: engine RSS ${rss} KiB over ${max_kib} KiB" >>"$OUT/input-boot.err"
+            kill "$eng" 2>/dev/null
+            break
+        fi
+        if [ "$elapsed" -ge 150 ]; then
+            echo "watchdog: 150 s of wall time" >>"$OUT/input-boot.err"
+            kill "$eng" 2>/dev/null
+            break
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+      done ) &
+    dog=$!
+    wait "$eng"
+    rc=$?
+    kill "$dog" 2>/dev/null
+    wait "$dog" 2>/dev/null
+    err="$OUT/input-boot.err"
+    ok0=0; ok1=0; okidc=0
+    grep -q "New device: id=[0-9]*, fd=[0-9]*, path='/dev/input/event0', name='xiaoji_touchscreen'" "$err" && ok0=1
+    grep -q "New device: id=[0-9]*, fd=[0-9]*, path='/dev/input/event1', name='xiaoji_keyboard'" "$err" && ok1=1
+    grep -q "path='/dev/input/event0'.*configuration='/vendor/usr/idc/xiaoji_touchscreen.idc'" "$err" && okidc=1
+    if [ "$ok0" = 1 ] && [ "$ok1" = 1 ] && [ "$okidc" = 1 ]; then
+        echo "PASS  input boot (B16): EventHub adds event0 (xiaoji_touchscreen, its idc) and event1 (xiaoji_keyboard) (exit $rc)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  input boot (B16): event0 $ok0, event1 $ok1, idc $okidc (exit $rc; $err)"
+        fail=$((fail + 1))
+    fi
 fi
 
 echo
