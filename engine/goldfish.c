@@ -283,7 +283,7 @@ static void process(gfpipe_t *p)
             gl_reply rep = {0};
             if (gf_trace())
                 fprintf(stderr, "xiaoji: gf: opengles request op %u, %u bytes\n", (unsigned)rd32(p->in), (unsigned)total);
-            if (gl_host_decode(gl_host_null(), p, rd32(p->in), p->in, total, &rep) != 0) {
+            if (gl_host_decode(gl_host_current(), p, rd32(p->in), p->in, total, &rep) != 0) {
                 fprintf(stderr, "xiaoji: goldfish: opengles: opcode %u is not decoded (packet %u bytes)\n",
                         (unsigned)rd32(p->in), (unsigned)total);
                 free(rep.buf);

@@ -210,6 +210,117 @@ async function runBoot(chromium, baseUrl) {
   }
 }
 
+// The frame path without a guest (G2, opt-in: XIAOJI_WEB_FRAMES=1): a worker runs xj_gl_selftest (engine/gl_webgl.c),
+// which draws on the WebGL2 color buffer and posts the frame. The page draws it with web/frame.js, and the pixels are
+// read back: the clear colour at (10, 10), and the scissored colour inside its box (rows 560..859, x 150).
+async function runGlSelfTest(chromium, baseUrl) {
+  mkdirSync(SHOTS, { recursive: true });
+  const browser = await chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
+  const page = await browser.newPage({ viewport: VIEW });
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  try {
+    await page.goto(baseUrl, { waitUntil: 'load' });
+    const got = await page.evaluate(async () => {
+      const base = new URL('./', location.href).href;
+      const { newFrameView } = await import(base + 'frame.js');
+      const canvas = document.createElement('canvas');
+      canvas.id = 'selftest';
+      canvas.style.cssText = 'position:fixed;left:0;top:0;width:270px;height:480px;z-index:9999;background:#000;';
+      document.body.appendChild(canvas);
+      const sab = new SharedArrayBuffer(8);
+      const view = newFrameView(canvas, new Int32Array(sab));
+      return await new Promise((resolve) => {
+        const w = new Worker(base + 'worker.js', { type: 'module' });
+        const timer = setTimeout(() => resolve({ error: 'no frame and no done within 120 s' }), 120000);
+        const px = (x, y) => Array.from(canvas.getContext('2d').getImageData(x, y, 1, 1).data.slice(0, 3));
+        // The frame is posted before 'done' (the worker's selftest returns after it), so the result needs both.
+        const got = {};
+        const finish = () => {
+          if (got.state === undefined || got.done === undefined) return;
+          clearTimeout(timer);
+          w.terminate();
+          resolve(got);
+        };
+        w.onmessage = (ev) => {
+          const m = ev.data;
+          if (m.type === 'frame') {
+            got.state = view.show(m, 0);
+            got.clear = px(10, 10);
+            got.boxed = px(150, 700);
+            finish();
+          } else if (m.type === 'done') {
+            got.done = m.exitCode;
+            got.alias = m.alias;
+            finish();
+          } else if (m.type === 'error') {
+            clearTimeout(timer);
+            w.terminate();
+            resolve({ error: m.text });
+          }
+        };
+        w.postMessage({ type: 'glselftest', base, frameSab: sab });
+      });
+    });
+    if (got.error) console.log(`    selftest: ${got.error.split('\n')[0]}`);
+    const st = got.state;
+    check(got.done === 1, `selftest: the engine reports one frame posted (${got.done})`);
+    check(st && st.frames === 1, 'selftest: one frame arrives from rcFBPost (WebGL2 backend, no guest)');
+    check(st && st.w === 540 && st.h === 960, `selftest: the frame is the display size (${st ? st.w + 'x' + st.h : '-'})`);
+    const near = (a, b) => a && a.every((v, i) => Math.abs(v - b[i]) <= 2);
+    check(near(got.clear, [26, 128, 230]), `selftest: the clear colour is at (10, 10) of the top-first frame (${got.clear})`);
+    check(near(got.boxed, [255, 51, 51]), `selftest: the scissored colour is inside the box, read top-first (${got.boxed})`);
+    const alias = got.alias === undefined ? null : [(got.alias >> 16) & 255, (got.alias >> 8) & 255, got.alias & 255];
+    check(near(alias, [230, 230, 26]), `selftest: a texture bound by name and attached to a guest FBO through rcBindTexture draws into the color buffer (${alias})`);
+    check(pageErrors.length === 0, `selftest: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
+    const el = page.locator('#selftest');
+    await el.screenshot({ path: join(SHOTS, 'glselftest.png') });
+    console.log(`    screenshot: ${join(SHOTS, 'glselftest.png')}`);
+  } finally {
+    await browser.close();
+  }
+}
+
+// The Android screen (G2, opt-in: XIAOJI_WEB_FRAMES=1): the boot runs with the WebGL2 backend (?gl=webgl, the page's
+// default) and the first frame SurfaceFlinger composes must arrive (rcFBPost, engine/gl_webgl.c) as a picture that is
+// not one colour. It waits up to XN_FRAME_TIMEOUT_MS (default 900000) for the frame, then saves the screen and stops.
+async function runFrames(chromium, baseUrl) {
+  mkdirSync(SHOTS, { recursive: true });
+  const browser = await chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
+  const page = await browser.newPage({ viewport: VIEW });
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  const FRAME_TIMEOUT_MS = Number(process.env.XN_FRAME_TIMEOUT_MS ?? 900000);
+  try {
+    await page.goto(baseUrl + '?boot=pack&gl=webgl', { waitUntil: 'load' });
+    await page.click('#boot');
+    const t0 = Date.now();
+    await page.waitForFunction(() => window.xb.frames && window.xb.frames.frames > 0, null, {
+      timeout: FRAME_TIMEOUT_MS,
+      polling: 500,
+    }).catch(() => {});
+    const xb = await page.evaluate(() => ({ frames: window.xb.frames, status: window.xb.status, error: window.xb.error }));
+    const f = xb.frames;
+    console.log(`--- frames: ${f ? f.frames : 0} frame(s), first at ${f && f.firstMs !== null ? (f.firstMs / 1000).toFixed(1) : '-'} s after the press, ` +
+      `${Math.round((Date.now() - t0) / 1000)} s wait, status "${xb.status}"`);
+    if (xb.error) console.log(`    error: ${xb.error.split('\n')[0]}`);
+    check(f && f.frames > 0, 'frames: at least one frame arrives (rcFBPost, WebGL2 backend)');
+    check(f && f.distinct > 1, `frames: the frame is not one colour (${f ? f.distinct : 0} distinct colours in a sample)`);
+    check(f && f.w === 540 && f.h === 960, `frames: the frame is the display size (${f ? f.w + 'x' + f.h : '-'})`);
+    check(pageErrors.length === 0, `frames: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
+    await page.waitForTimeout(500);
+    await page.locator('#phone').screenshot({ path: join(SHOTS, 'android-frame.png') });
+    console.log(`    screenshot: ${join(SHOTS, 'android-frame.png')}`);
+    await page.click('#stop').catch(() => {});
+    await page.waitForFunction(() => window.xb.status !== 'running' && window.xb.status !== 'loading', null, {
+      timeout: 60000,
+      polling: 200,
+    }).catch(() => {});
+  } finally {
+    await browser.close();
+  }
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const bootOnly = argv.includes('--boot-only');
@@ -225,7 +336,8 @@ async function main() {
   }
   const needed = ['build/wasm/xiaoji.mjs'];
   if (names.length) needed.push('build/web/manifest.json', 'build/rootfs/data/hello.dex');
-  if (bootOnly || bootToo) needed.push('build/web/manifest-xiaoji.json', 'build/web/xj/manifest-xiaoji-v2.json', 'build/rootfs-xiaoji/system/bin/init');
+  const frames = process.env.XIAOJI_WEB_FRAMES === '1';
+  if (bootOnly || bootToo || frames) needed.push('build/web/manifest-xiaoji.json', 'build/web/xj/manifest-xiaoji-v2.json', 'build/rootfs-xiaoji/system/bin/init');
   for (const f of needed) {
     if (!existsSync(join(ROOT, f))) {
       console.error(`missing ${f}; run make test-web (it builds the prerequisites)`);
@@ -243,6 +355,10 @@ async function main() {
     if (bootOnly || bootToo) {
       await runDownloadShot(chromium);
       await runBoot(chromium, srv.url);
+    }
+    if (process.env.XIAOJI_WEB_FRAMES === '1') {
+      await runGlSelfTest(chromium, srv.url);
+      await runFrames(chromium, srv.url);
     }
   } finally {
     await srv.close();

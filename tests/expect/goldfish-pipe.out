@@ -1,10 +1,10 @@
 name opengles 14
 clientFlags 4
 rcGetRendererVersion write 8 read 4 reply 1
-FB_WIDTH write 12 read 4 reply 720
-FB_HEIGHT write 12 read 4 reply 1280
-FB_XDPI write 12 read 4 reply 72
-FB_YDPI write 12 read 4 reply 72
+FB_WIDTH write 12 read 4 reply 540
+FB_HEIGHT write 12 read 4 reply 960
+FB_XDPI write 12 read 4 reply 240
+FB_YDPI write 12 read 4 reply 240
 FB_FPS write 12 read 4 reply 60
 FB_MIN_SWAP_INTERVAL write 12 read 4 reply 1
 FB_MAX_SWAP_INTERVAL write 12 read 4 reply 1

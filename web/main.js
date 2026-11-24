@@ -7,6 +7,7 @@
 
 import { BOOT, RESTART } from './cases.js';
 import { DEFAULT_THEME, loadTheme } from './theme.js';
+import { newFrameView } from './frame.js';
 import {
   newScreen, startRun, onDownload, onBootTree, onMilestone, onRestart, onError, onEnd, onStop, render as renderScreen,
 } from './bootscreen.js';
@@ -207,6 +208,12 @@ $('boot').addEventListener('click', async () => {
 
   const worker = new Worker(new URL('./worker.js', location.href), { type: 'module' });
   bootWorker = worker;
+  // The Android screen (G2): the frame counters are shared with the engine's worker, which needs cross-origin
+  // isolation (the pack path needs it too). ?gl=null keeps the null backend (no frames).
+  const bootT0 = performance.now();
+  const frameSab = self.crossOriginIsolated ? new SharedArrayBuffer(8) : null;
+  const frames = newFrameView($('android'), frameSab ? new Int32Array(frameSab) : null);
+  const glBackend = params.get('gl') === 'null' ? 'null' : 'webgl';
   setControls();
   render();
   // The packs (pack mode) come from a second worker, so the engine's worker can block on a pack while the rest
@@ -294,6 +301,10 @@ $('boot').addEventListener('click', async () => {
       stopBoot('error');
     } else if (m.type === 'out') {
       appendLog(m.text);
+    } else if (m.type === 'frame') {
+      // The engine's composed frame (rcFBPost). window.xb.frames is the count and the first and last frame times.
+      window.xb.frames = frames.show(m, now - bootT0);
+      $('phone').dataset.frame = '1';
     }
   };
   worker.onerror = (ev) => {
@@ -311,7 +322,7 @@ $('boot').addEventListener('click', async () => {
   worker.postMessage({
     type: 'boot', base: new URL('./', location.href).href, trace: params.has('trace'), mode,
     lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'), statsAt: params.has('statsat'),
-    early: params.get('early'),
+    early: params.get('early'), gl: glBackend, frameSab,
   });
   if (mode === 'pack') {
     // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).

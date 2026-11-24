@@ -626,3 +626,154 @@ Still answered by the default in the long product boot (`build/tests/boot/long2.
 - **The binder fix has no guest test** with the kernel as oracle (the plan asked for one; B5 explains what it needs).
 - **The specs' licensing** (deviation 5), and the NOTICE file.
 - **The Google image** (`build/rootfs`): it has no `vndservicemanager`, so its composer 2.4 does not register and SurfaceFlinger does not connect its display. The product tree does this part.
+
+
+## G2: the WebGL2 backend (web build), the frame path, and the boot's state (status, 2026-11-24)
+
+Status: **the WebGL2 backend runs in headless Chromium. Its context is made on the worker's OffscreenCanvas, RenderEngine
+sets up EGL and GLES on it, and its shaders compile and link. No Android frame has been composed in any run: this tree's
+boot never draws a window, so SurfaceFlinger has nothing to compose (checkpoint 3 of the plan is not reached).** The frame
+path is verified with a synthetic frame that the engine draws with the same GL calls and posts with `rcFBPost`, and the page
+shows it (below). Screenshots: `build/web-shots/glselftest.png` (the synthetic frame), `build/web-shots/android-frame.png`
+(the boot screen when the boot frame check ran), `build/web-shots/probe-webgl.png` (the boot screen after 200 s).
+
+### What was built (where)
+
+- `engine/gl_webgl.c`: the backend. Compiled only with `XIAOJI_WEB`; the native and Node builds get `gl_host_webgl() == NULL`.
+  It copies the null backend's tables (`gl_host_null()`, `engine/gl_null.c`) and replaces the entries it implements (114 GLES
+  2/3 entries, 22 renderControl entries, 6 custom decodes).
+- `engine/gl_host.c`, `engine/gl_host.h`: the dispatch chooses the backend per request (`gl_host_current()`: the selected one,
+  or null when it is not available). `--gl null|webgl` (main.c) selects it; the default is null. The four addon calls the guest
+  encoder sends as `*Data` and `*Offset` (`glVertexAttribPointerData`, `glVertexAttribPointerOffset`, `glDrawElementsData`,
+  `glDrawElementsOffset`) are decoded by hand, with exact length checks. The generator marks them `not_api`, but the guest sends
+  them (`gl2_enc.cpp`), so a client-array draw used to break the stream.
+- `engine/gl_display.h`: the one display setting, 540x960 at 240 dpi. `gl_null.c` reports it through `rcGetFBParam`
+  (FB_WIDTH, FB_HEIGHT, FB_XDPI, FB_YDPI), and `props.c` sets `ro.sf.lcd_density` from it. It was 720x1280 at 72 dpi. The native
+  log confirms the framework reads it: `RanchuHwc: initializing display:0 with config: w:540 h:960 dpi-x:240 dpi-y:240`, and
+  WindowManager's configuration reads `240dpi`, 540x960.
+- `web/worker.js`: for the boot (`opts.gl === 'webgl'`) sets `self.xjCanvas` (an OffscreenCanvas, 540x960) and
+  `self.xjFrameCtl` (a shared Int32Array, see the frame path), and passes `--gl webgl`. The message `glselftest` runs the
+  synthetic frame.
+- `web/main.js`, `web/frame.js`, `web/index.html`: the boot page sends `gl: webgl` (or `?gl=null`) and the shared counter. A
+  frame is drawn on a canvas over the phone frame, which is hidden until the first frame (the boot screen stays until then).
+  `window.xb.frames` holds the count, the first and last frame times, the size, and the number of distinct colours in a sample.
+- `tests/web.mjs`: with `XIAOJI_WEB_FRAMES=1`, `make test-web` runs the synthetic frame check (`runGlSelfTest`) and the boot's
+  frame check (`runFrames`, which waits up to `XN_FRAME_TIMEOUT_MS`, default 900 s). `make test-web` builds the boot's chunk
+  store for this, as `XIAOJI_WEB_BOOT=1` does.
+
+### Context multiplexing
+
+- The decoder's context is the pipe stream (`gfpipe_t *`), one per guest thread. `stream_slot()` maps it to the guest EGL
+  context made current on it (`rcMakeCurrent`); a stream with none uses a default context.
+- A guest context (`gctx_t`) holds what the engine can rebind: its draw and read surfaces, its framebuffer name (0 is the draw
+  surface's color buffer), program, VAO, the active texture unit and the texture on each unit (a guest name), viewport and
+  scissor. Every GLES call starts with `enter()`: when the stream's context is not the one applied to the WebGL2 context, the
+  tracked state is rebound (`apply()`). `rcMakeCurrent` re-applies, so a surface change takes effect at once.
+- Not switched (a known gap): the enables (blend, depth, stencil, cull, colour mask), the texture units other than the active
+  one, the pixel store state, and the scratch buffers for the client-array calls (one per attribute index, shared by all
+  contexts). The engine's own calls save and restore the host bindings (`save_host`/`restore_host`), so color buffer uploads and
+  read-backs leave the guest's state as it was.
+- Names: a guest object name is the host name, because the host allocates it in `glGen*`. WebGL has one namespace, so every
+  context sees every object by name. The share-group argument of `rcCreateContext` is stored but not used: no per-share-group
+  table is built, which deviates from the plan. Two guest objects never share a name, so the table is not needed yet.
+- Stream slots are never released (64 slots; a stream beyond them uses the default context). A pipe that is closed keeps its slot.
+
+### Color buffers, surfaces and aliases
+
+- A color buffer is an RGBA8 texture with its own FBO (`cb_create`). `rcCreateColorBuffer` and `...DMA` create one (RGBA8 only,
+  as in the null backend). `rcCloseColorBuffer` deletes both.
+- A window surface holds a color buffer (`rcSetWindowColorBuffer`). A surface without one gets its own, of its size, when it is
+  first drawn to. The guest's framebuffer 0 maps to the draw surface's FBO. A surface's color buffer has no depth or stencil
+  attachment, although the EGL config advertises 24 and 8 bits; the framework's composition does not use them.
+- `rcUpdateColorBuffer` and `rcReadColorBuffer` are `texSubImage2D` and `readPixels` on the color buffer, with unpack and pack
+  state set to tight rows, restored after. `rcFlushWindowColorBuffer` is `glFlush`.
+- **Gralloc images, as the guest uses them** (`GLESv2/gl2.cpp`, `glEGLImageTargetTexture2DOES` with an
+  `EGL_NATIVE_BUFFER_ANDROID` image): the guest sends no image call to the host. It calls `rcBindTexture(cb)` on the texture it
+  has bound, and `rcBindRenderbuffer(cb)` for a renderbuffer. So `rc_BindTexture` makes the guest name bound on the active unit
+  stand for the color buffer (`tex_alias`; every later bind of the name binds the color buffer's texture), and
+  `rc_BindRenderbuffer` does the same for the bound renderbuffer (`rb_alias`). `glFramebufferRenderbuffer` attaches the color
+  buffer's texture for such a name, because WebGL cannot alias a renderbuffer to a texture.
+- **GL_TEXTURE_2D images** (`eglCreateImageKHR` with a texture, `egl.cpp`): `rcCreateClientImage` receives the guest's texture
+  name. `glEGLImageTargetTexture2DOES` then makes the bound name an alias of that texture.
+- The external texture target (`GL_TEXTURE_EXTERNAL_OES`) is `GL_TEXTURE_2D` here.
+
+### GLES opcode coverage
+
+- Overridden GLES 2/3 entries: state and enables, buffers, 2D textures, FBOs, renderbuffers, shaders and programs (with the
+  status and info-log queries), uniforms and attributes, VAOs, `glDrawArrays`, the client-array and client-index draws,
+  `glReadPixels`, `glGetActiveAttrib` and `glGetActiveUniform`, and `glFinish`/`glFlush`. `glGetIntegerv` answers WebGL2's
+  limits, except `GL_NUM_EXTENSIONS` (the advertised list, 4), `GL_MAJOR_VERSION` (3) and `GL_MINOR_VERSION` (0).
+- Still the null answers, each logged once as `answered by the default`: the GLES 1 calls, the 3D and multisample texture and
+  buffer calls, transform feedback, samplers, queries, sync objects, program binaries, compute and image calls. The browser boot
+  listed these defaults: `rcSetPuid`, `rcCreateDisplayById`, `rcOpenColorBuffer2`, `rcSetDisplayPoseDpi`. None is on the frame path.
+- Shaders: the guest sends GLSL ES in `glShaderString`. The backend drops the `#extension GL_OES_EGL_image_external...` lines and
+  reads `samplerExternalOES` as `sampler2D`. WebGL2 compiles `#version 100` and `#version 300 es` as they are. A failed compile or
+  link is logged with its info log. The browser boot logged no failure.
+- Advertised: the null backend's strings, with the renderer `xiaoji WebGL2`. The extension list still names
+  `GL_OES_EGL_image_external_essl3`, which WebGL2 does not have. The shader translation makes external textures 2D, so the name
+  stays for the framework's shader path; this is an inconsistency.
+
+### The frame path
+
+- `rcFBPost(cb)` is SurfaceFlinger's composed frame. HostComposer reaches it through its fallback to `post`
+  (`hwc2/HostComposer.cpp`, when the host advertises no host composition, which this build does not). If the page has taken the
+  last frame, the color buffer is read back (`glReadPixels` on its FBO), the rows are turned top-first, the alpha is set to 255,
+  and the bytes go to the page (`xj_frame_send`: a copy, transferred with `postMessage`). Otherwise the frame is dropped before the
+  read, and the drop is logged every 300 frames.
+- Throttle: a shared Int32Array `[posted, taken]`. The engine posts only when they are equal, and the page adds one to `taken`
+  after it draws. The worker is busy in the engine, so it cannot receive an acknowledgement message; the counter is read
+  synchronously instead. The engine reads the array through `globalThis`, and a pointer is taken as unsigned (`>>> 0`), since
+  the wasm heap addresses reach JavaScript as signed 32-bit values.
+- The page draws the frame on a 2D canvas, sized to the frame, over the boot screen (`web/frame.js`).
+
+### Verification (this worktree, 2026-11-24)
+
+- `make` (native), `make wasm-node`, `make wasm`: built. `clang -std=c11 -Wall -Wextra` and `emcc -std=c11 -Wall -Wextra` report no
+  warning for the changed engine files (`gl_webgl.c` and `gl_host.c` under emcc, all of them under clang), without the
+  `-Wno-unused-parameter` of the Makefile's CFLAGS.
+- `tests/run.sh`: 200 passed, 46 failed (engine and Node lines together). The failures are not from this change:
+  - 32 lines are `no oracle output`: this worktree has no `build/oracle` for the toybox, shell and hello cases (the main
+    checkout has them, and the `hello-*` files were copied in for the web checks).
+  - The rest are the cases `attrs`, `nproc-root`, `pidfd`, `simd` and `threads-many`. For four of their binaries
+    (`nproc-root-O0`, `threads-many-O0`, `pidfd-O0`, `simd-O0`), the engine at HEAD and this engine give identical stdout and
+    stderr in a scratch root. `pidfd`'s syscall 434 and `simd`'s `SSRA` (`0x4f0d1420`) are not implemented at HEAD either. The
+    `attrs` binary has no source in this tree (`tests/guest/attrs.c` is absent), so it is from another tree.
+  - `goldfish-pipe` (the display setting, 540, 960, 240 dpi) passes for the engine and for Node, with the updated expectation.
+- `make test-web` (default: `hello-jit` and `hello-int` against their oracle files): both pass, with stdout and exit codes
+  matching and no page errors.
+- `XIAOJI_WEB_FRAMES=1 XN_FRAME_TIMEOUT_MS=300000 make test-web`: the seven synthetic-frame checks pass. The boot frame check
+  (`runFrames`) fails three of its four checks: no frame arrived in 300 s, so the page's frame is still the boot screen (its
+  screenshot is `build/web-shots/android-frame.png`). `make` exits with status 2, which is the failure count. No leftover
+  browser, node or engine process remained after the run.
+- Browser, the synthetic frame (`xj_gl_selftest`, via a worker message): one frame arrives from `rcFBPost`, at 540x960. The clear
+  colour is at (10, 10) of the top-first frame, (26, 128, 230), and the scissored colour inside its box, (255, 51, 51), so the
+  read-back and row order are right. A texture bound by name and attached to a guest FBO through `rcBindTexture` draws into the
+  color buffer, read back as (230, 230, 26).
+- Browser, the Android boot (`?boot=manifest&gl=webgl`, the product tree): the backend is ready (`the WebGL2 backend is ready`),
+  and RenderEngine reports `renderer: xiaoji WebGL2`. In a 200 s run no frame arrived, and no shader compile or link failed.
+  In the 300 s boot frame check (the chunk-store boot, `?boot=pack`), no frame arrived either.
+  The app process `m.android.phone` aborted at about 159 s with `pthread_create failed for new thread pool worker thread: Try again`.
+  That abort is not a GL error as far as the log shows, but no `?gl=null` run was made to compare.
+- Native boot (null backend, `build/rootfs-xiaoji`, 480 s): RenderEngine and the display come up, `FallbackHome` starts, and
+  `SystemUIFactory` fails to build. No `frame ... posted` line appears in any run of this tree.
+
+### Performance
+
+- Frames per second and time to the first Android frame: not measured, because no Android frame was composed. The synthetic
+  frame's cost is one readback of 540x960x4 bytes (about 2 MB) and one copy to the page; it was not timed.
+- The browser and native boots were not timed against each other, so no speed ratio is given.
+
+### Known gaps
+
+1. **No Android frame.** SurfaceFlinger composes only with a layer. In this tree no window is drawn: SystemUI fails to build, and
+   FallbackHome does not draw. This is the boot's state (docs/boot.md), not the backend's. The boot frame check (`runFrames`)
+   therefore fails in this tree, and it fails by design until a window draws.
+2. **The app process abort** (`pthread_create` `EAGAIN`, about 159 s into the browser boot): not diagnosed; the first thing to fix
+   before frames can be seen.
+3. **Per-context state**: the enables and the other texture units are shared (above). Stream slots are not released.
+4. **Share groups**: not mapped (names are host names; the share argument is ignored).
+5. **Extensions**: `GL_OES_EGL_image_external_essl3` is advertised without WebGL2 support (above).
+6. **Renderbuffer aliases** are attachments only, and a renderbuffer alias cannot be written in place.
+7. **Surface depth and stencil** are not attached (above).
+8. **GLES 1, sync objects, queries, transform feedback, samplers, compute, program binaries**: the null defaults.
+9. **Native GLES**: not built (the plan's optional step).
