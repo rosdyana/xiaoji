@@ -27,7 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "gl_display.h"
+#include "display.h"
+#include "gles2_opcodes.h"
 
 /* Constants the GLES 3 header does not give (EXT and OES names). */
 #define XJ_TEXTURE_EXTERNAL_OES 0x8D65
@@ -78,6 +79,7 @@ typedef struct cb {
     int used;
     uint32_t w, h;
     GLuint tex, fbo;
+    int refs; /* the creation reference (held by the allocator's refcount pipe) and one per open (rcOpenColorBuffer) */
 } cb_t;
 
 typedef struct alias {
@@ -154,6 +156,43 @@ EM_JS(void, xj_frame_send, (const uint8_t *px, int w, int h, int seq), {
     Atomics.add(c, 0, 1);
     postMessage({ type: 'frame', w: w, h: h, seq: seq, px: bytes.buffer, t: performance.now() }, [bytes.buffer]);
 });
+
+/* ---------- wire data into the GL entry points ----------
+ * The guest's values sit at packet offsets, so they are not necessarily 4-byte aligned, and emscripten's GL glue reads and
+ * writes 32-bit and float arguments through typed arrays (HEAP32[p >> 2] and so on), which needs alignment. Values are
+ * therefore copied into aligned memory around the call. Byte arguments (glBufferData, the RGBA8 pixels) need no copy. */
+static void *copy_in(const void *p, size_t n)
+{
+    void *c = malloc(n ? n : 1);
+    if (c && n)
+        memcpy(c, p, n);
+    return c;
+}
+
+/* glGen*: the names are made in aligned memory, then copied to the guest's buffer (n names, len bytes). */
+static void gen_into(void (*gen)(GLsizei, GLuint *), int32_t n, void *out, uint32_t len)
+{
+    if (n <= 0 || (uint64_t)n * 4 > len)
+        return;
+    GLuint *t = malloc((size_t)n * 4);
+    if (!t)
+        return;
+    gen((GLsizei)n, t);
+    memcpy(out, t, (size_t)n * 4);
+    free(t);
+}
+
+/* glDelete*: the names are copied to aligned memory first. */
+static void delete_from(void (*del)(GLsizei, const GLuint *), int32_t n, const void *in, uint32_t len)
+{
+    if (n <= 0 || (uint64_t)n * 4 > len)
+        return;
+    GLuint *t = copy_in(in, (size_t)n * 4);
+    if (!t)
+        return;
+    del((GLsizei)n, t);
+    free(t);
+}
 
 /* ---------- host state, saved and restored around the engine's own GL calls ---------- */
 
@@ -239,6 +278,7 @@ static cb_t *cb_create(uint32_t w, uint32_t h)
     c->h = h;
     c->tex = tex;
     c->fbo = fbo;
+    c->refs = 1;
     return c;
 }
 
@@ -256,7 +296,7 @@ static cb_t *surf_cb(surf_t *s)
     if (!s)
         return NULL;
     if (!s->cb) {
-        cb_t *c = cb_create(s->w ? s->w : XJ_FB_WIDTH, s->h ? s->h : XJ_FB_HEIGHT);
+        cb_t *c = cb_create(s->w ? s->w : XJ_DISPLAY_W, s->h ? s->h : XJ_DISPLAY_H);
         if (!c)
             return NULL;
         s->cb = c->handle;
@@ -446,10 +486,10 @@ static uint32_t rc_CreateContext(void *ctx, uint32_t config, uint32_t share, uin
     c->used = 1;
     c->handle = next_handle++;
     c->share = share;
-    c->vp[2] = XJ_FB_WIDTH;
-    c->vp[3] = XJ_FB_HEIGHT;
-    c->sc[2] = XJ_FB_WIDTH;
-    c->sc[3] = XJ_FB_HEIGHT;
+    c->vp[2] = XJ_DISPLAY_W;
+    c->vp[3] = XJ_DISPLAY_H;
+    c->sc[2] = XJ_DISPLAY_W;
+    c->sc[3] = XJ_DISPLAY_H;
     return c->handle;
 }
 
@@ -542,11 +582,28 @@ static uint32_t rc_CreateColorBufferDMA(void *ctx, uint32_t width, uint32_t heig
     return rc_CreateColorBuffer(ctx, width, height, internalFormat);
 }
 
-static void rc_CloseColorBuffer(void *ctx, uint32_t colorbuffer)
+/* A reference per open and per close. The buffer is deleted with its last reference (the allocator's refcount pipe
+ * closing releases its own, goldfish_free), so an importer that unregisters does not delete a buffer another process
+ * still composes from. */
+static void rc_OpenColorBuffer(void *ctx, uint32_t colorbuffer)
 {
     (void)ctx;
     cb_t *c = cb_find(colorbuffer);
     if (c)
+        c->refs++;
+}
+
+static int32_t rc_OpenColorBuffer2(void *ctx, uint32_t colorbuffer)
+{
+    rc_OpenColorBuffer(ctx, colorbuffer);
+    return 0;
+}
+
+static void rc_CloseColorBuffer(void *ctx, uint32_t colorbuffer)
+{
+    (void)ctx;
+    cb_t *c = cb_find(colorbuffer);
+    if (c && --c->refs <= 0)
         cb_destroy(c);
 }
 
@@ -804,7 +861,13 @@ static void w_glGetIntegerv(void *ctx, uint32_t pname, void *params, uint32_t pa
         put_ints(params, params_len, &v, 1);
         return;
     }
-    /* Array-valued pnames (more than the buffer of 16 below) are left to the null answers. */
+    /* No compressed texture formats and no shader binary formats: the counts are 0, so the guest asks for no list. */
+    if (pname == 0x86A2 || pname == 0x8DF9) {
+        GLint zero = 0;
+        put_ints(params, params_len, &zero, 1);
+        return;
+    }
+    /* The arrays of those lists (more than the buffer of 16 below) are left to the null answers. */
     if (pname == 0x86A3 || pname == 0x8DF8)
         return;
     GLint v[16] = {0};
@@ -835,22 +898,50 @@ static void w_glGetBooleanv(void *ctx, uint32_t pname, void *params, uint32_t pa
         ((uint8_t *)params)[i] = v[i];
 }
 
+/* Sampler objects (Skia uses them on ES 3.0, GrGLCaps.cpp): WebGL2 has them, and the names are the host's. The sampler
+ * bindings are shared by the contexts (see the gaps in the design note). */
+static void w_glGenSamplers(void *ctx, int32_t n, void *samplers, uint32_t len)
+{
+    enter(ctx);
+    gen_into(glGenSamplers, n, samplers, len);
+}
+
+static void w_glDeleteSamplers(void *ctx, int32_t n, const void *samplers, uint32_t len)
+{
+    enter(ctx);
+    delete_from(glDeleteSamplers, n, samplers, len);
+}
+
+static void w_glBindSampler(void *ctx, uint32_t unit, uint32_t sampler)
+{
+    enter(ctx);
+    glBindSampler(unit, sampler);
+}
+
+static void w_glSamplerParameteri(void *ctx, uint32_t sampler, uint32_t pname, int32_t param)
+{
+    enter(ctx);
+    glSamplerParameteri(sampler, pname, param);
+}
+
+static void w_glSamplerParameterf(void *ctx, uint32_t sampler, uint32_t pname, float param)
+{
+    enter(ctx);
+    glSamplerParameterf(sampler, pname, param);
+}
+
 /* Buffers. */
 
 static void w_glGenBuffers(void *ctx, int32_t n, void *buffers, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glGenBuffers(n, buffers);
+    gen_into(glGenBuffers, n, buffers, len);
 }
 
 static void w_glDeleteBuffers(void *ctx, int32_t n, const void *buffers, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glDeleteBuffers(n, buffers);
+    delete_from(glDeleteBuffers, n, buffers, len);
 }
 
 static void w_glBindBuffer(void *ctx, uint32_t target, uint32_t buffer)
@@ -877,22 +968,23 @@ static void w_glBufferSubData(void *ctx, uint32_t target, int32_t offset, int32_
 static void w_glGenTextures(void *ctx, int32_t n, void *textures, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glGenTextures(n, textures);
+    gen_into(glGenTextures, n, textures, len);
 }
 
 static void w_glDeleteTextures(void *ctx, int32_t n, const void *textures, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
+    if (n <= 0 || (uint64_t)n * 4 > len)
         return;
-    const GLuint *names = textures;
+    GLuint *names = copy_in(textures, (size_t)n * 4);
+    if (!names)
+        return;
     for (int32_t i = 0; i < n; i++)
         for (int k = 0; k < NALIAS; k++)
             if (tex_alias[k].used && tex_alias[k].name == names[i])
                 tex_alias[k].used = 0;
-    glDeleteTextures(n, textures);
+    glDeleteTextures(n, names);
+    free(names);
 }
 
 static void w_glActiveTexture(void *ctx, uint32_t texture)
@@ -916,16 +1008,26 @@ static void w_glTexImage2D(void *ctx, uint32_t target, int32_t level, int32_t in
                            int32_t border, uint32_t format, uint32_t type, const void *pixels, uint32_t pixels_len)
 {
     enter(ctx);
-    (void)pixels_len;
+    void *c = NULL;
+    if (pixels && pixels_len && ((uintptr_t)pixels & 3)) {
+        c = copy_in(pixels, pixels_len);
+        pixels = c;
+    }
     glTexImage2D(tgt(target), level, internalformat, width, height, border, format, type, pixels);
+    free(c);
 }
 
 static void w_glTexSubImage2D(void *ctx, uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t width,
                               int32_t height, uint32_t format, uint32_t type, const void *pixels, uint32_t pixels_len)
 {
     enter(ctx);
-    (void)pixels_len;
+    void *c = NULL;
+    if (pixels && pixels_len && ((uintptr_t)pixels & 3)) {
+        c = copy_in(pixels, pixels_len);
+        pixels = c;
+    }
     glTexSubImage2D(tgt(target), level, xoffset, yoffset, width, height, format, type, pixels);
+    free(c);
 }
 
 static void w_glTexStorage2D(void *ctx, uint32_t target, int32_t levels, uint32_t internalformat, int32_t width, int32_t height)
@@ -972,17 +1074,13 @@ static void w_glEGLImageTargetTexture2DOES(void *ctx, uint32_t target, uint64_t 
 static void w_glGenFramebuffers(void *ctx, int32_t n, void *fbs, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glGenFramebuffers(n, fbs);
+    gen_into(glGenFramebuffers, n, fbs, len);
 }
 
 static void w_glDeleteFramebuffers(void *ctx, int32_t n, const void *fbs, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glDeleteFramebuffers(n, fbs);
+    delete_from(glDeleteFramebuffers, n, fbs, len);
 }
 
 static void w_glBindFramebuffer(void *ctx, uint32_t target, uint32_t framebuffer)
@@ -1007,17 +1105,13 @@ static void w_glFramebufferTexture2D(void *ctx, uint32_t target, uint32_t attach
 static void w_glGenRenderbuffers(void *ctx, int32_t n, void *rbs, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glGenRenderbuffers(n, rbs);
+    gen_into(glGenRenderbuffers, n, rbs, len);
 }
 
 static void w_glDeleteRenderbuffers(void *ctx, int32_t n, const void *rbs, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glDeleteRenderbuffers(n, rbs);
+    delete_from(glDeleteRenderbuffers, n, rbs, len);
 }
 
 static void w_glBindRenderbuffer(void *ctx, uint32_t target, uint32_t rb)
@@ -1262,23 +1356,130 @@ static uint32_t vec_bytes(int32_t count, uint32_t per, uint32_t len)
     return need <= len ? (uint32_t)need : 0;
 }
 
-static void w_glUniform1fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 1, len)) glUniform1fv(loc, count, v); }
-static void w_glUniform2fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 2, len)) glUniform2fv(loc, count, v); }
-static void w_glUniform3fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 3, len)) glUniform3fv(loc, count, v); }
-static void w_glUniform4fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 4, len)) glUniform4fv(loc, count, v); }
-static void w_glUniform1iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 1, len)) glUniform1iv(loc, count, v); }
-static void w_glUniform2iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 2, len)) glUniform2iv(loc, count, v); }
-static void w_glUniform3iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 3, len)) glUniform3iv(loc, count, v); }
-static void w_glUniform4iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 4, len)) glUniform4iv(loc, count, v); }
-static void w_glUniformMatrix2fv(void *ctx, int32_t loc, int32_t count, uint8_t t, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 4, len)) glUniformMatrix2fv(loc, count, t, v); }
-static void w_glUniformMatrix3fv(void *ctx, int32_t loc, int32_t count, uint8_t t, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 9, len)) glUniformMatrix3fv(loc, count, t, v); }
-static void w_glUniformMatrix4fv(void *ctx, int32_t loc, int32_t count, uint8_t t, const void *v, uint32_t len) { enter(ctx); if (vec_bytes(count, 16, len)) glUniformMatrix4fv(loc, count, t, v); }
+static void w_glUniform1fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 1, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform1fv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform2fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 2, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform2fv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform3fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 3, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform3fv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform4fv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 4, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform4fv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform1iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 1, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform1iv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform2iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 2, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform2iv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform3iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 3, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform3iv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniform4iv(void *ctx, int32_t loc, int32_t count, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 4, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniform4iv(loc, count, c);
+        free(c);
+    }
+}
+static void w_glUniformMatrix2fv(void *ctx, int32_t loc, int32_t count, uint8_t t, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 4, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniformMatrix2fv(loc, count, t, c);
+        free(c);
+    }
+}
+static void w_glUniformMatrix3fv(void *ctx, int32_t loc, int32_t count, uint8_t t, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 9, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniformMatrix3fv(loc, count, t, c);
+        free(c);
+    }
+}
+static void w_glUniformMatrix4fv(void *ctx, int32_t loc, int32_t count, uint8_t t, const void *v, uint32_t len)
+{
+    enter(ctx);
+    uint32_t b = vec_bytes(count, 16, len);
+    void *c = b ? copy_in(v, b) : NULL;
+    if (c) {
+        glUniformMatrix4fv(loc, count, t, c);
+        free(c);
+    }
+}
 
 static void w_glVertexAttrib1f(void *ctx, uint32_t i, float x) { enter(ctx); glVertexAttrib1f(i, x); }
 static void w_glVertexAttrib2f(void *ctx, uint32_t i, float x, float y) { enter(ctx); glVertexAttrib2f(i, x, y); }
 static void w_glVertexAttrib3f(void *ctx, uint32_t i, float x, float y, float z) { enter(ctx); glVertexAttrib3f(i, x, y, z); }
 static void w_glVertexAttrib4f(void *ctx, uint32_t i, float x, float y, float z, float w) { enter(ctx); glVertexAttrib4f(i, x, y, z, w); }
-static void w_glVertexAttrib4fv(void *ctx, uint32_t i, const void *v, uint32_t len) { enter(ctx); if (len >= 16) glVertexAttrib4fv(i, v); }
+static void w_glVertexAttrib4fv(void *ctx, uint32_t i, const void *v, uint32_t len)
+{
+    enter(ctx);
+    if (len < 16)
+        return;
+    GLfloat f[4];
+    memcpy(f, v, sizeof f);
+    glVertexAttrib4fv(i, f);
+}
 
 /* glGetActiveAttrib and glGetActiveUniform: the name, size and type of one active variable. The host writes into a
  * local buffer (names are short), and the guest's buffers get what fits. */
@@ -1337,17 +1538,13 @@ static void w_glDisableVertexAttribArray(void *ctx, uint32_t index) { enter(ctx)
 static void w_glGenVertexArrays(void *ctx, int32_t n, void *arrays, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glGenVertexArrays(n, arrays);
+    gen_into(glGenVertexArrays, n, arrays, len);
 }
 
 static void w_glDeleteVertexArrays(void *ctx, int32_t n, const void *arrays, uint32_t len)
 {
     enter(ctx);
-    if (n < 0 || (uint64_t)n * 4 > len)
-        return;
-    glDeleteVertexArrays(n, arrays);
+    delete_from(glDeleteVertexArrays, n, arrays, len);
 }
 
 static void w_glBindVertexArray(void *ctx, uint32_t array)
@@ -1436,6 +1633,165 @@ static int32_t w_glFinishRoundTrip(void *ctx)
  * and the scissored colour inside the box (x 100..299, y 100..399 from the bottom, so rows 560..859 from the top). */
 static char selftest_stream;
 static uint32_t selftest_alias_px; /* the alias path's pixel, RGB packed (0xRRGGBB) */
+static uint32_t selftest_quad_px;  /* the quad's pixel on the surface, or ~0u when the draw did not run */
+static uint32_t selftest_life_ok;  /* 1 when open and close count references, and the last close deletes */
+
+/* ----- the self test's wire packets: built as the guest builds them, and fed through gl_host_decode ----- */
+typedef struct {
+    uint8_t *b;
+    size_t n, cap;
+} pkt_t;
+
+static void pk_put(pkt_t *p, const void *d, size_t n)
+{
+    if (p->n + n > p->cap) {
+        size_t nc = p->cap ? p->cap : 128;
+        while (nc < p->n + n)
+            nc *= 2;
+        uint8_t *nb = realloc(p->b, nc);
+        if (!nb)
+            return;
+        p->b = nb;
+        p->cap = nc;
+    }
+    memcpy(p->b + p->n, d, n);
+    p->n += n;
+}
+
+static void pk_u32(pkt_t *p, uint32_t v)
+{
+    uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
+    pk_put(p, b, 4);
+}
+
+static void pk_begin(pkt_t *p, uint32_t op)
+{
+    p->n = 0;
+    pk_u32(p, op);
+    pk_u32(p, 0); /* the total, set when the packet is sent */
+}
+
+/* Sends the packet to the GL host (the stream k), and returns the decoder's result. */
+static int pk_send(void *k, pkt_t *p, uint32_t op, gl_reply *rep)
+{
+    uint32_t n = (uint32_t)p->n;
+    p->b[4] = (uint8_t)n;
+    p->b[5] = (uint8_t)(n >> 8);
+    p->b[6] = (uint8_t)(n >> 16);
+    p->b[7] = (uint8_t)(n >> 24);
+    return gl_host_decode(gl_host_webgl(), k, op, p->b, p->n, rep);
+}
+
+/* The reply's first word (a name, or a location), and the reply freed. */
+static uint32_t rep_u32(gl_reply *r)
+{
+    uint32_t v = 0;
+    if (r->len >= 4)
+        memcpy(&v, r->buf, 4);
+    free(r->buf);
+    memset(r, 0, sizeof *r);
+    return v;
+}
+
+static int selftest_quad(void *k)
+{
+    static const char vs[] = "#version 300 es\nlayout(location = 0) in vec2 a_pos;\nuniform mat4 u_m;\n"
+                             "void main() { gl_Position = u_m * vec4(a_pos, 0.0, 1.0); }\n";
+    static const char fs[] = "#version 300 es\nprecision mediump float;\nout vec4 o;\n"
+                             "void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    static const char uname[] = "u_m";
+    static const float verts[8] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+    static const float mat[16] = {0.5f, 0, 0, 0, 0, 0.5f, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; /* a column-major scale */
+    static const uint8_t no = 0;
+    pkt_t p = {0};
+    gl_reply rep = {0};
+    uint32_t vsh, fsh, prog, loc;
+    int ok = 0;
+
+#define PK_CHECK(e) do { if ((e) != 0) goto out; } while (0)
+    pk_begin(&p, OP_glCreateShader);
+    pk_u32(&p, 0x8B31); /* GL_VERTEX_SHADER */
+    PK_CHECK(pk_send(k, &p, OP_glCreateShader, &rep));
+    vsh = rep_u32(&rep);
+    pk_begin(&p, OP_glCreateShader);
+    pk_u32(&p, 0x8B30); /* GL_FRAGMENT_SHADER */
+    PK_CHECK(pk_send(k, &p, OP_glCreateShader, &rep));
+    fsh = rep_u32(&rep);
+    pk_begin(&p, OP_glShaderString);
+    pk_u32(&p, vsh);
+    pk_u32(&p, (uint32_t)sizeof vs - 1);
+    pk_put(&p, vs, sizeof vs - 1);
+    pk_u32(&p, (uint32_t)sizeof vs - 1);
+    PK_CHECK(pk_send(k, &p, OP_glShaderString, &rep));
+    pk_begin(&p, OP_glShaderString);
+    pk_u32(&p, fsh);
+    pk_u32(&p, (uint32_t)sizeof fs - 1);
+    pk_put(&p, fs, sizeof fs - 1);
+    pk_u32(&p, (uint32_t)sizeof fs - 1);
+    PK_CHECK(pk_send(k, &p, OP_glShaderString, &rep));
+    pk_begin(&p, OP_glCompileShader);
+    pk_u32(&p, vsh);
+    PK_CHECK(pk_send(k, &p, OP_glCompileShader, &rep));
+    pk_begin(&p, OP_glCompileShader);
+    pk_u32(&p, fsh);
+    PK_CHECK(pk_send(k, &p, OP_glCompileShader, &rep));
+    pk_begin(&p, OP_glCreateProgram);
+    PK_CHECK(pk_send(k, &p, OP_glCreateProgram, &rep));
+    prog = rep_u32(&rep);
+    pk_begin(&p, OP_glAttachShader);
+    pk_u32(&p, prog);
+    pk_u32(&p, vsh);
+    PK_CHECK(pk_send(k, &p, OP_glAttachShader, &rep));
+    pk_begin(&p, OP_glAttachShader);
+    pk_u32(&p, prog);
+    pk_u32(&p, fsh);
+    PK_CHECK(pk_send(k, &p, OP_glAttachShader, &rep));
+    pk_begin(&p, OP_glLinkProgram);
+    pk_u32(&p, prog);
+    PK_CHECK(pk_send(k, &p, OP_glLinkProgram, &rep));
+    pk_begin(&p, OP_glUseProgram);
+    pk_u32(&p, prog);
+    PK_CHECK(pk_send(k, &p, OP_glUseProgram, &rep));
+    pk_begin(&p, OP_glGetUniformLocation);
+    pk_u32(&p, prog);
+    pk_u32(&p, (uint32_t)sizeof uname - 1);
+    pk_put(&p, uname, sizeof uname - 1);
+    PK_CHECK(pk_send(k, &p, OP_glGetUniformLocation, &rep));
+    loc = rep_u32(&rep);
+    pk_begin(&p, OP_glEnableVertexAttribArray);
+    pk_u32(&p, 0);
+    PK_CHECK(pk_send(k, &p, OP_glEnableVertexAttribArray, &rep));
+    /* glVertexAttribPointerData: index, size, type, normalized (1 byte), stride, the data (datalen) and datalen again */
+    pk_begin(&p, OP_glVertexAttribPointerData);
+    pk_u32(&p, 0);
+    pk_u32(&p, 2);
+    pk_u32(&p, 0x1406); /* GL_FLOAT */
+    pk_put(&p, &no, 1);
+    pk_u32(&p, 0);
+    pk_u32(&p, sizeof verts);
+    pk_put(&p, verts, sizeof verts);
+    pk_u32(&p, sizeof verts);
+    PK_CHECK(pk_send(k, &p, OP_glVertexAttribPointerData, &rep));
+    /* glUniformMatrix4fv: the location, the count, transpose (1 byte), and the matrix: at an odd packet offset */
+    pk_begin(&p, OP_glUniformMatrix4fv);
+    pk_u32(&p, loc);
+    pk_u32(&p, 1);
+    pk_put(&p, &no, 1);
+    pk_u32(&p, sizeof mat);
+    pk_put(&p, mat, sizeof mat);
+    PK_CHECK(pk_send(k, &p, OP_glUniformMatrix4fv, &rep));
+    pk_begin(&p, OP_glDrawArrays);
+    pk_u32(&p, 0x0005); /* GL_TRIANGLE_STRIP */
+    pk_u32(&p, 0);
+    pk_u32(&p, 4);
+    PK_CHECK(pk_send(k, &p, OP_glDrawArrays, &rep));
+    ok = 1;
+out:
+#undef PK_CHECK
+    free(rep.buf);
+    free(p.b);
+    return ok;
+}
 
 int EMSCRIPTEN_KEEPALIVE xj_gl_selftest(void)
 {
@@ -1445,8 +1801,8 @@ int EMSCRIPTEN_KEEPALIVE xj_gl_selftest(void)
     void *k = &selftest_stream;
     const gles2_backend_t *g2 = h->gles2;
     uint32_t ctx = rc_CreateContext(NULL, 0, 0, 0x30000);
-    uint32_t surf = rc_CreateWindowSurface(NULL, 0, XJ_FB_WIDTH, XJ_FB_HEIGHT);
-    uint32_t cb = rc_CreateColorBuffer(NULL, XJ_FB_WIDTH, XJ_FB_HEIGHT, GL_RGBA);
+    uint32_t surf = rc_CreateWindowSurface(NULL, 0, XJ_DISPLAY_W, XJ_DISPLAY_H);
+    uint32_t cb = rc_CreateColorBuffer(NULL, XJ_DISPLAY_W, XJ_DISPLAY_H, GL_RGBA);
     rc_SetWindowColorBuffer(NULL, surf, cb);
     rc_MakeCurrent(k, ctx, surf, surf);
     enter(k);
@@ -1458,6 +1814,20 @@ int EMSCRIPTEN_KEEPALIVE xj_gl_selftest(void)
     glClearColor(1.0f, 0.2f, 0.2f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
+    /* A quad through the wire path: two shaders, a link, a client array, a matrix uniform, a draw. */
+    selftest_quad_px = ~0u;
+    if (selftest_quad(k)) {
+        uint8_t q[4] = {0, 0, 0, 0};
+        rc_ReadColorBuffer(k, cb, XJ_DISPLAY_W / 2, XJ_DISPLAY_H / 2 - 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, q, sizeof q);
+        selftest_quad_px = (uint32_t)q[0] << 16 | (uint32_t)q[1] << 8 | q[2];
+    }
+    /* Reference counts: create (1), open (2), close (1: still there), close (0: deleted). */
+    uint32_t cbL = rc_CreateColorBuffer(NULL, 2, 2, GL_RGBA);
+    rc_OpenColorBuffer2(NULL, cbL);
+    rc_CloseColorBuffer(NULL, cbL);
+    int alive = cb_find(cbL) != NULL;
+    rc_CloseColorBuffer(NULL, cbL);
+    selftest_life_ok = alive && !cb_find(cbL);
     /* The alias path, as RenderEngine's output texture is used: a guest texture name bound, rcBindTexture on the
      * color buffer, the name attached to a guest FBO, and a clear through that FBO. */
     uint32_t cb4 = rc_CreateColorBuffer(NULL, 4, 4, GL_RGBA);
@@ -1479,6 +1849,16 @@ int EMSCRIPTEN_KEEPALIVE xj_gl_selftest(void)
     rc_FBPost(NULL, cb);
     rc_MakeCurrent(k, 0, 0, 0);
     return (int)frames_posted;
+}
+
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_quad(void)
+{
+    return selftest_quad_px;
+}
+
+uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_life(void)
+{
+    return selftest_life_ok;
 }
 
 uint32_t EMSCRIPTEN_KEEPALIVE xj_gl_selftest_alias(void)
@@ -1506,17 +1886,17 @@ static int init_gl(void)
         fprintf(stderr, "xiaoji: gl(webgl): no WebGL2 context on the worker's canvas; the null backend answers\n");
         return 0;
     }
-    glViewport(0, 0, XJ_FB_WIDTH, XJ_FB_HEIGHT);
-    glScissor(0, 0, XJ_FB_WIDTH, XJ_FB_HEIGHT);
+    glViewport(0, 0, XJ_DISPLAY_W, XJ_DISPLAY_H);
+    glScissor(0, 0, XJ_DISPLAY_W, XJ_DISPLAY_H);
     dflt = NULL;
     for (int i = 0; i < NCTX && !dflt; i++)
         if (!ctxs[i].used) {
             ctxs[i].used = 1;
             ctxs[i].handle = next_handle++;
-            ctxs[i].vp[2] = XJ_FB_WIDTH;
-            ctxs[i].vp[3] = XJ_FB_HEIGHT;
-            ctxs[i].sc[2] = XJ_FB_WIDTH;
-            ctxs[i].sc[3] = XJ_FB_HEIGHT;
+            ctxs[i].vp[2] = XJ_DISPLAY_W;
+            ctxs[i].vp[3] = XJ_DISPLAY_H;
+            ctxs[i].sc[2] = XJ_DISPLAY_W;
+            ctxs[i].sc[3] = XJ_DISPLAY_H;
             dflt = &ctxs[i];
         }
     ready = 1;
@@ -1548,6 +1928,8 @@ const gl_host_t *gl_host_webgl(void)
     rc_table.rcCreateColorBuffer = rc_CreateColorBuffer;
     rc_table.rcCreateColorBufferDMA = rc_CreateColorBufferDMA;
     rc_table.rcCloseColorBuffer = rc_CloseColorBuffer;
+    rc_table.rcOpenColorBuffer = rc_OpenColorBuffer;
+    rc_table.rcOpenColorBuffer2 = rc_OpenColorBuffer2;
     rc_table.rcReadColorBuffer = rc_ReadColorBuffer;
     rc_table.rcUpdateColorBuffer = rc_UpdateColorBuffer;
     rc_table.rcBindTexture = rc_BindTexture;
@@ -1670,6 +2052,11 @@ const gl_host_t *gl_host_webgl(void)
     gles2_table.glDeleteVertexArrays = w_glDeleteVertexArrays;
     gles2_table.glBindVertexArray = w_glBindVertexArray;
     gles2_table.glDrawArrays = w_glDrawArrays;
+    gles2_table.glGenSamplers = w_glGenSamplers;
+    gles2_table.glDeleteSamplers = w_glDeleteSamplers;
+    gles2_table.glBindSampler = w_glBindSampler;
+    gles2_table.glSamplerParameteri = w_glSamplerParameteri;
+    gles2_table.glSamplerParameterf = w_glSamplerParameterf;
     gles2_table.glGetActiveAttrib = w_glGetActiveAttrib;
     gles2_table.glGetActiveUniform = w_glGetActiveUniform;
 

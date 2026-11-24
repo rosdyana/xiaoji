@@ -211,8 +211,10 @@ async function runBoot(chromium, baseUrl) {
 }
 
 // The frame path without a guest (G2, opt-in: XIAOJI_WEB_FRAMES=1): a worker runs xj_gl_selftest (engine/gl_webgl.c),
-// which draws on the WebGL2 color buffer and posts the frame. The page draws it with web/frame.js, and the pixels are
-// read back: the clear colour at (10, 10), and the scissored colour inside its box (rows 560..859, x 150).
+// which draws on the WebGL2 color buffer (a clear, a scissored clear, a quad through the wire path, and an alias) and
+// posts the frame. The page draws it on the boot page's own #android-screen canvas, over the phone frame, and reads the pixels
+// back: the clear colour at (10, 10), the scissored colour inside its box and outside the quad (115, 800), the quad's
+// green at the centre, and the alias result. Stop must still be the element at its centre, over the canvas.
 async function runGlSelfTest(chromium, baseUrl) {
   mkdirSync(SHOTS, { recursive: true });
   const browser = await chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
@@ -224,10 +226,7 @@ async function runGlSelfTest(chromium, baseUrl) {
     const got = await page.evaluate(async () => {
       const base = new URL('./', location.href).href;
       const { newFrameView } = await import(base + 'frame.js');
-      const canvas = document.createElement('canvas');
-      canvas.id = 'selftest';
-      canvas.style.cssText = 'position:fixed;left:0;top:0;width:270px;height:480px;z-index:9999;background:#000;';
-      document.body.appendChild(canvas);
+      const canvas = document.getElementById('android-screen');
       const sab = new SharedArrayBuffer(8);
       const view = newFrameView(canvas, new Int32Array(sab));
       return await new Promise((resolve) => {
@@ -247,11 +246,15 @@ async function runGlSelfTest(chromium, baseUrl) {
           if (m.type === 'frame') {
             got.state = view.show(m, 0);
             got.clear = px(10, 10);
-            got.boxed = px(150, 700);
+            got.boxed = px(115, 800);
+            got.centre = px(270, 480);
+            got.canvasVisible = !canvas.hidden;
             finish();
           } else if (m.type === 'done') {
             got.done = m.exitCode;
             got.alias = m.alias;
+            got.quad = m.quad;
+            got.life = m.life;
             finish();
           } else if (m.type === 'error') {
             clearTimeout(timer);
@@ -263,18 +266,32 @@ async function runGlSelfTest(chromium, baseUrl) {
       });
     });
     if (got.error) console.log(`    selftest: ${got.error.split('\n')[0]}`);
+    // Stop is above the canvas: its centre is the button (the button is hidden outside a boot, so it is shown for the test).
+    const stopOnTop = await page.evaluate(() => {
+      const stop = document.getElementById('stop');
+      const was = stop.hidden;
+      stop.hidden = false;
+      const r = stop.getBoundingClientRect();
+      const el = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      stop.hidden = was;
+      return !!el && (el === stop || stop.contains(el));
+    });
     const st = got.state;
     check(got.done === 1, `selftest: the engine reports one frame posted (${got.done})`);
     check(st && st.frames === 1, 'selftest: one frame arrives from rcFBPost (WebGL2 backend, no guest)');
     check(st && st.w === 540 && st.h === 960, `selftest: the frame is the display size (${st ? st.w + 'x' + st.h : '-'})`);
+    check(got.canvasVisible === true, 'selftest: the frame is shown on the boot page\'s #android-screen canvas');
     const near = (a, b) => a && a.every((v, i) => Math.abs(v - b[i]) <= 2);
     check(near(got.clear, [26, 128, 230]), `selftest: the clear colour is at (10, 10) of the top-first frame (${got.clear})`);
-    check(near(got.boxed, [255, 51, 51]), `selftest: the scissored colour is inside the box, read top-first (${got.boxed})`);
-    const alias = got.alias === undefined ? null : [(got.alias >> 16) & 255, (got.alias >> 8) & 255, got.alias & 255];
-    check(near(alias, [230, 230, 26]), `selftest: a texture bound by name and attached to a guest FBO through rcBindTexture draws into the color buffer (${alias})`);
+    check(near(got.boxed, [255, 51, 51]), `selftest: the scissored colour is inside the box, outside the quad, read top-first (${got.boxed})`);
+    check(near(got.centre, [0, 255, 0]), `selftest: the quad (shaders, client array, matrix uniform, draw) is green at the centre (${got.centre})`);
+    const unpack = (v) => (v === undefined || v === null ? null : [(v >> 16) & 255, (v >> 8) & 255, v & 255]);
+    check(near(unpack(got.quad), [0, 255, 0]), `selftest: the quad's pixel read back from the surface through the wire path (${unpack(got.quad)})`);
+    check(near(unpack(got.alias), [230, 230, 26]), `selftest: a texture bound by name and attached to a guest FBO through rcBindTexture draws into the color buffer (${unpack(got.alias)})`);
+    check(got.life === 1, 'selftest: color buffer references: open and close count, and the last close deletes');
+    check(stopOnTop, 'selftest: Stop is still the element at its centre, over the Android canvas');
     check(pageErrors.length === 0, `selftest: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
-    const el = page.locator('#selftest');
-    await el.screenshot({ path: join(SHOTS, 'glselftest.png') });
+    await page.locator('#phone').screenshot({ path: join(SHOTS, 'glselftest.png') });
     console.log(`    screenshot: ${join(SHOTS, 'glselftest.png')}`);
   } finally {
     await browser.close();

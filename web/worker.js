@@ -16,7 +16,7 @@ import { BOOT, CASES, ENGINE_ENV_ARGS } from './cases.js';
 import { openTrace } from './trace.js';
 import { ChunkStore, buildChunkTree, earlyPackIndex } from './chunks.js';
 
-// The display the engine presents (engine/gl_display.h, the one setting): the size of the OffscreenCanvas.
+// The display the engine presents (engine/display.h, XJ_DISPLAY_W and XJ_DISPLAY_H): the size of the OffscreenCanvas.
 const FB_WIDTH = 540;
 const FB_HEIGHT = 960;
 
@@ -324,7 +324,7 @@ async function runBoot(base, opts) {
 
 // The frame path without a guest (tests/web.mjs, XIAOJI_WEB_FRAMES=1; engine/gl_webgl.c, xj_gl_selftest): the engine
 // draws a test picture on its WebGL2 color buffer and posts it as a frame. 'done' follows the frame, with the frames posted
-// (-1: no backend) and the alias path's pixel (RGB, packed).
+// (-1: no backend), the alias path's pixel and the quad's pixel (RGB, packed).
 async function glSelfTest(base, frameSab) {
   self.xjFrameCtl = new Int32Array(frameSab);
   self.xjCanvas = new OffscreenCanvas(FB_WIDTH, FB_HEIGHT);
@@ -334,7 +334,10 @@ async function glSelfTest(base, frameSab) {
     printErr: (line) => post({ type: 'err', text: line }),
   });
   const frames = Module._xj_gl_selftest();
-  post({ type: 'done', name: 'glselftest', exitCode: frames, alias: Module._xj_gl_selftest_alias() });
+  post({
+    type: 'done', name: 'glselftest', exitCode: frames, alias: Module._xj_gl_selftest_alias(),
+    quad: Module._xj_gl_selftest_quad(), life: Module._xj_gl_selftest_life(),
+  });
 }
 
 self.onmessage = async (ev) => {

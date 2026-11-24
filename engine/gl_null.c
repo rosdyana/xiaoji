@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "gl_display.h"
+#include "display.h"
 #include "gl_host.h"
 
 extern const renderControl_backend_t renderControl_null_defaults;
@@ -37,9 +37,9 @@ extern const gles1_backend_t gles1_null_defaults;
 #define EGL_NONE 0x3038
 #define EGL_DONT_CARE (-1)
 
-/* The display the engine presents (gl_display.h, the one setting). */
-#define NULL_FB_WIDTH XJ_FB_WIDTH
-#define NULL_FB_HEIGHT XJ_FB_HEIGHT
+/* The display the engine presents (display.h, the one setting). */
+#define NULL_FB_WIDTH XJ_DISPLAY_W
+#define NULL_FB_HEIGHT XJ_DISPLAY_H
 #define NULL_RENDERER_VERSION 1
 
 /* What the null host advertises. Only the features the design lists (docs/graphics.md, 3.2): GLES 3.0 and
@@ -118,8 +118,8 @@ static int32_t fb_param(int32_t param)
     switch (param) {
     case FB_WIDTH: return NULL_FB_WIDTH;
     case FB_HEIGHT: return NULL_FB_HEIGHT;
-    case FB_XDPI: return XJ_FB_DPI;
-    case FB_YDPI: return XJ_FB_DPI;
+    case FB_XDPI: return XJ_DISPLAY_DPI;
+    case FB_YDPI: return XJ_DISPLAY_DPI;
     case FB_FPS: return 60;
     case FB_MIN_SWAP_INTERVAL: return 1;
     case FB_MAX_SWAP_INTERVAL: return 1;

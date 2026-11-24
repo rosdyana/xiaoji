@@ -203,6 +203,9 @@ $('boot').addEventListener('click', async () => {
   renderMilestoneRows();
   window.xb = { status: 'loading', lines: 0, milestones: {}, fetch: null, done: null, error: null, screen: null };
   setBootStatus('loading');
+  // A new boot starts with the boot screen: the Android canvas is hidden until its first frame.
+  $('android-screen').hidden = true;
+  delete $('phone').dataset.frame;
   startRun(scr);
   bootTimer = setInterval(render, 250);
 
@@ -212,7 +215,7 @@ $('boot').addEventListener('click', async () => {
   // isolation (the pack path needs it too). ?gl=null keeps the null backend (no frames).
   const bootT0 = performance.now();
   const frameSab = self.crossOriginIsolated ? new SharedArrayBuffer(8) : null;
-  const frames = newFrameView($('android'), frameSab ? new Int32Array(frameSab) : null);
+  const frames = newFrameView($('android-screen'), frameSab ? new Int32Array(frameSab) : null);
   const glBackend = params.get('gl') === 'null' ? 'null' : 'webgl';
   setControls();
   render();
