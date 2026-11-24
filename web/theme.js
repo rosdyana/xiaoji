@@ -1,11 +1,13 @@
-// Theme of the Boot Android screen (W2): the name, subtitle, logo, colours and stage labels. The default is
-// web/theme.json; ?theme=<name> loads web/theme-<name>.json. A theme that does not validate is replaced by
-// the built-in default (the same values as theme.json), and loadTheme says why in `note`.
+// Theme of the Boot Android screen (W2): the name, subtitle, logo, colours, stage labels and the boot
+// animation (W3). The default is web/theme.json; ?theme=<name> loads web/theme-<name>.json. A theme that does
+// not validate is replaced by the built-in default (the same values as theme.json), and loadTheme says why in
+// `note`.
 //
 // The stage mapping: stages[k].from is the milestone (an id of BOOT.milestones) that starts stage k+1 of
 // the screen. "boot" starts the first stage when the engine starts; null is a stage the boot does not reach
 // yet. The ids must come in the boot's order, so the screen only moves forward.
 import { BOOT } from './cases.js';
+import { ANIM_DEFAULT } from './bootscreen.js';
 
 export const DEFAULT_THEME = {
   name: 'Xiao',
@@ -20,6 +22,7 @@ export const DEFAULT_THEME = {
     { label: 'Starting services', from: 'phase100' },
     { label: 'Starting home', from: 'completed' },
   ],
+  animation: { ...ANIM_DEFAULT },
 };
 
 const COLOURS = ['bg1', 'bg2', 'ink', 'dim', 'accent'];
@@ -83,7 +86,30 @@ export function validateTheme(raw, base) {
     return { label, from: st.from };
   });
   if (stages[0].from !== 'boot') throw new Error('stages[0].from: want "boot"');
-  return { name, accentPart, subtitle, logo, colors, stages };
+  return { name, accentPart, subtitle, logo, colors, stages, animation: validateAnimation(raw.animation) };
+}
+
+// The boot animation (W3, web/bootscreen.js): optional; each field that is left out takes its default.
+const ANIM_MS = { introMs: [0, 5000], outroMs: [0, 2000], spinMs: [400, 10000], breatheMs: [1000, 20000] };
+
+function validateAnimation(raw) {
+  const a = { ...ANIM_DEFAULT };
+  if (raw === undefined) return a;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('animation: not an object');
+  if (raw.style !== undefined) {
+    if (raw.style !== 'default' && raw.style !== 'none') throw new Error('animation.style: want "default" or "none"');
+    a.style = raw.style;
+  }
+  for (const [k, [lo, hi]] of Object.entries(ANIM_MS)) {
+    if (raw[k] === undefined) continue;
+    if (!Number.isInteger(raw[k]) || raw[k] < lo || raw[k] > hi) throw new Error(`animation.${k}: want an integer from ${lo} to ${hi}`);
+    a[k] = raw[k];
+  }
+  if (raw.glow !== undefined) {
+    if (typeof raw.glow !== 'boolean') throw new Error('animation.glow: want true or false');
+    a.glow = raw.glow;
+  }
+  return a;
 }
 
 // Loads the theme for ?theme=<name> (name null: the default). Returns { theme, source, note }: note is null

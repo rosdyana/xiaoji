@@ -10,6 +10,7 @@ import { DEFAULT_THEME, loadTheme } from './theme.js';
 import { newFrameView } from './frame.js';
 import {
   newScreen, startRun, onDownload, onBootTree, onMilestone, onRestart, onError, onEnd, onStop, render as renderScreen,
+  onShown, onAnimRun, onFrame, animPhase, animTimings, animNextMs,
 } from './bootscreen.js';
 import { createRing, attachInput, ensureScreen } from './input.js';
 
@@ -132,12 +133,56 @@ function setText(el, t) {
   if (el.textContent !== t) el.textContent = t;
 }
 
+// The boot animation (W3): the part (bootscreen.js animPhase) and the motion go on the phone as data-anim and
+// data-motion, and the CSS in index.html plays them. prefers-reduced-motion is read on each render, so a change
+// takes effect at once. A hidden tab pauses the loop (data-paused). A timer renders again when the intro or the
+// outro ends, also when no boot runs (the boot's own timer renders every 250 ms).
+const reducedMq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+let animTimer = null;
+let animVars = '';
+
+function renderAnim(now) {
+  const phone = $('phone');
+  const reduced = !!(reducedMq && reducedMq.matches);
+  onShown(scr, now);
+  const t = animTimings(scr.theme, reduced);
+  const vars = `${t.introMs} ${t.outroMs} ${t.spinMs} ${t.breatheMs}`;
+  if (vars !== animVars) {
+    animVars = vars;
+    const root = document.documentElement.style;
+    root.setProperty('--intro', t.introMs + 'ms');
+    root.setProperty('--outro', t.outroMs + 'ms');
+    root.setProperty('--spin', t.spinMs + 'ms');
+    root.setProperty('--breathe', t.breatheMs + 'ms');
+  }
+  const phase = animPhase(scr, now, reduced);
+  if (phone.dataset.motion !== t.motion) phone.dataset.motion = t.motion;
+  if (phone.dataset.anim !== phase) phone.dataset.anim = phase;
+  phone.dataset.glow = t.glow ? 'on' : 'off';
+  const next = animNextMs(scr, now, reduced);
+  if (animTimer) clearTimeout(animTimer);
+  animTimer = next === null ? null : setTimeout(() => {
+    animTimer = null;
+    render();
+  }, Math.max(0, next) + 20);
+  return { anim: phase, motion: t.motion };
+}
+
+if (reducedMq && reducedMq.addEventListener) reducedMq.addEventListener('change', () => render());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) $('phone').dataset.paused = '1';
+  else delete $('phone').dataset.paused;
+});
+if (document.hidden) $('phone').dataset.paused = '1';
+
 // Draws the screen from its state, and records it in window.xb.screen for the tests.
 function render() {
   if (!scr) return;
-  const v = renderScreen(scr, performance.now());
+  const now = performance.now();
+  const v = renderScreen(scr, now);
   const phone = $('phone');
   phone.dataset.state = v.state;
+  const a = renderAnim(now);
   setText($('stage-label'), v.label);
   setText($('stage-count'), v.count);
   setText($('detail'), v.detail);
@@ -150,6 +195,7 @@ function render() {
   window.xb.screen = {
     state: v.state, phase: scr.phase, stage: scr.stage, label: v.label, count: v.count, detail: v.detail,
     fill: pct, errorKind: v.errorKind, stageLog: scr.stageLog.slice(), fromCache: scr.dl.fromCache,
+    anim: a.anim, motion: a.motion,
   };
   setControls();
 }
@@ -215,6 +261,7 @@ $('boot').addEventListener('click', async () => {
   $('android-screen').hidden = true;
   delete $('phone').dataset.frame;
   startRun(scr);
+  onAnimRun(scr);
   bootTimer = setInterval(render, 250);
 
   // The input ring (web/input.js) is shared with the engine's worker, which drains it (docs/input.md); off without SharedArrayBuffer.
@@ -318,7 +365,12 @@ $('boot').addEventListener('click', async () => {
     } else if (m.type === 'frame') {
       // The engine's composed frame (rcFBPost). window.xb.frames is the count and the first and last frame times.
       window.xb.frames = frames.show(m, now - bootT0);
-      $('phone').dataset.frame = '1';
+      if (!$('phone').dataset.frame) {
+        // The first frame: the boot animation's outro (W3) fades the boot screen into the picture.
+        $('phone').dataset.frame = '1';
+        onFrame(scr, now);
+        render();
+      }
     }
   };
   worker.onerror = (ev) => {

@@ -105,7 +105,7 @@ async function runDownloadShot(chromium) {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.goto(slow.url + '?boot=pack', { waitUntil: 'load' });
     await page.click('#boot');
-    const spin = await page.evaluate(() => getComputedStyle(document.querySelector('.arc')).animationName);
+    const spin = await page.evaluate(() => getComputedStyle(document.querySelector('.l-spin')).animationName);
     check(spin === 'none', 'boot screen: the arc does not spin with prefers-reduced-motion');
     await page.emulateMedia({ reducedMotion: 'no-preference' });
     await page.waitForFunction(
@@ -227,6 +227,8 @@ async function runGlSelfTest(chromium, baseUrl) {
       const base = new URL('./', location.href).href;
       const { newFrameView } = await import(base + 'frame.js');
       const canvas = document.getElementById('android-screen');
+      // As main.js does on the first frame: the canvas is see-through until then (the boot animation's outro, W3).
+      document.getElementById('phone').dataset.frame = '1';
       const sab = new SharedArrayBuffer(8);
       const view = newFrameView(canvas, new Int32Array(sab));
       return await new Promise((resolve) => {

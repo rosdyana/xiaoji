@@ -97,6 +97,7 @@ test-web: wasm build/web/manifest.json   ## run the web build in headless Chromi
 	@if [ "$(XIAOJI_WEB_BOOT)" = 1 ] || [ "$(XIAOJI_WEB_FRAMES)" = 1 ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json && node tests/chunks.mjs; fi
 	node tests/web.mjs hello-jit hello-int
 	node tests/input.mjs
+	node tests/bootanim.mjs
 
 serve: wasm build/web/manifest.json   ## dev server for the web page (web/serve.mjs), port 8080
 	@if [ -d build/rootfs-xiaoji ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json; else echo "serve: no build/rootfs-xiaoji, Boot Android is off"; fi

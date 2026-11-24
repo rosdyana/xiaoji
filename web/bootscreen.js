@@ -195,3 +195,85 @@ export function render(s, now) {
   }
   return { state, label, count, detail, fill: s.fill, steps, errorKind: s.errorKind };
 }
+
+// ---- The boot animation (W3) ----
+//
+// The logo animates like a phone's boot animation, in three parts: an intro that plays once when the screen is
+// first shown (the ring, the arc, the glyph and the wordmark come in), a loop while the run works (the arc spins,
+// the glow breathes), and an outro when Android's first frame arrives (the boot screen fades into the picture).
+// animPhase gives the part to show now; main.js sets it as the phone's data-anim, and the CSS in index.html draws
+// it with transform and opacity only.
+//
+// Phases: 'intro' (once, theme.animation.introMs after the screen is shown), 'loop' (download, boot or any other
+// working phase), 'rest'
+// (idle, stopped, done: the arc stands still), 'calm' (an error or a restart before any frame: the arc stops and
+// dims, nothing reads as success), 'outro' (outroMs after the first frame), 'off' (the boot screen is hidden).
+//
+// Motion: 'full', 'reduced' (prefers-reduced-motion: no intro and no loop, a short fade for the outro) or 'none'
+// (theme animation style "none": nothing moves, the outro is a cut). The phases are the same in each; the CSS
+// only animates with 'full'. The state is kept in s.anim, apart from the screen's own fields.
+
+export const ANIM_DEFAULT = { style: 'default', introMs: 2000, outroMs: 600, spinMs: 1600, breatheMs: 3600, glow: true };
+export const REDUCED_OUTRO_MS = 200;
+
+function animState(s) {
+  if (!s.anim) s.anim = { shownAt: null, frameAt: null };
+  return s.anim;
+}
+
+export function animMotion(theme, reducedMotion) {
+  const a = (theme && theme.animation) || ANIM_DEFAULT;
+  if (a.style === 'none') return 'none';
+  return reducedMotion ? 'reduced' : 'full';
+}
+
+// The timings in effect: the theme's, with the intro off and the outro short or cut when motion is not full.
+export function animTimings(theme, reducedMotion) {
+  const a = { ...ANIM_DEFAULT, ...((theme && theme.animation) || {}) };
+  const motion = animMotion(theme, reducedMotion);
+  return {
+    motion,
+    introMs: motion === 'full' ? a.introMs : 0,
+    outroMs: motion === 'full' ? a.outroMs : motion === 'reduced' ? Math.min(a.outroMs, REDUCED_OUTRO_MS) : 0,
+    spinMs: a.spinMs,
+    breatheMs: a.breatheMs,
+    glow: a.glow,
+  };
+}
+
+// The screen is first drawn: the intro starts (only the first call counts).
+export function onShown(s, now) {
+  const a = animState(s);
+  if (a.shownAt === null) a.shownAt = now;
+}
+
+// A new run: the boot screen is back, so the outro of the last run is forgotten.
+export function onAnimRun(s) {
+  animState(s).frameAt = null;
+}
+
+// Android's first frame: the outro starts (later frames do not restart it).
+export function onFrame(s, now) {
+  const a = animState(s);
+  if (a.frameAt === null) a.frameAt = now;
+}
+
+export function animPhase(s, now, reducedMotion) {
+  const a = animState(s);
+  const t = animTimings(s.theme, reducedMotion);
+  if (a.frameAt !== null) return now - a.frameAt < t.outroMs ? 'outro' : 'off';
+  if (s.restarted || s.errorKind) return 'calm';
+  if (a.shownAt !== null && now - a.shownAt < t.introMs) return 'intro';
+  // Every phase that is not at rest is work (download, boot, and any phase added later), so the arc turns.
+  return s.phase === 'idle' || s.phase === 'stopped' || s.phase === 'done' ? 'rest' : 'loop';
+}
+
+// Milliseconds until animPhase changes by time alone (the end of the intro or of the outro), or null.
+export function animNextMs(s, now, reducedMotion) {
+  const a = animState(s);
+  const t = animTimings(s.theme, reducedMotion);
+  const p = animPhase(s, now, reducedMotion);
+  if (p === 'outro') return a.frameAt + t.outroMs - now;
+  if (p === 'intro') return a.shownAt + t.introMs - now;
+  return null;
+}

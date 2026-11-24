@@ -42,21 +42,74 @@
      gives way: its logo and progress are hidden, and only the Stop and log buttons stay above the picture. */
   .phone .android { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; z-index: 1; touch-action: none; }
   .phone .bottom { position: relative; z-index: 2; }
+  /* The outro (W3): the boot screen fades into the picture over --outro, then is hidden (visibility, so it takes no taps). */
+  .logo, .name, .sub, .stage, .bar, .detail, .steps { transition: opacity var(--outro) ease, transform var(--outro) ease; }
   .phone[data-frame] .logo, .phone[data-frame] .name, .phone[data-frame] .sub, .phone[data-frame] .stage,
-  .phone[data-frame] .bar, .phone[data-frame] .detail, .phone[data-frame] .steps { visibility: hidden; }
+  .phone[data-frame] .bar, .phone[data-frame] .detail, .phone[data-frame] .steps {
+    visibility: hidden; opacity: 0;
+    transition: opacity var(--outro) ease, transform var(--outro) cubic-bezier(0.4, 0, 0.2, 1), visibility 0s linear var(--outro);
+  }
+  .phone[data-frame][data-motion="full"] .logo { transform: scale(1.18); }
+  .phone[data-frame][data-motion="full"] :is(.name, .sub) { transform: translateY(-8px); }
+  .phone[data-frame][data-motion="full"] :is(.stage, .bar, .detail, .steps) { transform: translateY(8px); }
+  /* Until the first frame the canvas is see-through, so the boot screen's own background shows; it fades in for the outro. */
+  .phone:not([data-frame]) .android { opacity: 0; }
+  .phone[data-frame] .android { transition: opacity var(--outro) ease; }
   .phone[data-frame] .bottom, .phone[data-frame] .actions { pointer-events: none; }
   .phone[data-frame] .actions button { pointer-events: auto; }
-  .logo { margin-top: 36%; width: 72px; height: 72px; }
-  .logo svg { width: 100%; height: 100%; display: block; }
+  .logo { margin-top: 36%; width: 72px; height: 72px; pointer-events: none; }
+  .logo svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .lyr { position: absolute; inset: 0; }
   .ring { stroke: rgba(255, 255, 255, 0.08); fill: none; stroke-width: 5; }
-  .arc {
-    stroke: var(--acc); stroke-linecap: round; fill: none; stroke-width: 5;
-    stroke-dasharray: 60 140; transform-origin: 50% 50%; animation: spin 1.6s linear infinite;
-  }
+  .arc { stroke: var(--acc); stroke-linecap: round; fill: none; stroke-width: 5; stroke-dasharray: 60 134.78; }
+  /* A fainter piece just behind the arc's tail, so the spin reads as one stroke moving. */
+  .tail { stroke: var(--acc); stroke-linecap: round; fill: none; stroke-width: 3; stroke-dasharray: 22 172.78; stroke-dashoffset: 30; opacity: 0.35; }
   .glyph { fill: var(--ink); font: 600 26px "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif; text-anchor: middle; dominant-baseline: central; }
-  @keyframes spin { to { transform: rotate(360deg); } }
   .name { margin-top: 16px; font-weight: 650; font-size: 22px; letter-spacing: 0.02em; }
+  .name span, .name b { display: inline-block; }
   .name b { color: var(--acc); font-weight: 650; }
+
+  /* The boot animation (W3, web/bootscreen.js): the phone's data-anim is the part (intro, loop, rest, calm, outro,
+     off) and data-motion says how much may move (full, reduced, none). Only transform and opacity animate, on
+     HTML layers, so the compositor does the work; there is no script per frame. The loop's animations are set
+     from the start and only run while data-anim is loop or outro and the tab is visible (data-paused): they
+     pause where they are, so no part change makes the logo jump. */
+  :root { --intro: 2000ms; --outro: 600ms; --spin: 1600ms; --breathe: 3600ms; }
+  .halo { position: absolute; inset: -42%; transition: opacity 0.8s ease; }
+  .halo i {
+    display: block; width: 100%; height: 100%; border-radius: 50%; opacity: 0.45;
+    background: radial-gradient(closest-side, color-mix(in srgb, var(--acc) 50%, transparent),
+      color-mix(in srgb, var(--acc) 14%, transparent) 55%, transparent);
+  }
+  .phone[data-glow="off"] .halo { display: none; }
+  .l-arc { transition: opacity 0.8s ease; }
+  .phone[data-motion="full"] .l-spin { animation: xj-spin var(--spin) linear infinite paused; will-change: transform; }
+  .phone[data-motion="full"] .halo i { animation: xj-breathe var(--breathe) ease-in-out infinite paused; will-change: transform, opacity; }
+  .phone[data-motion="full"]:is([data-anim="loop"], [data-anim="outro"]):not([data-paused]) :is(.l-spin, .halo i) { animation-play-state: running; }
+  @keyframes xj-spin { to { transform: rotate(360deg); } }
+  @keyframes xj-breathe { 50% { opacity: 0.85; transform: scale(1.1); } }
+  /* Calm (an error or a restart): the arc stops where it is and dims, and the glow goes out. */
+  .phone[data-anim="calm"] .l-arc { opacity: 0.3; }
+  .phone[data-anim="calm"] .halo { opacity: 0; }
+  /* Before the first render (the theme is loading) the logo waits, so the intro starts from nothing. */
+  @media (prefers-reduced-motion: no-preference) {
+    .phone[data-anim="pre"] :is(.logo, .name, .sub) { opacity: 0; transition: none; }
+  }
+  /* The intro: plays once, over --intro. Each piece ends on its resting pose, so the loop starts from it. */
+  .phone[data-motion="full"][data-anim="intro"] .halo { animation: xj-halo-in calc(var(--intro) * 0.7) ease-out both; }
+  .phone[data-motion="full"][data-anim="intro"] .l-ring { animation: xj-ring-in calc(var(--intro) * 0.45) cubic-bezier(0.34, 1.4, 0.64, 1) both; }
+  .phone[data-motion="full"][data-anim="intro"] .l-arc { animation: xj-arc-in calc(var(--intro) * 0.7) cubic-bezier(0.16, 0.84, 0.24, 1) calc(var(--intro) * 0.08) both; }
+  .phone[data-motion="full"][data-anim="intro"] .l-mark { animation: xj-mark-in calc(var(--intro) * 0.4) cubic-bezier(0.2, 0.8, 0.2, 1) calc(var(--intro) * 0.32) both; }
+  .phone[data-motion="full"][data-anim="intro"] .name span { animation: xj-rise calc(var(--intro) * 0.35) cubic-bezier(0.2, 0.8, 0.2, 1) calc(var(--intro) * 0.48) both; }
+  .phone[data-motion="full"][data-anim="intro"] .name b { animation: xj-pop calc(var(--intro) * 0.35) cubic-bezier(0.34, 1.5, 0.64, 1) calc(var(--intro) * 0.6) both; }
+  .phone[data-motion="full"][data-anim="intro"] .sub { animation: xj-fade calc(var(--intro) * 0.25) ease-out calc(var(--intro) * 0.75) both; }
+  @keyframes xj-halo-in { from { opacity: 0; transform: scale(0.5); } }
+  @keyframes xj-ring-in { from { opacity: 0; transform: scale(0.55); } }
+  @keyframes xj-arc-in { from { opacity: 0; transform: rotate(-450deg); } 30% { opacity: 1; } }
+  @keyframes xj-mark-in { from { opacity: 0; transform: scale(0.8); } }
+  @keyframes xj-rise { from { opacity: 0; transform: translateY(10px); } }
+  @keyframes xj-pop { from { opacity: 0; transform: translateY(6px) scale(0.85); } }
+  @keyframes xj-fade { from { opacity: 0; } }
   .sub { font-size: 11px; color: var(--dim); margin-top: 4px; letter-spacing: 0.08em; text-transform: uppercase; }
   .bottom { margin-top: auto; width: 100%; }
   .stage { font-size: 12px; display: flex; justify-content: space-between; gap: 8px; color: var(--ink); min-height: 1.4em; }
@@ -81,9 +134,10 @@
   #boot { background: var(--acc); color: #04140b; border-color: transparent; font-weight: 600; }
   #stop[hidden], #boot[hidden] { display: none; }
 
-  /* Reduced motion: the arc stays still and the bar jumps. */
+  /* Reduced motion: no intro and no loop (main.js sets data-motion="reduced"; this holds before the script runs
+     too), the bar jumps, and the outro is a short fade with no movement. */
   @media (prefers-reduced-motion: reduce) {
-    .arc { animation: none; }
+    .l-spin, .halo i { animation: none !important; }
     .bar i { transition: none; }
   }
 
@@ -106,15 +160,19 @@
 </head>
 <body>
 <main class="shell">
-  <div class="phone" id="phone" data-state="idle" aria-label="Boot screen">
+  <div class="phone" id="phone" data-state="idle" data-anim="pre" aria-label="Boot screen">
     <canvas class="android" id="android-screen" tabindex="0" hidden aria-label="Android screen"></canvas>
-    <div class="logo">
-      <svg viewBox="0 0 72 72" aria-hidden="true">
-        <circle class="ring" cx="36" cy="36" r="31"/>
+    <div class="logo" aria-hidden="true">
+      <div class="halo"><i></i></div>
+      <div class="lyr l-ring"><svg viewBox="0 0 72 72"><circle class="ring" cx="36" cy="36" r="31"/></svg></div>
+      <div class="lyr l-arc"><div class="lyr l-spin"><svg viewBox="0 0 72 72">
+        <circle class="tail" cx="36" cy="36" r="31"/>
         <circle class="arc" cx="36" cy="36" r="31"/>
+      </svg></div></div>
+      <div class="lyr l-mark"><svg viewBox="0 0 72 72">
         <text class="glyph" id="glyph" x="36" y="37">小机</text>
         <image id="logo-img" x="16" y="16" width="40" height="40" preserveAspectRatio="xMidYMid meet" style="display:none"/>
-      </svg>
+      </svg></div>
     </div>
     <div class="name" id="name"><span>Xiao</span><b>Ji</b></div>
     <div class="sub" id="sub">Android 13</div>

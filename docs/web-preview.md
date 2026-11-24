@@ -37,8 +37,9 @@ progress bar, a detail line and a five-step strip. The ART cases are still on th
   class count from the preload's end), 3 "Starting system server" until phase 100, 4 "Starting services" from phase
   100 on. Stage 5 "Starting home" is reserved and stays pending: the boot does not reach it yet. Stage 4 has no end
   in the log, so its bar only estimates (its expected time is a guess, 90 s).
-- **Frames** (B17): once the first frame arrives, the Android picture covers the phone and the boot screen's logo and
-  progress are hidden; Stop and Show log stay above it. The fifth stage, "Starting home", starts at
+- **Frames** (B17): once the first frame arrives, the boot screen fades into the Android picture (the outro, below),
+  then its logo and progress are hidden; Stop and Show log stay above it. Until then the canvas is see-through, so
+  the boot screen's background shows during the boot. The fifth stage, "Starting home", starts at
   `sys.boot_completed=1` (the milestone `completed`); the milestone `home` is the launcher started as HOME.
 - **Restart**: the log line `xiaoji: init: zygote exited` (init, when the framework's process exits) shows
   "Android stopped · Restarting…", and the screen keeps that state. In a browser boot without a fatal exception this
@@ -53,10 +54,47 @@ one browser boot) weight its slice, and the slice fills toward its end without r
 back. It starts at 0 when the engine starts; the download has its own bar.
 
 **Theme.** `web/theme.json` is the default: the name parts (`name`, `accentPart`), the subtitle, the logo (`text`
-or an http(s) `image`), the colours (`bg1`, `bg2`, `ink`, `dim`, `accent`) and the stage labels with the milestone
-that starts each stage (`from`, `null` for a stage the boot does not reach). `?theme=pink` loads
-`web/theme-pink.json`. A theme that does not validate (`web/theme.js`) is replaced by the built-in default, and
-the page says why under the log. The logo and colours are checked before they are used.
+or an http(s) `image`), the colours (`bg1`, `bg2`, `ink`, `dim`, `accent`), the stage labels with the milestone
+that starts each stage (`from`, `null` for a stage the boot does not reach) and the boot animation (`animation`,
+below). `?theme=pink` loads `web/theme-pink.json` (a slower animation as well as pink). A theme that does not
+validate (`web/theme.js`) is replaced by the built-in default, and the page says why under the log. The logo,
+colours and animation knobs are checked before they are used.
+
+**Boot animation (W3).** The logo plays a boot animation in three parts, like a phone's: an intro once, a loop
+while the run works, and an outro into the first frame. `animPhase` in `web/bootscreen.js` gives the part (pure, with
+the node checks in `tests/bootanim.mjs`); `web/main.js` sets it as the phone's `data-anim`, and the CSS in
+`web/index.html` plays it. Only `transform` and `opacity` animate, on HTML layers, so the compositor does the work and
+no script runs per frame.
+
+| Part | When | What moves |
+|---|---|---|
+| `intro` | once, for `introMs` after the page first draws the screen | the glow swells in, the ring scales up, the accent arc sweeps in (one and a quarter turns, easing out), the 小机 glyph scales in, "Xiao" rises, "Ji" pops in, the subtitle fades in |
+| `loop` | downloading or booting (after the intro) | the arc, with a fainter piece behind it, turns once per `spinMs`; the glow breathes (opacity and scale) once per `breatheMs` |
+| `rest` | idle, Stop, the end of the run | nothing: the arc stands where it was |
+| `calm` | "Something went wrong" or "Android stopped" before a frame | the arc stops where it is and dims, the glow goes out |
+| `outro` | for `outroMs` after the first frame | the logo grows and fades, the wordmark and the progress fade away from the centre, and the picture fades in |
+| `off` | after the outro | the boot screen is hidden (`visibility`, so it takes no taps) |
+
+The loop's animations are paused, not removed, outside `loop` and `outro`, so no part change makes the arc jump. A
+hidden tab pauses them too (`data-paused`). With `prefers-reduced-motion: reduce` there is no intro and nothing moves
+(`data-motion="reduced"`); the outro is a 200 ms fade with no movement. A theme with `"style": "none"` has no
+animation at all, and the outro is a cut.
+
+The knobs are the theme's `animation` object; it is optional, and each field left out takes its default:
+
+| Key | Default | Range | |
+|---|---|---|---|
+| `style` | `"default"` | `"default"`, `"none"` | `"none"`: a still logo and a cut to the picture |
+| `introMs` | 2000 | 0 to 5000 | the intro's length (0: none) |
+| `outroMs` | 600 | 0 to 2000 | the fade into the first frame |
+| `spinMs` | 1600 | 400 to 10000 | one turn of the arc |
+| `breatheMs` | 3600 | 1000 to 20000 | one breath of the glow |
+| `glow` | `true` | `true`, `false` | the glow behind the logo |
+
+The colour is the theme's `accent`. `tests/bootanim.mjs` (run by `make test-web`) drives the page with a stand-in for
+the engine's worker, so it needs no boot: it checks the parts, that the loop animates only transform and opacity,
+the hidden-tab pause, the error state, reduced motion and a theme with the animation off, and saves
+`build/web-shots/w3-intro-{1..4}.png`, `w3-loop-{1,2}.png`, `w3-outro-{1,2}.png`, `w3-calm.png` and `w3-reduced.png`.
 
 **Log.** The logcat pane, the milestone table and the fetch counters are behind **Show log** (or `?log=1`).
 

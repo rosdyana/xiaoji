@@ -16,5 +16,6 @@
     { "label": "Starting system server", "from": "forked" },
     { "label": "Starting services", "from": "phase100" },
     { "label": "Starting home", "from": "completed" }
-  ]
+  ],
+  "animation": { "style": "default", "introMs": 2400, "outroMs": 700, "spinMs": 2000, "breatheMs": 4200, "glow": true }
 }
