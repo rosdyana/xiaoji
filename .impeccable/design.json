@@ -1,0 +1,443 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-25T14:00:47.075418+00:00",
+  "title": "Design System: XiaoJi",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "neutral",
+        "displayName": "Datasheet Paper",
+        "canonical": "#f4f3ee",
+        "tonalRamp": [
+          "#0c0b09",
+          "#262522",
+          "#43423e",
+          "#62615d",
+          "#83827e",
+          "#a6a5a0",
+          "#cac9c5",
+          "#efeeeb"
+        ]
+      },
+      "paper-2": {
+        "role": "neutral",
+        "displayName": "Bright Paper",
+        "canonical": "#fbfaf6",
+        "tonalRamp": [
+          "#0b0b0a",
+          "#262523",
+          "#43423f",
+          "#62615e",
+          "#83827f",
+          "#a6a5a1",
+          "#cac9c6",
+          "#efeeec"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#141614",
+        "tonalRamp": [
+          "#0a0b0a",
+          "#242524",
+          "#404340",
+          "#5f625f",
+          "#808380",
+          "#a3a6a3",
+          "#c7cac7",
+          "#edefed"
+        ]
+      },
+      "text-2": {
+        "role": "neutral",
+        "displayName": "Second Ink",
+        "canonical": "#4f544e",
+        "tonalRamp": [
+          "#0a0c09",
+          "#232622",
+          "#3f433e",
+          "#5e635d",
+          "#7f847e",
+          "#a1a7a0",
+          "#c6cbc4",
+          "#ecf0eb"
+        ]
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "Rule",
+        "canonical": "#141614",
+        "tonalRamp": [
+          "#0a0b0a",
+          "#242524",
+          "#404340",
+          "#5f625f",
+          "#808380",
+          "#a3a6a3",
+          "#c7cac7",
+          "#edefed"
+        ]
+      },
+      "hair": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#b9bcb3",
+        "tonalRamp": [
+          "#0b0c08",
+          "#242621",
+          "#41433c",
+          "#60625a",
+          "#81847b",
+          "#a3a69e",
+          "#c8cac2",
+          "#edefe9"
+        ]
+      },
+      "seg-off": {
+        "role": "neutral",
+        "displayName": "Unlit Segment",
+        "canonical": "#d5d8ce",
+        "tonalRamp": [
+          "#0b0c08",
+          "#242620",
+          "#41433c",
+          "#60625a",
+          "#81847b",
+          "#a4a69d",
+          "#c8cac1",
+          "#edf0e8"
+        ]
+      },
+      "green": {
+        "role": "primary",
+        "displayName": "XiaoJi Green",
+        "canonical": "#17a35a",
+        "tonalRamp": [
+          "#001300",
+          "#003303",
+          "#005616",
+          "#007932",
+          "#009c53",
+          "#43c075",
+          "#79e49d",
+          "#b3ffcc"
+        ]
+      },
+      "green-ink": {
+        "role": "primary",
+        "displayName": "Green Ink",
+        "canonical": "#0f7a42",
+        "tonalRamp": [
+          "#001200",
+          "#00310c",
+          "#005321",
+          "#02753d",
+          "#39985e",
+          "#5fbc7f",
+          "#8cdfa6",
+          "#c0ffd3"
+        ]
+      },
+      "green-wash": {
+        "role": "primary",
+        "displayName": "Green Wash",
+        "canonical": "#e3f1e8",
+        "tonalRamp": [
+          "#080d09",
+          "#202722",
+          "#3a453e",
+          "#59655d",
+          "#79867e",
+          "#9ca9a0",
+          "#c0cdc5",
+          "#e7f1eb"
+        ]
+      },
+      "sel": {
+        "role": "primary",
+        "displayName": "Selection Green",
+        "canonical": "#cbe8d6",
+        "tonalRamp": [
+          "#040e08",
+          "#192920",
+          "#31483b",
+          "#4f6859",
+          "#6f8a7a",
+          "#91ad9c",
+          "#b7d1c1",
+          "#e0f5e8"
+        ]
+      },
+      "led": {
+        "role": "primary",
+        "displayName": "LED Green",
+        "canonical": "#3ddc84",
+        "tonalRamp": [
+          "#001500",
+          "#003500",
+          "#00580a",
+          "#007c2a",
+          "#009f4c",
+          "#0bc46e",
+          "#63e897",
+          "#a6ffc7"
+        ]
+      },
+      "device": {
+        "role": "neutral",
+        "displayName": "Device Black",
+        "canonical": "#0d1116",
+        "tonalRamp": [
+          "#090b0e",
+          "#222529",
+          "#3e4248",
+          "#5d6268",
+          "#7d838a",
+          "#a0a6ad",
+          "#c4cad0",
+          "#ebeff4"
+        ]
+      },
+      "fault": {
+        "role": "state",
+        "displayName": "Fault Red",
+        "canonical": "#8f2414",
+        "tonalRamp": [
+          "#240000",
+          "#4d0100",
+          "#7a1709",
+          "#a33827",
+          "#ca5b49",
+          "#f27f6a",
+          "#ffa893",
+          "#ffd5c3"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Part Number",
+        "purpose": "XJ-13 in the strip; one per page."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "The single title line under the strips."
+      },
+      "title": {
+        "displayName": "Part Title",
+        "purpose": "The part's long name in the strip."
+      },
+      "subtitle": {
+        "displayName": "Subtitle",
+        "purpose": "h3 steps, definition terms, button labels."
+      },
+      "section": {
+        "displayName": "Section Head",
+        "purpose": "Numbered uppercase section headings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Description, features, how-it-works prose."
+      },
+      "table": {
+        "displayName": "Table",
+        "purpose": "Characteristics and ordering tables."
+      },
+      "note": {
+        "displayName": "Note",
+        "purpose": "Captions, test conditions, strips, footer, session record."
+      },
+      "value": {
+        "displayName": "Measured Value",
+        "purpose": "Mono numbers in tables and record times."
+      },
+      "pin": {
+        "displayName": "Pin Label",
+        "purpose": "Pin callouts and device keys."
+      }
+    },
+    "shadows": [
+      {
+        "name": "device-on-paper",
+        "value": "0 1px 0 rgba(255,255,255,0.06) inset, 0 22px 40px -22px rgba(20,22,20,0.55), 0 2px 6px rgba(20,22,20,0.12)",
+        "purpose": "The device bezel only."
+      },
+      {
+        "name": "hover-halo",
+        "value": "0 0 0 3px #e3f1e8, 0 0 0 4px #17a35a",
+        "purpose": "Primary button hover ring."
+      }
+    ],
+    "motion": [
+      {
+        "name": "control-state",
+        "value": "120ms ease",
+        "purpose": "Background and colour changes on buttons and pin keys."
+      },
+      {
+        "name": "cell-lit",
+        "value": "1100ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Green Wash flash fading under a seven-segment cell as it lights; off under reduced motion."
+      },
+      {
+        "name": "boot-intro",
+        "value": "2000ms",
+        "purpose": "Boot screen intro (theme.json introMs)."
+      },
+      {
+        "name": "boot-outro",
+        "value": "600ms",
+        "purpose": "Boot screen fade into the Android picture."
+      },
+      {
+        "name": "boot-spin",
+        "value": "1600ms linear",
+        "purpose": "Logo arc spin loop."
+      },
+      {
+        "name": "boot-breathe",
+        "value": "3600ms ease-in-out",
+        "purpose": "Logo halo breathing loop."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "phone",
+        "value": "599px"
+      },
+      {
+        "name": "one-column",
+        "value": "959px"
+      },
+      {
+        "name": "two-column",
+        "value": "1279px"
+      },
+      {
+        "name": "compact-pad",
+        "value": "1379px"
+      },
+      {
+        "name": "short",
+        "value": "max-height 879px"
+      },
+      {
+        "name": "large-scale",
+        "value": "1500px x 1060px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Start Android: the one primary action, beneath Figure 1.",
+      "html": "<button class=\"ds-btn\">Start <b>Android</b></button>",
+      "css": ".ds-btn{font:640 15px/1 \"Archivo\",\"Helvetica Neue\",Arial,sans-serif;padding:11px 22px;border-radius:3px;border:1px solid #141614;background:#141614;color:#f4f3ee;cursor:pointer;transition:background-color 120ms ease,box-shadow 120ms ease}.ds-btn b{color:#3ddc84;font-weight:640}.ds-btn:hover{box-shadow:0 0 0 3px #e3f1e8,0 0 0 4px #17a35a}.ds-btn:focus-visible{outline:2px solid #0f7a42;outline-offset:3px}"
+    },
+    {
+      "name": "Quiet Button",
+      "kind": "button",
+      "refersTo": "button-quiet",
+      "description": "Secondary action beside the primary (Stop).",
+      "html": "<button class=\"ds-btn-quiet\">Stop</button>",
+      "css": ".ds-btn-quiet{font:640 15px/1 \"Archivo\",\"Helvetica Neue\",Arial,sans-serif;padding:11px 22px;border-radius:3px;border:1px solid #141614;background:transparent;color:#141614;cursor:pointer;transition:background-color 120ms ease}.ds-btn-quiet:hover{background:#fbfaf6}.ds-btn-quiet:focus-visible{outline:2px solid #0f7a42;outline-offset:3px}"
+    },
+    {
+      "name": "Pin Key",
+      "kind": "button",
+      "refersTo": "pin-key",
+      "description": "A device control drawn as a numbered pin (Back, Home).",
+      "html": "<button class=\"ds-pin-key\"><svg viewBox=\"0 0 12 12\" aria-hidden=\"true\"><path d=\"M7.5 2.5 4 6l3.5 3.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.4\" stroke-linecap=\"square\"/></svg>BACK<span class=\"ds-pno\">1</span></button>",
+      "css": ".ds-pin-key{display:inline-flex;align-items:center;gap:6px;padding:5px 8px 5px 7px;border:1px solid #141614;border-radius:2px;background:#fbfaf6;color:#141614;font:11.5px/1 \"Fragment Mono\",ui-monospace,Menlo,monospace;letter-spacing:.04em;cursor:pointer;transition:background-color 120ms ease,color 120ms ease}.ds-pin-key svg{width:12px;height:12px}.ds-pno{font:600 11px/1 \"Archivo\",Arial,sans-serif;color:#4f544e;margin-left:2px}.ds-pin-key:hover{background:#141614;color:#f4f3ee}.ds-pin-key:hover .ds-pno{color:inherit}.ds-pin-key:active{transform:translateY(1px)}.ds-pin-key:focus-visible{outline:2px solid #0f7a42;outline-offset:3px}"
+    },
+    {
+      "name": "Numbered Section Heading",
+      "kind": "custom",
+      "description": "Every section opens with a numbered, tracked uppercase head on a black rule.",
+      "html": "<h2 class=\"ds-h2\"><span>3</span>Characteristics</h2>",
+      "css": ".ds-h2{display:flex;gap:10px;align-items:baseline;margin:0 0 12px;font:700 13px/1.5 \"Archivo\",Arial,sans-serif;letter-spacing:.06em;text-transform:uppercase;color:#141614;border-bottom:1px solid #141614;padding-bottom:4px}.ds-h2 span{color:#4f544e;font-weight:500}"
+    },
+    {
+      "name": "Characteristics Row",
+      "kind": "custom",
+      "description": "Measured value in mono beside a This-session seven-segment readout, unlit until measured.",
+      "html": "<table class=\"ds-tbl\"><thead><tr><th>Parameter</th><th class=\"n\">Measured</th><th class=\"n\">This session</th></tr></thead><tbody><tr><td>Press to home screen</td><td class=\"n v\">2.8–4.2 s</td><td class=\"n\"><span class=\"ds-seg\"><svg viewBox=\"-1 0 38 18\" width=\"30\" height=\"14\"><g transform=\"skewX(-7) translate(2 0)\"><rect x=\"1\" y=\"0\" width=\"8\" height=\"2\"/><rect x=\"1\" y=\"8\" width=\"8\" height=\"2\"/><rect x=\"1\" y=\"16\" width=\"8\" height=\"2\"/><rect x=\"14\" y=\"0\" width=\"8\" height=\"2\"/><rect x=\"14\" y=\"8\" width=\"8\" height=\"2\"/><rect x=\"14\" y=\"16\" width=\"8\" height=\"2\"/><rect x=\"27\" y=\"0\" width=\"8\" height=\"2\"/><rect x=\"27\" y=\"8\" width=\"8\" height=\"2\"/><rect x=\"27\" y=\"16\" width=\"8\" height=\"2\"/></g></svg><span>s</span></span></td></tr></tbody></table>",
+      "css": ".ds-tbl{border-collapse:collapse;width:100%;font:13px \"Archivo\",Arial,sans-serif;font-variant-numeric:tabular-nums;color:#141614}.ds-tbl th,.ds-tbl td{border-bottom:1px solid #b9bcb3;padding:6px;text-align:left}.ds-tbl th{font-size:12px;font-weight:700;border-bottom-color:#141614}.ds-tbl .n{text-align:right}.ds-tbl .v{font:12.5px \"Fragment Mono\",ui-monospace,monospace}.ds-seg{display:inline-flex;gap:4px;align-items:baseline}.ds-seg rect{fill:#d5d8ce}.ds-seg span{font:12px \"Fragment Mono\",monospace;color:#4f544e}"
+    },
+    {
+      "name": "Block Diagram Layer",
+      "kind": "card",
+      "refersTo": "diagram-layer",
+      "description": "Layers hanging off one vertical axis; the engine layer carries the green accent.",
+      "html": "<div class=\"ds-axis\"><div class=\"ds-layer\"><div><b>This tab · Web Worker</b><span>JavaScript</span></div></div><p class=\"ds-if\">postMessage · SharedArrayBuffer</p><div class=\"ds-layer acc\"><div><b>XiaoJi engine · ARM64 → wasm</b><span>C</span></div></div></div>",
+      "css": ".ds-axis{position:relative;padding-left:26px;font-family:\"Archivo\",Arial,sans-serif;color:#141614}.ds-axis::before{content:\"\";position:absolute;left:6px;top:4px;bottom:4px;width:2px;background:#141614}.ds-layer{position:relative;margin-bottom:6px}.ds-layer::before{content:\"\";position:absolute;left:-20px;top:50%;width:20px;height:1px;background:#141614}.ds-layer::after{content:\"\";position:absolute;left:-23px;top:calc(50% - 3px);width:6px;height:6px;background:#141614}.ds-layer div{display:flex;justify-content:space-between;gap:12px;padding:7px 10px;border:1px solid #141614;background:#fbfaf6;font-size:13px}.ds-layer b{font-weight:600}.ds-layer span{font-size:12px;color:#4f544e}.ds-layer.acc div{border:2px solid #17a35a;padding:6px 9px;background:#e3f1e8}.ds-layer.acc::before,.ds-layer.acc::after{background:#17a35a}.ds-if{font:11px/1.2 \"Fragment Mono\",monospace;color:#4f544e;margin:-1px 0 5px 10px}"
+    },
+    {
+      "name": "Text Link",
+      "kind": "nav",
+      "description": "Strip navigation and inline links: ink underline that thickens and turns green on hover.",
+      "html": "<nav class=\"ds-nav\"><a href=\"#\">How it works</a><a href=\"#\">Measurements</a><a href=\"#\">GitHub</a></nav>",
+      "css": ".ds-nav{display:flex;gap:20px;font:600 15px/1.5 \"Archivo\",Arial,sans-serif}.ds-nav a{color:#141614;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}.ds-nav a:hover{color:#0f7a42;text-decoration-thickness:2px}.ds-nav a:focus-visible{outline:2px solid #0f7a42;outline-offset:3px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Component Datasheet",
+    "overview": "The page is published the way a semiconductor part is: a quiet, exact document on datasheet paper, in black ink, with a part number at the top, numbered sections, a characteristics table with its test conditions, and a block diagram. Its Figure 1 is not a picture of a phone but the phone itself, running, drawn at an exact scale with pin callouts to its controls. Everything on the paper is there to describe that one part honestly.\n\nDensity is that of a real datasheet: small, tabular, hairline-ruled, with the eye led by rules and numbers rather than by size or colour. One green is the only accent, and it marks either the brand (the \"-13\" of the part number, the headline's second clause, the engine layer) or an interaction state. The device is the one dark object on the sheet, and inside it the XiaoJi boot screen keeps its own dark theme and animation.\n\nThe world rejects the dark split-hero landing with a glowing device and a stat row. Numbers appear only with their conditions; a value not yet measured is shown as an unlit display, never as a placeholder number.",
+    "keyCharacteristics": [
+      "Warm off-white paper, near-black ink, one green; the device is the only dark mass.",
+      "A 3px part-number strip, then 1px black rules for structure and grey hairlines for rows.",
+      "Numbered, uppercase, tracked section headings sitting on a black rule.",
+      "Archivo (variable width, narrowed for display) for all text; Fragment Mono only for measured values, interfaces and pin labels.",
+      "Square leader-line terminals (5-6px squares) on pins, list bullets, and the diagram's vertical axis.",
+      "Seven-segment ghost readouts for values this session has not measured yet."
+    ],
+    "rules": [
+      {
+        "name": "The Spot Colour Rule",
+        "body": "Green is the only accent on the paper; Fault Red appears only on a failed record row. Use Green Ink for green text and outlines on paper, XiaoJi Green for lines and borders, Green Wash for fills, LED Green only on the dark device or the black button.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Dark Object Rule",
+        "body": "The device is the only dark surface on the page. Panels, tables and diagrams are paper with black rules, never dark cards.",
+        "section": "colors"
+      },
+      {
+        "name": "The Measured Mono Rule",
+        "body": "Monospace is for measured values, interface names and pin labels only. Prose, headings and buttons are Archivo.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Figures Rule",
+        "body": "Every place numbers line up (tables, notes, the strip's revision, the phone's stage count) uses tabular figures.",
+        "section": "typography"
+      },
+      {
+        "name": "The Exact Scale Rule",
+        "body": "The device is never sized fluidly. It is 540 x 960 multiplied by 0.5, 0.6 or 0.75, and the figure caption names the factor.",
+        "section": "layout"
+      },
+      {
+        "name": "The Rules Not Shadows Rule",
+        "body": "Nothing on the paper casts a shadow except the device. Separate and raise with rules and borders.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do number every section heading and set it uppercase 13px/700 at 0.06em on a 1px black rule.",
+      "Do print every performance number with its test conditions, and show unmeasured values as unlit seven-segment cells.",
+      "Do keep the device at 540 x 960 times 0.5, 0.6 or 0.75 and say the scale in the caption.",
+      "Do use Fragment Mono for measured values, interface names and pin labels, and Archivo for everything else.",
+      "Do use small filled squares as terminals and bullets."
+    ],
+    "donts": [
+      "Don't place a dark hero, a glowing device, or a row of big stat numbers on the page.",
+      "Don't add a second accent hue; green is the only accent, and Fault Red marks failures only.",
+      "Don't give paper surfaces shadows or rounded corners; only the device is rounded and shadowed.",
+      "Don't restyle the boot screen inside the phone with paper tokens; it follows its theme files."
+    ]
+  }
+}

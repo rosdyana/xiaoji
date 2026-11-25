@@ -13,6 +13,7 @@
 //   /xiaoji.rc              image/xiaoji.rc, the boot config the page passes to --init (W1)
 //   /xj/<path>              build/web/xj/<path>: the chunk store (tools/pack.py, docs/loading.md). The chunks
 //                           and packs are named by their hash, so they are served as immutable.
+//   /fonts/<name>           web/fonts/<name>: the page's fonts and their licences
 //   /<name>                 web/<name>, else build/wasm/<name>
 //   POST /__snap/<name>?off=N[&truncate=1]
 //                           only with --snapshot-upload DIR (make snapshot): the web engine's snapshot (engine/snap.c,
@@ -50,6 +51,7 @@ const TYPES = {
   '.json': 'application/json; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
+  '.woff2': 'font/woff2',
 };
 
 function contentType(path) {
@@ -71,6 +73,7 @@ async function locate(urlPath) {
   if (p.startsWith('/rootfs/')) return within(DIRS.rootfs, p.slice('/rootfs'.length));
   if (p.startsWith('/rootfs-xiaoji/')) return within(DIRS.rootfsXiaoji, p.slice('/rootfs-xiaoji'.length));
   if (p.startsWith('/xj/')) return within(DIRS.xj, p.slice('/xj'.length));
+  if (p.startsWith('/fonts/')) return within(join(DIRS.web, 'fonts'), p.slice('/fonts'.length)); // the page's fonts and their licences
   if (p === '/') p = '/index.html';
   const name = p.slice(1);
   if (!name || name.includes('/')) return null;

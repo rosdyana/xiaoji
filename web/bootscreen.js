@@ -25,6 +25,7 @@ export function newScreen(theme) {
     dl: { loaded: 0, total: 0, fromCache: false, cacheable: false },
     classes: null,
     errorKind: null, // null, 'fatal' (system_server) or 'error' (the worker)
+    errorWhat: null, // { label, detail } for an error, when the page knows what failed
     restarted: false, // init restarted the framework (RESTART in cases.js)
     fill: 0,
     exitCode: null,
@@ -34,7 +35,7 @@ export function newScreen(theme) {
 // A new run: the download phase starts.
 export function startRun(s) {
   Object.assign(s, {
-    phase: 'download', stage: -1, enteredAt: 0, stageLog: [], classes: null, errorKind: null, restarted: false,
+    phase: 'download', stage: -1, enteredAt: 0, stageLog: [], classes: null, errorKind: null, errorWhat: null, restarted: false,
     dl: { loaded: 0, total: 0, fromCache: false, cacheable: false }, fill: 0, exitCode: null,
   });
 }
@@ -89,8 +90,10 @@ export function onRestart(s) {
   if (s.phase === 'boot') s.restarted = true;
 }
 
-export function onError(s) {
+// what (optional): { label, detail }, what failed and what to do, in the visitor's words (main.js says it).
+export function onError(s, what) {
   if (!s.errorKind) s.errorKind = 'error';
+  if (what && !s.errorWhat) s.errorWhat = what;
 }
 
 export function onEnd(s, exitCode, now) {
@@ -138,7 +141,7 @@ export function render(s, now) {
 
   if (s.phase === 'idle') {
     label = 'Ready';
-    detail = 'Press Boot Android to start';
+    detail = 'Press Start Android';
   } else if (s.phase === 'download') {
     const d = s.dl;
     const pct = d.total ? Math.min(100, (d.loaded / d.total) * 100) : 0;
@@ -174,7 +177,7 @@ export function render(s, now) {
     }
   } else if (s.phase === 'stopped') {
     label = 'Stopped';
-    detail = 'Press Boot Android to start again';
+    detail = 'Press Start Android to start again';
     if (s.stage >= 0) {
       count = `${s.stage + 1} / ${n}`;
       for (let k = 0; k < s.stage; k++) steps[k] = 'done';
@@ -198,9 +201,17 @@ export function render(s, now) {
     detail = 'The framework exited; init restarts it';
     raw = s.fill;
   } else if (s.errorKind) {
+    // The label says what failed; the count and the steps go, so nothing on the screen reads as progress.
     state = 'error';
-    label = 'Something went wrong';
-    detail = s.errorKind === 'fatal' ? 'system_server stopped' : 'The engine stopped';
+    if (s.errorWhat) {
+      label = s.errorWhat.label;
+      detail = s.errorWhat.detail;
+    } else {
+      label = s.errorKind === 'fatal' ? 'Android stopped' : 'The engine stopped';
+      detail = s.errorKind === 'fatal' ? 'system_server stopped' : 'Press Start Android to try again';
+    }
+    count = '';
+    steps.fill('');
     raw = s.fill;
   }
 

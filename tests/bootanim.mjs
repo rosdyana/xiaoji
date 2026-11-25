@@ -371,7 +371,7 @@ async function pageChecks(chromium, baseUrl) {
       arc: getComputedStyle(document.querySelector('.l-arc')).opacity,
       halo: getComputedStyle(document.querySelector('.halo')).opacity,
     }));
-    check(a.anim === 'calm' && a.screen.label === 'Something went wrong', `page, error: calm, "${a.screen.label}"`);
+    check(a.anim === 'calm' && a.screen.label === 'The engine stopped' && a.screen.count === '', `page, error: calm, says what failed, no progress count ("${a.screen.label}", "${a.screen.count}")`);
     check(calm.spin === 'paused', 'page, error: the arc stops');
     await err.clock.runFor(1000);
     await resumeAll(err);

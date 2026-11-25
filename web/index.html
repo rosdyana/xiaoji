@@ -3,44 +3,300 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>XiaoJi: Android in the browser</title>
+<title>XiaoJi: Android 13 in a browser tab</title>
+<meta name="description" content="Real Android 13 running in a browser tab, on a user-mode ARM64 engine compiled to WebAssembly. No install, no VM, no server-side phone.">
+<meta name="theme-color" content="#f4f3ee">
+<link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
 <style>
-  :root {
-    --bg1: #0b0f14; --bg2: #121a24; --ink: #e8eef5; --dim: #7d8b9b; --acc: #3ddc84;
-    --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
-    color-scheme: dark;
+  @font-face {
+    font-family: "Archivo"; src: url("fonts/archivo.woff2") format("woff2");
+    font-weight: 100 900; font-stretch: 62% 125%; font-display: swap;
   }
-  html, body { height: 100%; margin: 0; }
-  body {
-    min-height: 100%; font: 14px/1.4 var(--sans); color: var(--ink);
-    background: radial-gradient(120% 80% at 50% 35%, var(--bg2), var(--bg1) 75%);
+  @font-face {
+    font-family: "Fragment Mono"; src: url("fonts/fragment-mono.woff2") format("woff2");
+    font-weight: 400; font-display: swap;
   }
 
-  /* The boot screen: a phone frame, centred. On a narrow viewport it fills the screen. */
-  .shell { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
-  /* The Android screen (web/input.js): the phone's display, 720 x 1280, shown only while the boot runs. */
-  /* The screen is under the boot's controls (they are raised above it), so the Stop button and the bar stay usable. */
-  .android-screen { position: absolute; z-index: 0; left: 50%; top: 50%; transform: translate(-50%, -50%); height: 100%; max-width: 100%; aspect-ratio: 720 / 1280; background: transparent; border-radius: 14px; outline: none; }
+  /* The page: datasheet paper, black ink, one green. The phone (#phone) keeps its own theme (web/theme.json). */
+  :root {
+    --paper: #f4f3ee; --paper-2: #fbfaf6; --text: #141614; --text-2: #4f544e; --rule: #141614; --hair: #b9bcb3;
+    --seg-off: #d5d8ce; --green: #17a35a; --green-ink: #0f7a42; --green-wash: #e3f1e8; --led: #3ddc84; --device: #0d1116;
+    --sel: #cbe8d6;
+    --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --mono: "Fragment Mono", ui-monospace, Menlo, monospace;
+    --pad: 56px; --gap: 40px; --pin: 104px; --pin-r: 150px;
+    /* The display's scale on the page: a clean fraction of 540 x 960 (0.5, 0.6 or 0.75), chosen by the viewport. */
+    --s: 0.6;
+    color-scheme: light;
+  }
+  @media (max-height: 879px) { :root { --s: 0.5; } }
+  @media (min-width: 1500px) and (min-height: 1060px) { :root { --s: 0.75; } }
+  @media (max-width: 1379px) { :root { --pad: 36px; --gap: 32px; --pin: 96px; --pin-r: 146px; } }
+  @media (max-width: 959px) { :root { --s: 0.5; --pad: 16px; --gap: 28px; } }
+
+  * { box-sizing: border-box; }
+  html { background: var(--paper); scrollbar-color: #8d9189 var(--paper); scroll-padding-top: 16px; }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+  body {
+    margin: 0; background: var(--paper); color: var(--text); caret-color: var(--green-ink);
+    font: 400 15px/1.5 var(--sans); font-kerning: normal; -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--sel); color: var(--text); }
+  a { color: var(--text); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:hover { color: var(--green-ink); text-decoration-thickness: 2px; }
+  :focus-visible { outline: 2px solid var(--green-ink); outline-offset: 3px; }
+  h1, h2, h3, p, ol, ul, dl, dd, figure { margin: 0; }
+  code, .mono { font-family: var(--mono); font-size: 0.92em; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+  /* Part-number strip. */
+  .strip {
+    display: grid; grid-template-columns: auto 1fr auto auto; align-items: end; gap: 12px 32px;
+    padding: 14px var(--pad) 9px; border-bottom: 3px solid var(--rule);
+  }
+  .pn { font: 760 32px/0.9 var(--sans); font-stretch: 88%; letter-spacing: -0.01em; }
+  .pn span { color: var(--green-ink); }
+  .title { font-size: 17px; font-weight: 600; line-height: 1.3; text-wrap: balance; }
+  .links { display: flex; gap: 20px; font-weight: 600; }
+  .meta { font-size: 12px; line-height: 1.35; color: var(--text-2); text-align: right; font-variant-numeric: tabular-nums; }
+  .strip-2 {
+    display: flex; flex-wrap: wrap; gap: 4px 36px; padding: 6px var(--pad); border-bottom: 1px solid var(--rule);
+    font-size: 12.5px; color: var(--text-2);
+  }
+  .strip-2 a { color: var(--text-2); }
+
+  /* First sheet: description, Figure 1, characteristics. */
+  .sheet {
+    display: grid; gap: 0 var(--gap); padding: 14px var(--pad) 0;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.12fr);
+    grid-template-rows: auto 1fr;
+    grid-template-areas: "lede fig spec" "feat fig spec";
+  }
+  .lede { grid-area: lede; }
+  .feat { grid-area: feat; padding-top: 22px; }
+  .fig { grid-area: fig; }
+  .spec { grid-area: spec; }
+  h2 {
+    display: flex; gap: 10px; align-items: baseline; font-size: 13px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; border-bottom: 1px solid var(--rule); padding-bottom: 4px; margin-bottom: 12px;
+  }
+  h2 .no { color: var(--text-2); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .titleblock { padding: 11px var(--pad) 10px; border-bottom: 1px solid var(--rule); }
+  h1 {
+    font-size: clamp(28px, 2.3vw, 40px); line-height: 1.08; font-weight: 720; font-stretch: 86%;
+    letter-spacing: -0.02em; text-wrap: balance;
+  }
+  h1 em { font-style: normal; color: var(--green-ink); }
+  .lede p { max-width: 60ch; margin-bottom: 10px; }
+  .feat ul { list-style: none; padding: 0; }
+  .feat li { position: relative; padding-left: 18px; margin-bottom: 7px; max-width: 56ch; }
+  .feat li::before { content: ""; position: absolute; left: 2px; top: 0.62em; width: 6px; height: 6px; background: var(--text); }
+
+  /* Figure 1: the device at an exact scale, with pin callouts. */
+  .fig { display: flex; flex-direction: column; align-items: center; }
+  .figure {
+    display: grid; grid-template-columns: var(--pin) auto var(--pin-r); position: relative;
+  }
+  .device {
+    grid-column: 2; padding: 12px; border-radius: 30px; background: var(--device);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 22px 40px -22px rgba(20, 22, 20, 0.55), 0 2px 6px rgba(20, 22, 20, 0.12);
+  }
+  .pins { position: relative; }
+  .pins-l { grid-column: 1; grid-row: 1; }
+  .pins-r { grid-column: 3; grid-row: 1; }
+  .pin { position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 6px; }
+  .pins-l .pin { flex-direction: row; }
+  .pins-r .pin { flex-direction: row-reverse; }
+  .pin .lead { flex: 1; height: 1px; background: var(--text); position: relative; min-width: 14px; }
+  /* The pin's end on the device: a small square pad. */
+  .pins-l .pin .lead::after, .pins-r .pin .lead::after {
+    content: ""; position: absolute; top: -2px; width: 5px; height: 5px; background: var(--text);
+  }
+  .pins-l .pin .lead::after { right: -12px; }
+  .pins-r .pin .lead::after { left: -12px; }
+  .pins-l .pin .lead { margin-right: -12px; }
+  .pins-r .pin .lead { margin-left: -12px; }
+  .pin-label { flex: none; font: 11.5px/1.3 var(--mono); letter-spacing: 0.02em; white-space: nowrap; }
+  .pins-r .pin-label { text-align: left; }
+  .pin-label .sep { display: none; }
+  .pin-label small { display: block; font: 11px/1.3 var(--sans); color: var(--text-2); letter-spacing: 0; white-space: normal; max-width: 13ch; }
+  .pin-key {
+    display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px 5px 7px; border: 1px solid var(--text); border-radius: 2px;
+    background: var(--paper-2); color: var(--text); font: 11.5px/1 var(--mono); letter-spacing: 0.04em; cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+  .pin-key svg { width: 12px; height: 12px; flex: none; }
+  .pno { font: 600 11px/1 var(--sans); color: var(--text-2); }
+  .pin-key .pno { margin-left: 2px; }
+  .pin-label { display: flex; gap: 6px; align-items: baseline; }
+  .pin-key:hover:not(:disabled) { background: var(--text); color: var(--paper); }
+  .pin-key:active:not(:disabled) { transform: translateY(1px); }
+  .pin-key:disabled { cursor: default; color: var(--text-2); border-color: var(--hair); background: transparent; }
+  .cap { margin-top: 6px; font-size: 12.5px; color: var(--text-2); text-align: center; max-width: 62ch; text-wrap: balance; }
+  .cap b { color: var(--text); font-weight: 650; }
+  .go { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: center; }
+  .btn {
+    font: 640 15px/1 var(--sans); padding: 11px 22px; border-radius: 3px; border: 1px solid var(--text); cursor: pointer;
+    background: var(--text); color: var(--paper); transition: background-color 120ms ease, box-shadow 120ms ease;
+  }
+  .btn b { color: var(--led); font-weight: 640; }
+  .btn:hover:not(:disabled) { box-shadow: 0 0 0 3px var(--green-wash), 0 0 0 4px var(--green); }
+  .btn.quiet { background: transparent; color: var(--text); }
+  .btn.quiet:hover { background: var(--paper-2); }
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  #stop[hidden], #boot[hidden] { display: none; }
+  .note { font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+  /* The session record: each stage and event lands once, with its time from the press. */
+  .record { width: 100%; max-width: 440px; margin-top: 10px; }
+  .record-head {
+    display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid var(--rule);
+    padding-bottom: 3px; font-size: 12px;
+  }
+  .record-head h3 { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+  .linkbtn {
+    font: inherit; font-size: 12px; background: none; border: 0; padding: 2px 0; color: var(--text-2); cursor: pointer;
+    text-decoration: underline; text-underline-offset: 3px;
+  }
+  .linkbtn:hover { color: var(--green-ink); }
+  #record { list-style: none; padding: 0; counter-reset: ev; font-size: 12.5px; }
+  #record li {
+    counter-increment: ev; display: grid; grid-template-columns: 2.2em 1fr auto; gap: 8px; align-items: baseline;
+    padding: 4px 0; border-bottom: 1px solid var(--hair);
+  }
+  #record li::before { content: counter(ev); color: var(--text-2); font-variant-numeric: tabular-nums; }
+  #record li.empty { display: block; color: var(--text-2); }
+  #record li.empty::before { content: none; }
+  #record li.bad { color: #8f2414; }
+  #record li.bad::before { color: #8f2414; }
+  #record time { font: 12px var(--mono); color: var(--text); white-space: nowrap; }
+
+  /* Characteristics. */
+  table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { border-bottom: 1px solid var(--hair); padding: 6px 6px; text-align: left; vertical-align: baseline; }
+  th { font-size: 12px; font-weight: 700; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  th:first-child, td:first-child { padding-left: 0; }
+  th.n, td.n { text-align: right; }
+  td.n { font: 12.5px var(--mono); white-space: nowrap; }
+  td sup, .notes sup { font: 600 9px var(--sans); color: var(--text-2); margin-left: 1px; }
+  /* This session: a seven-segment readout (main.js draws it). Unmeasured, every segment is drawn unlit; the session's
+     own value lights its segments once. */
+  .seg { display: inline-flex; align-items: baseline; gap: 4px; vertical-align: -1px; }
+  .seg svg { display: block; overflow: visible; }
+  .seg .off { fill: var(--seg-off); }
+  .seg .on { fill: var(--text); }
+  .seg .unit { font: 12px var(--mono); color: var(--text); min-width: 2ch; text-align: left; }
+  .seg .unit.off { color: var(--text-2); }
+  td.untimed { font: 12px var(--sans); color: var(--text-2); }
+  @media (prefers-reduced-motion: no-preference) {
+    td.just-lit { animation: lit 1100ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+    @keyframes lit { from { background: var(--green-wash); } }
+  }
+  .notes { margin-top: 8px; font-size: 12px; color: var(--text-2); }
+  .notes p + p { margin-top: 3px; }
+  .notes b { font-weight: 600; color: var(--text); }
+
+  /* The block diagram: one vertical axis, four layers hanging off it. */
+  .diagram { margin-top: 26px; }
+  .axis { position: relative; padding-left: 26px; }
+  .axis::before { content: ""; position: absolute; left: 6px; top: 4px; bottom: 4px; width: 2px; background: var(--text); }
+  .layer { position: relative; margin-bottom: 6px; }
+  .layer::before { content: ""; position: absolute; left: -20px; top: 50%; width: 20px; height: 1px; background: var(--text); }
+  .layer::after { content: ""; position: absolute; left: -23px; top: calc(50% - 3px); width: 6px; height: 6px; background: var(--text); }
+  .layer div {
+    display: flex; justify-content: space-between; gap: 12px; align-items: baseline; padding: 7px 10px;
+    border: 1px solid var(--rule); background: var(--paper-2); font-size: 13px;
+  }
+  .layer div b { font-weight: 600; }
+  .layer div span { font-size: 12px; color: var(--text-2); text-align: right; white-space: nowrap; }
+  .iface { font: 11px/1.2 var(--mono); color: var(--text-2); margin: -1px 0 5px 10px; }
+  .layer.acc div { border-color: var(--green); border-width: 2px; padding: 6px 9px; background: var(--green-wash); }
+  .layer.acc::before, .layer.acc::after { background: var(--green); }
+
+  /* Below the fold: how it works, limits, ordering information. */
+  .more {
+    display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 0 var(--gap);
+    grid-template-rows: auto 1fr; padding: 56px var(--pad) 0; max-width: 1440px;
+  }
+  .more section { margin-bottom: 40px; }
+  .how { grid-row: span 2; }
+  .how .axis { padding-left: 30px; }
+  .how .axis::before { top: 10px; }
+  .how .step { position: relative; margin-bottom: 18px; max-width: 64ch; }
+  .how .step::before { content: ""; position: absolute; left: -24px; top: 0.68em; width: 18px; height: 1px; background: var(--text); }
+  .how .step::after { content: ""; position: absolute; left: -27px; top: calc(0.68em - 3px); width: 6px; height: 6px; background: var(--text); }
+  .how .step.acc::before, .how .step.acc::after { background: var(--green); }
+  .how h3, .limits dt { font-size: 15px; font-weight: 650; margin-bottom: 3px; }
+  .limits dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; }
+  .limits dt { margin: 0; }
+  .limits dd { color: var(--text); max-width: 52ch; }
+  .order table td:first-child { font-weight: 600; white-space: nowrap; }
+  .order table td { font-size: 13.5px; }
+
+  .foot {
+    display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 32px; margin-top: 16px;
+    padding: 10px var(--pad) 28px; border-top: 1px solid var(--rule); font-size: 12.5px; color: var(--text-2);
+  }
+  .foot a { color: var(--text-2); }
+
+  /* Two columns (narrower desktops): the text beside the figure. */
+  @media (max-width: 1279px) {
+    .sheet { grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto 1fr; grid-template-areas: "lede fig" "feat fig" "spec fig"; }
+    .spec { padding-top: 26px; }
+    .more { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; }
+    .how { grid-row: auto; }
+  }
+  /* One column: the headline, then the figure, then the rest. */
+  @media (max-width: 959px) {
+    .strip { grid-template-columns: auto 1fr; }
+    .links { grid-column: 1 / -1; flex-wrap: wrap; }
+    .meta { text-align: left; grid-column: 1 / -1; }
+    .sheet { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "lede" "fig" "feat" "spec"; }
+    .fig { padding: 8px 0 4px; }
+    .feat { padding-top: 28px; }
+    h1 { font-size: 32px; }
+  }
+  /* Phones: the pins become a row under the device. */
+  @media (max-width: 599px) {
+    .figure { grid-template-columns: auto; justify-items: center; }
+    .device { grid-column: 1; }
+    .pin-label br { display: none; }
+    .pin-label .sep { display: inline; }
+    .pins { position: static; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px 16px; margin-top: 12px; }
+    .pins-l { grid-column: 1; grid-row: 2; }
+    .pins-r { grid-column: 1; grid-row: 3; }
+    .pins-r .pin { flex-direction: row; }
+    .pin { position: static; }
+    .pin .lead { display: none; }
+    .pin-label small { display: inline; max-width: none; margin-left: 4px; }
+    .limits dl { grid-template-columns: 1fr; gap: 2px; }
+    .limits dd { margin-bottom: 10px; }
+    .title { grid-column: 1 / -1; }
+  }
+
+  /* The screen (#phone): exactly 540 x 960 times the page's scale. Everything inside is the XiaoJi boot screen. */
+  #phone {
+    --bg1: #0b0f14; --bg2: #121a24; --ink: #e8eef5; --dim: #7d8b9b; --acc: #3ddc84;
+    --phsans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    font: 14px/1.4 var(--phsans); color: var(--ink); caret-color: auto;
+  }
+  #phone ::selection { background: rgba(61, 220, 132, 0.35); color: var(--ink); }
+  /* The Android screen (web/input.js) when the page creates it as a div. */
+  .android-screen { position: absolute; z-index: 0; inset: 0; background: transparent; border-radius: inherit; outline: none; }
   .phone > :not(.android-screen) { position: relative; z-index: 1; }
   .android-screen[hidden] { display: none; }
-  .android-screen:focus-visible { box-shadow: 0 0 0 2px #8ab4ff; }
-  .nav { display: flex; gap: 12px; }
   .phone {
     position: relative; box-sizing: border-box; overflow: hidden;
-    height: min(760px, 92vh); aspect-ratio: 9 / 19; max-width: 100vw;
-    border-radius: 26px; padding: 18px 18px 14px;
+    width: calc(540px * var(--s)); height: calc(960px * var(--s));
+    border-radius: 18px; padding: calc(30px * var(--s)) calc(30px * var(--s)) calc(26px * var(--s));
     background: radial-gradient(120% 70% at 50% 38%, var(--bg2), var(--bg1) 70%);
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset, 0 20px 60px rgba(0, 0, 0, 0.45);
     display: flex; flex-direction: column; align-items: center;
     font-variant-numeric: tabular-nums;
   }
-  @media (max-width: 480px) {
-    .phone { width: 100vw; height: 100vh; height: 100dvh; aspect-ratio: auto; border-radius: 0; box-shadow: none; }
-  }
-    /* The Android screen (web/frame.js): over the phone frame once the first frame arrives, scaled to fit. It is also
-     the touch screen (web/input.js maps its letterboxed picture to the display). Once frames arrive the boot screen
-     gives way: its logo and progress are hidden, and only the Stop and log buttons stay above the picture. */
-  .phone .android { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; z-index: 1; touch-action: none; }
+  /* The Android screen (web/frame.js): the 540 x 960 frame fills the screen box exactly. It is also the touch screen
+     (web/input.js maps its letterboxed picture to the display). Once frames arrive the boot screen gives way. */
+  .phone .android { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; z-index: 1; touch-action: none; border-radius: inherit; outline: none; }
+  .phone .android:focus-visible { box-shadow: 0 0 0 2px var(--acc) inset; }
   .phone .bottom { position: relative; z-index: 2; }
   /* The outro (W3): the boot screen fades into the picture over --outro, then is hidden (visibility, so it takes no taps). */
   .logo, .name, .sub, .stage, .bar, .detail, .steps { transition: opacity var(--outro) ease, transform var(--outro) ease; }
@@ -55,9 +311,8 @@
   /* Until the first frame the canvas is see-through, so the boot screen's own background shows; it fades in for the outro. */
   .phone:not([data-frame]) .android { opacity: 0; }
   .phone[data-frame] .android { transition: opacity var(--outro) ease; }
-  .phone[data-frame] .bottom, .phone[data-frame] .actions { pointer-events: none; }
-  .phone[data-frame] .actions button { pointer-events: auto; }
-  .logo { margin-top: 36%; width: 72px; height: 72px; pointer-events: none; }
+  .phone[data-frame] .bottom { pointer-events: none; }
+  .logo { margin-top: 36%; width: 72px; height: 72px; pointer-events: none; position: relative; }
   .logo svg { width: 100%; height: 100%; display: block; overflow: visible; }
   .lyr { position: absolute; inset: 0; }
   .ring { stroke: rgba(255, 255, 255, 0.08); fill: none; stroke-width: 5; }
@@ -123,84 +378,225 @@
   .steps i { flex: 1; height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.1); }
   .steps i.done { background: var(--acc); }
   .steps i.now { background: color-mix(in srgb, var(--acc) 50%, transparent); }
-  .actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; min-height: 30px; }
-  button {
-    font: inherit; font-size: 12px; color: var(--ink); background: rgba(255, 255, 255, 0.07);
-    border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 999px; padding: 6px 14px; cursor: pointer;
-  }
-  button:disabled { opacity: 0.4; cursor: default; }
-  button:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
-  button.link { background: none; border: 0; color: var(--dim); padding: 6px 2px; text-decoration: underline; }
-  #boot { background: var(--acc); color: #04140b; border-color: transparent; font-weight: 600; }
-  #stop[hidden], #boot[hidden] { display: none; }
 
   /* Reduced motion: no intro and no loop (main.js sets data-motion="reduced"; this holds before the script runs
      too), the bar jumps, and the outro is a short fade with no movement. */
   @media (prefers-reduced-motion: reduce) {
     .l-spin, .halo i { animation: none !important; }
     .bar i { transition: none; }
+    .pin-key, .btn { transition: none; }
   }
 
-  /* The developer panels, below the phone. Hidden unless asked for (Show log, ?log=1; ?cases=1). */
-  .dev { background: #f7f7f7; color: #111; padding: 1em 1.5em 2em; font: 14px/1.4 var(--sans); }
+  /* The engine's log and the developer panels. Hidden unless asked for (Show log, ?log=1; ?cases=1). */
+  .dev { margin: 0 var(--pad) 32px; padding: 16px 18px 20px; border: 1px solid var(--rule); background: var(--paper-2); font-size: 13.5px; }
   .dev[hidden] { display: none; }
-  .dev h2 { font-size: 18px; margin: 0.4em 0; }
-  .dev h3 { font-size: 15px; margin: 1em 0 0.3em; }
-  .dev p { margin: 0.4em 0; max-width: 60em; }
-  pre { background: #fff; border: 1px solid #ddd; padding: 0.75em; min-height: 2em; white-space: pre-wrap; }
-  table { border-collapse: collapse; }
-  td, th { padding: 0.15em 1em 0.15em 0; text-align: left; }
-  td.n { text-align: right; font-variant-numeric: tabular-nums; }
-  #blog { height: 24em; overflow-y: auto; font: 12px/1.3 ui-monospace, Menlo, monospace; }
-  #bms td { font-variant-numeric: tabular-nums; }
-  .dev button { background: #fff; color: #111; border-color: #bbb; }
+  .dev h2 { margin-bottom: 8px; }
+  .dev h3 { font-size: 13px; font-weight: 650; margin: 14px 0 4px; }
+  .dev p { margin: 6px 0; max-width: 90ch; }
+  .dev table { width: auto; }
+  .dev td, .dev th { padding: 3px 18px 3px 0; }
+  .dev td.n { font-size: 12px; }
+  .dev button { font: 600 13px var(--sans); padding: 6px 12px; border: 1px solid var(--text); background: var(--paper); color: var(--text); border-radius: 2px; cursor: pointer; }
+  .dev select { font: inherit; }
+  pre { background: var(--paper); border: 1px solid var(--hair); padding: 10px; min-height: 2em; white-space: pre-wrap; margin: 0; }
+  #blog { height: 24em; overflow-y: auto; font: 12px/1.35 var(--mono); }
+  #out, #err { font: 12px/1.35 var(--mono); }
   #themenote:empty { display: none; }
   #themenote { color: #8a4b00; }
 </style>
 </head>
 <body>
-<main class="shell">
-  <div class="phone" id="phone" data-state="idle" data-anim="pre" aria-label="Boot screen">
-    <canvas class="android" id="android-screen" tabindex="0" hidden aria-label="Android screen"></canvas>
-    <div class="logo" aria-hidden="true">
-      <div class="halo"><i></i></div>
-      <div class="lyr l-ring"><svg viewBox="0 0 72 72"><circle class="ring" cx="36" cy="36" r="31"/></svg></div>
-      <div class="lyr l-arc"><div class="lyr l-spin"><svg viewBox="0 0 72 72">
-        <circle class="tail" cx="36" cy="36" r="31"/>
-        <circle class="arc" cx="36" cy="36" r="31"/>
-      </svg></div></div>
-      <div class="lyr l-mark"><svg viewBox="0 0 72 72">
-        <text class="glyph" id="glyph" x="36" y="37">小机</text>
-        <image id="logo-img" x="16" y="16" width="40" height="40" preserveAspectRatio="xMidYMid meet" style="display:none"/>
-      </svg></div>
-    </div>
-    <div class="name" id="name"><span>Xiao</span><b>Ji</b></div>
-    <div class="sub" id="sub">Android 13</div>
-    <div class="bottom">
-      <div class="stage"><span id="stage-label" role="status" aria-live="polite"></span><span id="stage-count"></span></div>
-      <div class="bar" id="bar" role="progressbar" aria-label="Boot progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="bar-fill"></i></div>
-      <div class="detail" id="detail">Press Boot Android to start</div>
-      <div class="steps" id="steps" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
-      <div class="actions">
-        <button id="boot" type="button">Boot Android</button>
-        <button id="stop" type="button" hidden>Stop</button>
-        <button id="logtoggle" type="button" class="link" aria-expanded="false" aria-controls="devlog">Show log</button>
+<header class="strip">
+  <div class="pn" aria-label="Part number XJ-13">XJ<span>-13</span></div>
+  <p class="title">XiaoJi · Android 13 in a browser tab, on a user-mode ARM64 engine</p>
+  <nav class="links" aria-label="Page">
+    <a href="#how">How it works</a>
+    <a href="#characteristics">Measurements</a>
+    <a href="https://github.com/rosdyana/xiaoji">GitHub</a>
+  </nav>
+  <p class="meta">Rev. 2026-11<br>Apache-2.0</p>
+</header>
+<div class="strip-2">
+  <span>No install · no VM · no server-side phone</span>
+  <span>Sibling of <a href="https://github.com/rosdyana/xiaonux">xiaonux</a> (Debian in a tab)</span>
+  <span>Network: off in this build</span>
+  <span>Chromium-based browsers · desktop first</span>
+</div>
+
+<div class="titleblock">
+  <h1>Real Android 13, <em>running in this tab.</em></h1>
+</div>
+
+<main class="sheet">
+  <section class="lede" aria-labelledby="h-desc">
+    <h2 id="h-desc"><span class="no">1</span>Description</h2>
+    <p>An engine written in C and compiled to WebAssembly runs Android's own ARM64 programs and answers their Linux system calls itself: binder, futexes, files, input devices, the emulator's graphics pipe. OpenGL ES goes to WebGL2.</p>
+    <p>A booted snapshot restores straight to the home screen. Then open the app drawer, Settings, Files or Calculator.</p>
+  </section>
+
+  <section class="feat" aria-labelledby="h-feat">
+    <h2 id="h-feat"><span class="no">2</span>Features</h2>
+    <ul>
+      <li>Android 13 (AOSP): launcher, SystemUI, Settings, Files, Calculator</li>
+      <li>Touch, swipe and physical keyboard input</li>
+      <li>Restores a booted snapshot, delivered as content-addressed chunks</li>
+      <li>Runs on your machine: nothing is streamed from a server-side phone</li>
+    </ul>
+  </section>
+
+  <section class="fig" aria-label="Figure 1, the device">
+    <div class="figure">
+      <div class="pins pins-l">
+        <div class="pin" style="top: 22%">
+          <button id="btn-back" class="pin-key" type="button" disabled aria-label="Back">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M7.5 2.5 4 6l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/></svg>BACK<span class="pno" aria-hidden="true">1</span></button>
+          <i class="lead" aria-hidden="true"></i>
+        </div>
+        <div class="pin" style="top: 30%">
+          <button id="btn-home" class="pin-key" type="button" disabled aria-label="Home">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="3.6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>HOME<span class="pno" aria-hidden="true">2</span></button>
+          <i class="lead" aria-hidden="true"></i>
+        </div>
+      </div>
+      <div class="device">
+        <div class="phone" id="phone" data-state="idle" data-anim="pre" aria-label="Boot screen">
+          <canvas class="android" id="android-screen" tabindex="0" hidden aria-label="Android screen: click it, then type to use the keyboard"></canvas>
+          <div class="logo" aria-hidden="true">
+            <div class="halo"><i></i></div>
+            <div class="lyr l-ring"><svg viewBox="0 0 72 72"><circle class="ring" cx="36" cy="36" r="31"/></svg></div>
+            <div class="lyr l-arc"><div class="lyr l-spin"><svg viewBox="0 0 72 72">
+              <circle class="tail" cx="36" cy="36" r="31"/>
+              <circle class="arc" cx="36" cy="36" r="31"/>
+            </svg></div></div>
+            <div class="lyr l-mark"><svg viewBox="0 0 72 72">
+              <text class="glyph" id="glyph" x="36" y="37">小机</text>
+              <image id="logo-img" x="16" y="16" width="40" height="40" preserveAspectRatio="xMidYMid meet" style="display:none"/>
+            </svg></div>
+          </div>
+          <div class="name" id="name"><span>Xiao</span><b>Ji</b></div>
+          <div class="sub" id="sub">Android 13</div>
+          <div class="bottom">
+            <div class="stage"><span id="stage-label" role="status" aria-live="polite"></span><span id="stage-count"></span></div>
+            <div class="bar" id="bar" role="progressbar" aria-label="Boot progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="bar-fill"></i></div>
+            <div class="detail" id="detail">Press Start Android</div>
+            <div class="steps" id="steps" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+        </div>
+      </div>
+      <div class="pins pins-r" aria-label="Device characteristics">
+        <div class="pin" style="top: 22%">
+          <span class="pin-label"><span class="pno" aria-hidden="true">3</span><span>540 × 960<br><span class="sep"> · </span>240 dpi</span></span>
+          <i class="lead" aria-hidden="true"></i>
+        </div>
+        <div class="pin" style="top: 33%">
+          <span class="pin-label"><span class="pno" aria-hidden="true">4</span><span>KEYBOARD → evdev<small>Click the screen, then type</small></span></span>
+          <i class="lead" aria-hidden="true"></i>
+        </div>
       </div>
     </div>
-  </div>
-  <nav class="nav" aria-label="Android buttons">
-    <button id="btn-back" type="button" disabled>Back</button>
-    <button id="btn-home" type="button" disabled>Home</button>
-  </nav>
+    <p class="cap"><b>Figure 1.</b> Typical application: the device, live. <span id="scale"></span></p>
+    <div class="go">
+      <button id="boot" class="btn" type="button">Start <b>Android</b></button>
+      <button id="stop" class="btn quiet" type="button" hidden>Stop</button>
+      <span class="note" id="dlnote">Downloads the Android snapshot once</span>
+    </div>
+    <div class="record" aria-labelledby="h-record">
+      <div class="record-head">
+        <h3 id="h-record">Session record</h3>
+        <button id="logtoggle" type="button" class="linkbtn" aria-expanded="false" aria-controls="devlog">Show log</button>
+      </div>
+      <ol id="record" aria-live="polite"><li class="empty">Nothing yet. Each step lands here once, with its time from the press.</li></ol>
+    </div>
+  </section>
+
+  <section class="spec" aria-labelledby="characteristics">
+    <h2 id="characteristics"><span class="no">3</span>Characteristics</h2>
+    <table>
+      <thead><tr><th scope="col">Parameter</th><th scope="col" class="n">Measured</th><th scope="col" class="n">This session<sup>1</sup></th></tr></thead>
+      <tbody>
+        <tr><td>Press to home screen</td><td class="n">2.8–4.2 s</td><td class="n cell" data-cell="home"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>Open Settings, first time</td><td class="n">1.7–2.0 s</td><td class="n cell" data-cell="settings"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>Open Calculator, first time</td><td class="n">1.7–2.6 s</td><td class="n cell" data-cell="calculator"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>App drawer, swipe up</td><td class="n">0.8–1.2 s</td><td class="n untimed">not timed here<sup>2</sup></td></tr>
+        <tr><td>Snapshot download</td><td class="n">142 MB</td><td class="n cell" data-cell="download"><span class="sr">not measured yet</span></td></tr>
+      </tbody>
+    </table>
+    <div class="notes">
+      <p><b>Test conditions:</b> Apple M2, 8 GB, AC power; headless Chromium (SwiftShader WebGL2), localhost; 3 runs, range shown. App and drawer times are settled: from the input to the last frame that changed the picture.</p>
+      <p><sup>1</sup> Timed in this tab, from your press and your taps; fills in after a snapshot restore. <sup>2</sup> Not measured in the page: no event marks the drawer.</p>
+    </div>
+
+    <div class="diagram">
+      <h2><span class="no">4</span>Block diagram</h2>
+      <div class="axis" aria-label="Layers, top to bottom, with the interface between each pair">
+        <div class="layer"><div><b>This tab · Web Worker</b><span>JavaScript</span></div></div>
+        <p class="iface">postMessage · SharedArrayBuffer</p>
+        <div class="layer acc"><div><b>XiaoJi engine · ARM64 → wasm</b><span>C</span></div></div>
+        <div class="layer"><div><b>Linux interface · binder · evdev · goldfish</b><span>in the engine</span></div></div>
+        <p class="iface">syscalls · binder · ioctl</p>
+        <div class="layer"><div><b>Android 13 user space</b><span>ARM64 user code, AOSP</span></div></div>
+      </div>
+    </div>
+  </section>
 </main>
 
-<section class="dev" id="devlog" aria-label="Developer log" hidden>
-  <h2>Boot Android: log</h2>
+<div class="more">
+  <section class="how" aria-labelledby="how">
+    <h2 id="how"><span class="no">5</span>How it works</h2>
+    <div class="axis">
+      <div class="step">
+        <h3>The engine</h3>
+        <p>There is no virtual machine and no kernel. The engine runs Android's ARM64 user-space programs, translating hot code to WebAssembly, and implements the Linux interface they call: processes and threads, memory, files, futexes, binder, input devices and the goldfish graphics pipe.</p>
+      </div>
+      <div class="step">
+        <h3>The snapshot</h3>
+        <p>Android was booted once to its home screen and its memory saved. Start Android downloads that snapshot and restores it, so the phone starts where the boot ended instead of booting for minutes. When the snapshot does not match this engine, the page boots Android instead and says so.</p>
+      </div>
+      <div class="step">
+        <h3>Chunks</h3>
+        <p>The system image and the snapshot are cut into content-addressed chunks, packed in the order they are first read. The boot's chunks are kept in your browser's cache, and a chunk the phone needs later is read on demand.</p>
+      </div>
+      <div class="step acc">
+        <h3>GL to WebGL2</h3>
+        <p>Android draws with OpenGL ES through the emulator's graphics pipe. The engine replays those calls on WebGL2 and SurfaceFlinger's composed frame is drawn on the page, 540 × 960 at 240 dpi.</p>
+      </div>
+      <div class="step">
+        <h3>Input</h3>
+        <p>Pointer and keyboard events on the screen become Linux evdev events in a ring the engine reads, so Android sees a touchscreen and a keyboard. Back and Home send the phone's own keys.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="limits" aria-labelledby="limits">
+    <h2 id="limits"><span class="no">6</span>Known limits</h2>
+    <dl>
+      <dt>Network</dt><dd>Off in this build: apps see no connection.</dd>
+      <dt>Audio</dt><dd>None: the audio HAL is a null device.</dd>
+      <dt>Browsers</dt><dd>Chromium-based browsers. The page needs cross-origin isolation, SharedArrayBuffer and WebGL2.</dd>
+      <dt>Devices</dt><dd>Desktop first. There is no on-screen keyboard yet; type with a physical one.</dd>
+      <dt>First start</dt><dd>A download of about 142 MB before the phone appears. When there is no snapshot for this engine, Android boots from the start, which takes minutes.</dd>
+    </dl>
+  </section>
+
+  <section class="order" aria-labelledby="order">
+    <h2 id="order"><span class="no">7</span>Ordering information</h2>
+    <table>
+      <tbody>
+        <tr><td>Source</td><td><a href="https://github.com/rosdyana/xiaoji">github.com/rosdyana/xiaoji</a>, Apache-2.0</td></tr>
+        <tr><td>Sibling</td><td><a href="https://github.com/rosdyana/xiaonux">xiaonux</a>: Debian in a browser tab, full RISC-V machine emulation</td></tr>
+        <tr><td>Notices</td><td><a href="https://github.com/rosdyana/xiaoji/blob/main/NOTICE">NOTICE</a> and <a href="https://github.com/rosdyana/xiaoji/blob/main/LICENSE">LICENSE</a>; fonts Archivo and Fragment Mono under the <a href="fonts/OFL-Archivo.txt">SIL Open Font License</a></td></tr>
+        <tr><td>Android</td><td>AOSP components are not part of the repository and stay under their own licences</td></tr>
+      </tbody>
+    </table>
+  </section>
+</div>
+
+<section class="dev" id="devlog" aria-label="Engine log" hidden>
+  <h2>Engine log</h2>
   <p>
-    The native product boot (docs/boot.md, B7) in the browser: the same engine, the product tree, and
-    <code>--logcat --init image/xiaoji.rc</code>. It runs until the engine's init timeout, or until Stop.
-    With the WebGL backend (the default; <code>?gl=null</code> turns it off) the frames SurfaceFlinger composes are
-    drawn on the phone, and taps and keys on it go to Android. See docs/web-preview.md and docs/graphics.md. <span id="themenote"></span>
+    The engine's log for this session: Android's logcat and the engine's own lines. With the WebGL backend (the default;
+    <code>?gl=null</code> turns it off) the frames SurfaceFlinger composes are drawn on the phone, and taps and keys on it go
+    to Android. See docs/web-preview.md and docs/graphics.md. <span id="themenote"></span>
   </p>
   <p>Status: <span id="bstatus">idle</span></p>
   <p>Fetched: <span id="bfetch">0 requests, 0 files, 0 bytes</span></p>
@@ -210,7 +606,7 @@
 </section>
 
 <section class="dev" id="cases" aria-label="ART cases" hidden>
-  <h2>xiaoji: ART in a Web Worker</h2>
+  <h2>ART in a Web Worker</h2>
   <p>
     <label>Case
       <select id="case">
@@ -228,6 +624,12 @@
   <h3>Timings</h3>
   <table id="timing"></table>
 </section>
+
+<footer class="foot">
+  <span>XiaoJi is open source (Apache-2.0). Android components are under their own licences.</span>
+  <span>Known limits: no network, no audio, Chromium-based browsers, desktop first.</span>
+  <span id="buildnote" hidden></span>
+</footer>
 <script type="module" src="./main.js"></script>
 </body>
 </html>

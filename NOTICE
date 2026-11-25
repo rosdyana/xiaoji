@@ -12,5 +12,11 @@ This product includes dlmalloc 2.8.6 by Doug Lea (public domain, CC0), in the co
 shipped by Emscripten (MIT / University of Illinois/NCSA licenses for its changes).
 See third_party/dlmalloc/README.md.
 
+The web page (web/) includes two fonts under the SIL Open Font License 1.1, subset
+to Latin: Archivo, Copyright 2020 The Archivo Project Authors
+(https://github.com/Omnibus-Type/Archivo), and Fragment Mono, Copyright 2022 The
+Fragment-Mono Project Authors (https://github.com/weiweihuanghuang/fragment-mono).
+See web/fonts/OFL-Archivo.txt and web/fonts/OFL-FragmentMono.txt.
+
 Android system images and other guest software are not part of this repository;
 the tools download or build them separately under their own licenses.
