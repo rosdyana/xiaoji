@@ -1,33 +1,44 @@
 # xiaoji
 
-Android in your browser. Nothing to install. (Work in progress; will live at android.xiaonux.dev.)
+**Android 13 in your browser tab. Nothing to install.** Try it: **[android.xiaonux.dev](https://android.xiaonux.dev)** (Chromium-based browsers, desktop first).
 
-xiaoji (小机, "little phone", like 手机 shǒujī) is the Android sibling of [xiaonux](https://github.com/rosdyana/xiaonux), which runs Debian in a browser tab. The two projects take different approaches:
+xiaoji (小机, "little machine", like 手机 shǒujī, "phone") is the Android sibling of [xiaonux](https://github.com/rosdyana/xiaonux), which runs Debian in a browser tab. The two take different approaches:
 
 - **xiaonux** emulates a whole RISC-V machine.
-- **xiaoji** does not emulate a machine. Its engine, written in C and compiled to WebAssembly, runs Android's ARM64 user-space code and provides the Linux kernel interface itself: syscalls, binder, futexes, files, cgroups, input devices and the emulator's graphics pipe. Android's OpenGL ES calls go to WebGL2.
+- **xiaoji** does not emulate a machine. Its engine, written in C and compiled to WebAssembly, runs Android's own ARM64 user-space programs and provides the Linux kernel interface itself: syscalls, binder, futexes, files, cgroups, seccomp, input devices and the emulator's graphics pipe. Android's OpenGL ES calls go to WebGL2.
 
-There is no guest kernel, MMU or virtual hardware to emulate, which is why xiaoji doesn't build on Cuttlefish or another full-system VM. xiaoji's distinguishing goal is delivery, borrowed from xiaonux: content-addressed chunks fetched on demand, boot packs, a booted snapshot and per-app packs (planned). The aim is a small first download and a start measured in seconds, not a 1 GB download before the first boot.
+There is no guest kernel, MMU or virtual hardware to emulate, which is why xiaoji doesn't build on Cuttlefish or another full-system VM. Its other half is delivery, borrowed from xiaonux: content-addressed chunks fetched on demand and a booted snapshot whose memory loads lazily, so a visitor is on the home screen in seconds instead of downloading a 1 GB image and waiting minutes for a boot.
 
 ## Status
 
-Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`, with Wi-Fi, Bluetooth, telephony, NFC and UWB off) boots in a browser tab to the launcher. You can open the app drawer, start Settings, Files and Calculator (1 + 2 = 3), and type into the launcher's search. The demo apps are compiled ahead of time (docs/demo.md).
+The page restores a booted Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`) straight to the home screen. You can swipe up to the app drawer, open Settings, Files and Calculator (1 + 2 = 3), and type with a physical keyboard.
 
-| | Native engine (M2) | Browser (headless Chromium, M2) |
+| Measured (Apple M2, 8 GB, headless Chromium, AC power) | localhost | 50 Mbit/s, 40 ms |
 |---|---|---|
-| `sys.boot_completed` | about 270 s | about 6 min |
-| Launcher on screen | about 285 s | about 6.5 min |
+| Download before the phone appears | 12 MB | 12 MB |
+| Press of Start Android to the home screen | 0.9 s | 3.7 s |
+| Rest of the snapshot in (background) | about 3 s | about 35 s |
+| First open of Settings / Calculator / Files, settled | 2.2 / 2.0 / 3.5 s | 2.7 / 2.2 / 4.5 s |
+| Repeat visit: press to home, download | 0.8 s, 3 MB | 1.6 s, 3 MB |
 
-The browser numbers were measured on an 8 GB machine that was swapping, on battery.
+A boot from scratch (no snapshot) still works: about 270 s natively and about 6 min in the browser.
 
-A booted snapshot skips the boot (docs/snapshot.md): the page restores Android at the home screen from a snapshot the web engine wrote, with the demo apps already opened once (docs/demo.md, P1). On localhost, Boot Android shows the launcher about 2.6 s after the press on AC (a 142 MiB download, inflated by four workers into the engine's memory), against about 6.5 min for a boot. `make snapshot` makes it for the current tree and engine. The last measurement (headless Chromium on the M2, on battery with Low Power Mode on, a swapping 8 GB machine; medians of 3 runs against L1's snapshot in the same conditions): the first open of Settings settles in 3.5 s (23.6 s before P1), Calculator in 4.1 s (12.8 s), the drawer in 2.4 s (2.4 s), and the idle phone costs the browser 16% of a core (100%); the file pages the first minute needs are prefetched in the background. Since S5 the snapshot's guest pages are lazy (docs/snapshot.md, S5): the page downloads about 12 MiB before Android runs (146.9 MiB before), and the rest in the background in the order a recorded session first needed it, or on first touch. Press to the home screen: 0.9 s on localhost (2.6 s before) and 3.7 s at a simulated 50 Mbit/s with a 40 ms round trip (26.4 s before); everything is in after about 33 s on that link, and app opens afterwards are where they were. The snapshot is kept in Cache Storage, so a repeat visit downloads about 3 MB. Natively, `build/xiaoji --restore` resumes a snapshot in under a second.
+**Works:** launcher, SystemUI, Settings (including About), Files, Calculator; touch, swipe and keyboard input; the media provider and the software codec service.
+
+**Not yet:** network, audio (the audio HAL is a null device), an on-screen keyboard, Files' storage roots (the engine has no FUSE), installing APKs. Only SwiftShader WebGL2 is measured; real GPUs are untested. The product has no Wi-Fi, Bluetooth, telephony, NFC or UWB.
+
+Recent milestones: seccomp with Linux semantics, so the media codec service runs and the media provider stays up (docs/boot.md, B19); Settings > About fixed (no Wi-Fi rows; the model comes from the build like on a device); lazy snapshot pages (docs/snapshot.md, S5).
+
+## How it was made
+
+xiaoji was built by one developer pair-programming with [Claude Code](https://claude.com/claude-code). The repository keeps the whole trail: the plan for each milestone, what failed and why (docs/), the measurements, and over 330 tests that compare the engine against real Linux on the same binaries. Prior art showed the way: browser OS projects such as [v86](https://github.com/copy/v86) and [JSLinux](https://bellard.org/jslinux/), and Android-in-user-space projects such as Twoyi. The engine and its tooling are written here.
 
 Milestone notes:
 
 | Doc | What |
 |---|---|
 | [docs/spike-0.md](docs/spike-0.md) | the first question: ART (`dalvikvm64`) on the engine, natively and in wasm |
-| [docs/boot.md](docs/boot.md) | the boot, milestone by milestone (B1 to B19): init, binder, zygote, system_server, HALs, the product, the launcher |
+| [docs/boot.md](docs/boot.md) | the boot, milestone by milestone (B1 to B19): init, binder, zygote, system_server, HALs, seccomp, the product, the launcher |
 | [docs/graphics.md](docs/graphics.md) | the goldfish pipe, the gfxstream decoders, the null and WebGL2 backends (G1 to G4) |
 | [docs/input.md](docs/input.md) | the touchscreen and keyboard (evdev) and how the page feeds them |
 | [docs/loading.md](docs/loading.md) | chunks, boot packs, early start and caching |
@@ -50,7 +61,7 @@ make oracle          # reference runs in the VM -> build/oracle
 make guest-tests     # the guest test programs, built in the VM
 make test            # the suite: every case natively and in Node, against the oracle
 make serve           # the page at http://127.0.0.1:8080/ (needs build/rootfs-xiaoji)
-make snapshot        # the page's booted snapshot and its touch recording (headless Chromium, about 20 min; docs/snapshot.md, docs/demo.md)
+make snapshot        # the page's booted snapshot, its page and touch recordings (headless Chromium, about 25 min; docs/snapshot.md, docs/demo.md)
 make help            # every target
 ```
 
@@ -60,19 +71,30 @@ Useful test switches: `XIAOJI_JOBS=4` runs cases in parallel, `XIAOJI_BOOT=1` ad
 
 Guest files come from Google's AOSP image or from our AOSP build. They are never committed.
 
+## Deploy
+
+The site is static, on Cloudflare Pages:
+
+```sh
+tools/deploy.sh --stage   # build/site: the page, the engine and the chunk store pruned to what the manifests name; checks Pages' limits
+tools/deploy.sh           # stage, then wrangler pages deploy (project xiaoji; XIAOJI_PAGES_PROJECT overrides)
+```
+
+It writes `_headers` for cross-origin isolation (COOP/COEP, needed for SharedArrayBuffer), a Content-Security-Policy, and immutable caching of packs and chunks. Pages answers Range requests with the whole file, so a lazy page fault there downloads its whole pack (up to 1 MiB) instead of one 128 KiB chunk.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `engine/` | the C engine: ARM64 interpreter and JIT, syscalls, binder, init, procfs and sysfs, cgroups, bpf maps, evdev, goldfish pipe, GL decoders and backends |
-| `aosp/device/xiaoji/` | the AOSP product: trimmed device config, netd stub, null audio HAL |
+| `aosp/device/xiaoji/` | the AOSP product: trimmed device config, Settings overlay, netd stub, null audio HAL |
 | `image/` | the init config the engine boots (`xiaoji.rc`) |
-| `web/` | the page, its worker, the pack loader, the boot screen and its themes, input |
-| `tools/` | image fetch and extraction, AOSP build and fetch, manifests and packs, GL and kernel-config generators, remote runner |
+| `web/` | the page, its worker, the pack and snapshot loaders, lazy pages, the boot screen and its themes, input |
+| `tools/` | image fetch and extraction, AOSP build and fetch, manifests and packs, snapshots, latency yardstick, deploy, GL and kernel-config generators, remote runner |
 | `tests/` | guest test programs, init cases, expected outputs, suite and page tests |
 | `third_party/gfxstream/` | the GL protocol specs (Apache-2.0) the decoders are generated from |
 | `docs/` | milestone notes, plans, measurements |
 
 ## License
 
-Apache-2.0. Android components are under their own licenses (AOSP); they are downloaded or built, never redistributed from this repository. See [NOTICE](NOTICE) for the vendored gfxstream specs.
+Apache-2.0. Android components are under their own licenses (AOSP); they are downloaded or built, never committed to this repository (the demo site serves our own AOSP build). See [NOTICE](NOTICE) for the vendored gfxstream specs, dlmalloc and the page's fonts.

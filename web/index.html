@@ -6,6 +6,7 @@
 <title>XiaoJi: Android 13 in a browser tab</title>
 <meta name="description" content="Real Android 13 running in a browser tab, on a user-mode ARM64 engine compiled to WebAssembly. No install, no VM, no server-side phone.">
 <meta name="theme-color" content="#f4f3ee">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
 <style>
   @font-face {
@@ -514,15 +515,15 @@
     <table>
       <thead><tr><th scope="col">Parameter</th><th scope="col" class="n">Measured</th><th scope="col" class="n">This session<sup>1</sup></th></tr></thead>
       <tbody>
-        <tr><td>Press to home screen</td><td class="n">2.8–4.2 s</td><td class="n cell" data-cell="home"><span class="sr">not measured yet</span></td></tr>
-        <tr><td>Open Settings, first time</td><td class="n">1.7–2.0 s</td><td class="n cell" data-cell="settings"><span class="sr">not measured yet</span></td></tr>
-        <tr><td>Open Calculator, first time</td><td class="n">1.7–2.6 s</td><td class="n cell" data-cell="calculator"><span class="sr">not measured yet</span></td></tr>
-        <tr><td>App drawer, swipe up</td><td class="n">0.8–1.2 s</td><td class="n untimed">not timed here<sup>2</sup></td></tr>
-        <tr><td>Snapshot download</td><td class="n">142 MB</td><td class="n cell" data-cell="download"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>Press to home screen</td><td class="n">0.8–1.0 s</td><td class="n cell" data-cell="home"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>Open Settings, first time</td><td class="n">1.8–2.5 s</td><td class="n cell" data-cell="settings"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>Open Calculator, first time</td><td class="n">2.0–2.4 s</td><td class="n cell" data-cell="calculator"><span class="sr">not measured yet</span></td></tr>
+        <tr><td>App drawer, swipe up</td><td class="n">0.9–1.0 s</td><td class="n untimed">not timed here<sup>2</sup></td></tr>
+        <tr><td>Download before the phone appears</td><td class="n">12 MB</td><td class="n cell" data-cell="download"><span class="sr">not measured yet</span></td></tr>
       </tbody>
     </table>
     <div class="notes">
-      <p><b>Test conditions:</b> Apple M2, 8 GB, AC power; headless Chromium (SwiftShader WebGL2), localhost; 3 runs, range shown. App and drawer times are settled: from the input to the last frame that changed the picture.</p>
+      <p><b>Test conditions:</b> Apple M2, 8 GB, AC power; headless Chromium (SwiftShader WebGL2), localhost; 3 runs per batch, range shown. At 50 Mbit/s with a 40 ms round trip, the press to home is about 3.7 s. App and drawer times are settled: from the input to the last frame that changed the picture.</p>
       <p><sup>1</sup> Timed in this tab, from your press and your taps; fills in after a snapshot restore. <sup>2</sup> Not measured in the page: no event marks the drawer.</p>
     </div>
 
@@ -574,7 +575,7 @@
       <dt>Audio</dt><dd>None: the audio HAL is a null device.</dd>
       <dt>Browsers</dt><dd>Chromium-based browsers. The page needs cross-origin isolation, SharedArrayBuffer and WebGL2.</dd>
       <dt>Devices</dt><dd>Desktop first. There is no on-screen keyboard yet; type with a physical one.</dd>
-      <dt>First start</dt><dd>A download of about 142 MB before the phone appears. When there is no snapshot for this engine, Android boots from the start, which takes minutes.</dd>
+      <dt>First start</dt><dd>About 12 MB before the phone appears; the rest of the snapshot (about 136 MB) streams in while you use it, and a repeat visit comes from the cache. When there is no snapshot for this engine, Android boots from the start, which takes minutes.</dd>
     </dl>
   </section>
 
@@ -585,7 +586,7 @@
         <tr><td>Source</td><td><a href="https://github.com/rosdyana/xiaoji">github.com/rosdyana/xiaoji</a>, Apache-2.0</td></tr>
         <tr><td>Sibling</td><td><a href="https://github.com/rosdyana/xiaonux">xiaonux</a>: Debian in a browser tab, full RISC-V machine emulation</td></tr>
         <tr><td>Notices</td><td><a href="https://github.com/rosdyana/xiaoji/blob/main/NOTICE">NOTICE</a> and <a href="https://github.com/rosdyana/xiaoji/blob/main/LICENSE">LICENSE</a>; fonts Archivo and Fragment Mono under the <a href="fonts/OFL-Archivo.txt">SIL Open Font License</a></td></tr>
-        <tr><td>Android</td><td>AOSP components are not part of the repository and stay under their own licences</td></tr>
+        <tr><td>Android</td><td>AOSP components are not part of the repository; this site serves them from our own AOSP build, under their own licences</td></tr>
       </tbody>
     </table>
   </section>
