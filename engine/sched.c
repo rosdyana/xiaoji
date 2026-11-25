@@ -26,6 +26,7 @@
 #include "mem.h"
 #include "prof.h"
 #include "proc.h"
+#include "seccomp.h"
 #include "timers.h"
 #include "signals.h"
 #include "snap.h"
@@ -164,6 +165,7 @@ static thread_t *add_thread(const cpu_t *from, uint64_t tid, proc_t *p)
     t->cpu.icount = 0; /* the copy is the parent: a new thread counts its own instructions */
     t->cpu.excl_valid = 0; /* a new thread never inherits the exclusive monitor */
     t->cpu.io_done = 0;
+    seccomp_thread_copy(&t->cpu); /* the chain is shared by reference */
     t->state = TS_RUNNABLE;
     t->proc = p;
     p->nthreads++;
@@ -180,6 +182,7 @@ static void reap(int slot)
     threads[slot]->proc->nthreads--;
     if (sig_debug_faults()) /* the process's name outlives its threads for the exit line (B9) */
         memcpy(threads[slot]->proc->dbg_comm, threads[slot]->comm, sizeof threads[slot]->proc->dbg_comm);
+    seccomp_thread_release(&threads[slot]->cpu);
     free(threads[slot]);
     threads[slot] = NULL;
 }

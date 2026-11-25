@@ -112,7 +112,6 @@ proc_t *proc_fork(proc_t *parent, int pid, int vfork)
     memcpy(c->attr_create, parent->attr_create, sizeof c->attr_create);
     c->dumpable = parent->dumpable;
     c->keepcaps = parent->keepcaps;
-    c->no_new_privs = parent->no_new_privs;
     c->securebits = parent->securebits;
     c->subreaper = parent->subreaper;
     c->timerslack = parent->timerslack;

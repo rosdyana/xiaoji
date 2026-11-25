@@ -5,7 +5,8 @@ and the other apps should respond like a phone's. Cold boot time does not matter
 (`aosp/device/xiaoji`), what was removed and why, the AOT question, the snapshot point, and the measurement method with
 the numbers before and after.
 
-Status: **done, with open issues** (the end of this note). P1 (below) made the snapshot pre-warmed and the restore
+Status: **done, with open issues** (the end of this note). B19 part 2 (the end of this note, and docs/boot.md) ended
+the media provider's restart loop: the first Files open after a restore settles in 3.7 s on AC. P1 (below) made the snapshot pre-warmed and the restore
 faster (on battery with Low Power Mode: the first Settings open 3.5 s against 23.6 s, press to home 5.0 s against
 12.3 s; AC not yet measured). The rest of this paragraph is L1's. The product has Calculator and seven fewer apps that ran,
 its demo apps are compiled ahead of time, and the snapshot is taken when the booted phone is idle: after a restore the
@@ -140,13 +141,12 @@ it out; it is an open issue below.
 Kept, with the reason:
 
 - **The media provider** (`com.android.providers.media.module`). It is not idle weight: DocumentsUI asks for its
-  `media.documents` roots, the process starts, waits for the codec2 HAL (`android.hardware.media.c2@1.1::IComponentStore/default`
-  is declared in the goldfish vendor manifest and never started), is killed after 40 s ("timeout publishing content
-  providers"), and starts again at the next request. Removing it is not possible without the APEX (its
-  `framework-mediaprovider.jar` is on the boot class path), and Files, downloads and SystemUI's screenshots use it.
-  Starting the two codec2 stores instead (`android.hardware.media.c2@1.0-service-goldfish` and the swcodec APEX's
-  `mediaswcodec`, in a trial boot on the build machine) fails: both install a seccomp filter through minijail, the
-  engine answers `prctl(PR_SET_SECCOMP)` with EINVAL, and they abort. Open issue below.
+  `media.documents` roots, and Files, downloads and SystemUI's screenshots use it (its `framework-mediaprovider.jar` is
+  on the boot class path, so it cannot be removed without the APEX). Until B19 part 2 (docs/boot.md) it waited for the
+  hardware codec2 store (`android.hardware.media.c2@1.1::IComponentStore/default`, declared in the goldfish vendor
+  manifest and never started), was killed after 40 s ("timeout publishing content providers"), and started again at
+  the next request. Now the device manifest has no hardware store, the software store (`media.swcodec`, with its
+  seccomp filter, which the engine enforces) runs, and the provider starts once and stays up.
 - Provision (B16: it provisions the device and disables itself), PackageInstaller (PackageManager requires an
   installer), the providers the apps use (contacts in `android.process.acore`, downloads and MTP in
   `android.process.media`, external storage), KeyChain, Telecom (B16), NetworkStack (ConnectivityService needs it).
@@ -480,10 +480,11 @@ In order of what a visitor would notice:
 2. **Cached apps are killed.** The freezer's cause is fixed in P1: the engine's binder answers the freezer's ioctls
    with EINVAL and ActivityManager runs without the freezer (`Freezer disabled`). Not verified past about 6 minutes:
    the 16-minute soak ended with the page not answering a click (P1 verification).
-3. **The media provider's restart loop** (above): it waits for a codec2 HAL that is declared and not started, is
-   killed after 40 s, and starts again when DocumentsUI asks for it. Fix: the engine accepts a seccomp filter
-   (`prctl(PR_SET_SECCOMP)`, `seccomp(2)`) without enforcing it, and the boot config starts the two codec2 stores; or a
-   device manifest without the `IComponentStore/default` entry, and `mediaswcodec` started.
+3. **The media provider's restart loop**: fixed in B19 part 2 (docs/boot.md): the engine implements seccomp, the
+   product runs the software codec2 store (`media.swcodec`) and no longer declares the hardware one. Left: the
+   provider waits 5 s for `media.player` (no mediaserver) at its start, and its own roots (Images, Videos, Audio in the
+   drawer) need the emulated external volume, which needs FUSE (`/dev/fuse`) in the engine. The Images, Audio, Videos
+   row at the top of Files is DocumentsUI's search chips and does not depend on the provider.
 4. **RemoteProvisioner** stays (the keymint HAL requires it, and the override did not remove it): its BOOT_COMPLETED
    receiver asks for a network and waits; 240 s later ActivityManager reports an ANR and kills it. With the snapshot at
    HOME + 240 s that ANR, with its stack dumps, came 44 s after every restore, during the first Settings start; the
@@ -532,3 +533,38 @@ with before (L1 snapshot and engine, `prehot=0&inflaters=0&prefetch=0`); `build/
 | idle engine busy | 9–19 % | 13–17 % |
 
 The media provider still logs an ANR in two runs (`android.process.media`, a background process: no dialog is shown).
+
+### B19 part 2: the media provider and the software codecs (docs/boot.md)
+
+The engine enforces seccomp, the product runs `media.swcodec` and no longer declares the hardware codec2 store, and the
+media provider starts once. The snapshot (`make snapshot` of these sources, the pre-warm as P1) was made with the
+provider started at HOME + 57 s and never killed before the snapshot (the earlier make of the same engine on the old
+tree killed it five times: "timeout publishing content providers"). The only ANR before the snapshot is
+RemoteProvisioner's (open issue 4).
+
+AC power, Low Power Mode off (`pmset -g batt`: AC Power, 100%, charged; `pmset -g | grep lowpowermode`: 0), swap
+5.1 to 6.5 GB in use; headless Chromium, localhost; `tools/latency.mjs --runs 1 --warm --calc --files`, 3 runs, a new
+browser each (`build/b19/ac-*.json`, logs `build/web-shots/l1-b19-*.log`). Against P1's AC numbers above (after, 3
+runs; ranges):
+
+| | P1 (AC) | **B19 (AC), median (range)** |
+|---|---|---|
+| press to first frame | 2.8 to 4.2 s | 3.1 s (2.7 to 3.4), 146.9 MiB |
+| drawer settled | 0.8 to 1.2 s | 1.1 s (1.0 to 1.2) |
+| first Settings start settled | 1.7 to 2.0 s | 2.0 s (1.8 to 2.4) |
+| second Settings start settled | - | 1.8 s (1.6 to 1.9) |
+| home settled | 2.3 to 2.4 s | 2.3 s (2.0 to 2.7) |
+| first Calculator start settled | 1.7 to 2.6 s | 2.1 s (2.0 to 2.1) |
+| **first Files start: response / settled** | 6.7 / 17.1 s (2.5 to 31.7; battery) | **3.1 / 3.7 s (3.7 to 4.1)** |
+| idle engine busy | 13 to 17 % | 9 % (9 to 11) |
+| idle browser host CPU | - | 10 % (9 to 12) |
+
+In every run the provider process of the snapshot (pid 1604) answered DocumentsUI: no `Start proc` of the provider or
+of `android.process.media`, no "timeout publishing content providers", no ANR, no fatal signal; Files' `Displayed` came
+2.3 s after its START. `make test-snapshot-web`: all PASS (restore, first frame, Settings drawn with 64 colours, no ANR,
+fatal exception or fatal signal; the fallbacks).
+
+What Files shows is unchanged: the Downloads screen with the Images, Audio, Videos chips (DocumentsUI's search chips)
+and "Can't load content at the moment" for the list, because the external volume is not mounted (no FUSE in the
+engine; docs/boot.md, B19 part 2, open 2). The provider's own roots need that volume.
+

@@ -4,7 +4,9 @@
 # and this tree has no PRODUCT_PACKAGES_REMOVE, so the minigbm lines cannot be filtered out later.
 # The demo (docs/demo.md) also drops SdkSetup (the emulator's setup wizard: Provision provisions the device, and
 # SdkSetup only adds emulator settings such as auto-rotate), EmulatorRadioConfig (no telephony) and
-# MultiDisplayProvider (one display in a tab).
+# MultiDisplayProvider (one display in a tab). B19 (docs/boot.md): the device manifest is device/xiaoji/manifest.xml
+# (goldfish's without the hardware Codec2 store), and the goldfish Codec2 service and its codecs are not installed: the
+# codecs are the swcodec APEX's software ones (media.swcodec in image/xiaoji.rc).
 
 #
 # Copyright (C) 2018 The Android Open Source Project
@@ -37,7 +39,7 @@ PRODUCT_SYSTEM_EXT_PROPERTIES += ro.lockscreen.disable.default=1
 
 DISABLE_RILD_OEM_HOOK := true
 
-DEVICE_MANIFEST_FILE += device/generic/goldfish/64bitonly/manifest.xml
+DEVICE_MANIFEST_FILE += device/xiaoji/manifest.xml
 
 ifneq ($(EMULATOR_DISABLE_RADIO),true)
 DEVICE_MANIFEST_FILE += device/generic/goldfish/64bitonly/manifest.radio.xml
@@ -64,11 +66,6 @@ PRODUCT_PACKAGES += \
     android.hardware.graphics.mapper@3.0-impl-ranchu \
     hwcomposer.ranchu \
     toybox_vendor \
-    android.hardware.media.c2@1.0-service-goldfish \
-    libcodec2_goldfish_vp8dec \
-    libcodec2_goldfish_vp9dec \
-    libcodec2_goldfish_avcdec \
-    libcodec2_goldfish_hevcdec \
     sh_vendor \
     local_time.default \
     EmulatorConnectivityOverlay \

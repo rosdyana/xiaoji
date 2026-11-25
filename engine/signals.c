@@ -345,6 +345,29 @@ int sig_fault(cpu_t *c, int sig, int code, uint64_t addr)
     return 1;
 }
 
+#define SIGSYS_N 31
+#define SYS_SECCOMP 1 /* si_code */
+
+void sig_seccomp_trap(cpu_t *c, int32_t nr, uint32_t data, uint32_t arch)
+{
+    if (!catchable_now(c, SIGSYS_N)) {
+        die_by_signal(SIGSYS_N);
+        return;
+    }
+    /* sync: si_call_addr (offset 16) is the address after the svc, and fault_address stays 0 */
+    if (setup_frame(c, SIGSYS_N, SYS_SECCOMP, 1, c->pc, 0) < 0) {
+        sig_segv_fatal(c->sp, c->pc);
+        return;
+    }
+    uint8_t w[4];
+    put32(w, data); /* si_errno: SECCOMP_RET_DATA */
+    uint8_t u[8];
+    put32(u, (uint32_t)nr); /* si_syscall */
+    put32(u + 4, arch);     /* si_arch */
+    if (mem_copy_in(c->sp + 4, w, sizeof w) < 0 || mem_copy_in(c->sp + 24, u, sizeof u) < 0)
+        sig_segv_fatal(c->sp, c->pc);
+}
+
 void sig_rt_sigreturn(cpu_t *c)
 {
     uint8_t f[FRAME_SIZE];

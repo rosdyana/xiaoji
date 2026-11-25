@@ -396,6 +396,18 @@ service audioserver /system/bin/audioserver
     capabilities BLOCK_SUSPEND
     onrestart restart vendor.audio-hal
 
+# The software Codec2 store (B19, docs/boot.md): the block of the swcodec APEX's mediaswcodec.rc (Android 13, SDK 32
+# and later), with the user mediacodec and the group mediadrm written as media_codec and media_drm (the names in
+# engine/ids_gen.h). It registers android.hardware.media.c2@1.2::IComponentStore/software (the framework manifest's
+# entry), which every Codec2 client (MediaCodecList, in the media provider too) waits for. It installs its seccomp
+# filter (the APEX's mediaswcodec.policy, through minijail) at start.
+service media.swcodec /apex/com.android.media.swcodec/bin/mediaswcodec
+    class main
+    user media_codec
+    group camera drmrpc media_drm
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh
+
 # The XiaoJi audio HAL (device/xiaoji/audio): the null sink, as the HIDL passthrough service. The block of the stock
 # hardware/interfaces/audio service (vendor.audio-hal), with /vendor/bin/hw/xiaoji_audio_hal in place of the stock
 # binary, whose main aborts in this tree (docs/boot.md, B12).

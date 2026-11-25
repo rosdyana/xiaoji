@@ -2,6 +2,7 @@
  * /sys/devices/system/cpu/online. Only these files are provided: they are what
  * the oracle run of ART opens. */
 #include "procfs.h"
+#include "seccomp.h"
 #include "selinuxfs.h"
 
 #include <stdarg.h>
@@ -163,10 +164,12 @@ static char *attr_slot(proc_t *p, int idx)
 }
 
 #define BOOT_ID_PATH "/proc/sys/kernel/random/boot_id"
+#define SECCOMP_AVAIL_PATH "/proc/sys/kernel/seccomp/actions_avail"
+#define SECCOMP_LOGGED_PATH "/proc/sys/kernel/seccomp/actions_logged"
 
 int procfs_known(const char *guest)
 {
-    if (!strcmp(guest, BOOT_ID_PATH))
+    if (!strcmp(guest, BOOT_ID_PATH) || !strcmp(guest, SECCOMP_AVAIL_PATH) || !strcmp(guest, SECCOMP_LOGGED_PATH))
         return 1;
     if (!strcmp(guest, "/proc/self/stat") || !strcmp(guest, "/proc/self/status") || !strcmp(guest, "/proc/self/maps") ||
         !strcmp(guest, "/proc/filesystems") || !strcmp(guest, "/sys/devices/system/cpu/online") ||
@@ -270,7 +273,7 @@ int procfs_dir(const char *guest)
         return rest[0] == 0 || !strcmp(rest, "/attr") || !strcmp(rest, "/task");
     return !strcmp(guest, "/proc/self/task") || !strcmp(guest, "/sys/devices") || !strcmp(guest, "/sys/devices/system") ||
            !strcmp(guest, "/proc/sys") || !strcmp(guest, "/proc/sys/kernel") || !strcmp(guest, "/proc/sys/kernel/random") ||
-           !strcmp(guest, "/sys/devices/system/cpu") || !strcmp(guest, "/proc/self/attr") ||
+           !strcmp(guest, "/proc/sys/kernel/seccomp") || !strcmp(guest, "/sys/devices/system/cpu") || !strcmp(guest, "/proc/self/attr") ||
            !strcmp(guest, "/proc/thread-self") || !strcmp(guest, "/proc/thread-self/attr") ||
            !strcmp(guest, "/proc/pressure");
 }
@@ -327,6 +330,16 @@ static void build_status(sbuf *b, const proc_t *p)
     sb_fmt(b, "\nCapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\nCapBnd:\t%016llx\nCapAmb:\t%016llx\n",
            (unsigned long long)c->cap_inh, (unsigned long long)c->cap_perm, (unsigned long long)c->cap_eff,
            (unsigned long long)p->capbset, (unsigned long long)c->cap_amb);
+    /* NoNewPrivs and Seccomp are the main thread's (the leader's, as Linux prints them); Seccomp_filters counts its
+     * chain. */
+    const cpu_t *lead = sched_find_thread((uint64_t)p->pid);
+    int nnp = 0, mode = 0, nf = 0;
+    if (lead && sched_proc_of(lead) == p) {
+        nnp = lead->nnp;
+        mode = lead->sc_mode;
+        nf = seccomp_chain_length(lead);
+    }
+    sb_fmt(b, "NoNewPrivs:\t%d\nSeccomp:\t%d\nSeccomp_filters:\t%d\n", nnp, mode, nf);
 }
 
 /* /proc/self/stat: the 52 fields of proc(5). f[k] is field k+4 (fields 1 to 3 are
@@ -449,6 +462,11 @@ int procfs_read(const char *guest, uint8_t **data, size_t *len)
          * and falls back to /dev/ashmem when that node is absent (ashmem-dev.cpp). A fixed value keeps runs
          * the same. */
         sb_fmt(&b, "5c1d9a40-2f3e-4b7a-9e61-0d2c8f7a3b10\n");
+    } else if (!strcmp(guest, SECCOMP_AVAIL_PATH)) {
+        /* the actions seccomp.c implements, in the kernel's order */
+        sb_fmt(&b, "kill_process kill_thread trap errno user_notif trace log allow\n");
+    } else if (!strcmp(guest, SECCOMP_LOGGED_PATH)) {
+        sb_fmt(&b, "kill_process kill_thread trap errno user_notif trace log\n"); /* the kernel's default */
     } else if (!strcmp(guest, "/sys/devices/system/cpu/online")) {
         sb_fmt(&b, "0\n");
     } else if (!strcmp(guest, "/proc/version")) {

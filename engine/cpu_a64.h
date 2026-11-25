@@ -40,6 +40,11 @@ typedef struct cpu {
     int sig_restore;          /* the syscall just run was rt_sigreturn: keep x0 */
     int sig_suspended;        /* rt_sigsuspend: the mask to restore is sig_saved (the frame gets it) */
     uint64_t sig_saved;
+
+    /* seccomp (seccomp.c), per thread as in Linux: a fork or clone copies them (the chain by reference). */
+    struct sc_filter *sc_filter; /* the newest filter of the thread's chain, or NULL */
+    int sc_mode;                 /* SECCOMP_MODE_DISABLED, _STRICT or _FILTER */
+    int nnp;                     /* no_new_privs (prctl PR_SET_NO_NEW_PRIVS): kept across fork, clone and execve */
 } cpu_t;
 
 /* Runs the thread until it stops (exit, block, yield) or its slice budget is

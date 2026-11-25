@@ -149,9 +149,10 @@ make_oracle() {
     [ "$ORACLE_MODE" = recorded ] && return 1
     # mountns makes mounts, and binder-sg opens the builder VM's /dev/binder (root-only there): their
     # oracles run as root (passwordless sudo in the builder VM). threads-many needs root to start its NPROC child as
-    # another uid (setuid from 0), as the engine does; nproc-root drops capabilities as root (B16).
+    # another uid (setuid from 0), as the engine does; nproc-root drops capabilities as root (B16). seccomp installs a
+    # filter without NO_NEW_PRIVS as root (CAP_SYS_ADMIN), as the engine's guest is, and drops it for the EACCES case.
     local runas=""
-    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | binder-death-batch-* | creds-* | fmeta-* | bpfmap-* | threads-many-* | nproc-root-*) runas="sudo -n" ;; esac
+    case "$name" in mountns-* | binder-sg-* | binder-node-reuse-* | binder-read-pair-* | binder-death-batch-* | creds-* | fmeta-* | bpfmap-* | threads-many-* | nproc-root-* | seccomp-*) runas="sudo -n" ;; esac
     orb_acquire
     "$ORB" -m builder sh -c "cd '$ROOT' && $runas '$bin' $args > '$out' 2>/dev/null; echo \$? > '$rc'" \
         >/dev/null 2>&1

@@ -20,6 +20,7 @@
 #include "prof.h"
 #include "props.h"
 #include "sched.h"
+#include "seccomp.h"
 #include "timers.h"
 #include "signals.h"
 #include "sysfs.h"
@@ -108,6 +109,7 @@ const char *syscall_name(uint64_t nr)
 {
     switch (nr) {
     case 17: return "getcwd";
+    case 277: return "seccomp";
     case 23: return "dup";
     case 24: return "dup3";
     case 25: return "fcntl";
@@ -881,7 +883,7 @@ static int64_t sys_rt_sigtimedwait(cpu_t *c, uint64_t set, uint64_t info, uint64
     return sig_timedwait(c, wanted, info, poll, has, deadline);
 }
 
-static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5)
+static int64_t sys_prctl(cpu_t *c, uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5)
 {
     proc_t *me = proc_cur();
     /* The unused arguments must be zero for these options, as Linux checks them. */
@@ -942,12 +944,16 @@ static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t
         /* Only the setting to 1, with the other arguments zero, is valid (as in Linux). */
         if (arg2 != 1 || arg3 || arg4 || arg5)
             return -LE_INVAL;
-        me->no_new_privs = 1;
+        c->nnp = 1; /* per thread, as Linux's task flag */
         return 0;
     case LPR_GET_NO_NEW_PRIVS:
         if (arg2 || arg3 || arg4 || arg5)
             return -LE_INVAL;
-        return me->no_new_privs;
+        return c->nnp;
+    case LPR_GET_SECCOMP:
+        return seccomp_prctl_get(c);
+    case LPR_SET_SECCOMP:
+        return seccomp_prctl_set(c, arg2, arg3);
     case LPR_GET_TAGGED_ADDR_CTRL:
         return 0; /* no tagged addresses (no MTE, no TBI control) */
     case LPR_SET_TAGGED_ADDR_CTRL:
@@ -1368,7 +1374,7 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
         *ret = sig_rt_tgsigqueueinfo(a[0], a[1], a[2], a[3]);
         return;
     case SYS_PRCTL:
-        *ret = sys_prctl(a[0], a[1], a[2], a[3], a[4]);
+        *ret = sys_prctl(c, a[0], a[1], a[2], a[3], a[4]);
         return;
     case SYS_GETRANDOM:
         *ret = sys_getrandom(a[0], a[1]);
@@ -1422,6 +1428,9 @@ static void dispatch(cpu_t *c, uint64_t nr, const uint64_t a[6], int64_t *ret)
     case 280: /* bpf(2): the maps-only subset (bpf.c, B15) */
         *ret = bpf_syscall(a[0], a[1], a[2]);
         return;
+    case 277: /* seccomp(2) (B19, seccomp.c) */
+        *ret = seccomp_syscall(c, a[0], a[1], a[2]);
+        return;
     case 434: /* pidfd_open (B16) */
         *ret = sys_pidfd_open(a[0], a[1]);
         return;
@@ -1446,6 +1455,18 @@ void syscall_dispatch(cpu_t *c)
     uint64_t a[6] = {c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5]};
     int64_t ret = 0;
     proc_cur()->nsys++;
+    if (__builtin_expect(c->sc_mode != 0, 0)) { /* seccomp: one branch for a thread without it */
+        int r = seccomp_enter(c, nr, a, &ret);
+        if (r == SECCOMP_GONE) /* a SIGSYS frame, or the thread or process ends: the registers stay */
+            return;
+        if (r == SECCOMP_SKIP) {
+            c->x[0] = (uint64_t)ret;
+            c->io_done = 0;
+            if (prof_on)
+                prof_syscall(c->tid, nr, a, ret, 0);
+            return;
+        }
+    }
     dispatch(c, nr, a, &ret);
     if (prof_on)
         prof_syscall(c->tid, nr, a, ret, c->blocked);

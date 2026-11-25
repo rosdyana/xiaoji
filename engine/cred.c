@@ -12,6 +12,7 @@
 #include "linux.h"
 #include "mem.h"
 #include "proc.h"
+#include "sched.h"
 
 #define ID_KEEP 0xFFFFFFFFu /* -1: leave this id as it is */
 
@@ -335,7 +336,8 @@ void cred_exec(proc_t *p)
     int is_setid = c->euid != o.ruid || c->egid != o.rgid;
     uint64_t gained = c->cap_perm & ~o.cap_perm;
     if (is_setid || gained != 0) {
-        if (!cap_on(o.cap_eff, LCAP_SETUID) || p->no_new_privs) {
+        const cpu_t *self = sched_cur_cpu(); /* no_new_privs is the calling thread's */
+        if (!cap_on(o.cap_eff, LCAP_SETUID) || (self && self->nnp)) {
             c->euid = c->ruid;
             c->egid = c->rgid;
         }

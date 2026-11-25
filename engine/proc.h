@@ -39,8 +39,8 @@ typedef struct proc {
     proc_cred_t cred;
     int dumpable;
     /* prctl state (syscall.c): inherited by a fork, as Linux does. pdeathsig is recorded only
-     * (no signal is sent when the parent exits) and is not inherited. */
-    int keepcaps, no_new_privs, securebits, subreaper, timerslack, pdeathsig;
+     * (no signal is sent when the parent exits) and is not inherited. no_new_privs is per thread (cpu_t.nnp). */
+    int keepcaps, securebits, subreaper, timerslack, pdeathsig;
     uint64_t capbset; /* the bounding set: bit n is capability n, for n up to PROC_CAP_LAST */
     int exited;      /* ended: its threads are going away */
     int exit_code;   /* the exit status (exit_group's code, or 128+sig for a fatal signal) */

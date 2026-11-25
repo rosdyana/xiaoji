@@ -53,6 +53,12 @@ int sig_interrupt_pending(const cpu_t *c);
  * handler), and the caller reports and exits. */
 int sig_fault(cpu_t *c, int sig, int code, uint64_t addr);
 
+/* seccomp's TRAP action (seccomp.c): a forced SIGSYS for the system call just made (c->pc is the address after its
+ * svc, x0 still holds its first argument). A handler that is installed and not blocked gets a frame with si_code
+ * SYS_SECCOMP, si_errno data, si_call_addr, si_syscall nr and si_arch arch; otherwise (blocked, ignored or default)
+ * the process dies by SIGSYS, as Linux's force_sig_seccomp. */
+void sig_seccomp_trap(cpu_t *c, int32_t nr, uint32_t data, uint32_t arch);
+
 /* 1 if a fault with this signal would enter a guest handler now (installed and not
  * blocked). */
 int sig_catchable(const cpu_t *c, int sig);

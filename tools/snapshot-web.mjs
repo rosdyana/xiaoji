@@ -168,7 +168,11 @@ async function make(chromium) {
         failures++;
       });
     }
-    if (failures) throw new Error('make: the pre-warm failed');
+    if (failures) {
+      // the log of the failed make, for its cause (build/snap/web-make-full.log, as a finished make writes it)
+      writeFileSync(join(out, 'web-make-full.log'), (await page.evaluate(() => (window.xb.all || []).join('\n'))) + '\n');
+      throw new Error('make: the pre-warm failed');
+    }
     await page.waitForFunction(() => window.xb.status === 'done' || window.xb.status === 'error' || window.xb.error, null,
       { timeout: MAKE_TIMEOUT_MS, polling: 1000 });
     const top = await page.evaluate(() => (window.xb.all || []).filter((l) => /snapshot: range \d+:/.test(l)).pop() || '');

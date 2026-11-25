@@ -1299,7 +1299,7 @@ the wall time. The counts below are from that run.
   (Android's init creates them). Nothing has needed them yet.
 - A stat through `/proc/self/fd/N` of a pipe or socket is ENOENT (B4b, Linux-style names section).
 - `PR_SET_PDEATHSIG` is recorded only, and `PR_SET_SECCOMP` is not implemented (zygote's filter is not
-  reached yet; see the component table).
+  reached yet; see the component table). seccomp is implemented in B19 part 2.
 - Only pipes and sockets have object inodes. eventfd, timerfd, epoll and memfd keep their old inodes.
 
 ## B4c: mount namespaces, system_server's entry (milestone d1)
@@ -4951,3 +4951,134 @@ Files (from `git status --short`): changed `Makefile`, `engine/bpf.c`, `engine/e
 
 The demo product (Calculator, the lean list of B16 applied, AOT for the demo apps, the snapshot taken when the phone is
 idle) and its measurements are in docs/demo.md.
+
+### B19, part 2: the media provider, seccomp, and the software codecs
+
+Status: **done.** The media provider (`com.android.providers.media.module`) starts once and stays up: in a native
+product boot it ran from 290 s to the end of the run at 1,300 s, 17 minutes (one pid, no restart, no ANR of it or of
+`android.process.media`), Files opened at 611 s and again at 911 s (displayed in 1.3 s the second time). That boot ran
+on the previous tree with the vendor manifest's codec2 entry removed by hand, the change the product build makes; the
+rebuilt tree was then checked by `make snapshot` (the provider started at HOME + 57 s and was not killed in the 470 s
+to the snapshot; the same engine on the old tree killed it five times) and by three restores in the browser (the
+snapshot's provider answered every Files open; docs/demo.md, B19 part 2, with the latency table). The software
+Codec2 store runs (`media.swcodec`) with its seccomp filter, which the engine now enforces as Linux does.
+
+#### The root cause
+
+The provider's start (DocumentsUI asks for `media.documents`) builds the codec list in its process
+(`MediaCodecList`): it asks for `media.player` (not in the product: 5 s, then it builds the list itself), skips OMX
+(no `IOmxStore` is declared), and asks Codec2 for every `IComponentStore` the VINTF manifests declare:
+`Available Codec2 services: "default" "software"`. `default` was declared by the goldfish device manifest
+(`device/generic/goldfish/64bitonly/manifest.xml`, `@1.1::IComponentStore/default`) and is served only by the goldfish
+codec service (`android.hardware.media.c2@1.0-service-goldfish`, hardware decoders on the emulator's host through the
+goldfish pipe), which the product never started. HIDL's `getService` of a declared instance does not give up: it asks
+hwservicemanager to start it as a lazy HAL ("Could not find ... for ctl.interface_start" from the engine's init) and
+retries every second, forever. So the provider's main thread never finished `onCreate`, ActivityManager killed it
+after 40 s ("timeout publishing content providers"), and `android.process.media` (the downloads provider, which calls
+the media provider) was killed for an ANR. `software` (the swcodec APEX's `mediaswcodec`) was declared by the framework
+manifest and not started either. The trial in docs/demo.md (L1) showed why it was not just started: `mediaswcodec`
+installs a seccomp filter through minijail, the engine answered `prctl(PR_SET_SECCOMP)` with EINVAL, and minijail
+aborts on that.
+
+#### seccomp in the engine (`engine/seccomp.c`)
+
+Linux's semantics (`kernel/seccomp.c`, `net/core/filter.c`), per thread, in `cpu_t`:
+
+- **Entry points.** `prctl(PR_SET_SECCOMP, STRICT | FILTER, prog)` (arg3 ignored for strict), `prctl(PR_GET_SECCOMP)`,
+  and `seccomp(2)` (277): `SET_MODE_STRICT` (flags and args must be 0), `SET_MODE_FILTER`, `GET_ACTION_AVAIL`
+  (EOPNOTSUPP for an unknown action), `GET_NOTIF_SIZES` (80, 24, 64); any other op EINVAL. The errors in Linux's order:
+  unknown flags, TSYNC with NEW_LISTENER without TSYNC_ESRCH, WAIT_KILLABLE_RECV without NEW_LISTENER (EINVAL); the
+  `sock_fprog` (EFAULT); a length of 0 or above 4,096 (EINVAL); no NO_NEW_PRIVS and no CAP_SYS_ADMIN (EACCES); the
+  instructions (EFAULT); the checker (EINVAL); a strict thread (EINVAL); more than 32,768 instructions in the chain,
+  each older filter counting 4 more (ENOMEM); TSYNC.
+- **The checker.** `seccomp_check_filter`'s opcode list (word loads of `seccomp_data` only, 4-aligned and below 64;
+  the length loads become an immediate 64; no IND, MSH, byte or half loads, MOD, or RET X) and `bpf_check_classic`'s
+  rules (constant division by zero, shifts by 32 or more, scratch index below 16, jumps forward and inside the program,
+  a RET last, and no scratch word read before it is stored on every path).
+- **Running.** On every system call of a thread whose mode is not 0 (`syscall_dispatch` tests `c->sc_mode`: one branch
+  for every other thread), the chain runs newest first on `struct seccomp_data` (nr, `AUDIT_ARCH_AARCH64`, the pc after
+  the `svc`, x0 to x5). The interpreter is cBPF's: 32-bit A and X, A / 0 by X returns 0 (as the eBPF conversion), shifts by X
+  mod 32. The lowest action (as a signed number) wins; for equal actions, the newest filter's data.
+- **Actions.** ALLOW and LOG run the call (LOG writes a line with `XIAOJI_DEBUG_FAULTS`). ERRNO returns minus its data,
+  at most 4,095. TRACE and USER_NOTIF return ENOSYS (no tracer, no listener). TRAP is a forced SIGSYS: with a handler
+  that is installed and not blocked, a frame with `si_code` SYS_SECCOMP (1), `si_errno` the data, `si_call_addr` the pc
+  after the `svc`, `si_syscall`, `si_arch`, and the registers as they were at the call (x0 is the first argument; the
+  handler's x0 is the call's result); blocked, ignored or default, the process dies by SIGSYS. KILL_THREAD ends the
+  thread (the process, by SIGSYS, when it is the last), KILL_PROCESS and unknown actions end the process by SIGSYS.
+  Strict mode allows read, write, exit and rt_sigreturn and ends the thread (the process when it is the last) with
+  SIGKILL. Each kill writes a line on stderr (`xiaoji: seccomp: ...`, pid, tid, syscall, pc).
+- **Inheritance.** Filters are immutable and reference-counted. A fork or clone copies the chain and the mode, execve
+  keeps them, a thread's end drops its reference. TSYNC moves every other live thread of the process to the caller's
+  chain (and sets NO_NEW_PRIVS on them when the caller has it), after checking that each is unfiltered or on an
+  ancestor of the caller's chain; otherwise it fails with that thread's tid (ESRCH with TSYNC_ESRCH) and installs
+  nothing.
+- **NO_NEW_PRIVS** moved from the process to the thread (`cpu_t.nnp`), as Linux's task flag: TSYNC needs it per thread,
+  and execve's set-id rule (`cred_exec`) reads the calling thread's.
+- **The verdict cache.** When a run of the chain for a syscall number below 512 read nothing of `seccomp_data` but nr
+  and arch, its result holds for every call with that number (the program is deterministic in what it reads, and the
+  checker guarantees the scratch words are stored before they are read), so it is kept with the chain's newest filter.
+  A chain never changes (a new filter makes a new head), so nothing is invalidated. minijail's filters check the
+  arguments of a few calls (`mmap`, `mprotect`, `mremap` for `mediaswcodec`); every other call is one lookup.
+- **procfs.** `/proc/<pid>/status` has `NoNewPrivs`, `Seccomp` and `Seccomp_filters` (the main thread's), and
+  `/proc/sys/kernel/seccomp/actions_avail` and `actions_logged` are served (the kernel's texts).
+- **Not modelled.** The user-notification listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` is refused with EINVAL; the
+  USER_NOTIF action behaves as Linux's without a listener), ptrace, the audit log, compat system calls.
+
+Snapshots need nothing: the filters are engine memory, in the image.
+
+The test is `tests/guest/seccomp.c` (O0 and O2, engine and Node, against the native oracle, which runs it as root as
+the engine's guest is): the queries and the sysctl files; NO_NEW_PRIVS (EACCES with the effective capabilities
+dropped, accepted with CAP_SYS_ADMIN); 25 programs the checker refuses (and EFAULTs, unknown flags) and one with the
+edge cases it accepts; ERRNO (clamped), TRACE, USER_NOTIF, LOG; precedence across filters; filters on arguments, on the
+instruction pointer, and on the ALU, X, scratch memory and jumps; division by zero in X; TRAP with every siginfo field
+and the ucontext, and with SIGSYS blocked, ignored and default; KILL_PROCESS, KILL_THREAD with one and two threads,
+two unknown actions; strict mode (a killed `getpid` and `exit_group`, a clean `exit`); inheritance across fork, clone
+and execve; TSYNC (with NO_NEW_PRIVS on the other thread), its failure (the tid, ESRCH) and its ancestor rule; the
+instruction limit. `seccomp` is in `tests/run.sh`'s root-oracle list.
+
+#### The product
+
+- `aosp/device/xiaoji/manifest.xml`: goldfish's device manifest without the `IComponentStore/default` entry, used in
+  place of it (`xiaoji_vendor.mk`); the goldfish Codec2 service and its four decoders are no longer installed. The
+  product has no hardware codecs; the framework manifest declares only `software`.
+- `image/xiaoji.rc`: `media.swcodec`, the APEX's block (user `media_codec`, groups `camera drmrpc media_drm`).
+
+In the boot (`XIAOJI_STAMP=1 build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs-xiaoji --input-script
+<files script> --init-timeout 1300`, a fresh `/data`):
+
+```
+I/mediaswcodec(1023): media swcodec service starting
+W/mediaswcodec(1023): libminijail[1023]: logging seccomp filter failures
+I/HidlServiceManagement(1023): Registered android.hardware.media.c2@1.2::IComponentStore/software
+I/ActivityManager(1078): Start proc 1608:com.android.providers.media.module/u0a53 for content provider {...MediaDocumentsProvider}
+W/ServiceManager(1608): Service media.player didn't start. Returning NULL
+I/Codec2Client(1608): Available Codec2 services: "software"
+D/MediaCodecsXmlParser(1608): parsing /apex/com.android.media.swcodec/etc/media_codecs.xml...
+I/ActivityTaskManager(1078): Displayed com.android.documentsui/.files.FilesActivity: +5m41s650ms      (611 s)
+I/ActivityTaskManager(1078): Displayed com.android.documentsui/.files.FilesActivity: +1s290ms         (911 s)
+```
+
+minijail logs filter failures on a userdebug build with a SIGSYS handler (on Android it never reads `actions_avail`
+and uses TRAP, not LOG): no `blocked syscall` line appeared in any run. The one ANR in the boot is RemoteProvisioner's
+(docs/demo.md, open issue 4).
+
+#### What Files shows
+
+The Images, Audio, Videos and Documents row at the top of Files is DocumentsUI's search chips (`SearchChipViewManager`,
+fixed MIME-type filters), not the media provider's roots. The media provider's own roots (Images, Videos, Audio,
+Documents in the drawer) appear only after it attaches an external volume (`MediaDocumentsProvider.queryRoots` returns
+none until `onMediaStoreReady`), and the emulated volume is `unmountable` in this engine: vold mounts it with FUSE
+(`Failed to open /dev/fuse`; Android 13 has no non-FUSE path), and MediaProvider is the FUSE daemon. That was so before
+this change too (the "no roots" line for `com.android.externalstorage.documents` is in every earlier run). Now the
+provider answers `queryRoots` at once (an empty list) instead of blocking; serving `/dev/fuse` is a separate milestone
+(open below).
+
+#### Open
+
+1. **`media.player`**: the provider waits 5 s for it at each start (`MediaCodecList::getInstance` asks mediaserver for
+   the codec list first), then builds the list itself (about 10 s of the engine's time at boot). AOSP emulators run
+   `mediaserver`; starting it would move that work out of the provider and give `MediaMetadataRetriever` (thumbnails)
+   its service. Not done: with the provider kept alive it is paid once, before the snapshot.
+2. **External storage needs FUSE** (above): the media roots and the files under `/sdcard`.
+3. minijail logs `failed to get path of fd 4` (its `realpath("/proc/self/fd/4")` of the policy file): only the name in
+   its warnings.
