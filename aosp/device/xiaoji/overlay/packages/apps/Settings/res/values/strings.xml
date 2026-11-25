@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The goldfish product is an emulator (PRODUCT_CHARACTERISTICS), whose title is "About emulated device". -->
+    <string name="about_settings" product="emulator">About XiaoJi</string>
+    <string name="about_settings" product="default">About XiaoJi</string>
+</resources>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- XiaoJi has no Wi-Fi service (the lean product), so the WifiManager Settings gets is null. These rows of
+     Settings > About call it without a null check: the Wi-Fi MAC address row threw a NullPointerException when
+     About opened, the IP address row reads Wi-Fi too, and saving a new device name sets the hotspot's SSID.
+     Hidden here; the Model row still shows the device's model (ro.product.model). -->
+<resources>
+    <bool name="config_show_wifi_mac_address">false</bool>
+    <bool name="config_show_wifi_ip_address">false</bool>
+    <bool name="config_show_device_name">false</bool>
+    <bool name="config_show_wifi_settings">false</bool>
+</resources>

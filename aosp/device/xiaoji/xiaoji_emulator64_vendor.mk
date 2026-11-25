@@ -31,7 +31,8 @@ endif
 PRODUCT_PACKAGES += \
     vndk-sp
 
-DEVICE_PACKAGE_OVERLAYS := device/generic/goldfish/overlay
+# device/xiaoji/overlay first: it wins over goldfish's (Settings: rows that need Wi-Fi, the About title).
+DEVICE_PACKAGE_OVERLAYS := device/xiaoji/overlay device/generic/goldfish/overlay
 
 PRODUCT_CHARACTERISTICS := emulator
 

@@ -30,6 +30,9 @@ ssh "$HOST" "cd $TREE && cat > xiaoji-build.sh <<'EOS'
 cd ~/xiaoji-aosp
 renice -n 5 \$\$ >/dev/null
 source build/envsetup.sh
+# The build's user and host go into build.prop (ro.build.user, ro.build.host, the build number Settings shows) and
+# from there into the public snapshot: fixed names, not the build machine's.
+export BUILD_USERNAME=xiaoji BUILD_HOSTNAME=xiaoji
 lunch xiaoji_arm64-userdebug
 echo \"== build start \$(date -u)\"
 if [ \"\$1\" = 1 ]; then m installclean; fi

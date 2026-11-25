@@ -406,6 +406,116 @@ static const char *const engine_props[][2] = {
     {"ro.sf.lcd_density", XJ_DISPLAY_DPI_STR},
 };
 
+/* The value of a short property (NUL-terminated, in the area), or NULL when it is unset, long or empty. */
+static const char *get_short(const char *name)
+{
+    uint32_t d = lookup(name, strlen(name));
+    if (!d || is_long(d) || !(rd32(F(d)) >> 24))
+        return NULL;
+    return (const char *)A + F(d) + 4;
+}
+
+static void put_str(const char *name, const char *value)
+{
+    put(name, strlen(name), value, strlen(value));
+}
+
+/* The source order of init's ro.product.* derivation: ro.product.property_source_order when every entry is
+ * allowed, else the default. Writes up to 8 partition names into out and returns their count. */
+static int source_order(const char *def, const char *const *allowed, size_t nallowed, char out[8][16])
+{
+    const char *order = get_short("ro.product.property_source_order");
+    for (int pass = 0; pass < 2; pass++) {
+        const char *s = pass == 0 && order ? order : def;
+        int n = 0, ok = 1;
+        while (*s && ok) {
+            const char *e = strchr(s, ',');
+            size_t len = e ? (size_t)(e - s) : strlen(s);
+            ok = 0;
+            for (size_t i = 0; i < nallowed; i++)
+                if (strlen(allowed[i]) == len && !memcmp(allowed[i], s, len))
+                    ok = 1;
+            if (ok && n < 8 && len < 16) {
+                memcpy(out[n], s, len);
+                out[n++][len] = 0;
+            }
+            s += len + (e ? 1 : 0);
+        }
+        if (ok && n)
+            return n;
+        if (pass == 0 && order)
+            fprintf(stderr, "xiaoji: props: ro.product.property_source_order=%s is not valid; using the default\n",
+                    order);
+    }
+    return 0;
+}
+
+/* What init's PropertyLoadBootDefaults derives after loading the build.prop files (system/core/init/
+ * property_service.cpp, Android 13): ro.product.{brand,device,manufacturer,model,name} from the partitions'
+ * ro.product.<partition>.*, ro.build.fingerprint, and ro.product.cpu.abilist{,32,64}. Without them
+ * Build.MODEL, Build.BRAND... read "unknown" (Settings' About shows "unknown") and Build.SUPPORTED_ABIS is empty. */
+static void derive_build_props(void)
+{
+    static const char *const fields[] = {"brand", "device", "manufacturer", "model", "name"};
+    static const char *const allowed[] = {"odm", "product", "system_ext", "system", "vendor"};
+    char order[8][16], key[64];
+    int n = source_order("product,odm,vendor,system_ext,system", allowed, 5, order);
+    for (size_t f = 0; f < sizeof fields / sizeof fields[0]; f++) {
+        snprintf(key, sizeof key, "ro.product.%s", fields[f]);
+        if (get_short(key))
+            continue;
+        for (int i = 0; i < n; i++) {
+            char src[64];
+            snprintf(src, sizeof src, "ro.product.%s.%s", order[i], fields[f]);
+            const char *v = get_short(src);
+            if (v) {
+                char copy[PROP_VALUE_MAX];
+                snprintf(copy, sizeof copy, "%s", v);
+                put_str(key, copy);
+                break;
+            }
+        }
+    }
+
+    if (!get_short("ro.build.fingerprint")) {
+        static const char *const parts[] = {"ro.product.brand", "/", "ro.product.name", "/", "ro.product.device", ":",
+                                            "ro.build.version.release_or_codename", "/", "ro.build.id", "/",
+                                            "ro.build.version.incremental", ":", "ro.build.type", "/",
+                                            "ro.build.tags"};
+        char fp[256]; /* an ro.* value may be long (a long record) */
+        size_t len = 0;
+        for (size_t i = 0; i < sizeof parts / sizeof parts[0] && len < sizeof fp; i++) {
+            const char *v = parts[i][0] == 'r' ? get_short(parts[i]) : parts[i];
+            len += (size_t)snprintf(fp + len, sizeof fp - len, "%s", v ? v : "unknown");
+        }
+        if (len < sizeof fp)
+            put_str("ro.build.fingerprint", fp);
+    }
+
+    /* property_initialize_ro_cpu_abilist: the first partition (product, odm, vendor, system) that sets
+     * ro.<partition>.product.cpu.abilist gives all three. */
+    if (!get_short("ro.product.cpu.abilist")) {
+        static const char *const abi_parts[] = {"product", "odm", "vendor", "system"};
+        static const char *const sfx[] = {"abilist", "abilist32", "abilist64"};
+        for (size_t i = 0; i < sizeof abi_parts / sizeof abi_parts[0]; i++) {
+            char src[64];
+            snprintf(src, sizeof src, "ro.%s.product.cpu.abilist", abi_parts[i]);
+            if (!get_short(src))
+                continue;
+            for (size_t s = 0; s < 3; s++) {
+                char copy[PROP_VALUE_MAX] = "";
+                snprintf(src, sizeof src, "ro.%s.product.cpu.%s", abi_parts[i], sfx[s]);
+                const char *v = get_short(src);
+                if (v)
+                    snprintf(copy, sizeof copy, "%s", v);
+                snprintf(key, sizeof key, "ro.product.cpu.%s", sfx[s]);
+                put_str(key, copy);
+            }
+            break;
+        }
+    }
+}
+
 int props_init(const char *const *overrides, int noverrides)
 {
     area_memfd = memfd_new("properties");
@@ -424,6 +534,7 @@ int props_init(const char *const *overrides, int noverrides)
 
     for (size_t i = 0; i < sizeof build_props / sizeof build_props[0]; i++)
         load_file(build_props[i]);
+    derive_build_props();
     for (size_t i = 0; i < sizeof engine_props / sizeof engine_props[0]; i++) {
         const char *k = engine_props[i][0], *v = engine_props[i][1];
         put(k, strlen(k), v, strlen(v));

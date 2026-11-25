@@ -76,4 +76,5 @@ PRODUCT_PROPERTY_OVERRIDES += pm.dexopt.disable_bg_dexopt=true
 PRODUCT_BRAND := Android
 PRODUCT_NAME := xiaoji_arm64
 PRODUCT_DEVICE := xiaoji_arm64
-PRODUCT_MODEL := xiaoji
+PRODUCT_MODEL := XiaoJi
+PRODUCT_MANUFACTURER := XiaoJi
