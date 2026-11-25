@@ -7,7 +7,7 @@ xiaoji (小机, "little phone", like 手机 shǒujī) is the Android sibling of 
 - **xiaonux** emulates a whole RISC-V machine.
 - **xiaoji** does not emulate a machine. Its engine, written in C and compiled to WebAssembly, runs Android's ARM64 user-space code and provides the Linux kernel interface itself: syscalls, binder, futexes, files, cgroups, input devices and the emulator's graphics pipe. Android's OpenGL ES calls go to WebGL2.
 
-There is no guest kernel, MMU or virtual hardware to emulate, which is why xiaoji doesn't build on Cuttlefish or another full-system VM. xiaoji's distinguishing goal is delivery, borrowed from xiaonux: content-addressed chunks fetched on demand, boot packs, a booted snapshot (planned) and per-app packs. The aim is a small first download and a start measured in seconds, not a 1 GB download before the first boot.
+There is no guest kernel, MMU or virtual hardware to emulate, which is why xiaoji doesn't build on Cuttlefish or another full-system VM. xiaoji's distinguishing goal is delivery, borrowed from xiaonux: content-addressed chunks fetched on demand, boot packs, a booted snapshot and per-app packs (planned). The aim is a small first download and a start measured in seconds, not a 1 GB download before the first boot.
 
 ## Status
 
@@ -18,7 +18,9 @@ Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`, with Wi-Fi, Blue
 | `sys.boot_completed` | about 270 s | about 6 min |
 | Launcher on screen | about 285 s | about 6.5 min |
 
-The browser numbers were measured on an 8 GB machine that was swapping, on battery. The next step is a snapshot after boot, so that a visitor starts at the home screen instead of booting.
+The browser numbers were measured on an 8 GB machine that was swapping, on battery.
+
+A booted snapshot skips the boot (docs/snapshot.md): the page restores Android at the home screen from a snapshot the web engine wrote. On localhost, Boot Android shows the launcher about 6 s after the press (a 115 MiB download, written into the engine's memory; the engine itself needs about 0.3 s to its first frame), against about 6.5 min for a boot. `make snapshot` makes it for the current tree and engine; natively, `build/xiaoji --restore` resumes a snapshot in under a second.
 
 Milestone notes:
 
@@ -29,6 +31,7 @@ Milestone notes:
 | [docs/graphics.md](docs/graphics.md) | the goldfish pipe, the gfxstream decoders, the null and WebGL2 backends (G1 to G4) |
 | [docs/input.md](docs/input.md) | the touchscreen and keyboard (evdev) and how the page feeds them |
 | [docs/loading.md](docs/loading.md) | chunks, boot packs, early start and caching |
+| [docs/snapshot.md](docs/snapshot.md) | booted snapshots: the design, `--snapshot-at` and `--restore`, the WebGL objects, the page's restore (S1 to S4) |
 | [docs/web-preview.md](docs/web-preview.md) | the browser page and its boot screen |
 | [docs/testing.md](docs/testing.md) | the test suite, parallel runs, the remote runner |
 | [docs/features.md](docs/features.md) | draft: which Android features are base, add-on, engine-backed or never |
@@ -46,6 +49,7 @@ make oracle          # reference runs in the VM -> build/oracle
 make guest-tests     # the guest test programs, built in the VM
 make test            # the suite: every case natively and in Node, against the oracle
 make serve           # the page at http://127.0.0.1:8080/ (needs build/rootfs-xiaoji)
+make snapshot        # the page's booted snapshot (headless Chromium, about 7 min; docs/snapshot.md)
 make help            # every target
 ```
 
