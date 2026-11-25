@@ -329,6 +329,10 @@ let restoreStarted = false;
 function describeFailure(text) {
   const net = /NetworkError|Failed to fetch|network|HTTP \d{3}|status \d{3}|ERR_/i.test(String(text || ''));
   const restoring = restoreStarted && !(window.xb.restore && window.xb.restore.state === 'loaded');
+  if (/snapshot: the lazy pages/.test(String(text || ''))) {
+    return { label: 'Snapshot download failed', detail: 'Network error · press Start Android to retry',
+      record: 'Part of the snapshot could not be downloaded after several tries (network error), so Android stopped. Press Start Android to try again.' };
+  }
   if (net && restoring) {
     return { label: 'Snapshot download failed', detail: 'Network error · press Start Android to retry',
       record: 'The snapshot download failed (network error). Press Start Android to try again, or open the page with ?snapshot=off to boot instead.' };
@@ -393,7 +397,8 @@ snapInfo.then((snap) => {
   if (!self.crossOriginIsolated) {
     note.textContent = 'This page is not cross-origin isolated, so Android starts slowly';
   } else if (snap && Number.isFinite(snap.download_bytes)) {
-    note.textContent = `Downloads ${Math.round(snap.download_bytes / 1048576)} MB`;
+    note.textContent = `Downloads ${Math.round(snap.download_bytes / 1048576)} MB` +
+      (snap.lazy ? ` to start, ${Math.round(snap.lazy.bytes / 1048576)} MB more while it runs` : '');
     if (snap.build) {
       $('buildnote').textContent = `Snapshot for engine build ${snap.build}.`;
       $('buildnote').hidden = false;
@@ -486,12 +491,19 @@ $('boot').addEventListener('click', async () => {
       onRestore(scr, { loaded: m.loaded || 0, total: m.total });
       render();
     } else if (m.type === 'restore-loaded') {
-      window.xb.restore = { ...window.xb.restore, state: 'loaded', loadedWall: m.wall, loadMs: m.loadMs, bytes: m.bytes, timing: m.timing };
+      window.xb.restore = { ...window.xb.restore, state: 'loaded', loadedWall: m.wall, loadMs: m.loadMs, bytes: m.bytes, timing: m.timing,
+        lazy: m.lazy, mainAt: m.mainAt };
       appendLog(`snapshot: ${fmtBytes(m.bytes)} in ${(m.loadMs / 1000).toFixed(2)} s`);
       session.setCell(sess, 'download', m.bytes);
       session.note(sess, 'loaded', `Snapshot read: ${fmtBytes(m.bytes)} in ${(m.loadMs / 1000).toFixed(1)} s; restoring`, now);
       renderSession();
       setBootStatus('running');
+    } else if (m.type === 'lazy') {
+      // The lazy pages' fill (docs/snapshot.md, S5): its counters, and in a recording the first touches.
+      window.xb.lazy = m.stats;
+      if (m.done) appendLog(`snapshot: every lazy page is in after ${(m.stats.doneMs / 1000).toFixed(1)} s ` +
+        `(${m.stats.faults} faults, ${m.stats.syncFetches} fetched on demand)`);
+      if (m.touches) (window.xb.lazyTouches = window.xb.lazyTouches || []).push(...m.touches);
     } else if (m.type === 'restore-refused') {
       // The snapshot is another build's or another tree's: boot instead (this page load does not try it again).
       appendLog(`snapshot not used: ${m.text}; booting`);
@@ -574,6 +586,7 @@ $('boot').addEventListener('click', async () => {
         $('phone').dataset.frame = '1';
         if (window.xb.restore && window.xb.restore.state === 'loaded') {
           window.xb.restore.firstFrameWall = now - bootT0;
+          window.xb.restore.firstFrameAt = performance.timeOrigin + now;
           session.setCell(sess, 'home', now - sess.pressAt);
           session.note(sess, 'frame', 'Home screen: first frame', now);
         } else {
@@ -611,6 +624,10 @@ $('boot').addEventListener('click', async () => {
     // A restore (docs/demo.md, P1): ?prehot=0 leaves out --jit-prehot; ?inflaters=N sets the helpers that inflate the
     // snapshot's chunks (0: the engine's worker inflates them itself).
     prehot: params.get('prehot'), inflaters: params.get('inflaters'), prefetch: params.get('prefetch'),
+    // Lazy pages (docs/snapshot.md, S5): ?snaplazy=0 loads them before main too; ?snaprecord=1 records the first touch of
+    // each (tools/snapshot-web.mjs record); ?snapcache=0 leaves the snapshot's Cache Storage alone.
+    snapLazy: params.get('snaplazy'), snapRecord: params.get('snaprecord'), snapCache: params.get('snapcache'),
+    lazyPoison: params.get('lazypoison'), // ?lazypoison=1: pending pages hold 0xA5 until they arrive (a test of the fill)
   });
   if (mode === 'pack' && !snap) {
     // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).

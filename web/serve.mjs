@@ -1,9 +1,9 @@
 // Dev server for the web page (M4). Node only, no dependencies.
 //
-//   node web/serve.mjs [--port N] [--host H] [--no-coop]
-//   throttle: { mbps, rttMs } (startServer / createHandler, for the boot benchmark). Every response waits
-//   rttMs before its headers, and all bodies share one bucket of mbps (0 = no limit), so the limit holds
-//   for the worker's requests too.
+//   node web/serve.mjs [--port N] [--host H] [--no-coop] [--snapshot-upload DIR] [--throttle MBPS:RTT_MS]
+//   throttle: { mbps, rttMs } (startServer / createHandler, for the boot benchmark and tools/latency.mjs). Every
+//   response waits rttMs before its headers, and all bodies share one bucket of mbps (0 = no limit), so the limit
+//   holds for the worker's requests too. startServer's result has counters: the bodies' bytes and the requests.
 //
 // URL layout:
 //   /manifest.json          build/web/manifest.json (make build/web/manifest.json)
@@ -126,8 +126,9 @@ function send(res, status, headers, body) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 // Streams src to res through the shared bucket: each chunk takes len / rate of bucket time.
-async function pipeThrottled(src, res, bucket) {
+async function pipeThrottled(src, res, bucket, counters) {
   for await (const chunk of src) {
+    counters.bytes += chunk.length;
     const now = Date.now();
     bucket.free = Math.max(bucket.free, now) + chunk.length / bucket.bytesPerMs;
     if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
@@ -154,9 +155,17 @@ async function snapUpload(req, res, url, dir, common) {
   return send(res, 200, common, 'ok\n');
 }
 
-export function createHandler({ coop = true, log = () => {}, throttle = null, snapshotUpload = null } = {}) {
+// counters (optional): the bodies' bytes and the requests answered, for the measurements (tools/latency.mjs).
+export function createHandler({ coop = true, log = () => {}, throttle = null, snapshotUpload = null, counters = null } = {}) {
   const limited = throttle && (throttle.mbps > 0 || throttle.rttMs > 0);
   const bucket = { free: 0, bytesPerMs: throttle && throttle.mbps > 0 ? throttle.mbps * 125 : Infinity };
+  const count = counters || { bytes: 0, requests: 0 };
+  const body = (src, res) => {
+    count.requests++;
+    if (limited) return pipeThrottled(src, res, bucket, count);
+    src.on('data', (c) => (count.bytes += c.length));
+    return src.pipe(res);
+  };
   return async (req, res) => {
     if (limited && throttle.rttMs > 0) await sleep(throttle.rttMs);
     const url = new URL(req.url, 'http://localhost');
@@ -206,21 +215,20 @@ export function createHandler({ coop = true, log = () => {}, throttle = null, sn
       log(`206 ${req.method} ${url.pathname} ${range.start}-${range.end}`);
       res.writeHead(206, headers);
       if (req.method === 'HEAD') return res.end();
-      const part = createReadStream(hit.file, { start: range.start, end: range.end });
-      return limited ? pipeThrottled(part, res, bucket) : part.pipe(res);
+      return body(createReadStream(hit.file, { start: range.start, end: range.end }), res);
     }
     headers['Content-Length'] = String(size);
     log(`200 ${req.method} ${url.pathname} ${size}`);
     res.writeHead(200, headers);
     if (req.method === 'HEAD') return res.end();
-    const whole = createReadStream(hit.file);
-    return limited ? pipeThrottled(whole, res, bucket) : whole.pipe(res);
+    return body(createReadStream(hit.file), res);
   };
 }
 
 // Starts the server and resolves to { server, port, url, close() }. Port 0 picks a free port.
 export function startServer({ port = 8080, host = '127.0.0.1', coop = true, log, throttle = null, snapshotUpload = null } = {}) {
-  const handler = createHandler({ coop, log, throttle, snapshotUpload });
+  const counters = { bytes: 0, requests: 0 };
+  const handler = createHandler({ coop, log, throttle, snapshotUpload, counters });
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
       if (!res.headersSent) send(res, 500, { 'Cache-Control': 'no-store' }, 'server error\n');
@@ -236,10 +244,19 @@ export function startServer({ port = 8080, host = '127.0.0.1', coop = true, log,
         server,
         port: addr.port,
         url,
+        counters,
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
   });
+}
+
+// "MBPS:RTT_MS" (e.g. 50:40): every response waits one RTT, and all bodies share one bucket of MBPS megabits a second
+// (docs/loading.md, section 5: a model, without TCP slow start or connection reuse).
+export function parseThrottle(arg) {
+  const m = /^([\d.]+):([\d.]+)$/.exec(String(arg || ''));
+  if (!m) throw new Error(`--throttle wants MBPS:RTT_MS, not ${arg}`);
+  return { mbps: Number(m[1]), rttMs: Number(m[2]) };
 }
 
 function parseArgs(argv) {
@@ -250,6 +267,7 @@ function parseArgs(argv) {
     else if (a === '--host') opts.host = argv[++i];
     else if (a === '--no-coop') opts.coop = false;
     else if (a === '--snapshot-upload') opts.snapshotUpload = resolve(argv[++i]);
+    else if (a === '--throttle') opts.throttle = parseThrottle(argv[++i]);
     else throw new Error(`unknown argument: ${a}`);
   }
   return opts;

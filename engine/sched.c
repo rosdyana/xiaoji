@@ -30,6 +30,7 @@
 #include "timers.h"
 #include "signals.h"
 #include "snap.h"
+#include "snaplazy.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include "jit.h"
@@ -448,6 +449,9 @@ static thread_t *pick(void)
     return NULL;
 }
 
+/* While a restore's pages arrive in the background (snaplazy.c), an idle loop wakes every 4 ms to copy them in. */
+static uint64_t sleep_cap(uint64_t ns) { return snap_lazy_bits && ns > 4000000ull ? 4000000ull : ns; }
+
 /* Sleeps the host until the earliest deadline. Returns 0 if no thread has one. */
 static int wait_for_timers(void)
 {
@@ -477,7 +481,7 @@ static int wait_for_timers(void)
     if (earliest > now) {
         if (prof_on)
             prof_idle(earliest - now);
-        host_sleep_ns(earliest - now);
+        host_sleep_ns(sleep_cap(earliest - now));
         idle_ns += host_monotonic_ns() - now;
     }
     return 1;
@@ -781,7 +785,7 @@ static void idle_wait(uint64_t (*deadline)(void))
     uint64_t wait = IDLE_POLL_NS;
     if (dl && dl - now < wait)
         wait = dl - now;
-    host_sleep_ns(wait);
+    host_sleep_ns(sleep_cap(wait));
     idle_ns += host_monotonic_ns() - now;
 }
 
@@ -825,6 +829,8 @@ loop:
     while (!init_proc->exited) {
         /* The snapshot point (snap.c): a slice boundary, where every thread is runnable or in a wait the image holds. */
         snap_point();
+        if (snap_lazy_bits) /* a restore's pages that arrived in the background (snaplazy.c) */
+            snap_lazy_poll();
         for (int i = 0; i < 8; i++)
             if (dump_at_ns[i] && host_monotonic_ns() >= dump_at_ns[i]) {
                 dump_at_ns[i] = 0;

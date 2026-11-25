@@ -56,6 +56,7 @@ void mem_snap_drop_clean(uint64_t *clean, uint64_t *dirty);
 uint64_t mem_pool_nonzero(void);
 /* 1 if p is in one of the pool's slabs (a guest or memfd page, used or free). */
 int mem_pool_contains(const void *p);
+size_t mem_pool_slabs(uint8_t *const **slabs, size_t *slab_bytes);
 
 /* Mapping. Addresses and lengths must be page aligned. Pages that are already
  * mapped keep their contents and get the new protection. Return 0 or -1. */

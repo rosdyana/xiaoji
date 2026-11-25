@@ -5,6 +5,10 @@
 //                                         a snapshot at the home screen (the launcher's HOME start + 480 s and a quiet
 //                                         window, below) to the dev server (build/snap/web.snap), then
 //                                         tools/snappack.py packs it into the chunk store (build/web/xj/snapshot.json)
+//   node tools/snapshot-web.mjs record    restores the snapshot with every lazy page on demand (?snaprecord=1) and
+//                                         records the first touch of each page while the phone idles and the demo
+//                                         apps open (build/snap/touch.json), for tools/snappack.py --order
+//                                         (docs/snapshot.md, S5); make runs it and packs again
 //   node tools/snapshot-web.mjs fallback  the page boots instead when the snapshot is another build's, or missing
 //   node tools/snapshot-web.mjs restore   opens the page, which restores the snapshot, and checks it: the first frame
 //                                         after the restore is the launcher (not one colour), a swipe up and a tap on
@@ -13,7 +17,7 @@
 //
 // Playwright comes from XN_PLAYWRIGHT (default: the xiaonux bench's playwright-core), XN_CHROME picks a browser.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -130,6 +134,12 @@ async function prewarm(page, ui, apps) {
 if (process.env.XN_XJ) DIRS.xj = resolve(process.env.XN_XJ);
 
 async function make(chromium) {
+  await makeSnapshot(chromium);
+  const snap = join(ROOT, 'build', 'snap', 'web.snap');
+  if (!failures && existsSync(snap)) await packSnapshot(chromium, snap);
+}
+
+async function makeSnapshot(chromium) {
   const out = join(ROOT, 'build', 'snap');
   const srv = await startServer({ port: 0, snapshotUpload: out });
   const browser = await launch(chromium);
@@ -204,13 +214,36 @@ async function make(chromium) {
     await browser.close();
     await srv.close();
   }
-  const snap = join(out, 'web.snap');
-  if (!failures && existsSync(snap)) {
+}
+
+// tools/snappack.py, the touch order and the tree's prefetch (docs/snapshot.md, S4 and S5; docs/demo.md, P1).
+async function packSnapshot(chromium, snap) {
+  {
     console.log(`    build/snap/web.snap: ${(statSync(snap).size / 1048576).toFixed(1)} MiB`);
-    execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, DIRS.xj,
-      '--tree', join(DIRS.xj, 'manifest-xiaoji-v2.json')], { stdio: 'inherit' });
+    const pack = (...extra) => execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, DIRS.xj,
+      '--tree', join(DIRS.xj, 'manifest-xiaoji-v2.json'), ...extra], { stdio: 'inherit' });
+    pack();
+    // Lazy pages (docs/snapshot.md, S5): a restore records which pages the first frame, the idle phone and the demo
+    // apps touch, and the snapshot is packed again with those hot (up to the first frame) and the rest in that order.
+    let order = join(ROOT, 'image', 'restore-order.json');
+    if (process.env.XN_SNAP_RECORD !== 'off') {
+      const rec = await record(chromium);
+      if (rec) {
+        pack('--order', rec.touch);
+        // The recording's file reads are this snapshot's own prefetch order: its clean pages are the ones its make
+        // left out. First, then the committed order's other chunks (a session the recording did not make).
+        execFileSync('python3', ['-I', join(ROOT, 'tools', 'prefetch.py'), 'record', rec.fetchLog, '--tree',
+          join(DIRS.xj, 'manifest-xiaoji-v2.json'), '--out', join(ROOT, 'build', 'snap', 'restore-order.json')], { stdio: 'inherit' });
+        const mine = JSON.parse(readFileSync(join(ROOT, 'build', 'snap', 'restore-order.json'), 'utf8'));
+        const theirs = existsSync(order) ? JSON.parse(readFileSync(order, 'utf8')) : [];
+        const seen = new Set(mine.map((x) => JSON.stringify(x)));
+        const both = [...mine, ...theirs.filter((x) => !seen.has(JSON.stringify(x)))];
+        order = join(ROOT, 'build', 'snap', 'prefetch-order.json');
+        writeFileSync(order, JSON.stringify(both) + '\n');
+        console.log(`    prefetch order: ${mine.length} chunks from the recording, ${both.length - mine.length} more from image/restore-order.json`);
+      }
+    }
     // The restore's prefetch (docs/demo.md, P1): the chunks of the recorded first minute, packed for the page.
-    const order = join(ROOT, 'image', 'restore-order.json');
     if (existsSync(order)) {
       execFileSync('python3', ['-I', join(ROOT, 'tools', 'prefetch.py'), 'pack', order, '--xj', DIRS.xj], { stdio: 'inherit' });
     }
@@ -235,6 +268,85 @@ async function gesture(page, points, stepMs) {
     await page.waitForTimeout(stepMs);
   }
   await page.mouse.up();
+}
+
+// The touch order of a restore (docs/snapshot.md, S5): the page restores with ?snaprecord=1, so every lazy page is
+// read on demand, one at a time, and its first touch is kept with its time since main. The tree's prefetch is off
+// (?prefetch=0), so the server's log has every file chunk the session reads (build/snap/fetch.log, for
+// tools/prefetch.py record). The phone idles
+// (XN_RECORD_IDLE, default 20 s), then the demo apps open from the drawer in the order tools/latency.mjs opens them
+// (Settings, Calculator, Files), each with Home after it. Writes build/snap/touch.json: {pages: [[address, ms], ...],
+// first_frame_ms, marks}; returns {touch, fetchLog}, or null when the snapshot has no lazy pages.
+async function record(chromium) {
+  const fetchLines = [];
+  const srv = await startServer({ port: 0, log: (l) => fetchLines.push(`${Date.now()} ${l}`) });
+  const browser = await launch(chromium);
+  const out = join(ROOT, 'build', 'snap', 'touch.json');
+  const ui = drawerLayout(DIRS.xj);
+  try {
+    const page = await browser.newPage({ viewport: VIEW });
+    watch(page, browser, 'record');
+    await page.goto(srv.url + '?keeplog=1&snaprecord=1&prefetch=0&load=5000', { waitUntil: 'load' });
+    await page.click('#boot');
+    await page.waitForFunction(() => window.xb.restore && /loaded|refused/.test(window.xb.restore.state) || window.xb.error,
+      null, { timeout: 600000, polling: 200 });
+    const st = await page.evaluate(() => ({ restore: window.xb.restore, error: window.xb.error }));
+    if (!st.restore || st.restore.state !== 'loaded' || !st.restore.lazy) {
+      console.log(`--- record: no lazy restore (${st.error ? st.error.split('\n')[0] : JSON.stringify(st.restore && st.restore.state)})`);
+      return null;
+    }
+    await page.waitForFunction(() => window.xb.frames && window.xb.frames.frames > 0, null, { timeout: 600000, polling: 200 });
+    const marks = [];
+    const mark = async (what) => marks.push([what, await page.evaluate(() => performance.timeOrigin + performance.now())]);
+    await mark('first frame');
+    await page.waitForTimeout(Number(process.env.XN_RECORD_IDLE ?? 20) * 1000);
+    const swipe = [];
+    for (let k = 0; k <= 14; k++) swipe.push([270, 860 - k * 45]);
+    // Every page is read on demand here, so the phone is slower than a visitor's: the drawer gets 20 s to open, and a
+    // tap that started nothing (a swipe read as something else) is tried again, up to three times.
+    for (const app of [PREWARM[2], PREWARM[1], PREWARM[0]]) {
+      if (!ui[app.key]) continue;
+      let started = false;
+      for (let tries = 1; tries <= 3 && !started; tries++) {
+        await page.click('#btn-home').catch(() => {});
+        await page.waitForTimeout(5000);
+        await mark(`drawer for ${app.key}`);
+        await gesture(page, swipe, 20);
+        await page.waitForTimeout(20000);
+        const k = await logLen(page);
+        await mark(app.key);
+        await gesture(page, [ui[app.key], ui[app.key]], 80);
+        started = await waitLog(page, new RegExp(`START u0 .*cmp=${esc(app.component)}`), k, 60000);
+        console.log(`    record: ${app.key} ${started ? 'started' : 'did not start'} (try ${tries})`);
+      }
+      // A recording without an app's first open would leave its pages out of the order: the make fails (run
+      // `node tools/snapshot-web.mjs record` again; the snapshot is packed with what was recorded).
+      check(started, `record: ${app.key} started from the drawer`);
+      await page.waitForTimeout(20000);
+    }
+    await page.click('#btn-home').catch(() => {});
+    await page.waitForTimeout(10000);
+    await mark('end');
+    await page.waitForTimeout(1500); // the last batch of touches (the worker posts them every 0.5 s)
+    const r = await page.evaluate(() => ({ touches: window.xb.lazyTouches || [], restore: window.xb.restore, lazy: window.xb.lazy }));
+    const mainAt = r.restore.mainAt;
+    const rec = {
+      pages: r.touches,
+      first_frame_ms: Math.round(r.restore.firstFrameAt - mainAt),
+      marks: marks.map(([w, t]) => [w, Math.round(t - mainAt)]),
+    };
+    writeFileSync(out, JSON.stringify(rec) + '\n');
+    const before = rec.pages.filter(([, t]) => t <= rec.first_frame_ms).length;
+    console.log(`--- record: ${rec.pages.length} pages touched (${before} before the first frame, at ${rec.first_frame_ms} ms ` +
+      `after main), of ${r.restore.lazy.pages} lazy; ${r.lazy ? r.lazy.syncFetches : '-'} chunks fetched -> ${out}`);
+    for (const [w, t] of rec.marks) console.log(`    ${w}: ${t} ms, ${rec.pages.filter(([, x]) => x <= t).length} pages by then`);
+    const fetchLog = join(ROOT, 'build', 'snap', 'fetch.log');
+    writeFileSync(fetchLog, fetchLines.join('\n') + '\n');
+    return { touch: out, fetchLog };
+  } finally {
+    await browser.close();
+    await srv.close();
+  }
 }
 
 async function restore(chromium) {
@@ -352,9 +464,30 @@ async function fallback(chromium) {
 }
 
 const mode = process.argv[2];
-const modes = { make, restore, fallback };
+const modes = {
+  make,
+  restore,
+  fallback,
+  // record, then pack again with the order (an existing build/snap/web.snap; no new boot)
+  record: async (chromium) => {
+    const snap = join(ROOT, 'build', 'snap', 'web.snap');
+    await packSnapshot(chromium, snap);
+  },
+  // the packing only, eager (XN_SNAP_RECORD=off) or with an existing order (XN_SNAP_ORDER=FILE)
+  pack: async () => {
+    const snap = join(ROOT, 'build', 'snap', 'web.snap');
+    const extra = process.env.XN_SNAP_ORDER ? ['--order', process.env.XN_SNAP_ORDER] : [];
+    if (process.env.XN_SNAP_HOT_MS) extra.push('--hot-ms', process.env.XN_SNAP_HOT_MS);
+    execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, DIRS.xj, '--tree', join(DIRS.xj, 'manifest-xiaoji-v2.json'),
+      ...extra], { stdio: 'inherit' });
+    // the prefetch order of the last recording (build/snap/prefetch-order.json), else the committed one
+    const mine = join(ROOT, 'build', 'snap', 'prefetch-order.json');
+    const order = existsSync(mine) && process.env.XN_SNAP_ORDER ? mine : join(ROOT, 'image', 'restore-order.json');
+    if (existsSync(order)) execFileSync('python3', ['-I', join(ROOT, 'tools', 'prefetch.py'), 'pack', order, '--xj', DIRS.xj], { stdio: 'inherit' });
+  },
+};
 if (!modes[mode]) {
-  console.error('usage: node tools/snapshot-web.mjs make|restore|fallback');
+  console.error('usage: node tools/snapshot-web.mjs make|record|pack|restore|fallback');
   process.exit(2);
 }
 const { chromium } = await import(pathToFileURL(PW).href);

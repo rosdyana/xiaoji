@@ -250,4 +250,202 @@ function check(ok, what) {
   }
 }
 
+// ---- lazy snapshot pages (docs/snapshot.md, S5): tools/snappack.py's split, web/lazypages.js, web/snaploader.js ----
+{
+  const dir = mkdtempSync(join(tmpdir(), 'xiaoji-lazy-'));
+  const { mkdirSync } = await import('node:fs');
+  try {
+    const PG = 4096;
+    const rnd = (n, seed) => {
+      const b = Buffer.alloc(n);
+      let x = seed;
+      for (let i = 0; i < n; i++) {
+        x = (x * 1103515245 + 12345) >>> 0;
+        b[i] = x >>> 24;
+      }
+      return b;
+    };
+    // A version 2 file: the header, the trees, the extent table, the region table (a pool slab, the WebGL blob), data.
+    const POOL = 0x100000, BLOB = 0x40000, ENG = 0x10000;
+    const e1 = rnd(3 * PG, 11); // engine memory
+    const e2 = Buffer.concat(Array.from({ length: 40 }, (_, i) => rnd(PG, 100 + i))); // 40 pool pages
+    const e3 = rnd(2 * PG, 12); // the blob
+    const exts = [[ENG, e1], [BLOB, e3], [POOL, e2]].sort((a, b) => a[0] - b[0]);
+    const regions = [[POOL, 64 * PG, 1], [BLOB, 2 * PG, 2]];
+    const hdr = Buffer.alloc(4096);
+    hdr.write('XJSNAP\0\x01', 0, 'latin1');
+    hdr.writeUInt32LE(2, 8);
+    hdr.write('web-test-build', 16);
+    hdr.writeBigUInt64LE(1n, 104);
+    hdr.writeBigUInt64LE(4096n, 112);
+    hdr.writeBigUInt64LE(BigInt(POOL + 64 * PG), 120);
+    const tree = Buffer.from('trees');
+    const extOff = (4096 + tree.length + 15) & ~15;
+    const regOff = extOff + 16 * exts.length;
+    const dataOff = Math.ceil((regOff + 24 * regions.length) / 4096) * 4096;
+    const table = Buffer.alloc(16 * exts.length);
+    exts.forEach(([a, d], k) => {
+      table.writeBigUInt64LE(BigInt(a), 16 * k);
+      table.writeBigUInt64LE(BigInt(d.length), 16 * k + 8);
+    });
+    const rt = Buffer.alloc(24 * regions.length);
+    regions.forEach(([a, l, kind], k) => {
+      rt.writeBigUInt64LE(BigInt(a), 24 * k);
+      rt.writeBigUInt64LE(BigInt(l), 24 * k + 8);
+      rt.writeBigUInt64LE(BigInt(kind), 24 * k + 16);
+    });
+    const total = exts.reduce((n, [, d]) => n + d.length, 0);
+    hdr.writeBigUInt64LE(BigInt(exts.length), 240);
+    hdr.writeBigUInt64LE(BigInt(extOff), 248);
+    hdr.writeBigUInt64LE(BigInt(dataOff), 256);
+    hdr.writeBigUInt64LE(BigInt(total), 264);
+    hdr.writeBigUInt64LE(BigInt(regions.length), 1384);
+    hdr.writeBigUInt64LE(BigInt(regOff), 1392);
+    const parts = [hdr, Buffer.alloc(extOff - 4096)];
+    tree.copy(parts[1], 0);
+    const file = Buffer.alloc(dataOff + total);
+    Buffer.concat(parts).copy(file, 0);
+    table.copy(file, extOff);
+    rt.copy(file, regOff);
+    let at = dataOff;
+    for (const [, d] of exts) {
+      d.copy(file, at);
+      at += d.length;
+    }
+    writeFileSync(join(dir, 'test.snap'), file);
+    writeFileSync(join(dir, 'tree.json'), '{"tree":2}');
+    // The recorded order: page 5 before the first frame (hot), then pages 7 and 3 (first in the lazy order).
+    const pg = (i) => POOL + i * PG;
+    writeFileSync(join(dir, 'touch.json'), JSON.stringify({ first_frame_ms: 20, pages: [[pg(5), 10], [pg(7), 50], [pg(3), 60], [pg(7), 70]] }));
+    const xj = join(dir, 'xj');
+    execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), join(dir, 'test.snap'), xj, '--tree', join(dir, 'tree.json'),
+      '--order', join(dir, 'touch.json'), '--lazy-pages', '4', '--lazy-pack-max', '20000'], { stdio: 'pipe' });
+    const m = JSON.parse(readFileSync(join(xj, 'snapshot.json'), 'utf8'));
+    const lz = m.lazy;
+    check(m.version === 2 && lz && lz.pages === 39 && lz.touched === 2 && lz.packs.length > 1,
+      `snappack: the pool pages are lazy but the hot one (${lz ? lz.pages : 0} lazy, ${lz ? lz.touched : 0} touched, ${lz ? lz.packs.length : 0} packs)`);
+    const pages = new Uint32Array(new Uint8Array(inflateSync(readFileSync(join(xj, lz.map.file)))).buffer);
+    const expectOrder = [7, 3, ...Array.from({ length: 40 }, (_, i) => i).filter((i) => ![3, 5, 7].includes(i))].map((i) => pg(i) / PG);
+    check(pages.length === 39 && pages.every((p, i) => p === expectOrder[i]),
+      'snappack: the lazy order is the recorded first touches, then the rest in address order');
+    const raw = new Map();
+    const hotBytes = [];
+    for (const p of m.packs) {
+      const buf = readFileSync(join(xj, p.file));
+      for (const [id, off, zlen] of p.chunks) raw.set(id, inflateSync(buf.subarray(off, off + zlen)));
+    }
+    const mem = new Map();
+    for (const [a, len, ids] of m.extents) {
+      const b = Buffer.concat(ids.map((id) => raw.get(id)));
+      hotBytes.push([a, len]);
+      for (let o = 0; o < len; o++) mem.set(a + o, b[o]);
+    }
+    const hotHas = (a, d) => [...d].every((v, o) => mem.get(a + o) === v);
+    check(hotHas(ENG, e1) && hotHas(BLOB, e3) && hotHas(pg(5), e2.subarray(5 * PG, 6 * PG)) &&
+      !mem.has(pg(3)) && !mem.has(pg(7)) && !mem.has(pg(39)),
+      'snappack: the hot extents hold the engine memory, the blob and the hot pool page, and no lazy page');
+    check(m.classes.pool.raw === 40 * PG && m.classes.gl_blob.raw === 2 * PG && m.classes.engine.raw === 3 * PG,
+      `snappack: the census by kind (${JSON.stringify(m.classes)})`);
+
+    // The engine's side (web/lazypages.js), with a fake engine: a fault copies the page's chunk in.
+    const { LazyPages, lazyBuffers, lazyChunks, HEAD, TAIL, SLOT0, DELIVERED } = await import('../web/lazypages.js');
+    const fileOf = (url) => join(xj, url.slice('xj:/'.length));
+    let failNext = 0, gets = 0;
+    const get = (url, s, e) => {
+      gets++;
+      if (failNext > 0) {
+        failNext--;
+        throw new Error('HTTP 503');
+      }
+      return new Uint8Array(readFileSync(fileOf(url)).subarray(s, e));
+    };
+    const page = (i) => e2.subarray(i * PG, (i + 1) * PG);
+    const BITS = 0x1f0000;
+    const mk = (opts = {}) => {
+      const Module = { HEAPU8: new Uint8Array(0x200000) };
+      const lp = new LazyPages({ Module, lazy: lz, pages, base: 'xj:/', bufs: lazyBuffers(lz), get, retryMs: [1, 1, 1], ...opts });
+      return { Module, lp };
+    };
+    {
+      const { Module, lp } = mk();
+      check(lp.lo() === pg(0) && lp.hi() === pg(40) && lp.mark(BITS) === 39, 'lazy: the range and the marked pages');
+      const has = (i) => Buffer.from(Module.HEAPU8.subarray(pg(i), pg(i) + PG)).equals(page(i));
+      const n = lp.fault(pg(3) + 100);
+      check(n === 4 && has(7) && has(3) && has(0) && has(1) && !lp.pending(pg(3) / PG) && lp.pending(pg(2) / PG),
+        `lazy: a fault on a page not yet loaded gets the right bytes, with its chunk's other pages (${n} written)`);
+      // A page the engine freed before it arrived (snap_lazy_drop clears its bit) keeps the bytes it has now.
+      const i2 = pg(2) - lp.lo();
+      Module.HEAPU8[BITS + (i2 >>> 15)] &= ~(1 << ((i2 >>> 12) & 7));
+      Module.HEAPU8.fill(0xee, pg(2), pg(2) + PG);
+      lp.fault(pg(4));
+      check(Module.HEAPU8[pg(2)] === 0xee && has(4) && has(6), 'lazy: a freed page is not overwritten when its chunk arrives');
+      // The ring: the loader puts chunk 3, poll copies it in.
+      const k = 3, ch = lazyChunks(lz)[k];
+      const z = get('xj:/' + lz.packs[ch[0]].file, ch[1], ch[1] + ch[2]);
+      const data = inflateSync(z);
+      new Uint8Array(lp.bufs.ring, 0, data.length).set(data);
+      Atomics.store(lp.bufs.ctrl, SLOT0, k);
+      Atomics.store(lp.bufs.ctrl, HEAD, 1);
+      const polled = lp.poll();
+      const kp = Array.from(pages.subarray(k * 4, k * 4 + 4)).map((p) => (p * PG - POOL) / PG);
+      check(polled === 4 && kp.every(has) && Atomics.load(lp.bufs.ctrl, TAIL) === 1 && Atomics.load(lp.bufs.chunkState, k) === DELIVERED,
+        `lazy: poll copies in what the loader put in the ring (${polled} pages)`);
+      failNext = 2;
+      lp.fault(pg(39));
+      check(has(39) && lp.stats.retries === 2, `lazy: a failed download is retried (${lp.stats.retries} retries)`);
+      failNext = 10;
+      let msg = '';
+      try {
+        lp.fault(pg(20));
+      } catch (e) {
+        msg = String(e.message);
+      }
+      failNext = 0;
+      check(/could not be downloaded \(4 tries: HTTP 503\)/.test(msg) && lp.pending(pg(20) / PG),
+        `lazy: a download that keeps failing ends with a clear error and the page still pending (${msg.slice(0, 90)})`);
+      const fin = lp.finish();
+      check(Array.from({ length: 40 }, (_, i) => i).filter((i) => i !== 2 && i !== 5).every(has) && fin > 0,
+        'lazy: finish brings every pending page in');
+    }
+
+    // The background loader (web/snaploader.js) against the dev server: the packs arrive in the ring, a failed pack is
+    // retried, and every lazy page comes in without a fault.
+    const { DIRS, startServer } = await import('../web/serve.mjs');
+    DIRS.xj = xj;
+    const srv = await startServer({ port: 0 });
+    const realFetch = globalThis.fetch;
+    let failedOnce = 0;
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith(lz.packs[0].file) && failedOnce === 0) {
+        failedOnce++;
+        return new Response('busy', { status: 503 });
+      }
+      return realFetch(url, init);
+    };
+    const msgs = [];
+    globalThis.self = { postMessage: (x) => msgs.push(x) };
+    try {
+      await import('../web/snaploader.js');
+      const { Module, lp } = mk({ loader: { postMessage: (x) => globalThis.self.onmessage({ data: x }) } });
+      globalThis.self.onmessage({ data: { type: 'start', base: srv.url + 'xj/', lazy: lz, prefetch: null, bufs: lp.bufs, prefetchBufs: null, hotIds: [] } });
+      lp.mark(BITS);
+      const t0 = Date.now();
+      while (lp.stats.pagesIn < 39 && Date.now() - t0 < 20000) {
+        await new Promise((r) => setTimeout(r, 5));
+        lp.poll();
+      }
+      const all = Array.from({ length: 40 }, (_, i) => i).filter((i) => i !== 5)
+        .every((i) => Buffer.from(Module.HEAPU8.subarray(pg(i), pg(i) + PG)).equals(page(i)));
+      check(all && lp.stats.faults === 0 && failedOnce === 1,
+        `lazy: the background loader brings every page in, retrying a failed pack (${lp.stats.pagesIn} pages, ${lp.stats.ringChunks} chunks)`);
+      check(!msgs.some((x) => x.type === 'pack-error'), 'lazy: no pack failed for good');
+    } finally {
+      globalThis.fetch = realFetch;
+      await srv.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 process.exit(failures ? 1 : 0);

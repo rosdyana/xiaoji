@@ -13,8 +13,10 @@
  * image is therefore tied to the build that wrote it (snap_build_id).
  *
  * The file: a 4 KiB header, the writable trees (records: kind, mode, path, bytes), the extent table (address and
- * length of each run of non-zero pages, in address order), then the extents' bytes. The ranges in the header are
- * what the image covers; a restore zeroes what no extent holds. */
+ * length of each run of non-zero pages, in address order), the region table (version 2: what parts of the image are,
+ * for the packer and lazy restores: the page pool's slabs, the WebGL blob; address, length, kind), then the extents'
+ * bytes. The ranges in the header are what the image covers; a restore zeroes what no extent holds. A restore may
+ * leave pool pages pending and bring them in on first touch (snaplazy.c; docs/snapshot.md, S5). */
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
 #elif !defined(__EMSCRIPTEN__)
@@ -39,6 +41,7 @@
 #include "host.h"
 #include "mem.h"
 #include "sched.h"
+#include "snaplazy.h"
 #include "vfs.h"
 #include "mntns.h"
 #ifdef __EMSCRIPTEN__
@@ -66,7 +69,7 @@
 #endif
 
 #define SNAP_MAGIC "XJSNAP\0\1"
-#define SNAP_VERSION 1u
+#define SNAP_VERSION 2u
 #define HDR_SIZE 4096u
 #define PAGE 4096u
 #define MAX_RANGES 8
@@ -83,7 +86,9 @@ typedef struct {
     uint64_t tree_off, tree_len, tree_entries;
     char root[1024];
     char tree[64]; /* the root's fingerprint (tree_id); empty in the web build, whose page checks its tree itself */
+    uint64_t nregions, reg_off; /* the region table (version 2): {address, length, kind} each, kinds REG_* */
 } hdr_t;
+enum { REG_POOL = 1, REG_GL_BLOB = 2 };
 _Static_assert(sizeof(hdr_t) <= HDR_SIZE, "header fits its block");
 
 /* A record of the writable trees. */
@@ -684,6 +689,8 @@ static int take(void)
     uint8_t *buf = malloc(cap);
     if (!h || !buf)
         return -1;
+    /* A run restored with pages still pending (snaplazy.c) brings them all in: the image is the whole memory. */
+    snap_lazy_finish();
     memcpy(h->magic, SNAP_MAGIC, 8);
     h->version = SNAP_VERSION;
     h->flags = sched_is_init_mode() ? F_INIT : 0;
@@ -732,6 +739,27 @@ static int take(void)
     h->tree_len = off - h->tree_off;
     free(buf);
     gl_host_snap_save(); /* the WebGL objects, as a blob in engine memory (gl_webgl.c, gl_snap.js) */
+    /* The region table: the pool's slabs and the GL blob. Made now: from here on nothing allocates, so it stays true. */
+    uint8_t *const *slabs;
+    size_t slab_bytes, nslabs = mem_pool_slabs(&slabs, &slab_bytes);
+    uint64_t blob_len;
+    const void *blob = gl_host_snap_blob(&blob_len);
+    uint64_t *regs = calloc(nslabs + 1, 24);
+    if (!regs)
+        return -1;
+    uint64_t nreg = 0;
+    for (size_t i = 0; i < nslabs; i++, nreg++) {
+        regs[nreg * 3] = (uint64_t)(uintptr_t)slabs[i];
+        regs[nreg * 3 + 1] = slab_bytes;
+        regs[nreg * 3 + 2] = REG_POOL;
+    }
+    if (blob && blob_len) {
+        regs[nreg * 3] = (uint64_t)(uintptr_t)blob;
+        regs[nreg * 3 + 1] = blob_len;
+        regs[nreg * 3 + 2] = REG_GL_BLOB;
+        nreg++;
+    }
+    h->nregions = nreg;
 
     /* From here on nothing allocates: the image must be the memory as it is now. */
     mem_pool_zero_free();
@@ -746,6 +774,9 @@ static int take(void)
     }
     h->nranges = (uint64_t)nr;
     census(h);
+    fprintf(stderr, "xiaoji: snapshot: regions: %llu pool slabs (%llu MiB), the WebGL blob %llu MiB\n",
+            (unsigned long long)nslabs, (unsigned long long)((uint64_t)nslabs * slab_bytes >> 20),
+            (unsigned long long)(blob_len >> 20));
     uint64_t hu, hf;
     arena_heap_stats(&hu, &hf);
     fprintf(stderr, "xiaoji: snapshot: heap %llu MiB in use, %llu MiB free (%llu MiB of free chunks zeroed); guest and memfd "
@@ -763,14 +794,15 @@ static int take(void)
         return -1;
     h->nextents = n;
     h->ext_off = (h->tree_off + h->tree_len + 15) & ~15ull;
-    h->data_off = (h->ext_off + n * 16 + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+    h->reg_off = h->ext_off + n * 16;
+    h->data_off = (h->reg_off + nreg * 24 + PAGE - 1) & ~(uint64_t)(PAGE - 1);
     h->image_bytes = bytes;
     uint64_t n2, bytes2;
     if (walk_extents(h->range, nr, 1, h->ext_off, h->data_off, &n2, &bytes2) < 0 || n2 != n || bytes2 != bytes) {
         fprintf(stderr, "xiaoji: snapshot: the image changed while it was written\n");
         return -1;
     }
-    if (put(0, h, HDR_SIZE) < 0 || sink_close() < 0)
+    if ((nreg && put(h->reg_off, regs, nreg * 24) < 0) || put(0, h, HDR_SIZE) < 0 || sink_close() < 0)
         return -1;
     double took = (double)(host_monotonic_ns() - h->mono_ns) / 1e9;
     out_fd = -1;
@@ -858,6 +890,9 @@ int snap_restore(const char *path)
     hdr_t h;
     char build[64];
     uint64_t t_start = host_monotonic_ns();
+    /* Read before the image is in: in wasm the environment lives in linear memory, which the image replaces. */
+    const char *lz_env = getenv("XIAOJI_SNAP_LAZY");
+    int lazy_test = lz_env ? atoi(lz_env) : 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "xiaoji: restore: cannot open %s: %s\n", path, strerror(errno));
@@ -974,6 +1009,8 @@ loaded:
      * the stats and dump times, a new snapshot condition) are applied next. */
     uint64_t t_loaded = host_monotonic_ns();
     host_snap_clock(h.mono_ns);
+    /* Pool pages the page has not written yet (web), or a test's (XIAOJI_SNAP_LAZY): pending, filled on first touch. */
+    snap_lazy_begin(path, h.data_off, h.ext_off, h.nextents, h.reg_off, h.nregions, lazy_test);
     restore_load_ns = t_loaded - t_start;
     snprintf(restore_path, sizeof restore_path, "%s", path);
     restored = 1;

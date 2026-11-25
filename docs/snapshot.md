@@ -1,4 +1,4 @@
-# Booted snapshots (S1 to S4)
+# Booted snapshots (S1 to S5)
 
 Goal: a visitor restores Android at the home screen in seconds (plus the download) instead of booting it (about 6.5 min
 in the browser, 285 s natively). This note is the design (S1), then what each stage built and measured.
@@ -99,10 +99,11 @@ and their contents, and a restore makes them again **under the same names**:
 
 ### Format and delivery
 
-The file written by `--snapshot-out` (`engine/snap.c`): a 4 KiB header (magic `XJSNAP` version 1, the build id, the
+The file written by `--snapshot-out` (`engine/snap.c`): a 4 KiB header (magic `XJSNAP` version 2, the build id, the
 flags, the snapshot's monotonic and real time and instruction count, the image's ranges, the guest root), the writable
-trees, the extent table (address and length of each run of non-zero pages), then the extents' bytes. A restore zeroes
-what no extent covers.
+trees, the extent table (address and length of each run of non-zero pages), the region table (since S5: the page pool's
+slabs and the WebGL blob, so the packer can tell guest pages from the engine's own memory), then the extents' bytes. A
+restore zeroes what no extent covers.
 
 The build id is `<flavor>-<hash>-<layout>`: the flavor (native, node, web), a hash of every file the engines are built
 from (the Makefile's `XJ_BUILD_ID`), and the address of a static of `snap.c` (a check that the layout is the image's).
@@ -116,10 +117,9 @@ removes `snapshot.json` when it repacks the tree.
 For the web (S3, S4), the file is packed like the boot packs (docs/loading.md): the image cut into content-addressed,
 zlib-compressed chunks named by their hash, listed in a snapshot manifest next to the packs, so they are cached forever
 and shared between snapshots that have equal chunks. The page fetches them, inflates them straight into the wasm
-memory before `main` runs, and starts the engine with `--restore`. Eager first: every chunk before the restore. Lazy
-guest pages (a page-table bit "in the snapshot, not loaded", filled on first touch from its chunk, as lazy file
-mappings are) are the next step if the eager size is too large; they need the page pool's pages to be keyed by chunk,
-which the pool makes possible.
+memory before `main` runs, and starts the engine with `--restore`. Eager first: every chunk before the restore. Since
+S5 the guest pages are lazy: a bit per host page of the page pool says "in the snapshot, not loaded", and the page is
+filled on first touch or in the background (S5, below).
 
 ### Size
 
@@ -293,19 +293,20 @@ Five problems the browser runs found, fixed:
 
 ### Open
 
-- **Size.** The snapshot is as big as the boot packs. Most of it is the guest's anonymous memory (401 MiB of guest
-  pages not zero in the web census: ART heaps of 49 processes) and 81 MB of texture pixels. Lazy guest pages (a page
-  fetched from its chunk on first touch, S1 "Format and delivery"), dropping the textures the composer can redraw, and
-  trimming processes the home screen does not need (docs/boot.md B16's lean list) are the next steps.
+- **Size.** Done in S5 for what comes before the first frame: the guest's pages are lazy, and 11.7 MiB comes before
+  `main` (146.9 MiB before S5). The total is about the same (128.6 MiB of snapshot packs). The texture pixels turned
+  out cheap (5.8 MiB compressed, S5). Trimming processes the home screen does not need (docs/boot.md B16's lean list)
+  would shrink the total.
 - **Writing it takes a minute** in the browser (synchronous POSTs of 64 MiB parts and the WebGL read-back).
-- **The download is not cached yet:** the packs are fetched with `fetch` but not put into the chunk store's Cache
-  Storage as the boot packs are (docs/loading.md).
+- **The download is cached** since S5: the snapshot's chunks go into Cache Storage (`xiaoji-snap-v1`), and a repeat
+  visit downloads only the manifests and the page.
 - After a restore the tree's chunks are read on demand, synchronously (the boot packs are not fetched). On localhost
   each read cost about 2.5 ms (fetch and inflate; 0.7 s for a drawer's first open); over a network each would be a
   round trip. Since P1 the chunks a recorded first minute reads are prefetched in the background (above); the rest
   are still read this way.
-- A snapshot pack that fails to download mid-restore is a hard error (memory is already being replaced); there is no
-  fallback to a boot at that point.
+- A snapshot pack that fails to download is retried since S5 (4 tries before `main`, then the restore ends and the
+  worker is dropped with its memory: "Snapshot download failed", press again; a lazy page: 5 tries, then the engine
+  stops with the same message). There is still no fallback to a boot at that point.
 - **Native snapshots skip pages `mincore` reports not resident.** On macOS the runs under heavy swap restored correctly;
   on Linux a swapped-out page reports as absent and would be left out. `XJ_NOMINCORE=1` reads every page; reading
   `/proc/self/pagemap` (which tells swapped from untouched) is the fix.
@@ -343,23 +344,296 @@ Five problems the browser runs found, fixed:
   restore with `--jit-prehot` (the page passes it; `?prehot=0` does not) queues each for translation at its first run.
 - **The freezer**: the engine's binder answers `BINDER_GET_FROZEN_INFO` and `BINDER_FREEZE` with EINVAL, and
   ActivityManager runs without the cached-app freezer, which killed cached apps about 10 minutes after they were cached.
-- **Lazy guest pages** (S1, "Format and delivery") are still not done: the restore is eager. With the loader above it
-  did not need to be lazy this round.
+- **Lazy guest pages** (S1, "Format and delivery") were not done in P1: the restore was eager. Done in S5.
+
+## S5. Lazy snapshot pages
+
+Goal: a first-time visitor over a real network downloads much less before the home screen appears; the rest comes in
+the background, in the order a recorded session first needed it, or on demand; the first opens of the drawer and the
+demo apps stay where they were once the background download is done; and the engine never reads a page that has not
+arrived as zeros.
+
+Status: **done.** The page downloads 11.7 MiB before Android runs instead of 146.9 MiB; press to the home screen
+takes 0.9 s instead of 2.6 s on localhost and 3.7 s instead of 26.4 s at 50 Mbit/s with a 40 ms round trip; the rest
+arrives in the background (3 s and 33 s) in the order a recorded session needed it, and app opens afterwards are
+unchanged within the spread. A repeat visit downloads 2.8 MiB.
+
+### What is lazy, and why only that
+
+The census of the image by kind (`tools/snappack.py` now prints it, from the snapshot's new region table; the final
+snapshot of these sources, zlib level 6 per run of one kind):
+
+| Kind | Raw (MiB) | zlib level 6 (MiB) |
+|---|---|---|
+| the page pool's pages (guest and memfd pages not zero) | 462.5 | 136.8 |
+| the WebGL blob (its pages not zero; textures, buffers, programs) | 129.2 | 5.8 |
+| the rest: the engine's own memory (page tables, processes, binder, malloc) | 361.3 | 6.3 |
+| the image | 953.0 | 148.9 |
+
+The guest's pages are almost all of the download, and they are the only part of the image whose every access goes
+through a few places in the engine: the page table's TLB fill (`page_lookup` in `engine/mem.c`, which the interpreter,
+the translator's inline TLB probe, `mem_copy_in`/`out` and every syscall reach on a TLB miss), the copy-on-write copy,
+and the memfd functions (`engine/memfd.c`: binder's buffers, ashmem, the shared file cache). The rest of the image (the
+engine's own structures: page tables, processes, binder, the GL decoders, malloc's state) is reached by C pointers from
+everywhere, so it stays hot: it is in memory before `main`. It is 361 MiB raw but compresses to 6 MiB (page tables full
+of "mapped, no page yet" entries).
+
+**Textures** were the other candidate (the task's "drop the textures the compositor can redraw"): the WebGL blob is
+169 MiB (66 textures of 1 MiB or more, 166 MiB: the cached apps' windows and the task snapshots of recents), but its
+pages that are not zero compress to 5.8 MiB. Dropping or deferring them would save at most that, and a dropped window
+buffer of a cached app shows garbage until the app redraws, so they stay in the hot part.
+
+### The engine (`engine/snaplazy.c`, `engine/snaplazy.h`)
+
+- A bit per host page of the page pool's range: "in the snapshot, not in memory yet". `snap_lazy_need(p)` before the
+  bytes of a pool page are read, written or copied: in `page_lookup` (after the permission check, before the TLBs or the
+  translator see the page's host address), in `cow_break` (`mem_poke` reaches it without `page_lookup`), in
+  `memfd_page`, `memfd_pread` and `memfd_truncate` (`memfd_pwrite` goes through `memfd_page`). With nothing pending,
+  `snap_lazy_bits` is NULL and the check is one load and a branch on the TLB-miss path; the translator's inline probe
+  and every TLB hit are unchanged. The TLBs and the fetch cache are empty after a restore (as before), so no host
+  pointer to a pending page can be cached.
+- A pending page that is freed (`mem_page_free`: an unmap, a process exit, a memfd's end) is dropped: its bit is cleared
+  and its bytes are never fetched; its next owner writes it before reading it. This also keeps a late arrival from
+  overwriting a page that was freed and handed out again.
+- The scheduler loop calls `snap_lazy_poll` at its top every 2 ms while pages are pending (the page copies in what the
+  background loader has brought), and an idle loop sleeps at most 4 ms at a time until the last page is in.
+- A snapshot taken by a run that still has pages pending first brings them all in (`snap_lazy_finish`), so the image
+  is whole.
+- The cost of the check: HEAD's engines against these, alternating, `jitstress-O2` (31 M instructions), 20 pairs:
+  Node's interpreter (`XIAOJI_JIT=0`) 0.400 s against 0.398 s (medians; the new one faster in 11 of 20), the native
+  engine 0.268 s against 0.269 s; with Node's translator, 10 pairs, about 0.23 s both. No difference beyond the
+  run-to-run spread.
+- The page supplies the pages through seven JavaScript functions (`Module.xjLazy`: `lo`, `hi`, `mark`, `fault`, `poll`,
+  `finish`, `end`; below). Natively and in Node,
+  `XIAOJI_SNAP_LAZY=1` makes a restore read the image as always, then poison every pool page of it (0xA5) and mark it
+  pending; a fault reads the page from the snapshot file again (2: also a background fill of 64 pages every 2 ms). A
+  path that read a pending page without filling it would read the poison, not zeros, and the cases below would fail.
+- The snapshot file (version 2) has a region table: the pool's slabs and the WebGL blob.
+
+### The page
+
+- `tools/snappack.py`: the hot part is every byte of the image that is not a pool page, plus the pool pages a recorded
+  restore touched before its first frame. It is cut into 256 KiB chunks in packs of at most 4 MiB, as before (S4). The
+  lazy pool pages go into chunks of 32 pages (128 KiB), in the recorded first-touch order and then in address order,
+  in packs of at most 1 MiB; `packs/<id>.map` lists the pages' numbers in that order (one zlib stream). The manifest is
+  version 2 (`lazy`).
+- Before `main` (`web/worker.js`, `loadSnapshot`): the hot packs and the map. Each pack is taken from Cache Storage
+  (`xiaoji-snap-v1`, one entry per chunk, keyed by its id) when all its chunks are there, else downloaded and its chunks
+  put there; a download is tried 4 times (0.5, 2 and 5 s apart). A pack that still fails ends the restore before
+  `main`: nothing has run, the worker is dropped with its memory, and the page says "Snapshot download failed · press
+  Start Android to retry" (a new press makes a new worker). `?snapcache=0` leaves the cache alone; `?snaplazy=0` loads
+  the lazy packs before `main` too (the eager restore, from S5's packs).
+- The background loader (`web/snaploader.js`, a worker of the engine's worker, told to start by the engine when it
+  marks the pages): two downloads at a time; the lazy packs that hold recorded touches interleaved by bytes with the
+  tree's prefetch packs (P1; one queue, so the two streams do not fight for the link), then the other lazy packs; a pack
+  a fault needs moves to the front. It inflates each chunk (`DecompressionStream`), checks it against its id (SHA-256),
+  and puts it into a ring of 64 slots of 128 KiB in a SharedArrayBuffer: only the engine's thread can write the engine's
+  memory (it is not shared), and it gets no messages while `main` runs. A pack is retried 3 times; one that fails for
+  good is marked, its pages are then read on demand, and the loader tries it again every 10 s, doubling up to 5 min,
+  until the engine has every page (pending pages keep the engine's 2 ms poll going).
+- The engine's side (`web/lazypages.js`, `LazyPages`): `mark` sets the bits; `poll` copies what is in the ring, page by
+  page, only where the bit is still set; `fault` drains the ring, waits for the page's pack if the loader is on it (at
+  most 2 s), and otherwise fetches the page's chunk itself with a synchronous Range request (a server that answers 200
+  with the whole pack works too) and inflates it with `web/inflate.js`; 5 tries (0.25, 1, 3 and 6 s apart), then
+  `snapshot: the lazy pages of packs/... could not be downloaded`, which stops the engine and shows "Snapshot download
+  failed". `finish` and `end` are the engine's last two calls.
+- The load report's `load+` line has the lazy counters (faults, chunks fetched on demand, time waiting, pages in), and
+  the page logs when every lazy page is in.
+- `?lazypoison=1` fills every pending page with 0xA5 when it is marked, so a read that skipped the fill reads that and
+  not the zeros of fresh memory (the browser's counterpart of `XIAOJI_SNAP_LAZY`).
+- The touch order: `tools/snapshot-web.mjs record` (run by `make snapshot` after the first packing) restores with
+  `?snaprecord=1`: no background loader, every page on demand and one at a time, and each first touch kept with its time.
+  The order is per snapshot: anonymous pages have no identity across boots, so unlike the tree's `restore-order.json`
+  it cannot be committed. A recording in which an app does not start fails the make.
+- The recording also runs without the tree's prefetch (`?prefetch=0`), so the server's log has every file chunk the
+  session read; `tools/prefetch.py record` turns it into this snapshot's prefetch order (`build/snap/restore-order.json`,
+  then the committed `image/restore-order.json`'s other chunks). The first measurements below were made with the
+  committed order alone, and the new snapshot's Files open then read 18 to 20 file chunks on demand (0 or 1 with B19's
+  snapshot): the clean pages a snapshot drops depend on its own make.
+
+Two makes of this work: the one measured below (`make snapshot`, then `node tools/snapshot-web.mjs record` twice more:
+the first recording missed two taps, and the record step now tries a tap three times; then for the prefetch order),
+and the final one, made after an unrelated change to `engine/props.c` changed the build id and the product tree was
+replaced by a rebuild (`build/rootfs-xiaoji`: a Settings overlay for the About crash, model and manufacturer XiaoJi;
+`make snapshot` alone, the second try: the first make's pre-warm did not see Settings drawn in 150 s):
+
+| | measured make | final make |
+|---|---|---|
+| image | 916 MiB of memory, 108,362 lazy pages (423 MiB) | 953 MiB, 118,392 lazy pages (462 MiB) |
+| recording (about 4.5 minutes, every page on demand) | 44,176 pages touched (173 MiB): 26 before the first frame, 17,025 by the end of the 20 s idle, 24,293 by the tap on Settings, 36,702 by the tap on Files | 42,151 (165 MiB), 0 before the first frame |
+| before `main` | **11.7 MiB**: 3 hot packs (4.0, 4.0, 3.6 MiB) and the page map (188 KiB) | **12.2 MiB** (4.0, 3.9, 4.0 MiB and a small fourth; map 202 KiB) |
+| after `main`: lazy packs | 116.9 MiB in 120 packs (the recorded touches in the first 50, 48.9 MiB) | 135.6 MiB in 139 packs |
+| after `main`: the tree's prefetch | 68.1 MiB (1,453 chunks: 1,280 from the recording, 173 more from `image/restore-order.json`) | 67.2 MiB (1,431: 1,258 and 173) |
+| `snapshot.json` | 592 KiB (2.6 MiB for B19's eager manifest, which listed every chunk of the image) | 618 KiB |
+
+B19's eager snapshot downloaded **146.9 MiB** before `main`.
+
+The hot pool pages are few because the first frame comes before the guest runs: it is the last composed frame, posted
+again by the restore of the WebGL objects (S3). Everything the guest touches after that is in the lazy order.
+
+### Measurements
+
+Headless Chromium (SwiftShader) on the M2 with 8 GB, AC power, Low Power Mode off (`pmset` at every run);
+`tools/latency.mjs --runs 1 --calc --files --wait-fill --revisit`, a new browser profile per run; **before** is HEAD's
+page, engine and B19's eager snapshot, frozen (`--web`, `--wasm`, `--xj`), **after** this tree's; before and after
+alternated, one run at a time (`build/lazy/measure.sh`). Throttled is the dev server's model (`--throttle 50:40`: one
+40 ms round trip per response, all bodies sharing 50 Mbit/s; it does not model TCP slow start). App opens are measured
+after `--wait-fill`, once every lazy page and prefetch pack is in. Medians (range) of 3 runs; seconds unless marked.
+
+First batch (swap 5.0 to 7.0 GB in use; the after runs used the committed prefetch order, see "The page"):
+
+| | before, localhost | **after, localhost** | before, 50 Mbit/s, 40 ms | **after, 50 Mbit/s, 40 ms** |
+|---|---|---|---|---|
+| snapshot bytes before `main` | 146.9 MiB | **11.7 MiB** | 146.9 MiB | **11.7 MiB** |
+| server bytes, page load to the first frame | 173.4 MiB (169.4 to 173.4) | 22.5 MiB (22.4 to 24.5) | 153.2 MiB (153.1 to 153.5) | **16.3 MiB** (16.0 to 16.8) |
+| server bytes, whole run | 218.4 MiB | 199.8 MiB | 219.5 MiB | 201.7 MiB |
+| press to the first frame | 2.6 (2.6 to 2.7) | **0.9** (0.9 to 1.0) | 26.4 (26.3 to 26.7) | **3.7** (3.7 to 4.0) |
+| every lazy page in, after `main` | - | 3.2 (3.1 to 3.4) | - | 32.6 (32.5 to 32.8) |
+| lazy faults in the run (chunks fetched on demand, ms blocked) | - | 0 in each run | - | 3 (1, 52 ms); 1 (0, 7 ms); 1 (0, 11 ms) |
+| idle 30 s after the first frame: engine busy | 11% | 12% | 17% | 26% (the fill) |
+| idle: the browser's CPU (one core = 100%) | 12% | 13% | 15% | 42% (the fill) |
+| drawer: response / settled | 0.6 / 0.9 | 0.5 / 0.9 | 0.5 / 1.0 | 0.6 / 1.0 |
+| first Settings: response / settled | 1.5 / 1.8 (1.8 to 1.9) | 1.6 / 2.2 (1.9 to 2.3) | 2.2 / 2.5 (1.7 to 5.8) | 2.2 / 2.7 (2.2 to 2.9) |
+| first Calculator: response / settled | 1.1 / 1.7 (1.6 to 1.8) | 1.2 / 2.0 (1.9 to 2.1) | 1.5 / 1.9 (1.6 to 2.7) | 1.3 / 2.2 (2.1 to 2.2) |
+| first Files: response / settled | 2.3 / 2.9 (2.9 to 3.0) | 2.8 / 3.5 (3.5 to 3.6) | 3.7 / 4.1 (4.0 to 4.9) | 3.7 / 4.5 (4.3 to 4.5) |
+| repeat visit (same profile): press to the first frame | 2.4 | **0.8** | 26.3 | **1.6** |
+| repeat visit: server bytes to the first frame / in its first 20 s | 169.4 / 216.2 MiB | **2.8 / 3.7 MiB** | 153.0 / 217.2 MiB | **2.8 / 3.0 MiB** |
+
+Second batch, localhost, with the snapshot's own prefetch order and two controls on the same snapshot: **eager**
+(`?snaplazy=0&snapcache=0`: every page before `main`, nothing cached) and **no cache** (`?snapcache=0`). Its second and
+third rounds shared the Mac with another session's native boot and a dev server (swap 8.5 to 10 GB): the ranges are
+wide, and only the medians and the counts below are worth reading.
+
+| | before | after | after, eager | after, no cache |
+|---|---|---|---|---|
+| press to the first frame | 2.9 (2.7 to 3.8) | 1.0 (0.9 to 1.4) | 3.0 (2.8 to 7.0) | 0.9 (0.7 to 1.1) |
+| idle 20 s after the fill: engine busy / browser CPU | 9% / 10% | 7% / 8% | 8% / 10% | 7% / 7% |
+| first Settings settled | 2.4 (1.9 to 8.0) | 2.5 (2.4 to 2.7) | 3.8 (2.1 to 7.9) | 2.6 (1.9 to 3.2) |
+| first Calculator settled | 2.4 (2.2 to 12.9) | 2.4 (2.1 to 3.9) | 2.9 (2.1 to 3.6) | 4.5 (2.6 to 5.6) |
+| first Files settled | 3.4 (1.4 to 6.8) | 3.4 (3.0 to 5.0) | 4.6 (3.3 to 5.0) | 4.6 (3.9 to 5.3) |
+| file chunks read on demand by the Files open | 9, 0, 10 | 0, 0, 1 | 0, 0, 17 | 0, 0, 1 |
+
+What the rows show:
+
+- **Before the first frame** the page now downloads 11.7 MiB of snapshot (16 to 25 MiB from the page load, with the
+  page, the engine, the two manifests and, on localhost, what the background loader fetched in the half second after
+  `main`), against 147 MiB. Press to the first frame: 0.9 s against 2.6 s on localhost, **3.7 s against 26.4 s** at
+  50 Mbit/s. The total over a session is a little lower (200 against 219 MiB: this snapshot is smaller, and its
+  manifest is 592 KiB instead of 2.6 MiB).
+- **The background fill** takes 3 s on localhost and 33 s at 50 Mbit/s (117 MiB of lazy packs and 64 to 68 MiB of
+  prefetch). On the throttled link the engine faulted on 1 to 3 pages in a whole run and fetched at most one chunk on
+  demand: the recorded order brought the pages before the phone touched them. While it runs the engine is busier (26%
+  against 17% idle, from copying 423 MiB in and the 4 ms wake-ups); after it, the idle phone costs what it did (7% busy
+  and 8% of a core against 9% and 10%, second batch).
+- **App opens once the fill is done** are within the run-to-run spread of before in the second batch (Settings 2.5
+  against 2.4, Calculator 2.4 against 2.4, Files 3.4 against 3.4 settled, medians), and within the task's reference
+  (drawer 1.1, Settings 2.0, Calculator 2.1, Files 3.7 s) give or take 0.4 s. In the first batch after was 0.3 to 0.6 s
+  slower, with more guest instructions per open (Files 199 to 214 M against 135 to 185 M) and 18 to 20 file chunks read
+  on demand by Files: the new snapshot's own state and its missing prefetch, which the recorded prefetch order fixed (0
+  or 1 chunk). The eager control of the same snapshot is not faster than the lazy restore, so the lazy path costs the
+  opens nothing measurable; the per-access check is measured above (no difference).
+- **A repeat visit** downloads 2.8 MiB (the page, the engine and the manifests, which the dev server sends `no-store`)
+  and shows the home screen in 0.8 s on localhost and 1.6 s at 50 Mbit/s, against 26 s before (HEAD never cached the
+  snapshot).
+- The snapshot of these sources is not the one measured: the final engine (with an unrelated change to
+  `engine/props.c` from another session) and the rebuilt product tree needed a new `make snapshot`. One run of each
+  network on it (localhost, then 50 Mbit/s; swap about 8.5 GB): press to the first frame 0.9 and 3.7 s, every lazy page
+  in after 3.4 and 36.4 s, 22 and 37 faults (21 and 34 chunks fetched on demand, 78 ms and 1.8 s blocked in all),
+  drawer 0.9 and 1.0 s, Settings 2.7 and 3.3 s, Calculator 4.0 and 2.9 s, Files 4.2 and 3.3 s settled, the idle phone
+  after the fill 7% busy, a repeat visit 2.8 MiB. (An intermediate make, on the old tree with the new engine, had one
+  run each too; its throttled Files open is under Open.)
+
+### Tests
+
+`tests/run.sh` (native and Node), with every pool page of the image poisoned and pending (`XIAOJI_SNAP_LAZY`); each
+output must be the oracle's (or the uninterrupted run's) and a page must have faulted:
+
+| Case | What |
+|---|---|
+| `snapwait snapshot lazy` | the S2 snapshot restored on demand only: the blocked threads' stacks, the pipe and futex words, the child; one page is freed before it is read |
+| `snapwait snapshot lazy chained` | restored with the background fill, then a second snapshot 0.1 s on (it must bring every pending page in first), restored on demand |
+| `procs`, `memory`, `jitstress`, `threads` (O2) `lazy restore mid-run` | a snapshot at an instruction count in the middle of the program (fork's copy-on-write pages, mmap'd and mprotect'd memory, translated code in Node, threads' stacks), restored on demand |
+| `snapshot-binder lazy`, `snapshot-init lazy` | servicemanager's and the shell's memory, binder's buffers and ashmem (memfd pages), on demand (binder) and with the background fill (init) |
+
+`tests/snapshot.mjs` (`make test-web`), in Node:
+
+- `tools/snappack.py` on a synthetic version 2 snapshot: the pool pages are lazy except the one touched before the first
+  frame; the lazy order is the recorded first touches, then address order; the hot extents hold the engine's memory,
+  the blob and the hot page and no lazy page; the census by kind.
+- `LazyPages` with a fake engine: a fault on a page not yet loaded gets the right bytes (and its chunk's other pages); a
+  page freed before its chunk arrives keeps its new bytes; `poll` copies what the loader put in the ring; a failed
+  download is retried; one that keeps failing ends with the error and the page still pending; `finish` brings
+  everything in.
+- `web/snaploader.js` against the dev server: every lazy page arrives through the ring with no fault, and a pack whose
+  first download fails (503) is retried.
+
+`make test-snapshot-web` restores the real snapshot (lazily) in the page.
+
+### Open
+
+- **The hot set is the pages touched before the first frame**, which is almost nothing (the first frame comes before
+  the guest runs). On a slow link the pages the idle phone touches right after it are read on demand until the
+  loader has their packs (the throttled rows above). `snappack.py --hot-ms` moves the cut (for instance to the end of
+  the recorded idle window, about 17,000 pages, some 10 MiB more before `main`); not measured.
+- **Range requests on Cloudflare Pages** are assumed, not verified: a fault fetches one 128 KiB chunk (about 35 KiB of
+  zlib) with a Range header. A host that answers 200 still works, but each such fault then downloads its whole pack
+  (up to 1 MiB).
+- **The recording is per snapshot** (anonymous pages have no identity across boots) and adds about 6 minutes to
+  `make snapshot`; it is made with every page on demand, so its times are stretched and only its order is used. A tap
+  the slow recording misses is tried again (three times).
+- **Every lazy page is downloaded**, also those no recorded session touched (about 60% of the lazy bytes), so the total
+  download is about what it was; a visitor who leaves early stops it. Leaving the untouched ones on demand only would
+  save their bytes for every visitor and cost a round trip for each later first touch.
+- **A repeat visit still downloads the manifests** (`snapshot.json`, 592 KiB, and the tree's 1.1 MiB manifest; the dev
+  server sends them `no-store`) and the page's files. A deployment can cache them by name.
+- **Codec.** Each chunk on its own, as the page decodes them (`build/lazy/codec.mjs` over the packs of the make before the final one): the hot part
+11.6 MiB with zlib level 9, 10.4 with brotli 9, 9.1 with brotli 11 (every 8th chunk, scaled), 9.9 with zstd 19; the
+lazy part 136.6, 123.4, 115.2 and 121.0 MiB. Brotli 11 would save about 2.5 MiB before `main` (0.4 s at 50 Mbit/s) and
+21 MiB in the background, but the browser's `DecompressionStream` has no brotli or zstd here, so it would need a wasm
+or JavaScript decoder on the fault path and in the loader. Not adopted; the store stays zlib.
+- The fault path inflates with the page's JavaScript inflater (1 to 6 ms a 128 KiB chunk); the background path uses
+  the browser's.
+- The page cannot tell a lazy page a visitor's session needs but the recording did not; such a page is read on demand
+  (a round trip) unless the loader has reached its pack.
+- In the final snapshot's one throttled check, the Files open started a second DocumentsUI process (275 M guest
+  instructions, 29 file chunks read on demand, 1.5 s of fetching; 13.4 s settled); its localhost check settled in 6.1 s.
+  One run each, not investigated; it looks like that snapshot's state, not the lazy path (no lazy fault in either run).
+- One eager control run (second batch, 10 GB of swap in use) lost system_server (`DeadSystemException` in Files); it
+  had no lazy pages. Not investigated.
+- The first batch's before runs were measured, then their JSON files deleted with other scratch files when the disk
+  filled; their numbers are in the table above as the tool printed them.
+
 
 ## S4. Tooling
 
 | Command | What |
 |---|---|
-| `make snapshot` | the page's snapshot for the current tree and web engine (`tools/snapshot-web.mjs make`): boots in headless Chromium with `?snapshot=make`, the engine writes `build/snap/web.snap` through the dev server, `tools/snappack.py` packs it into `build/web/xj/snapshot.json` and `build/web/xj/packs/`. About 15 minutes since B19 (HOME + 480 s and the quiet window, docs/demo.md: `XN_SNAP_AFTER`, `XN_SNAP_QUIET`, `XN_SNAP_AT`, `XN_XJ`, and the pre-warm, off by default: `XN_SNAP_PREWARM=on`, `XN_PREWARM_DELAY`); it fails when the last system_server started SystemUI more than once, or a pre-warmed app does not start. Playwright as in `tests/web.mjs` (`XN_PLAYWRIGHT`; `PLAYWRIGHT_BROWSERS_PATH=$PWD/build/pw-browsers` when the cache has no Chromium) |
+| `make snapshot` | the page's snapshot for the current tree and web engine (`tools/snapshot-web.mjs make`): boots in headless Chromium with `?snapshot=make`, the engine writes `build/snap/web.snap` through the dev server, `tools/snappack.py` packs it into `build/web/xj/snapshot.json` and `build/web/xj/packs/`, a restore records the touch order of the lazy pages (S5, `record` below) and the snapshot is packed again with it (`XN_SNAP_RECORD=off`: no recording). About 20 minutes since B19 (HOME + 480 s and the quiet window, docs/demo.md: `XN_SNAP_AFTER`, `XN_SNAP_QUIET`, `XN_SNAP_AT`, `XN_XJ`, and the pre-warm, off by default: `XN_SNAP_PREWARM=on`, `XN_PREWARM_DELAY`); it fails when the last system_server started SystemUI more than once, or a pre-warmed app does not start. Playwright as in `tests/web.mjs` (`XN_PLAYWRIGHT`; `PLAYWRIGHT_BROWSERS_PATH=$PWD/build/pw-browsers` when the cache has no Chromium) |
 | `make test-snapshot-web` | the page restores it: first frame, drawer, Settings (`tools/snapshot-web.mjs restore`; Settings' place in the drawer is the tree's, `tools/ui-points.mjs`), screenshots `build/web-shots/s1-*.png` and the whole log `s1-restore.log` |
 | `node tools/latency.mjs` | the demo's yardstick: press to first frame, the idle load, drawer, Settings, Home, Calculator (docs/demo.md) |
+| `node tools/snapshot-web.mjs record` | (S5) restores `build/snap/web.snap`'s packs with `?snaprecord=1` (every lazy page on demand, one at a time), idles 20 s (`XN_RECORD_IDLE`), opens Settings, Calculator and Files from the drawer, writes the first touch of each page to `build/snap/touch.json`, and packs the snapshot again with it |
+| `node tools/snapshot-web.mjs pack` | packs `build/snap/web.snap` again without a boot: eager with `XN_SNAP_RECORD=off`, or with an order (`XN_SNAP_ORDER=FILE`, `XN_SNAP_HOT_MS=MS`) |
 | `make snapshot-native` | the native engine's (null GL) from a fresh `/data` -> `build/snap/native.snap`, for `build/xiaoji --restore` |
-| `tools/snappack.py SNAP OUT --tree MANIFEST` | packs any snapshot file: content-addressed zlib chunks of 256 KiB in packs of at most 16 MiB (Cloudflare Pages' 25 MiB file limit), only packs are written (the deployment's file count stays the tree's 10,8xx chunks plus packs); the previous snapshot's packs are removed |
+| `tools/snappack.py SNAP OUT --tree MANIFEST` | packs any snapshot file: content-addressed zlib chunks of 256 KiB in packs of at most 4 MiB (`--pack-max`; Cloudflare Pages' limit is 25 MiB a file), only packs are written (the deployment's file count stays the tree's 10,8xx chunks plus packs); the previous snapshot's packs are removed. A version 2 snapshot's pool pages go into lazy packs of at most 1 MiB, 32 pages a chunk (S5: `--order`, `--hot-ms`, `--eager`, `--lazy-pages`, `--lazy-pack-max`); it prints the census of the image by kind |
+| `XIAOJI_SNAP_LAZY=1` (2, 3) | (restore, native and Node) every pool page of the image poisoned and pending, read again from the file on first touch (2: also a background fill; 3: as 2 without the poison); the tests' way into the lazy page path (S5) |
 
 A snapshot is tied to the build: after any engine change, `make snapshot` again (the page boots cold, with a log line
 saying why, when the snapshot is another build's or another tree's).
 
 ## Verification (final sources)
+
+S5 (lazy snapshot pages), on the final sources and the final snapshot:
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` | exit 0, no warning |
+| `XIAOJI_JOBS=4 tests/run.sh` | **335 passed, 0 failed, 0 xfail** (315 before S5, plus the 20 lazy cases: `snapshot lazy`, `lazy chained`, `lazy restore mid-run`, `snapshot-binder/init lazy`, native and Node) |
+| `make test-web` | exit 0, no FAIL (`tests/snapshot.mjs` with the lazy checks) |
+| `node tests/input.mjs` | all passed |
+| `make snapshot` (new tree; second try), then `make test-snapshot-web` | snapshot: 12.2 MiB before `main`, 135.6 MiB lazy, recording with all three apps started; restore: first frame 1.1 s after the press, Settings drawn, no ANR, fatal exception or fatal signal, no page errors; fallback for another build and for no snapshot: all PASS |
+| `make test-snapshot-web` with `XN_SNAP_QUERY='&lazypoison=1'`, and a throttled `tools/latency.mjs` run with it | all PASS; drawer, Settings, Calculator (1 + 2 = 3) and Files open, no ANR, fatal exception or fatal signal |
+
+Before S5:
 
 | Command | Result |
 |---|---|

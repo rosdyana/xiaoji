@@ -15,6 +15,7 @@
 import { BOOT, CASES, ENGINE_ENV_ARGS } from './cases.js';
 import { openTrace } from './trace.js';
 import { ChunkStore, buildChunkTree, earlyPackIndex, inflateNative, layoutPacks } from './chunks.js';
+import { LazyPages, SNAP_CACHE, lazyBuffers, lazyChunks } from './lazypages.js';
 
 // The display the engine presents (engine/display.h, XJ_DISPLAY_W and XJ_DISPLAY_H): the size of the OffscreenCanvas.
 const FB_WIDTH = 540;
@@ -288,30 +289,135 @@ async function loadSnapshot(Module, snap, base, progress, opts) {
     pump();
   };
   // At most FETCHES packs are downloading at once, in the manifest's order.
+  // A pack's bytes: from the snapshot cache (docs/snapshot.md, S5: a repeat visit downloads nothing) when every chunk of
+  // it is there, else from the network, retried (nothing has run yet: a pack written twice writes the same bytes, and
+  // a pack that fails for good ends the restore, whose worker the page then drops with its memory).
+  const cache = opts.cache === false || typeof caches === 'undefined' ? null : await caches.open(SNAP_CACHE).catch(() => null);
+  const key = (id) => base + 'xj/snapchunks/' + id;
+  timing.cachePacks = 0;
+  timing.retries = 0;
+  const getPack = async (p) => {
+    if (cache && p.chunks.length) {
+      const hits = await Promise.all(p.chunks.map(([id]) => cache.match(key(id)).catch(() => undefined)));
+      if (hits.every(Boolean)) {
+        const parts = await Promise.all(hits.map(async (h) => new Uint8Array(await h.arrayBuffer())));
+        const buf = new Uint8Array(p.bytes);
+        p.chunks.forEach(([, off], i) => buf.set(parts[i], off));
+        timing.cachePacks++;
+        return buf;
+      }
+    }
+    let err = null;
+    for (let t = 0; t < 4; t++) {
+      if (t) {
+        timing.retries++;
+        await new Promise((r) => setTimeout(r, [0, 500, 2000, 5000][t]));
+      }
+      try {
+        const res = await fetch(base + 'xj/' + p.file);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = new Uint8Array(await res.arrayBuffer());
+        if (buf.length !== p.bytes) throw new Error(`${buf.length} bytes, the manifest says ${p.bytes}`);
+        if (cache) p.chunks.forEach(([id, off, zlen]) => cache.put(key(id), new Response(buf.slice(off, off + zlen))).catch(() => {}));
+        return buf;
+      } catch (e) {
+        err = e;
+      }
+    }
+    throw new Error(`snapshot ${p.file}: download failed after 4 tries (${err && err.message ? err.message : err})`);
+  };
   const FETCHES = 3;
   let next = 0;
   const fetcher = async () => {
     while (next < snap.packs.length) {
       const p = snap.packs[next++];
       const tf = now();
-      const res = await fetch(base + 'xj/' + p.file);
-      if (!res.ok) throw new Error(`snapshot ${p.file}: HTTP ${res.status}`);
-      const buf = new Uint8Array(await res.arrayBuffer());
+      const buf = await getPack(p);
       timing.fetchMs += now() - tf;
       loaded += buf.length;
       progress(loaded, total);
       await onPack(p, buf);
     }
   };
+  let pages = null;
+  const getMap = async () => {
+    const m = snap.lazy.map;
+    // One stream, cached under its own name (it is named by its hash, as a pack is).
+    const hit = cache ? await cache.match(base + 'xj/' + m.file).catch(() => undefined) : undefined;
+    const z = hit ? new Uint8Array(await hit.arrayBuffer()) : await getPack({ file: m.file, bytes: m.bytes, chunks: [] });
+    if (cache && !hit) cache.put(base + 'xj/' + m.file, new Response(z.slice())).catch(() => {});
+    loaded += z.length;
+    progress(loaded, total);
+    const raw = await inflateNative(z, snap.lazy.pages * 4);
+    pages = new Uint32Array(raw.buffer, raw.byteOffset, snap.lazy.pages);
+  };
   try {
-    await Promise.all(Array.from({ length: Math.min(FETCHES, snap.packs.length) }, fetcher));
+    await Promise.all([...Array.from({ length: Math.min(FETCHES, snap.packs.length) }, fetcher), snap.lazy ? getMap() : null]);
     while (pending > 0 && !failed) await new Promise((r) => (wake = r));
     if (failed) throw failed;
+    if (snap.lazy && opts.eagerLazy) {
+      // ?snaplazy=0: the lazy pages before main too (the eager restore of S4, from the S5 packs).
+      const chunks = lazyChunks(snap.lazy);
+      const cp = snap.lazy.chunk_pages;
+      let k = 0;
+      for (const p of snap.lazy.packs) {
+        const buf = await getPack(p);
+        loaded += buf.length;
+        for (const [, off, zlen, raw] of p.chunks) {
+          const data = await inflateNative(buf.subarray(off, off + zlen), raw);
+          for (let j = 0; j * 4096 < data.length; j++) Module.HEAPU8.set(data.subarray(j * 4096, (j + 1) * 4096), pages[k * cp + j] * 4096);
+          k++;
+        }
+      }
+      if (k !== chunks.length) throw new Error('snapshot: the lazy packs do not match their map');
+      pages = null;
+    }
   } finally {
     for (const h of pool) h.terminate();
   }
   Module._xj_snap_preloaded();
-  return { head, downloadMs: now() - t0, bytes: total, timing };
+  return { head, downloadMs: now() - t0, bytes: loaded, timing, pages };
+}
+
+// The background loader of the lazy pages and the tree's prefetch packs (web/snaploader.js), started before main and
+// told to go by the engine (LazyPages.mark). Returns the engine's side (Module.xjLazy).
+async function startLazy(Module, snap, base, pages, store, opts) {
+  const lazy = snap.lazy;
+  const bufs = lazyBuffers(lazy);
+  const record = opts.record;
+  let loader = null;
+  if (!record) {
+    try {
+      loader = new Worker(new URL('./snaploader.js', import.meta.url), { type: 'module' });
+    } catch {
+      loader = null;
+    }
+  }
+  const pf = snap.prefetch && snap.prefetch.packs && snap.prefetch.packs.length && opts.prefetch !== '0' &&
+    typeof SharedArrayBuffer !== 'undefined' ? snap.prefetch : null;
+  let prefetchBufs = null;
+  if (pf && loader) {
+    const { total } = layoutPacks(pf.packs);
+    prefetchBufs = { sab: new SharedArrayBuffer(Math.max(1, total)), ctrl: new Int32Array(new SharedArrayBuffer(4 * pf.packs.length)) };
+    store.attachPrefetch(pf.packs, prefetchBufs.sab, prefetchBufs.ctrl);
+  } else if (pf) {
+    const p = makePrefetcher(store, base + 'xj/', pf.packs);
+    if (p) await p.start();
+  }
+  if (loader) {
+    await new Promise((resolve) => {
+      loader.onmessage = (ev) => {
+        if (ev.data && ev.data.type === 'started') resolve();
+      };
+      loader.onerror = () => resolve();
+      const hotIds = [...snap.head.chunks, ...snap.packs.flatMap((p) => p.chunks.map((c) => c[0]))];
+      loader.postMessage({ type: 'start', base: base + 'xj/', lazy, prefetch: pf, bufs, prefetchBufs, hotIds, noCache: !!opts.noCache });
+      setTimeout(resolve, 2000);
+    });
+  }
+  const lp = new LazyPages({ Module, lazy, pages, base: base + 'xj/', bufs, loader, record, post, poison: !!opts.poison });
+  Module.xjLazy = lp;
+  return lp;
 }
 
 // The restore's prefetch worker (web/prefetch.js): the chunk store gets the packs' buffer and control words, and
@@ -445,6 +551,7 @@ async function runBoot(base, opts) {
   let files;
   let restored = null;
   let prefetcher = null;
+  let lazy = null;
   if (snap) {
     // A restore: the tree's chunks are read on demand (the boot packs are not waited for), the image is written now.
     const tm = await fetch(base + 'xj/manifest-xiaoji-v2.json', { cache: 'no-store' });
@@ -462,13 +569,22 @@ async function runBoot(base, opts) {
     // started once the image is in (web/prefetch.js; ?prefetch=0 leaves it out).
     const pf = snap.prefetch && snap.prefetch.packs && snap.prefetch.packs.length && opts.prefetch !== '0' &&
       typeof SharedArrayBuffer !== 'undefined' ? snap.prefetch : null;
-    if (pf) prefetcher = makePrefetcher(store, base + 'xj/', pf.packs);
+    // The tree's prefetch: its own worker for an eager restore (no lazy pages, or ?snaplazy=0), else the lazy pages'
+    // loader takes its packs too (startLazy).
+    if (pf && (!snap.lazy || opts.snapLazy === '0')) prefetcher = makePrefetcher(store, base + 'xj/', pf.packs);
     restored = await loadSnapshot(Module, snap, base, (loaded, total) => post({ type: 'restore-progress', loaded, total }),
-      { inflaters: opts.inflaters === null || opts.inflaters === undefined || opts.inflaters === '' ? NaN : Number(opts.inflaters) });
+      { inflaters: opts.inflaters === null || opts.inflaters === undefined || opts.inflaters === '' ? NaN : Number(opts.inflaters),
+        eagerLazy: opts.snapLazy === '0', cache: opts.snapCache !== '0' });
     files = buildChunkTree(Module.FS, manifest, store);
     Module.FS.writeFile('/snap.head', restored.head);
     if (prefetcher) await prefetcher.start();
-    post({ type: 'restore-loaded', wall: now() - t0, loadMs: restored.downloadMs, bytes: restored.bytes, timing: restored.timing });
+    // Lazy pages (docs/snapshot.md, S5): the engine marks them pending and they come in the background or on touch.
+    if (restored.pages) {
+      lazy = await startLazy(Module, snap, base, restored.pages, store, { record: opts.snapRecord === '1', prefetch: opts.prefetch,
+        noCache: opts.snapCache === '0', poison: opts.lazyPoison === '1' });
+    }
+    post({ type: 'restore-loaded', wall: now() - t0, loadMs: restored.downloadMs, bytes: restored.bytes, timing: restored.timing,
+      lazy: lazy ? { pages: snap.lazy.pages, bytes: snap.lazy.bytes, record: lazy.record } : null, mainAt: performance.timeOrigin + now() });
   } else if (packMode) {
     // The packs come from the downloader while the module loads. The engine starts once the first pack (or the
     // first opts.early MB) is in; its reads of a later pack wait for that pack. ?nopack, or no layout (the page
@@ -527,13 +643,23 @@ async function runBoot(base, opts) {
   // The engine's load report (?load=MS) adds the chunk store's reads of the interval (engine/sched.c, load+).
   if (store) {
     let last = { ...store.stats };
+    let lastLazy = {};
     self.xjLoadExtra = () => {
       const s = store.stats;
       const d = (k) => s[k] - (last[k] || 0);
-      const txt = `chunks: ${d('syncFetches')} read (${(d('syncBytes') / 1048576).toFixed(1)} MiB, ` +
+      let txt = `chunks: ${d('syncFetches')} read (${(d('syncBytes') / 1048576).toFixed(1)} MiB, ` +
         `${Math.round(d('syncFetchMs'))} ms fetch, ${Math.round(d('syncDecodeMs'))} ms inflate), ${d('packChunks')} from packs` +
         (s.prefetchHits !== undefined ? `, ${d('prefetchHits')} prefetched` : '');
       last = { ...s };
+      if (lazy) {
+        // The lazy pages (docs/snapshot.md, S5): faults, what they waited for and fetched, pages in so far.
+        const z = lazy.stats;
+        const lz = (k) => z[k] - (lastLazy[k] || 0);
+        txt += `; lazy: ${lz('faults')} faults (${Math.round(lz('faultMs'))} ms), ${lz('syncFetches')} fetched ` +
+          `(${(lz('syncBytes') / 1048576).toFixed(1)} MiB), ${Math.round(lz('waitMs'))} ms waiting, ${z.pagesIn} of ${z.pages} pages in`;
+        lastLazy = { ...z };
+        lazy.report(); // the page's view of the fill (it also says when the background loader is done)
+      }
       return txt;
     };
   }
@@ -587,6 +713,8 @@ self.onmessage = async (ev) => {
         snapshot: msg.snapshot || null, snap: msg.snap || null, snapAfter: msg.snapAfter || 0,
         loadEvery: msg.loadEvery || 0, props: msg.props || [], snapQuiet: msg.snapQuiet || null, snapAt: msg.snapAt || null,
         prehot: msg.prehot || null, inflaters: msg.inflaters ?? null, prefetch: msg.prefetch || null,
+        snapLazy: msg.snapLazy || null, snapRecord: msg.snapRecord || null, snapCache: msg.snapCache || null,
+        lazyPoison: msg.lazyPoison || null,
       });
     }
   } catch (e) {

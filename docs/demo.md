@@ -17,7 +17,8 @@ the next cost.
 
 ## The yardstick: `tools/latency.mjs`
 
-`node tools/latency.mjs [--runs N] [--xj DIR] [--label NAME] [--idle S] [--warm] [--calc] [--json FILE] [--fetch-log FILE]`
+`node tools/latency.mjs [--runs N] [--xj DIR] [--label NAME] [--idle S] [--warm] [--calc] [--json FILE] [--fetch-log FILE]
+[--throttle MBPS:RTT_MS] [--web DIR] [--wasm DIR] [--wait-fill] [--revisit]`
 (or `--summary A.json,B.json,...`: the table of earlier runs) drives the
 page in headless Chromium (Playwright, as `tools/snapshot-web.mjs`). Each run is a new browser (nothing cached) that
 presses Boot Android, restores the snapshot, and then:
@@ -43,7 +44,12 @@ can count from a launch that began before the snapshot (in the first runs, from 
 transition had not ended when the snapshot was taken: the before snapshot's Settings showed `+2m16s` for a 15 s start).
 
 `--xj DIR` serves another chunk store, so two trees and their snapshots, frozen in directories, are measured with one
-engine build (a snapshot restores only into the build that wrote it). The tool prints the medians and ranges, writes the
+engine build (a snapshot restores only into the build that wrote it). Since S5 (docs/snapshot.md): `--web DIR` and
+`--wasm DIR` serve a frozen page and engine; `--throttle MBPS:RTT_MS` puts the dev server's network model in front of
+everything (`web/serve.mjs --throttle` too); the runs record the server's bytes from the page load to the first frame
+and in the whole run; `--wait-fill` starts the actions only once the background loader has every lazy page and
+prefetch pack, and measures 20 s more of idle after it; `--revisit` opens the page again in the same profile at the end
+(a repeat visit: what Cache Storage saves). The tool prints the medians and ranges, writes the
 runs as JSON (each action's frame timeline included), and saves `build/web-shots/l1-<label>-*.png` of the first run, and
 the whole log as `l1-<label>.log`.
 
@@ -336,7 +342,8 @@ the AC runs are the first thing to do next (`build/p1/interleave2.sh`).
    engine runs; it fetches and inflates the packs (native `DecompressionStream`) into a SharedArrayBuffer, and the
    chunk store takes a chunk from there when its pack is in, waits up to 250 ms for a pack in flight, and otherwise
    reads it itself (`?prefetch=0` turns it off). Result: the drawer's and Settings' chunk reads went to 0 or 1.
-   - *Item 2 of the task (demand paging of the snapshot).* Not done: the restore is still eager. It did not need to
+   - *Item 2 of the task (demand paging of the snapshot).* Not done in P1: the restore was still eager (done since, in
+     docs/snapshot.md, S5). It did not need to
      be lazy this round: with the loader above, a 142 MiB snapshot restores to its first frame in 2.6 s on AC
      (median of 3) against 6.4 s for 116 MiB before, and in 5.0 s against 12.3 s on battery. Packs are in snappack's first-use order (the address order of the image), not first touch:
      with an eager restore the order does not change when the engine starts.

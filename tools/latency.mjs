@@ -3,7 +3,7 @@
 // (Playwright, as tools/snapshot-web.mjs) on the page's booted snapshot.
 //
 //   node tools/latency.mjs [--runs N] [--xj DIR] [--label NAME] [--idle S] [--calc] [--warm] [--json FILE] [--query Q]
-//                          [--fetch-log FILE]
+//                          [--fetch-log FILE] [--throttle MBPS:RTT_MS] [--web DIR] [--wasm DIR] [--wait-fill] [--revisit]
 //   node tools/latency.mjs --summary A.json,B.json,... [--label NAME]     the table of runs written before (--json)
 //
 // Each run is a new browser (a fresh profile: nothing cached), which restores the snapshot and then:
@@ -33,7 +33,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { DIRS, startServer } from '../web/serve.mjs';
+import { DIRS, parseThrottle, startServer } from '../web/serve.mjs';
 import { drawerLayout } from './ui-points.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -58,12 +58,21 @@ const QUERY = opt('--query', '');
 const WARM = args.includes('--warm');
 const CALC = args.includes('--calc');
 const FILES = args.includes('--files');
+const WAIT_FILL = args.includes('--wait-fill');
+// --revisit: at the end, the same browser profile opens the page again and presses Boot Android (a repeat visit: what
+// Cache Storage saves, docs/snapshot.md S5); its press to first frame and bytes are kept.
+const REVISIT = args.includes('--revisit');
 // --summary A.json,B.json: no runs; the table of the runs these files hold (several --runs 1 invocations, one table).
 const SUMMARY = opt('--summary', null);
 // --fetch-log FILE: every request the server answers, with its time (which chunks of which files a step reads).
 const FETCH_LOG = opt('--fetch-log', null);
+// --throttle MBPS:RTT_MS: the dev server's network model (web/serve.mjs; e.g. 50:40, a decent home connection).
+const THROTTLE = opt('--throttle', null) ? parseThrottle(opt('--throttle', null)) : null;
 if (XJ) DIRS.xj = resolve(XJ);
 if (WASM) DIRS.wasm = resolve(WASM);
+// --web DIR serves another copy of the page (web/): a frozen page with its frozen engine and snapshot.
+const WEB = opt('--web', null);
+if (WEB) DIRS.web = resolve(WEB);
 
 // Calculator's keys (ExactCalculator, portrait 540x960).
 const CALC_KEYS = { 1: [70, 715], 2: [189, 715], plus: [440, 865], eq: [307, 858] };
@@ -313,6 +322,7 @@ async function oneRun(chromium, srv, k, ui) {
     page.on('crash', () => console.log(`  run ${k}: the page crashed`));
     const pageErrors = [];
     page.on('pageerror', (e) => pageErrors.push(String(e)));
+    const bytes0 = srv.counters.bytes, req0 = srv.counters.requests;
     await page.goto(srv.url + '?keeplog=1&load=1000' + QUERY, { waitUntil: 'load' });
     await page.evaluate(installHooks);
     await page.click('#boot');
@@ -324,6 +334,9 @@ async function oneRun(chromium, srv, k, ui) {
     const r0 = await page.evaluate(() => ({ boot: window.__lat.boot, first: window.__lat.frames[0].t, restore: window.xb.restore }));
     const run = {
       run: k,
+      // What the server sent from the page load to the first frame (polled every 50 ms), and its requests.
+      bytesToFrame: srv.counters.bytes - bytes0,
+      requestsToFrame: srv.counters.requests - req0,
       pressToFrameMs: Math.round(r0.first - r0.boot),
       downloadMiB: Number((r0.restore.bytes / 1048576).toFixed(1)),
       loadMs: Math.round(r0.restore.loadMs),
@@ -340,6 +353,25 @@ async function oneRun(chromium, srv, k, ui) {
     const lines = await page.evaluate(() => window.__lat.lines);
     run.idle = loadSummary(lines.filter((l) => l.t >= idleFrom));
     run.restoreExtra = loadExtra(lines.filter((l) => l.t < idleFrom + 5000)); // the restore's first seconds
+    // --wait-fill: the app opens are measured once the background loader (lazy pages and the tree's prefetch,
+    // docs/snapshot.md S5) has everything.
+    if (WAIT_FILL) {
+      await page.waitForFunction(() => !window.xb.restore.lazy || (window.xb.lazy && window.xb.lazy.loaderDone), null,
+        { timeout: 600000, polling: 500 }).catch(() => {});
+      await page.waitForTimeout(3000);
+      // The idle phone once everything is in: 20 s more of load reports and the browser's CPU (the idle window above
+      // can overlap the background fill on a slow link).
+      const tA = await page.evaluate(() => performance.now());
+      const c0 = browserCpuS(), wA = Date.now();
+      await page.waitForTimeout(20000);
+      const c1 = browserCpuS();
+      const lines2 = await page.evaluate(() => window.__lat.lines);
+      run.idleAfterFill = loadSummary(lines2.filter((l) => l.t >= tA));
+      if (c0 != null && c1 != null) run.idleAfterFillCpuPct = Math.round((100 * (c1 - c0)) / ((Date.now() - wA) / 1000));
+    }
+    run.fillAtFrame = await page.evaluate(() => window.xb.lazy || null);
+    run.fillDoneMs = await page.evaluate(() => (window.xb.lazy && window.xb.lazy.loaderDone ? performance.now() : null));
+    if (run.fillDoneMs != null) run.fillDoneMs = Math.round(run.fillDoneMs - r0.first);
     run.actions = [];
     run.actions.push(await openDrawer(page));
     await shot(page, 'drawer');
@@ -372,9 +404,27 @@ async function oneRun(chromium, srv, k, ui) {
       await shot(page, 'files');
     }
     const all = await page.evaluate(() => window.__lat.lines.map((l) => l.text));
+    run.bytesTotal = srv.counters.bytes - bytes0;
+    run.requestsTotal = srv.counters.requests - req0;
+    run.lazy = await page.evaluate(() => window.xb.lazy || null); // the lazy pages' fill (docs/snapshot.md, S5)
     run.bad = all.filter((l) => /ANR in|FATAL EXCEPTION|Fatal signal/.test(l)).map((l) => l.slice(0, 160));
     run.pageErrors = pageErrors;
     if (shots) writeFileSync(join(SHOTS, `l1-${LABEL}.log`), (await page.evaluate(() => (window.xb.all || []).join('\n'))) + '\n');
+    if (REVISIT) {
+      await page.waitForTimeout(5000); // the last Cache Storage writes
+      await page.close();
+      const p2 = await ctx.newPage();
+      const b0 = srv.counters.bytes;
+      await p2.goto(srv.url + '?keeplog=1&load=1000' + QUERY, { waitUntil: 'load' });
+      await p2.evaluate(installHooks);
+      await p2.click('#boot');
+      await p2.waitForFunction(() => window.__lat.frames.length > 0, null, { timeout: 300000, polling: 50 });
+      const v = await p2.evaluate(() => ({ boot: window.__lat.boot, first: window.__lat.frames[0].t, restore: window.xb.restore }));
+      run.revisit = { pressToFrameMs: Math.round(v.first - v.boot), bytesToFrame: srv.counters.bytes - b0,
+        cachePacks: v.restore.timing ? v.restore.timing.cachePacks : null };
+      await p2.waitForTimeout(20000);
+      run.revisit.bytes20s = srv.counters.bytes - b0;
+    }
     return run;
   } finally {
     await browser.close();
@@ -416,6 +466,8 @@ function table(runs, label, idleS) {
   const pair = (xs, k1, k2) => `${fmt(xs.map((a) => a[k1]))} / ${fmt(xs.map((a) => a[k2]))}`;
   const rows = [
     ['press to first frame', fmt(ok.map((r) => r.pressToFrameMs))],
+    ['bytes from page load to first frame', fmt(ok.map((r) => r.bytesToFrame), 'MiB', 1048576)],
+    ['bytes in the whole run', fmt(ok.map((r) => r.bytesTotal), 'MiB', 1048576)],
     ['snapshot download', `${ok.length ? ok[0].downloadMiB : '-'} MiB`],
     [`idle ${idleS} s: engine busy`, fmt(ok.map((r) => r.idle && r.idle.busyPct), '%', 1)],
     [`idle ${idleS} s: guest instructions`, fmt(ok.map((r) => r.idle && r.idle.mInsnPerS), 'M/s', 1)],
@@ -435,6 +487,24 @@ function table(runs, label, idleS) {
   rows.push(['drawer: chunk reads, fetch + inflate ms, translate ms', opened.map((a) => a.extra ? `${a.extra.chunkReads}, ${a.extra.fetchMs} + ${a.extra.inflateMs}, ${a.extra.translateMs}` : '-').join('; ')]);
   rows.push(['restore: fetch ms (sum over packs) / helpers', ok.map((r) => r.restoreTiming ? `${Math.round(r.restoreTiming.fetchMs)} / ${r.restoreTiming.helpers}` : '-').join('; ')]);
   if (keys.length) rows.push(['Calculator key: response', fmt(keys.map((a) => a.responseMs))]);
+  const lz = ok.filter((r) => r.lazy);
+  const af = ok.filter((r) => r.idleAfterFill);
+  if (af.length) {
+    rows.push(['idle 20 s after the fill: engine busy / browser CPU', `${fmt(af.map((r) => r.idleAfterFill.busyPct), '%', 1)} / ` +
+      `${fmt(af.map((r) => r.idleAfterFillCpuPct), '%', 1)}`]);
+  }
+  const rv = ok.filter((r) => r.revisit);
+  if (rv.length) {
+    rows.push(['repeat visit: press to first frame', fmt(rv.map((r) => r.revisit.pressToFrameMs))]);
+    rows.push(['repeat visit: bytes to first frame / in its first 20 s', `${fmt(rv.map((r) => r.revisit.bytesToFrame), 'MiB', 1048576)} / ` +
+      `${fmt(rv.map((r) => r.revisit.bytes20s), 'MiB', 1048576)}`]);
+  }
+  if (lz.length) {
+    // Lazy pages (docs/snapshot.md, S5): when the last one was in (after main), and what the engine waited for.
+    rows.push(['lazy pages: all in after main', fmt(lz.map((r) => r.lazy.doneMs))]);
+    rows.push(['lazy pages: faults, fetched on demand, ms in faults (whole run)',
+      lz.map((r) => `${r.lazy.faults}, ${r.lazy.syncFetches} (${(r.lazy.syncBytes / 1048576).toFixed(1)} MiB), ${Math.round(r.lazy.faultMs)}`).join('; ')]);
+  }
   rows.push(['missed: swipes / Settings taps', `${missedSwipes} / ${missedTaps}`]);
   console.log(`\n| ${label} (${ok.length} of ${runs.length} runs; median, range) | |\n|---|---|`);
   for (const [k, v] of rows) console.log(`| ${k} | ${v} |`);
@@ -461,10 +531,12 @@ const { chromium } = await import(pathToFileURL(PW).href);
 BROWSER_EXE = process.env.XN_CHROME || chromium.executablePath().replace(/\/chromium-\d+\/.*$/, "/chromium_headless_shell-"); // this tool's browsers only (another suite may run its own)
 const ui = drawerLayout(DIRS.xj);
 const fetchLines = [];
-const srv = await startServer({ port: 0, ...(FETCH_LOG ? { log: (l) => fetchLines.push(`${Date.now()} ${l}`) } : {}) });
+const srv = await startServer({ port: 0, throttle: THROTTLE, ...(FETCH_LOG ? { log: (l) => fetchLines.push(`${Date.now()} ${l}`) } : {}) });
 const env = power();
 console.log(`latency: ${LABEL}, ${RUNS} runs, chunk store ${DIRS.xj} (${ui.name} drawer), idle ${IDLE_S} s; ` +
-  `power ${env.source}, low power mode ${env.lowPower}, swap used ${env.swapUsed}`);
+  `power ${env.source}, low power mode ${env.lowPower}, swap used ${env.swapUsed}` +
+  (THROTTLE ? `; throttled to ${THROTTLE.mbps} Mbit/s, ${THROTTLE.rttMs} ms RTT` : '; localhost'));
+env.throttle = THROTTLE;
 const runs = [];
 try {
   for (let k = 1; k <= RUNS; k++) {

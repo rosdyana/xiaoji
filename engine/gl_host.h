@@ -77,6 +77,8 @@ int gl_host_select(const char *name);
  * GL state is all in engine memory. resume: 1 when it restored the WebGL objects, 0 when there were none, -1 on failure. */
 void gl_host_snap_save(void);
 int gl_host_snap_resume(void);
+/* The blob gl_host_snap_save made (its address and length; NULL when none), for the snapshot's region table. */
+const void *gl_host_snap_blob(uint64_t *len);
 
 /* The backend the next request goes to: the selected one, or null when the selected one is not available. */
 const gl_host_t *gl_host_current(void);

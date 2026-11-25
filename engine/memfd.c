@@ -1,5 +1,6 @@
 #include "memfd.h"
 #include "mem.h"
+#include "snaplazy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +106,7 @@ uint8_t *memfd_page(memfd_t *m, uint64_t idx)
         if (m->fill)
             m->fill(m, idx, p, m->ctx);
     }
+    snap_lazy_need(m->pages[idx]); /* a page of a restored snapshot that is not in yet (snaplazy.h) */
     return m->pages[idx];
 }
 
@@ -119,6 +121,7 @@ int memfd_truncate(memfd_t *m, uint64_t size)
             if (end > m->size)
                 end = m->size;
             if (idx < m->cap && m->pages[idx]) {
+                snap_lazy_need(m->pages[idx]);
 #ifdef __EMSCRIPTEN__
                 jit_page_changed(m->pages[idx]);
 #endif
@@ -146,8 +149,10 @@ int64_t memfd_pread(memfd_t *m, void *buf, size_t n, uint64_t off)
         size_t chunk = MFD_PAGE - in;
         if (chunk > n - done)
             chunk = n - done;
-        if (idx < m->cap && m->pages[idx])
+        if (idx < m->cap && m->pages[idx]) {
+            snap_lazy_need(m->pages[idx]);
             memcpy(d + done, m->pages[idx] + in, chunk);
+        }
         else if (m->fill && memfd_page(m, idx))
             memcpy(d + done, m->pages[idx] + in, chunk); /* a file cache fills the page on first use */
         else

@@ -258,7 +258,62 @@ check_snapshot() {
     else
         echo "FAIL  $tag chained (exits $rc3, $rc4; stderr: $(tail -n 1 "$base.4.err"))"
     fi
+    # Lazy pages (docs/snapshot.md, S5): the same restore with every pool page poisoned and pending, read again from the
+    # file on its first touch (XIAOJI_SNAP_LAZY=1); then with the background fill too (2), taking the chained snapshot,
+    # which must bring every pending page in first.
+    rm -f "$base".b
+    XIAOJI_SNAP_LAZY=1 run_engine "$runner" --restore "$base.a" >"$base.5" 2>"$base.5.err" 7<Makefile 8</dev/null
+    local rc5=$?
+    if [ "$rc5" = "$expect_rc" ] && cat "$base.1" "$base.5" | cmp -s - "$ORACLE/$name.out" && lazy_faulted "$base.5.err"; then
+        echo "PASS  $tag lazy ($(lazy_line "$base.5.err"))"
+    else
+        echo "FAIL  $tag lazy (exit $rc5; $(lazy_line "$base.5.err"); stderr: $(tail -n 1 "$base.5.err"))"
+    fi
+    XIAOJI_SNAP_LAZY=2 run_engine "$runner" --restore "$base.a" --snapshot-at time:0.1 --snapshot-out "$base.b" >"$base.6" 2>"$base.6.err"
+    local rc6=$?
+    XIAOJI_SNAP_LAZY=1 run_engine "$runner" --restore "$base.b" >"$base.7" 2>"$base.7.err"
+    local rc7=$?
+    if [ "$rc6" = 0 ] && [ "$rc7" = "$expect_rc" ] && cat "$base.1" "$base.6" "$base.7" | cmp -s - "$ORACLE/$name.out"; then
+        echo "PASS  $tag lazy chained"
+    else
+        echo "FAIL  $tag lazy chained (exits $rc6, $rc7; stderr: $(tail -n 1 "$base.7.err"))"
+    fi
     rm -f "$base".a "$base".b
+}
+
+# A lazy restore's word on its pages (snaplazy.c): "N pending", then "all M in after ...: F faults" or, at exit,
+# "N of M in at exit: F faults"; and "first fault at ADDRESS" once a page was read on demand.
+lazy_line() {
+    local l
+    l=$(grep -o 'lazy pages: \(all [0-9]* in\|[0-9]* of [0-9]* in at exit\)[^,]*: [0-9]* faults' "$1" | tail -n 1)
+    [ -n "$l" ] || l=$(grep -o 'lazy pages: [0-9]* pending' "$1" | tail -n 1)
+    echo "$l"
+}
+lazy_faulted() {
+    grep -q 'lazy pages: first fault at 0x' "$1"
+}
+
+# Lazy pages mid-run (docs/snapshot.md, S5): a snapshot at an instruction count, while the program's memory is full of
+# its own data (fork's copy-on-write pages, mmap'd and protected pages, threads' stacks), and a restore with every pool
+# page poisoned and pending (XIAOJI_SNAP_LAZY=1). The two outputs must be the oracle's, and pages must have faulted.
+check_lazy_mid() {
+    local runner=$1 name=$2 bin=$3 at=$4
+    local tag="$name lazy restore mid-run $runner" base="$OUT/$name.lazymid.$runner"
+    run_engine "$runner" --snapshot-at "icount:$at" --snapshot-out "$base.snap" "$bin" >"$base.1" 2>"$base.1.err"
+    local rc1=$?
+    if grep -q "cannot run with a fixed layout" "$base.1.err"; then
+        echo "note: $tag skipped (no fixed layout on this host)"
+        return 0
+    fi
+    XIAOJI_SNAP_LAZY=1 run_engine "$runner" --restore "$base.snap" >"$base.2" 2>"$base.2.err"
+    local rc2=$?
+    if [ "$rc1" = 0 ] && [ "$rc2" = "$(cat "$ORACLE/$name.rc")" ] && cat "$base.1" "$base.2" | cmp -s - "$ORACLE/$name.out" &&
+        lazy_faulted "$base.2.err"; then
+        echo "PASS  $tag ($(lazy_line "$base.2.err"))"
+    else
+        echo "FAIL  $tag (exits $rc1, $rc2; $(lazy_line "$base.2.err"); stderr: $(tail -n 1 "$base.2.err"))"
+    fi
+    rm -f "$base.snap"
 }
 
 # The load meter (--load-every, docs/demo.md): snapwait runs with a report every 100 ms. Its stdout must still be the
@@ -376,6 +431,14 @@ run_case() {
         [ -f "$NODE_JS" ] && check_load node "$name" "$bin"
         check_quiet engine "$name" "$bin"
         [ -f "$NODE_JS" ] && check_quiet node "$name" "$bin"
+        ;;
+    procs | memory | jitstress | threads)
+        if [ "${name##*-}" = O2 ]; then
+            local at
+            case "$name" in procs-O2) at=300000 ;; memory-O2) at=6000000 ;; jitstress-O2) at=15000000 ;; *) at=1000000 ;; esac
+            check_lazy_mid engine "$name" "$bin" "$at"
+            [ -f "$NODE_JS" ] && check_lazy_mid node "$name" "$bin" "$at"
+        fi
         ;;
     esac
 }
@@ -650,6 +713,19 @@ root_lane() {
                 else
                     echo "FAIL  snapshot-$what $runner (exits $rc, $rc2; stderr: $(tail -n 1 "$OUT/snap-$what.$runner.2.err"))"
                     cat "$OUT/snap-$what.$runner.1" "$OUT/snap-$what.$runner.2" | diff "$expect" - | head -n 6 | sed 's/^/        /'
+                fi
+                # The same restore with lazy pages (docs/snapshot.md, S5): servicemanager's and the shell's memory,
+                # binder's and ashmem's memfds, poisoned and pending; binder on demand only, init with the background fill.
+                local lz=1
+                [ "$what" = init ] && lz=2
+                XIAOJI_SNAP_LAZY=$lz run_engine "$runner" --restore "$snap" --init-timeout 60 >"$OUT/snap-$what.$runner.3" \
+                    2>"$OUT/snap-$what.$runner.3.err"
+                local rc3=$?
+                if [ "$rc3" = 0 ] && cat "$OUT/snap-$what.$runner.1" "$OUT/snap-$what.$runner.3" | cmp -s - "$expect" &&
+                    lazy_faulted "$OUT/snap-$what.$runner.3.err"; then
+                    echo "PASS  snapshot-$what $runner lazy ($(lazy_line "$OUT/snap-$what.$runner.3.err"))"
+                else
+                    echo "FAIL  snapshot-$what $runner lazy (exit $rc3; $(lazy_line "$OUT/snap-$what.$runner.3.err"); stderr: $(tail -n 1 "$OUT/snap-$what.$runner.3.err"))"
                 fi
             done
         done

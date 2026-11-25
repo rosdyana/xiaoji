@@ -3845,6 +3845,12 @@ void gl_host_snap_save(void)
     fprintf(stderr, "xiaoji: gl(webgl): snapshot of the WebGL objects: %u bytes\n", (unsigned)snap_blob_len);
 }
 
+const void *gl_host_snap_blob(uint64_t *len)
+{
+    *len = snap_blob_len;
+    return snap_blob;
+}
+
 int gl_host_snap_resume(void)
 {
     if (ready != 1 || !snap_blob)
@@ -4111,5 +4117,10 @@ const gl_host_t *gl_host_webgl(void)
 
 void gl_host_snap_save(void) {}
 int gl_host_snap_resume(void) { return 0; }
+const void *gl_host_snap_blob(uint64_t *len)
+{
+    *len = 0;
+    return NULL;
+}
 
 #endif

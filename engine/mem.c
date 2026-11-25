@@ -22,6 +22,7 @@
 #include "host.h"
 #include "filecache.h"
 #include "memfd.h"
+#include "snaplazy.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -544,6 +545,7 @@ static void cow_break(uint64_t vpn, uint64_t *slot)
     uint64_t e = *slot;
     uint8_t *old = (uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS);
     uint8_t *p = old;
+    snap_lazy_need(old); /* the copy reads it (mem_poke reaches here without page_lookup) */
     host_page_changed(old);
     if (share_extra(old)) {
         p = mem_page_alloc();
@@ -600,6 +602,7 @@ void mem_page_free(uint8_t *p)
 {
     if (!p)
         return;
+    snap_lazy_drop(p); /* a pending page of a restore that is freed unread: its bytes are never needed */
     if (pool_nfree == pool_cfree) {
         size_t nc = pool_cfree * 2 + POOL_SLAB_PAGES;
         uint8_t **nf = realloc(pool_free, nc * sizeof *nf);
@@ -630,6 +633,14 @@ uint64_t mem_pool_nonzero(void)
                 }
         }
     return n;
+}
+
+/* The slabs of the pool, for the snapshot's region table (snap.c). */
+size_t mem_pool_slabs(uint8_t *const **slabs, size_t *slab_bytes)
+{
+    *slabs = pool_slabs;
+    *slab_bytes = (size_t)POOL_SLAB_PAGES * MEM_PAGE_SIZE;
+    return pool_nslabs;
 }
 
 int mem_pool_contains(const void *p)
@@ -746,6 +757,9 @@ static uint8_t *page_lookup(uint64_t vpn, unsigned need)
     uint64_t have = (e & PTE_W) ? (e | PTE_R) : e;
     if (!(e & PTE_MAPPED) || !(have & need))
         return NULL;
+    /* A page of a restored snapshot that is not in yet (snaplazy.h): before its bytes are read, written or copied
+     * (cow_break), and before the TLBs or the translator see its host address. */
+    snap_lazy_need((const void *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS));
     if ((need & PTE_W) && (e & PTE_COW)) {
         cow_break(vpn, slot);
         e = *slot;
