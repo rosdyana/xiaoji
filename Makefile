@@ -110,8 +110,9 @@ test-web: wasm build/web/manifest.json   ## run the web build in headless Chromi
 	node tests/snapshot.mjs
 
 # Booted snapshots (docs/snapshot.md). snapshot: the page's, for the current tree and web engine: the product boots in
-# headless Chromium (WebGL2) with ?snapshot=make, the engine writes its snapshot at the launcher's HOME start + 60 s
-# (XN_SNAP_AFTER) to the dev server (build/snap/web.snap), and tools/snappack.py packs it into the chunk store
+# headless Chromium (WebGL2) with ?snapshot=make, the demo apps are opened once and the phone sent home (the pre-warm,
+# docs/demo.md P1), the engine writes its snapshot once the phone is quiet (tools/snapshot-web.mjs has the procedure)
+# to the dev server (build/snap/web.snap), and tools/snappack.py packs it into the chunk store
 # (build/web/xj/snapshot.json, chunks and packs beside the tree's). The page restores it when it matches its engine and
 # tree. snapshot-native: the native engine's (null GL backend), from a fresh /data -> build/snap/native.snap, for
 # build/xiaoji --restore. test-snapshot-web: the page restores the snapshot, shows the launcher and opens Settings.

@@ -56,7 +56,9 @@ def main(argv):
     old_packs = set()
     try:
         with open(os.path.join(a.out, "snapshot.json")) as o:
-            old_packs = {p["file"] for p in json.load(o)["packs"]}
+            old = json.load(o)
+            old_packs = {p["file"] for p in old["packs"]}
+            old_packs |= {p["file"] for p in old.get("prefetch", {}).get("packs", [])}  # tools/prefetch.py's
         with open(a.tree) as o:
             old_packs -= {p["file"] for p in json.load(o).get("packs", [])}
     except (OSError, ValueError, KeyError):

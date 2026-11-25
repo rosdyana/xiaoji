@@ -28,11 +28,23 @@ void jit_page_changed(const uint8_t *host_page);
 /* Empties the block chain cache; the memory layer calls it on every mapping change. */
 void jit_chain_flush(void);
 
+/* At a snapshot, before the clean file pages are dropped: records the translated blocks' pcs (the pre-hot set). */
+void jit_snap_mark(void);
+
 /* After a restore (snap.c): drops every translated block of the image (they name another instance's table). */
 void jit_snap_reset(void);
 
+/* --jit-prehot: after a restore, a pc whose block the image had translated is queued for translation at its first
+ * entry instead of after JIT_HOT entries. The counts: pcs in the set, pcs queued from it so far. */
+void jit_set_prehot(int on);
+void jit_prehot_counts(uint64_t *set, uint64_t *queued);
+
 /* 1 if the host page holds translated code (any block on it, live or not). */
 int jit_page_is_code(const uint8_t *host_page);
+
+/* The translator's running counts, for the load report (sched.c): instructions run in translated code, blocks
+ * translated, modules compiled, host nanoseconds spent translating and compiling. */
+void jit_load_counts(uint64_t out[4]);
 
 /* XIAOJI_STATS=1 line for the translator. total_insns is the engine's count. */
 void jit_print_stats(uint64_t total_insns);

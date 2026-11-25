@@ -521,11 +521,51 @@ uint64_t host_realtime_ns(void)
     return ns_of(&ts);
 }
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+/* Emscripten's nanosleep is a busy loop without pthreads: an idle engine kept a host core at 100% (docs/demo.md, P1).
+ * Atomics.wait blocks the worker (or Node's thread) instead. In the page it waits on the input ring's head (word 0 of
+ * Module.inputRing, web/input.js), which the page notifies after each event, so input ends the sleep at once; elsewhere
+ * on a private word nobody notifies. It returns at once when an event arrived since the last wait (an event that no
+ * reader takes does not keep it awake: the head is compared with the head it saw, not with the tail). Without a
+ * SharedArrayBuffer (a page that is not cross-origin isolated) it spins as before. */
+EM_JS(void, xj_idle_wait, (double ms), {
+    var r = Module['inputRing'];
+    if (r) {
+        var head = Atomics.load(r, 0);
+        if (head !== Module['xjIdleHead']) {
+            Module['xjIdleHead'] = head; /* something arrived: the loop looks before it sleeps */
+            return;
+        }
+        Atomics.wait(r, 0, head, ms);
+        return;
+    }
+    if (!Module['xjIdleWord'] && typeof SharedArrayBuffer !== 'undefined') {
+        try {
+            Module['xjIdleWord'] = new Int32Array(new SharedArrayBuffer(4));
+        } catch (e) {
+            Module['xjIdleWord'] = null;
+        }
+    }
+    if (Module['xjIdleWord']) {
+        Atomics.wait(Module['xjIdleWord'], 0, 0, ms);
+        return;
+    }
+    var end = performance.now() + ms;
+    while (performance.now() < end) {
+    }
+});
+#endif
+
 void host_sleep_ns(uint64_t ns)
 {
+#ifdef __EMSCRIPTEN__
+    xj_idle_wait((double)ns / 1e6);
+#else
     struct timespec ts = {(time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull)};
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
         ;
+#endif
 }
 
 void host_random(void *buf, size_t len)

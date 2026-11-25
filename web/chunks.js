@@ -14,6 +14,7 @@ export const CHUNK_CACHE = 'xiaoji-chunks-v1';
 export const PACK_PENDING = 0;
 export const PACK_READY = 1;
 export const PACK_FAILED = 2;
+const PREFETCH_WAIT_MS = 250;
 const now = () => performance.now();
 
 export async function sha256Id(bytes) {
@@ -95,6 +96,36 @@ export class ChunkStore {
     this.stats.packs = packs.length;
   }
 
+  // The restore's prefetch (web/prefetch.js, docs/demo.md P1): packs a second worker fills while the engine runs.
+  // Their control words are PACK_PENDING (not started), 3 (in flight), PACK_READY or PACK_FAILED.
+  attachPrefetch(packs, sab, ctrl) {
+    this.pwhere = layoutPacks(packs).where;
+    this.psab = sab;
+    this.pctrl = ctrl;
+    Object.assign(this.stats, { prefetchHits: 0, prefetchWaits: 0, prefetchWaitMs: 0, prefetchMisses: 0 });
+  }
+
+  // A chunk of the prefetch: its bytes when its pack is in (waiting up to PREFETCH_WAIT_MS for a pack in flight, which
+  // is faster than a request and the synchronous decoder), else null (not started yet, or failed).
+  prefetched(id, rawLen) {
+    const w = this.pwhere && this.pwhere.get(id);
+    if (!w || w.raw !== rawLen) return null;
+    let v = Atomics.load(this.pctrl, w.k);
+    if (v === 3) {
+      const t0 = now();
+      Atomics.wait(this.pctrl, w.k, 3, PREFETCH_WAIT_MS);
+      v = Atomics.load(this.pctrl, w.k);
+      this.stats.prefetchWaits++;
+      this.stats.prefetchWaitMs += now() - t0;
+    }
+    if (v !== PACK_READY) {
+      this.stats.prefetchMisses++;
+      return null;
+    }
+    this.stats.prefetchHits++;
+    return new Uint8Array(this.psab, w.off, w.raw);
+  }
+
   // Async, before the engine starts: resolves when packs 0..upto are ready or failed. A failed pack is not an
   // error here: its chunks fall back to synchronous reads.
   async waitStart(upto) {
@@ -134,6 +165,13 @@ export class ChunkStore {
         return data;
       }
       this.stats.packFailedFallbacks++;
+    }
+    if (this.pwhere) {
+      const data = this.prefetched(id, rawLen);
+      if (data) {
+        this.mem.set(id, data);
+        return data;
+      }
     }
     const t0 = now();
     const xhr = new XMLHttpRequest();

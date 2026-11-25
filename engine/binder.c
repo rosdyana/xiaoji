@@ -2030,12 +2030,12 @@ int64_t binder_ioctl(binder_proc_t *b, uint32_t cmd, uint64_t arg, int nonblock)
         return mem_copy_in(arg, buf, 24) < 0 ? -LE_FAULT : 0;
     }
     case BINDER_FREEZE:
-        return -LE_INVAL; /* freezing is not modelled */
     case BINDER_GET_FROZEN_INFO:
-        if (mem_copy_out(buf, arg, 12) < 0)
-            return -LE_FAULT;
-        memset(buf, 0, 12); /* no proc is frozen */
-        return mem_copy_in(arg, buf, 12) < 0 ? -LE_FAULT : 0;
+        /* Freezing is not modelled, and the driver says so as an older kernel's does: ActivityManager's freezer check
+         * (CachedAppOptimizer.isFreezerSupported) asks BINDER_GET_FROZEN_INFO, and an error turns the freezer off.
+         * Answering it (no proc frozen) made ActivityManager think it could freeze, fail at BINDER_FREEZE and kill
+         * every cached app about 10 minutes after it was cached ("Unable to freeze binder interface"). */
+        return -LE_INVAL;
     default:
         return -LE_INVAL;
     }

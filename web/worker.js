@@ -14,7 +14,7 @@
 
 import { BOOT, CASES, ENGINE_ENV_ARGS } from './cases.js';
 import { openTrace } from './trace.js';
-import { ChunkStore, buildChunkTree, earlyPackIndex, inflateNative } from './chunks.js';
+import { ChunkStore, buildChunkTree, earlyPackIndex, inflateNative, layoutPacks } from './chunks.js';
 
 // The display the engine presents (engine/display.h, XJ_DISPLAY_W and XJ_DISPLAY_H): the size of the OffscreenCanvas.
 const FB_WIDTH = 540;
@@ -197,14 +197,30 @@ function snapshotMismatch(Module, snap, treeHex) {
 // Downloads the snapshot's packs (in parallel) and writes each chunk where the image has it as soon as it is inflated
 // (a chunk can appear at many places: equal pages are stored once). progress(loaded, total) after each pack. Returns
 // { head, downloadMs, bytes }.
-async function loadSnapshot(Module, snap, base, progress) {
+// The restore's helpers (web/inflater.js): DecompressionStream inflates on its caller's thread, so the chunks are
+// inflated by several workers at once, in batches, and written into memory here. ?inflaters=N (0: inflate here).
+function startInflaters(n) {
+  const pool = [];
+  for (let i = 0; i < n; i++) {
+    try {
+      pool.push(new Worker(new URL('./inflater.js', import.meta.url), { type: 'module' }));
+    } catch {
+      break;
+    }
+  }
+  return pool;
+}
+
+async function loadSnapshot(Module, snap, base, progress, opts) {
   const t0 = now();
   const total = snap.download_bytes;
   let top = 0;
   for (const [, hi] of snap.ranges) top = Math.max(top, hi);
+  // New wasm memory is zero, so only the memory the module had before the grow is zeroed (the image's gaps must be
+  // zero). Zeroing the image's whole range wrote every page of it, about 2 GB, on a machine where that swaps.
+  const before = Module.HEAPU8.length;
   if (!Module._xj_snap_grow(top)) throw new Error(`snapshot: cannot grow memory to ${top} bytes`);
-  const heap = Module.HEAPU8;
-  for (const [lo, hi] of snap.ranges) heap.fill(0, lo, hi);
+  for (const [lo, hi] of snap.ranges) if (lo < before) Module.HEAPU8.fill(0, lo, Math.min(hi, before));
   const head = new Uint8Array(snap.head.bytes);
   const targets = new Map(); // chunk id -> [[array, offset], ...]
   const want = (id, arr, off) => {
@@ -213,26 +229,116 @@ async function loadSnapshot(Module, snap, base, progress) {
   };
   for (const [addr, , ids] of snap.extents) ids.forEach((id, k) => want(id, null, addr + k * snap.chunk_size));
   snap.head.chunks.forEach((id, k) => want(id, head, k * snap.chunk_size));
+  const put = (id, c) => {
+    for (const [arr, at] of targets.get(id) || []) (arr || Module.HEAPU8).set(c, at);
+  };
+  const nHelpers = Math.max(0, Math.min(8, Number.isFinite(opts.inflaters) ? opts.inflaters
+    : Math.min(4, Math.max(1, (self.navigator && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4) - 2))));
+  const pool = startInflaters(nHelpers);
+  const timing = { fetchMs: 0, helpers: pool.length, jobs: 0 };
+  // The jobs: batches of a pack's chunks (at most BATCH chunks), each sent to an idle helper with a copy of its bytes.
+  const BATCH = 32;
+  const queue = [];
+  let idle = pool.slice();
+  let pending = 0;
+  let failed = null;
+  let wake = null;
+  const settle = () => {
+    if (wake) {
+      const w = wake;
+      wake = null;
+      w();
+    }
+  };
+  const pump = () => {
+    while (idle.length && queue.length) {
+      const h = idle.pop();
+      const job = queue.shift();
+      h.onmessage = (ev) => {
+        const m = ev.data;
+        if (m.error) failed = failed || new Error(`snapshot: ${m.error}`);
+        else m.bufs.forEach((b, i) => put(job.ids[i], new Uint8Array(b)));
+        pending--;
+        idle.push(h);
+        pump();
+        settle();
+      };
+      h.onerror = (e) => {
+        failed = failed || new Error(`snapshot: inflater: ${e.message || 'failed'}`);
+        pending--;
+        settle();
+      };
+      h.postMessage({ job: timing.jobs++, z: job.z, parts: job.parts }, [job.z]);
+    }
+  };
   let loaded = 0;
-  await Promise.all(snap.packs.map(async (p) => {
-    const res = await fetch(base + 'xj/' + p.file);
-    if (!res.ok) throw new Error(`snapshot ${p.file}: HTTP ${res.status}`);
-    const buf = new Uint8Array(await res.arrayBuffer());
-    loaded += buf.length;
-    progress(loaded, total);
-    await Promise.all(p.chunks.map(async ([id, off, zlen, rlen]) => {
-      const c = await inflateNative(buf.subarray(off, off + zlen), rlen);
-      for (const [arr, at] of targets.get(id) || []) (arr || Module.HEAPU8).set(c, at);
-    }));
-  }));
+  const onPack = async (p, buf) => {
+    if (!pool.length) {
+      await Promise.all(p.chunks.map(async ([id, off, zlen, rlen]) => put(id, await inflateNative(buf.subarray(off, off + zlen), rlen))));
+      return;
+    }
+    for (let i = 0; i < p.chunks.length; i += BATCH) {
+      const part = p.chunks.slice(i, i + BATCH);
+      const lo = part[0][1];
+      const last = part[part.length - 1];
+      const hi = last[1] + last[2];
+      queue.push({ z: buf.slice(lo, hi).buffer, ids: part.map((c) => c[0]), parts: part.map(([, off, zlen, rlen]) => [off - lo, zlen, rlen]) });
+      pending++;
+    }
+    pump();
+  };
+  // At most FETCHES packs are downloading at once, in the manifest's order.
+  const FETCHES = 3;
+  let next = 0;
+  const fetcher = async () => {
+    while (next < snap.packs.length) {
+      const p = snap.packs[next++];
+      const tf = now();
+      const res = await fetch(base + 'xj/' + p.file);
+      if (!res.ok) throw new Error(`snapshot ${p.file}: HTTP ${res.status}`);
+      const buf = new Uint8Array(await res.arrayBuffer());
+      timing.fetchMs += now() - tf;
+      loaded += buf.length;
+      progress(loaded, total);
+      await onPack(p, buf);
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(FETCHES, snap.packs.length) }, fetcher));
+    while (pending > 0 && !failed) await new Promise((r) => (wake = r));
+    if (failed) throw failed;
+  } finally {
+    for (const h of pool) h.terminate();
+  }
   Module._xj_snap_preloaded();
-  return { head, downloadMs: now() - t0, bytes: total };
+  return { head, downloadMs: now() - t0, bytes: total, timing };
 }
 
-// The Android boot (W1): the same command as the native product boot (docs/boot.md, B7), on the
-// product tree from build/web/manifest-xiaoji.json. Stops when the page stops the worker, or when
-// the engine's --init-timeout (wall clock, in seconds) runs out.
-// The guest paths of the manifest's files (under /rootfs, as buildTree mounts them) and their sizes.
+// The restore's prefetch worker (web/prefetch.js): the chunk store gets the packs' buffer and control words, and
+// start() resolves when the worker has its message, before the engine runs.
+function makePrefetcher(store, xjBase, packs) {
+  const { total } = layoutPacks(packs);
+  const sab = new SharedArrayBuffer(Math.max(1, total));
+  const ctrl = new Int32Array(new SharedArrayBuffer(4 * packs.length));
+  let w;
+  try {
+    w = new Worker(new URL('./prefetch.js', import.meta.url), { type: 'module' });
+  } catch {
+    return null;
+  }
+  store.attachPrefetch(packs, sab, ctrl);
+  return {
+    start: () => new Promise((resolve) => {
+      w.onmessage = (ev) => {
+        if (ev.data && ev.data.type === 'prefetch-started') resolve();
+      };
+      w.onerror = () => resolve();
+      w.postMessage({ base: xjBase, packs, sab, ctrl, delayMs: 0 });
+      setTimeout(resolve, 2000);
+    }),
+  };
+}
+
 function fileSizes(manifest) {
   const sizes = new Map();
   for (const e of manifest.entries) {
@@ -338,6 +444,7 @@ async function runBoot(base, opts) {
   if (opts && opts.input) Module.inputRing = new Int32Array(opts.input);
   let files;
   let restored = null;
+  let prefetcher = null;
   if (snap) {
     // A restore: the tree's chunks are read on demand (the boot packs are not waited for), the image is written now.
     const tm = await fetch(base + 'xj/manifest-xiaoji-v2.json', { cache: 'no-store' });
@@ -351,10 +458,17 @@ async function runBoot(base, opts) {
     size = tbuf.byteLength;
     store = new ChunkStore(base + 'xj/', manifest.chunk_size);
     post({ type: 'restore-start', total: snap.download_bytes, image: snap.image_bytes });
-    restored = await loadSnapshot(Module, snap, base, (loaded, total) => post({ type: 'restore-progress', loaded, total }));
+    // The prefetch's worker is made now, while this worker's event loop still runs (a worker's start needs it), and
+    // started once the image is in (web/prefetch.js; ?prefetch=0 leaves it out).
+    const pf = snap.prefetch && snap.prefetch.packs && snap.prefetch.packs.length && opts.prefetch !== '0' &&
+      typeof SharedArrayBuffer !== 'undefined' ? snap.prefetch : null;
+    if (pf) prefetcher = makePrefetcher(store, base + 'xj/', pf.packs);
+    restored = await loadSnapshot(Module, snap, base, (loaded, total) => post({ type: 'restore-progress', loaded, total }),
+      { inflaters: opts.inflaters === null || opts.inflaters === undefined || opts.inflaters === '' ? NaN : Number(opts.inflaters) });
     files = buildChunkTree(Module.FS, manifest, store);
     Module.FS.writeFile('/snap.head', restored.head);
-    post({ type: 'restore-loaded', wall: now() - t0, loadMs: restored.downloadMs, bytes: restored.bytes });
+    if (prefetcher) await prefetcher.start();
+    post({ type: 'restore-loaded', wall: now() - t0, loadMs: restored.downloadMs, bytes: restored.bytes, timing: restored.timing });
   } else if (packMode) {
     // The packs come from the downloader while the module loads. The engine starts once the first pack (or the
     // first opts.early MB) is in; its reads of a later pack wait for that pack. ?nopack, or no layout (the page
@@ -406,8 +520,22 @@ async function runBoot(base, opts) {
   if (opts && opts.dumpAt) argv.push('--dump-at', String(opts.dumpAt).replace(/[^0-9,]/g, ''));
   // ?load=MS: the engine's load report (docs/demo.md); ?prop=K=V: a property for a boot (not a restore).
   if (opts && Number(opts.loadEvery) > 0) argv.push('--load-every', String(Math.floor(Number(opts.loadEvery))));
+  if (restored && opts.prehot !== '0') argv.push('--jit-prehot'); // docs/demo.md, P1 (?prehot=0: off)
   if (opts && opts.props && !restored) {
     for (const p of opts.props) if (/^[A-Za-z0-9._-]+=[^\n]*$/.test(p)) argv.push('--prop', p);
+  }
+  // The engine's load report (?load=MS) adds the chunk store's reads of the interval (engine/sched.c, load+).
+  if (store) {
+    let last = { ...store.stats };
+    self.xjLoadExtra = () => {
+      const s = store.stats;
+      const d = (k) => s[k] - (last[k] || 0);
+      const txt = `chunks: ${d('syncFetches')} read (${(d('syncBytes') / 1048576).toFixed(1)} MiB, ` +
+        `${Math.round(d('syncFetchMs'))} ms fetch, ${Math.round(d('syncDecodeMs'))} ms inflate), ${d('packChunks')} from packs` +
+        (s.prefetchHits !== undefined ? `, ${d('prefetchHits')} prefetched` : '');
+      last = { ...s };
+      return txt;
+    };
   }
   let exitCode;
   try {
@@ -458,6 +586,7 @@ self.onmessage = async (ev) => {
         input: msg.input || null, debugFaults: !!msg.debugFaults, dumpAt: msg.dumpAt || 0, timeoutS: msg.timeoutS || 0,
         snapshot: msg.snapshot || null, snap: msg.snap || null, snapAfter: msg.snapAfter || 0,
         loadEvery: msg.loadEvery || 0, props: msg.props || [], snapQuiet: msg.snapQuiet || null, snapAt: msg.snapAt || null,
+        prehot: msg.prehot || null, inflaters: msg.inflaters ?? null, prefetch: msg.prefetch || null,
       });
     }
   } catch (e) {

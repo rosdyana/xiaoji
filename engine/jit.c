@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "cpu_a64.h"
+#include "host.h"
 #include "jit.h"
 #include "mem.h"
 #include "prof.h"
@@ -287,7 +288,7 @@ static uint32_t tlb_rd_base, tlb_wr_base, tlb_stride, tlb_page_off;
 
 static uint64_t st_dispatch, st_block_runs, st_insns, st_blocks, st_untranslatable,
     st_refused, st_modules, st_compile_fail, st_inv_pages, st_inv_blocks, st_faults, st_smc_exits,
-    st_flushes;
+    st_flushes, st_translate_ns;
 
 /* Block chaining. A block whose exit is known to the generated code tail-calls chain_fn
  * (a function of its module), which looks the next pc up in fast[] and tail-calls that
@@ -494,8 +495,71 @@ static void jit_flush_all(void)
 /* After a restore (snap.c): the image's blocks name table slots of the instance that wrote it. This instance's table
  * has none of them, so every block, page entry, queued pc and chain entry is dropped, and the table base is taken
  * again at the next batch. */
+/* The pre-hot set (docs/demo.md, P1): the guest pcs of the blocks the image had translated. A restore drops the
+ * translations, and each block would otherwise run JIT_HOT times in the interpreter before it is queued again; a pc
+ * of this set is queued at its first entry instead. Open addressing on pc + 1 (0 is empty); an entry is removed when
+ * it is queued. Off unless jit_set_prehot(1) (--jit-prehot). */
+#define JIT_PREHOT (2 * JIT_MAX_BLOCKS)
+static uint64_t prehot[JIT_PREHOT];
+static int prehot_on, prehot_n;
+static uint64_t st_prehot_queued;
+
+static uint32_t prehot_slot(uint64_t pc) { return (uint32_t)((pc >> 2) * 0x9E3779B97F4A7C15ull >> 40) & (JIT_PREHOT - 1); }
+
+static void prehot_add(uint64_t pc)
+{
+    if (prehot_n >= JIT_PREHOT / 2)
+        return;
+    for (uint32_t i = prehot_slot(pc);; i = (i + 1) & (JIT_PREHOT - 1)) {
+        if (prehot[i] == pc + 1)
+            return;
+        if (!prehot[i]) {
+            prehot[i] = pc + 1;
+            prehot_n++;
+            return;
+        }
+    }
+}
+
+/* 1 if pc is in the set; it leaves the set (a deleted entry is a tombstone, ~0, that keeps the probe chains). */
+static int prehot_take(uint64_t pc)
+{
+    for (uint32_t i = prehot_slot(pc), k = 0; k < JIT_PREHOT && prehot[i]; i = (i + 1) & (JIT_PREHOT - 1), k++)
+        if (prehot[i] == pc + 1) {
+            prehot[i] = ~0ull;
+            return 1;
+        }
+    return 0;
+}
+
+void jit_set_prehot(int on) { prehot_on = on; }
+
+void jit_prehot_counts(uint64_t *set, uint64_t *queued)
+{
+    *set = (uint64_t)prehot_n;
+    *queued = st_prehot_queued;
+}
+
+/* At the snapshot (snap.c), before the clean file pages are dropped (which invalidates the blocks on them): the
+ * translated blocks' guest pcs (page and offset; the host page of a file page is another one after the restore),
+ * kept in the image for jit_snap_reset. */
+static uint64_t snap_pcs[JIT_MAX_BLOCKS];
+static int32_t snap_npcs;
+
+void jit_snap_mark(void)
+{
+    snap_npcs = 0;
+    for (int32_t i = 0; i < blk_hwm && i < JIT_MAX_BLOCKS; i++)
+        if (blks[i].valid && blks[i].fn >= 0)
+            snap_pcs[snap_npcs++] = (blks[i].vpage << 12) | (blks[i].host & 0xFFF);
+}
+
 void jit_snap_reset(void)
 {
+    memset(prehot, 0, sizeof prehot);
+    prehot_n = 0;
+    for (int32_t i = 0; i < snap_npcs; i++)
+        prehot_add(snap_pcs[i]);
     memset(fast, 0, sizeof fast);
     for (int i = 0; i < JIT_BHASH; i++)
         bhash[i] = -1;
@@ -2421,6 +2485,7 @@ static Gen gen; /* reused for every block: its buffers keep their memory */
 
 static void translate_batch(void)
 {
+    uint64_t t_start = host_monotonic_ns();
     if (tbase < 0)
         tbase = js_jit_table_base();
     /* At a cap, start over: every block, page and slot is released, and the queued
@@ -2487,6 +2552,15 @@ static void translate_batch(void)
         }
     }
     qlen = 0;
+    st_translate_ns += host_monotonic_ns() - t_start;
+}
+
+void jit_load_counts(uint64_t out[4])
+{
+    out[0] = st_insns;
+    out[1] = st_blocks;
+    out[2] = st_modules;
+    out[3] = st_translate_ns;
 }
 
 /* ---------- dispatch ---------- */
@@ -2529,7 +2603,10 @@ int jit_dispatch(cpu_t *c, uint64_t *budget)
         return 1;
     }
     uint16_t *k = &cnt[cnt_hash(host, vpage)];
-    if (++*k >= JIT_HOT) { /* hot: queue it; batches are translated together */
+    int pre = prehot_on && prehot_n && prehot_take(pc & 0x00FFFFFFFFFFFFFFull);
+    if (pre)
+        st_prehot_queued++;
+    if (pre || ++*k >= JIT_HOT) { /* hot (or translated before the snapshot): queue it; batches are translated together */
         *k = 0;
         queue[qlen].host = host;
         queue[qlen].vpage = vpage;

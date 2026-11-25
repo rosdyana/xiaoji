@@ -361,7 +361,9 @@ EM_JS(int, xj_snap_post, (const char *url, double off, const void *p, double len
     var x = new XMLHttpRequest();
     x.open('POST', UTF8ToString(url) + '?off=' + off + (trunc ? "&truncate=1" : ""), false);
     try {
-        x.send(len ? HEAPU8.slice(p, p + len) : new Uint8Array(0));
+        /* p >>> 0: a C pointer at or above 2 GB arrives as a negative number (P1: the parts above 2 GB were posted
+         * from the wrong place, and the restored image was corrupt there). */
+        x.send(len ? HEAPU8.slice(p >>> 0, (p >>> 0) + len) : new Uint8Array(0));
     } catch (e) {
         return -1;
     }
@@ -664,6 +666,7 @@ static void census(const hdr_t *h)
             "restart, %llu vfork, %llu suspend\n",
             (unsigned long long)procs, (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2],
             (unsigned long long)st[3], (unsigned long long)st[4], (unsigned long long)st[5], (unsigned long long)st[6]);
+    sched_census_rss();
     fprintf(stderr, "xiaoji: snapshot: page pool %llu pages (%llu MiB), %llu free; host fds %d\n",
             (unsigned long long)pool, (unsigned long long)(pool * PAGE >> 20), (unsigned long long)pool_free,
             host_snap_fd_count());
@@ -694,6 +697,9 @@ static int take(void)
     }
     /* Pages that are a copy of their file are not kept: they come from the file again (the chunk store, on the web). */
     uint64_t clean = 0, dirty = 0;
+#ifdef __EMSCRIPTEN__
+    jit_snap_mark(); /* the pre-hot set (jit.c), before the drop invalidates the blocks on file pages */
+#endif
     if (!getenv("XIAOJI_SNAP_KEEP_CLEAN"))
         mem_snap_drop_clean(&clean, &dirty);
     fprintf(stderr, "xiaoji: snapshot: file pages: %llu dropped (as the file has them, %llu MiB), %llu kept (written)\n",

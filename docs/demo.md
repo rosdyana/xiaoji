@@ -5,7 +5,9 @@ and the other apps should respond like a phone's. Cold boot time does not matter
 (`aosp/device/xiaoji`), what was removed and why, the AOT question, the snapshot point, and the measurement method with
 the numbers before and after.
 
-Status: **done, with open issues** (the end of this note). The product has Calculator and seven fewer apps that ran,
+Status: **done, with open issues** (the end of this note). P1 (below) made the snapshot pre-warmed and the restore
+faster (on battery with Low Power Mode: the first Settings open 3.5 s against 23.6 s, press to home 5.0 s against
+12.3 s; AC not yet measured). The rest of this paragraph is L1's. The product has Calculator and seven fewer apps that ran,
 its demo apps are compiled ahead of time, and the snapshot is taken when the booted phone is idle: after a restore the
 engine is busy 17% of the time instead of 70%, nothing crashes or ANRs in the first minute, Home settles in 2.5 s
 instead of 3.0 s, and a second start of Settings takes 1.8 s. **The first start of Settings is slower: 15.2 s against
@@ -87,7 +89,7 @@ provisioner's, waits for a network until the broadcast's timeout ends it with an
 every restore. In the final make the quiet window came at once (busy 4%), and the snapshot held 43 processes with no
 thread runnable (the old point: 45 processes, 5 and 158 runnable in two makes).
 
-**Pre-warm** (`XN_SNAP_PREWARM=on`; off by default): before the snapshot, Files, Calculator and Settings are each
+**Pre-warm** (on by default since P1; `XN_SNAP_PREWARM=off`): before the snapshot, Files, Calculator and Settings are each
 opened from the drawer with the page's input, as a visitor would, until their START line (and `Displayed` or 60 s), a
 screenshot (`build/web-shots/s1-prewarm-<app>.png`), and Home; the condition is the last app's START line + 120 s and
 the quiet window. The idea: a visitor's first tap on Settings would be a second start, which takes about 2 s here instead
@@ -279,6 +281,188 @@ Screenshots (`build/web-shots/`, not committed, the last run of each): `l1-befor
 `s1-prewarm-files.png` (Downloads, with the media provider's Images, Audio and Videos roots listed). The runs' JSON is in
 `build/demo/` (`lat-*.json`, `ac-*.json`).
 
+## P1: the first open of an app after a restore
+
+Goal (P1): after Boot Android, the first open of Settings settled in 3 s or less, Calculator 2 s, the drawer 1 s,
+without making press to home worse than about 8 s. Before this round: Settings 11.8 s, Calculator 6.4 s, the drawer
+1.9 s (the table below).
+
+Status: **not verified against the target.** The pre-warmed snapshot works, after a defect that corrupted every
+image above 2 GB was found and fixed (item 7 below). The final engine and snapshot were measured only after the Mac
+had gone onto battery with Low Power Mode on (not something this round could change): there, against the L1
+snapshot measured in the same conditions, interleaved, the first Settings open settles in **3.5 s against 23.6 s**,
+Calculator in 4.1 s against 12.8 s, press to home 5.0 s against 12.3 s, and the idle browser uses 16% of a core
+against 100%. The drawer is not faster (2.4 s both). L1's battery numbers ran about 1.6 to 2 times its AC numbers,
+so on AC the targets for Settings (3 s) look within reach and Calculator's (2 s) and the drawer's (1 s) do not;
+the AC runs are the first thing to do next (`build/p1/interleave2.sh`).
+
+### What changed, and why
+
+1. **The demo apps are warm in the snapshot (the pre-warm, now on by default).** `make snapshot` opens Files,
+   Calculator and Settings from the drawer, waits for each one's `Displayed` line (150 s; a start that is not drawn is
+   tried again), sends the phone home and takes the snapshot when the engine is quiet (`tools/snapshot-web.mjs`,
+   `XN_SNAP_PREWARM=off` for the old point). A visitor's first open is then a hot start: the activity exists, and
+   the launcher's tap brings its task to the front (`START` with no `Start proc`, no `Displayed` line).
+   - *Why the L1 pre-warm did not restore:* not isolated. Two candidates, both fixed: the 2 GB defect (item 7; L1's
+     pre-warmed image was 997 MiB, which puts its top above 2 GB), and the restore's memory. `web/worker.js` zeroed
+     the image's whole range (about 2 GB: every page of the new wasm memory written, although new memory is zero)
+     and inflated every chunk of every pack at once (about 1 GB of raw chunks in flight), on a machine with 4 to 8 GB
+     of swap in use. Now only the memory the module had before the grow is zeroed, at most 3 packs download at once,
+     and four helper workers (`web/inflater.js`) inflate the chunks in batches of 32, each written into memory as it
+     arrives (`?inflaters=N`, 0 inflates in the engine's worker). The make's browser peaked at 1.2 to 1.4 GB and the
+     restores at about 0.9 GB; none crashed. `tools/snapshot-web.mjs` reports a crash of the page or the browser now,
+     with the browser's resident sets, and prints the image's top.
+   - *The cached-app freezer is off.* The engine answered `BINDER_GET_FROZEN_INFO` (no process frozen) but not
+     `BINDER_FREEZE`, so ActivityManager believed it could freeze, failed, and killed every cached app about 10 minutes
+     after it was cached ("Unable to freeze binder interface"): a pre-warmed app would have died in the visitor's
+     first minutes. The engine now answers both with EINVAL, as a kernel without the freezer does, and the framework
+     turns the freezer off (`unable to read freezer info`, `Freezer disabled` in every make since). Test:
+     `binder-freeze` (expectation case, engine and Node). After the restores, the only kills in the logs are the media
+     provider's known loop (open issue 3) and `android.process.media`'s background ANR, both before this round too;
+     no demo app was killed (`Killing` lines are in each run's JSON, `build/p1/`). `D/OomAdjuster: Not killing cached
+     processes` is the low-RAM device's policy (lmkd kills; it has no pressure here).
+   - *Size.* The snapshot grew from 115.8 MiB to 141.8 MiB (916 MiB of memory against 765). The WebGL objects grew
+     most: 177 MB, of which 66 textures of 1 MiB or more make 166 MiB (four 2048x1024 textures of 8 MiB and many
+     922x1024 ones of 3.6 MiB: the cached apps' window buffers and the task snapshots of recents; the census line
+     `textures of 1 MiB or more` names them). Dropping those (a memory trim before the snapshot) is open.
+2. **The restore no longer waits on the network for the file pages a visitor touches first: the prefetch.** The
+   snapshot drops clean file pages (code of libraries, the boot image, the apps' odex); after a restore each first
+   touch read its chunk with a synchronous request and a JS inflate. In the first warm run the drawer made 180 such
+   reads (505 ms fetch + 214 ms inflate) and Settings 296 (466 + 297 ms). `tools/prefetch.py record` turns a run's
+   server log (`tools/latency.mjs --fetch-log`) into the order of first reads (`image/restore-order.json`, as
+   [path, chunk] pairs that survive a rebuilt tree: 1,372 chunks of a session with the drawer, Settings, Calculator
+   and Files), and `tools/prefetch.py pack` packs them into 33 packs of 2 MiB (64.5 MiB, 159 MiB raw) listed in
+   `snapshot.json` as `prefetch` (`make snapshot` runs it). The engine's worker starts `web/prefetch.js` before the
+   engine runs; it fetches and inflates the packs (native `DecompressionStream`) into a SharedArrayBuffer, and the
+   chunk store takes a chunk from there when its pack is in, waits up to 250 ms for a pack in flight, and otherwise
+   reads it itself (`?prefetch=0` turns it off). Result: the drawer's and Settings' chunk reads went to 0 or 1.
+   - *Item 2 of the task (demand paging of the snapshot).* Not done: the restore is still eager. It did not need to
+     be lazy this round: with the loader above, a 142 MiB snapshot restores to its first frame in 2.6 s on AC
+     (median of 3) against 6.4 s for 116 MiB before, and in 5.0 s against 12.3 s on battery. Packs are in snappack's first-use order (the address order of the image), not first touch:
+     with an eager restore the order does not change when the engine starts.
+3. **A faster synchronous inflater** (`web/inflate.js`): a 10-bit lookup table for the Huffman codes instead of
+   puff's bit-at-a-time walk, 20 to 91 MiB/s (6 ms to 1.4 ms a 128 KiB chunk). Every chunk not prefetched still goes
+   through it. Test: `tests/snapshot.mjs` (stored, fixed, dynamic blocks, overlapping copies, long codes, a broken
+   stream, and every 8th chunk of the tree's store against Node's zlib; `XIAOJI_INFLATE_ALL=1`: all 11,339).
+4. **The JIT's pre-hot set** (`--jit-prehot`, on for a restore; `?prehot=0` off). A restore drops every translated
+   block, and each block then ran 1,000 times in the interpreter before it was queued again. At the snapshot the
+   engine now records the guest pcs of its translated blocks (before the clean-page drop invalidates the blocks on
+   file pages), and after the restore a pc of that set is queued at its first run. Test: `jitstress jit pre-hot node`.
+   The `load+` lines show translation is not the cost now: 90 to 190 ms of translating in a Settings open.
+5. **The idle engine sleeps** (`engine/host.c`): Emscripten's `nanosleep` spun without pthreads; `host_sleep_ns` now
+   waits in `Atomics.wait` on the input ring's head (the page notifies it with each event, `web/input.js`), and on a
+   private word in Node. The browser's CPU in the 25 s after the restore's first 5 s: **100% before, 9 to 12% after**
+   (all of the browser's processes, `ps`; one core = 100%; 16% against 100% on battery). Input is not slower:
+   Calculator's key response is the same before and after (0.3 s on AC, 0.5 s on battery). Test: `init-idle-sleep idle cpu` (engine and Node): host CPU under half of the wall time of a
+   run that is mostly sleeps (Node: 1.9 s of CPU in 8.7 s).
+6. **Measurement.** The engine's load report has a second line, `xiaoji: load+:`, with the share of instructions in
+   translated code, the blocks translated and the host time it took, the pre-hot set, and (in the page) the chunk
+   store's reads, their fetch and inflate time, and the prefetched chunks. `tools/latency.mjs` keeps them per action,
+   measures the browser's idle CPU, takes `--wasm DIR` (a frozen engine with its snapshot), and `--files` (Files'
+   first open). The snapshot census adds the largest textures and the largest processes.
+
+7. **A snapshot above 2 GB was corrupt** (`engine/snap.c`, `engine/gl_snap.js`, `engine/jit_lib.js`, `engine/sched.c`).
+   A C pointer reaches JavaScript as a signed 32-bit number, so a pointer at or above 2 GB arrives negative.
+   `xj_snap_post` sent `HEAPU8.slice(p, p + len)`, and every extent of the image above 2 GB was posted from the wrong
+   place. The pre-warmed images end above it (0x82ae7000 and 0x840f0000, against 0x72fac000 before): in the first
+   two pre-warmed snapshots the first extent above 2 GB held the engine's own format strings. Those snapshots
+   restored, showed their first frame (a restored color buffer) and drew blank screens at the first redraw by an app
+   (the status bar's clock, about 27 s later): no text, no icons in Settings, a home screen with the wallpaper only.
+   The pointers of every JavaScript function the engine calls with one (the post, the GL blob's save and load, the
+   JIT's module and slots, the input ring, the load report's text) are now taken with `>>> 0`. The fixed snapshot ends
+   at 0x8155a000 and draws (`build/web-shots/p1-*.png`). `make test-snapshot-web` checks it now: Settings' frame after
+   the restore must have 20 colours or more (64 in the fixed run; the blank one had 2). This is probably also why L1's
+   pre-warmed snapshot did not restore (its image was 997 MiB), but that was not tested; the item 1 notes on memory
+   are the other candidate.
+
+### Measurements
+
+Headless Chromium on the M2 (8 GB), localhost; `tools/latency.mjs --warm --calc --files`, a new browser per run;
+medians (range) in seconds; response / settled as in the yardstick section. **Before** is the shipped L1 snapshot with
+its engine (`build/p1/before-wasm`, `build/demo/final-xj`; the page's new loader, prefetch and pre-hot set off).
+**After** is the final engine and its pre-warmed snapshot (`make snapshot` of these sources, frozen in
+`build/p1/fixed-*`). Before and after alternated.
+
+**Battery, Low Power Mode on** (the final comparison; swap in use 5.4 to 5.9 GB):
+
+| | before (2 runs) | **after (3 runs)** | target (AC) |
+|---|---|---|---|
+| press Boot Android to the first frame | 12.3 (9.7 to 14.9) | **5.0 (4.9 to 7.0)** | about 8 |
+| snapshot download | 115.8 MiB | 141.8 MiB (+ 64.5 MiB of prefetch in the background) | |
+| idle: browser host CPU (one core = 100%) | 100% (99 to 101) | **16% (13 to 18)** | |
+| idle: engine busy / guest instructions | 24% / 4.8 M/s | 22% / 2.6 M/s | |
+| drawer: response / settled | 1.1 / 2.4 (2.1 to 2.7) | 1.2 (1.0 to 1.8) / 2.4 (1.9 to 4.0) | 1 |
+| first Settings open: response / settled | 9.2 (9.0 to 9.5) / 23.6 (23.3 to 23.9) | 3.3 (2.9 to 4.9) / **3.5 (3.2 to 5.3)** | 3 |
+| first Settings open: guest instructions | 560 M | 66 to 87 M | |
+| second Settings open: response / settled | 2.1 / 2.8 | 2.6 / 3.1 | |
+| Home from Settings: response / settled | 3.6 / 4.1 | 3.9 / 4.4 | |
+| first Calculator open: response / settled | 3.7 / 12.8 (8.7 to 16.8) | 3.4 (2.1 to 7.6) / **4.1 (2.6 to 8.0)** | 2 |
+| Calculator key: response | 0.5 | 0.5 | |
+| first Files open: response / settled | 9.7 / 42.3 (1 run) | 6.7 (1 run) / 17.1 (2.5 to 31.7) | |
+
+**AC power, Low Power Mode off** (swap 4.4 to 5.9 GB): only before was measured on a correct snapshot (5 runs: 3 at
+the start, 2 interleaved later): press 6.4 (4.8 to 7.4), drawer 1.0 / 1.7, first Settings 5.3 / 11.8 (10.2 to 14.6),
+second Settings 1.3 / 1.8, Home 2.0 / 2.4, Calculator 2.4 / 6.5, the idle browser 100% of a core. The after runs on AC
+(`build/p1/final-*.json`, `warm1*.json`) were of the corrupt snapshots (item 7): they measured screens without text
+and are not used. One of their numbers holds, because it does not depend on what is drawn: press to the first frame
+2.6 s (2.6 to 6.0) for a 143 MiB snapshot.
+
+An experiment that is not in the shipped snapshot: the window, transition and animator scales at 0.5 (an init service
+that ran `settings put global` after `sys.boot_completed`). That snapshot stayed under 2 GB and drew correctly; the
+drawer settled in 1.0 s and Calculator in 2.3 s (AC, 3 runs), against 1.3 s and 3.3 s for a snapshot without it made
+the same day (but corrupt, so not a clean comparison). In both makes with it the pre-warm's Settings was not drawn
+(one took the snapshot without Settings' `Displayed`, so the visitor's first open was a cold 10 s start; the next
+gave up after three tries), so it was taken out. Whether the scales caused that is not known.
+
+Screenshots: `build/web-shots/p1-{home,drawer,settings,home-after,calculator,calc-result,files}.png` (the last after
+run; Calculator shows 1 + 2 = 3). The runs' JSON: `build/p1/`.
+
+### Where the time goes now (a Settings open, after, battery)
+
+From the tap's release (the 3 after runs; the engine's load reports and the frame timeline):
+
+| Phase | Time | What |
+|---|---|---|
+| input to `START` | 0.1 s | the launcher's tap handling and its binder call to ActivityTaskManager |
+| `START` to the first changed frame | 2.8 to 4.8 s | the task brought to the front: the launcher's opening animation, Settings' `onRestart`, `onStart`, `onResume` (its `DashboardFragment.onResume` refreshes every top-level summary over binder) and its first draw; SurfaceFlinger composes |
+| to the settled frame | 0.2 to 0.4 s | the last frames of the animation |
+| in all | 66 to 87 M guest instructions | system_server 37 to 39%, the launcher 19 to 25%, SurfaceFlinger 20 to 22%, Settings 9 to 13% |
+
+Not the cost any more: file reads (0 or 1 chunk: the prefetch), translation (88 to 190 ms of host time), GC (not in the
+top threads). The first Settings open is now a hot start of 66 to 87 M instructions, against 560 M for L1's cold
+activity start in a warm process. The engine is busy 83 to 99% during it (the load reports): it is not waiting on
+frames, it runs out of speed, at about 20 to 25 M instructions a second with Low Power Mode on (L1's AC runs: 50 to 70
+M). **The next-biggest cost is the engine's speed on the transition's work**: system_server's window animation and
+binder calls (37 to 42%), the launcher (19 to 25%) and SurfaceFlinger (20 to 22%) do most of it, Settings itself 9 to
+13%. In the drawer's first open, `trigger_perfetto` (a process the launcher starts for its jank trace triggers) ran 27
+to 30% of the instructions in two of three runs: removing it from the product is a cheap next step. The other levers:
+fewer animation frames (the scales above, once the pre-warm interaction is understood) and the engine's speed (50 to
+70% of the instructions ran translated in these actions).
+
+Open, from these runs: the second Settings open is slower after than before (3.1 s against 2.8 s on battery; 2.7 s
+against 1.8 s in the AC runs of the corrupt snapshots), and Home from Settings slightly so (4.4 s against 4.1 s). Not
+isolated: the idle wait, the prefetch worker and the pre-warmed apps' extra live processes are all candidates. Files
+is pre-warmed but not warm in effect: in one run of three its process was started again on the tap (`Start proc
+com.android.documentsui`), and it waits on the media provider's restart loop either way (17 s settled, 2.5 to 31.7;
+open issue 3).
+
+### P1 verification (final sources)
+
+| Command | Result |
+|---|---|
+| `make && make wasm-node && make wasm` | built, no warnings |
+| `XIAOJI_JOBS=4 tests/run.sh` | **311 passed, 0 failed, 0 xfail**, with the new `binder-freeze` (engine, Node), `init-idle-sleep idle cpu` (engine 1.9 s of CPU in 8.9 s, Node 2.8 s in 9.4 s) and `jitstress-O2 jit pre-hot node` |
+| `make test-web` | 114 PASS, 0 FAIL (with `tests/snapshot.mjs`'s new inflater and prefetch checks) |
+| `node tests/input.mjs` | all passed |
+| `make snapshot`, then `make test-snapshot-web` | pre-warm of Files, Calculator, Settings (each drawn); snapshot at 4% busy, image top 0x8155a000, 141.8 MiB plus 64.5 MiB of prefetch; restore, first frame, Settings drawn (64 colours), no ANR, fatal exception or fatal signal, no page errors; fallback for another build and for no snapshot: all PASS |
+
+Not done in this round: the AC measurement of the final snapshot, and demand paging of the snapshot (item 2 of the
+task). The soak (`tools/latency.mjs --runs 1 --idle 960 --calc`: 16 minutes untouched after the restore, then the
+drawer, Settings and Calculator; battery, Low Power Mode on) did not finish: after the idle window the page did not
+answer a click on Home within 30 s (`page.click: Timeout`), and the run's log was not kept. Whether the page or the
+engine hung, and whether cached apps survive 15 guest minutes, is open. The runs that did finish lasted about 6
+minutes, and no demo app was killed in them.
+
 ## Open issues, and the next-biggest cost
 
 In order of what a visitor would notice:
@@ -293,12 +477,9 @@ In order of what a visitor would notice:
    Settings start in the first runs (`HeapTaskDaemon` of Settings, system_server and the permission controller: the
    low-RAM heap settings, `dalvik.vm.heapminfree=512k` and `heaptargetutilization=0.75`, make many small collections).
    A pre-warmed snapshot (above) would turn the first start into a second one.
-2. **Cached apps are killed.** The framework's cached-app freezer is on ("Freezer enabled": the engine's cgroup tree
-   has `cgroup.freeze` and answers `BINDER_GET_FROZEN_INFO`), but the engine has no `BINDER_FREEZE`, so ActivityManager
-   kills each cached process about 10 guest minutes after it became cached ("Unable to freeze binder interface"): in
-   the after runs, Provision, external storage, KeyChain and `android.process.media` died about 5 minutes into the
-   session, and a pre-warmed app would die the same way. Fix: the engine answers the freezer's binder check as
-   unsupported (the framework then does not freeze), or implements freezing.
+2. **Cached apps are killed.** The freezer's cause is fixed in P1: the engine's binder answers the freezer's ioctls
+   with EINVAL and ActivityManager runs without the freezer (`Freezer disabled`). Not verified past about 6 minutes:
+   the 16-minute soak ended with the page not answering a click (P1 verification).
 3. **The media provider's restart loop** (above): it waits for a codec2 HAL that is declared and not started, is
    killed after 40 s, and starts again when DocumentsUI asks for it. Fix: the engine accepts a seccomp filter
    (`prctl(PR_SET_SECCOMP)`, `seccomp(2)`) without enforcing it, and the boot config starts the two codec2 stores; or a
@@ -312,9 +493,7 @@ In order of what a visitor would notice:
    `?prop=K=V` makes the first a snapshot parameter (`XN_SNAP_QUERY='&prop=ro.config.low_ram=false' make snapshot`);
    the second needs a boot-time `settings put` (the engine's init has no property triggers) or a SettingsProvider
    overlay for two of the three scales.
-6. **The idle engine spins.** In the browser build the scheduler's idle sleep is Emscripten's `nanosleep`, a busy loop
-   without pthreads: an idle phone keeps one host core at 100%. `Atomics.wait` on a shared buffer (which the page could
-   also `notify` when input arrives) would make the idle worker cost nothing.
+6. **The idle engine spins.** Fixed in P1 (`Atomics.wait`): 9 to 12% of a core for the idle phone, from 100%.
 7. **Idle polling.** The idle phone still runs 4.8 M instructions per second: system_server's main thread, its
    `AdbDebuggingManager` thread (adb is on in a userdebug build, and there is no adbd to connect to), `SensorService`,
    servicemanager and a HAL. Turning adb off (`persist.sys.usb.config`, `ro.adb.secure`) is the first thing to try.
@@ -322,7 +501,7 @@ In order of what a visitor would notice:
    ("No service published for: auth" when SystemUI's keyguard starts) is latent in the product too. With it measured,
    AOT could be kept for system_server and SystemUI and dropped for the apps a visitor opens, if issue 1 says so.
 9. Headless Chromium uses SwiftShader for WebGL2; a run on a real GPU (a headed browser) was not made.
-10. The pre-warmed snapshot (above) does not restore in headless Chromium yet.
+10. The pre-warmed snapshot: restores since P1 (it is the shipped snapshot).
 
 ## Verification
 

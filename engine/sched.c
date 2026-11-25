@@ -29,6 +29,21 @@
 #include "timers.h"
 #include "signals.h"
 #include "snap.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include "jit.h"
+/* The host side's own counts for the load report (the page's worker sets globalThis.xjLoadExtra): a short text. */
+EM_JS(void, xj_load_extra, (char *out, int cap), {
+    var f = globalThis.xjLoadExtra;
+    var s = "";
+    try {
+        if (typeof f === 'function') s = String(f());
+    } catch (e) {
+        s = "";
+    }
+    stringToUTF8(s, out >>> 0, cap);
+});
+#endif
 
 /* The thread table starts with this many slots and doubles as threads are made (Linux has no fixed cap:
  * the limits are RLIMIT_NPROC per uid and the host memory). */
@@ -84,6 +99,9 @@ static uint64_t dead_icount;  /* instructions of threads already reaped */
 static char init_name[16] = "xiaoji";
 static uint64_t idle_ns; /* host time the loop slept with no thread to run (--load-every) */
 static uint64_t load_every_ns, load_next_ns, load_t0_ns, load_idle0_ns, load_icount0; /* --load-every */
+#ifdef __EMSCRIPTEN__
+static uint64_t load_jit_prev[4]; /* the translator's counts at the last report (load+) */
+#endif
 
 static thread_t *cur(void) { return cur_slot < nslots ? threads[cur_slot] : NULL; }
 
@@ -654,6 +672,25 @@ static void load_report(uint64_t now)
     for (int i = 0; i < nttop; i++)
         fprintf(stderr, "%s %s:%s %.0f%%", i ? "," : "", ttop[i].pname, ttop[i].name, (double)ttop[i].n * share);
     fputc('\n', stderr);
+#ifdef __EMSCRIPTEN__
+    /* The translator's share of the interval and its host cost; in the page, the chunk reads the worker made
+     * (globalThis.xjLoadExtra, web/worker.js). */
+    {
+        uint64_t *prev = load_jit_prev;
+        uint64_t j[4];
+        jit_load_counts(j);
+        char extra[256];
+        xj_load_extra(extra, (int)sizeof extra);
+        uint64_t pset, pq;
+        jit_prehot_counts(&pset, &pq);
+        fprintf(stderr, "xiaoji: load+: jit %.0f%% of insn translated, %llu blocks in %llu modules, %.0f ms translating "
+                "(pre-hot: %llu of %llu queued)%s%s\n",
+                insn ? 100.0 * (double)(j[0] - prev[0]) / (double)insn : 0.0, (unsigned long long)(j[1] - prev[1]),
+                (unsigned long long)(j[2] - prev[2]), (double)(j[3] - prev[3]) / 1e6, (unsigned long long)pq,
+                (unsigned long long)pset, extra[0] ? "; " : "", extra);
+        memcpy(load_jit_prev, j, sizeof load_jit_prev);
+    }
+#endif
     load_t0_ns = now;
     load_idle0_ns = idle_ns;
     load_icount0 = sched_icount();
@@ -663,6 +700,9 @@ uint64_t sched_idle_ns(void) { return idle_ns; }
 
 void sched_load_every(uint64_t ms)
 {
+#ifdef __EMSCRIPTEN__
+    jit_load_counts(load_jit_prev); /* the load+ line counts from here (a restore's image holds older counts) */
+#endif
     load_every_ns = ms * 1000000ull;
     load_t0_ns = host_monotonic_ns();
     load_next_ns = load_t0_ns + load_every_ns;
@@ -912,6 +952,23 @@ void sched_census(uint64_t counts[7], uint64_t *procs)
                 first = 0;
         *procs += (uint64_t)first;
     }
+}
+
+/* The census's processes by resident set (snap.c, docs/demo.md P1): the largest, on stderr. A page shared between
+ * processes (zygote's copy-on-write pages, shared views) counts in each. */
+void sched_census_rss(void)
+{
+    load_ent_t top[LOAD_TOP];
+    int ntop = 0;
+    for (proc_t *p = proc_first(); p; p = proc_next(p)) {
+        if (p->exited || p->zombie || !p->mm)
+            continue;
+        load_top_add(top, &ntop, (load_ent_t){mem_mm_rss_kib(p->mm), p->pid, load_proc_name(p), NULL});
+    }
+    fprintf(stderr, "xiaoji: snapshot: resident by process (shared pages in each):");
+    for (int i = 0; i < ntop; i++)
+        fprintf(stderr, "%s %s/%d %llu MiB", i ? "," : "", top[i].name, top[i].pid, (unsigned long long)(top[i].n >> 10));
+    fputc('\n', stderr);
 }
 
 proc_t *sched_proc_new_child(void)

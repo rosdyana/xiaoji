@@ -319,6 +319,30 @@ check_quiet() {
     rm -f "$base.snap"
 }
 
+# The pre-hot set (--jit-prehot, docs/demo.md P1; wasm only, so Node): jitstress snapshots after 20 M instructions,
+# when the translator has blocks; the restore with --jit-prehot must report a set of those blocks' pcs on its load+
+# line, queue at least one of them at its first run, and the two outputs together must be the oracle's.
+check_prehot() {
+    local name=$1 bin=$2
+    local tag="$name jit pre-hot node" base="$OUT/$name.prehot.node" why=""
+    node "$NODE_JS" --snapshot-at icount:20000000 --snapshot-out "$base.snap" "$bin" >"$base.1" 2>"$base.1.err"
+    node "$NODE_JS" --restore "$base.snap" --jit-prehot --load-every 20 >"$base.2" 2>"$base.2.err"
+    local rc=$?
+    [ "$rc" = "$(cat "$ORACLE/$name.rc")" ] && cat "$base.1" "$base.2" | cmp -s - "$ORACLE/$name.out" || why="output or exit differ (exit $rc)"
+    local line set queued
+    line=$(grep -m 1 'xiaoji: load+: .*pre-hot: ' "$base.2.err")
+    set=$(sed -n 's/.*pre-hot: [0-9]* of \([0-9]*\) queued.*/\1/p' <<<"$line")
+    queued=$(grep 'xiaoji: load+: ' "$base.2.err" | tail -n 1 | sed -n 's/.*pre-hot: \([0-9]*\) of.*/\1/p')
+    [ "${set:-0}" -gt 0 ] || why="$why; no pre-hot set (${line:0:120})"
+    [ "${queued:-0}" -gt 0 ] || why="$why; nothing queued from it"
+    rm -f "$base.snap"
+    if [ -z "$why" ]; then
+        echo "PASS  $tag ($queued of $set queued)"
+    else
+        echo "FAIL  $tag (${why#; })"
+    fi
+}
+
 run_case() {
     local name=$1 stretch=$2
     local bin="build/tests/guest/$name" args
@@ -342,6 +366,7 @@ run_case() {
         jitstress | jitthreads | control | arith | memory | signals | simd) check_icount "$name" "$bin" "$args" ;;
         esac
     fi
+    [ "$name" = jitstress-O2 ] && [ -f "$NODE_JS" ] && check_prehot "$name" "$bin"
     case "${name%-O?}" in
     snapwait)
         check_snapshot engine "$name" "$bin"
@@ -413,7 +438,7 @@ check_rootfs() {
 # the background, waits until "service check manager" finds it (up to about 10 s), runs,
 # then kills it and waits, so the engine exits. $! is the servicemanager pid.
 SM_WAIT='i=0; until /system/bin/service check manager 2>/dev/null | grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done'
-PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-gl goldfish-as sensors power-supply ashmem evdev kernel"
+PROP_CASES="prop-get prop-set prop-ro prop-list prop-wait evt binder-sm goldfish-pipe goldfish-gl goldfish-as sensors power-supply ashmem evdev kernel binder-freeze"
 prop_argv() {
     case "$1" in
     prop-get) ARGV=(/system/bin/sh -c '/system/bin/getprop ro.build.version.release; /system/bin/getprop ro.product.cpu.abi; /system/bin/getprop ro.hardware') ;;
@@ -428,6 +453,7 @@ prop_argv() {
     sensors) ARGV=(/data/local/tmp/sensors) ;;
     ashmem) ARGV=(/data/local/tmp/ashmem) ;;
     evdev) ARGV=(/data/local/tmp/evdev) ;;
+    binder-freeze) ARGV=(/data/local/tmp/binder-freeze) ;;
     # The kernel the engine presents (B18): uname, /proc/version and /proc/config.gz agree, and toybox's zcat
     # (which checks the gzip trailer's CRC and length) reads the configuration of the matrix's 5.15 entry.
     kernel) ARGV=(/system/bin/sh -c 'uname -r; uname -v; cat /proc/version; zcat /proc/config.gz > /data/local/tmp/kconfig && echo zcat ok; grep -c "^CONFIG_" /data/local/tmp/kconfig; grep -c "is not set" /data/local/tmp/kconfig; grep -E "^CONFIG_(ARM64|ANDROID_BINDER_DEVICES|BPF_SYSCALL|OF)=" /data/local/tmp/kconfig; rm /data/local/tmp/kconfig') ;;
@@ -523,6 +549,11 @@ root_lane() {
         if [ -f build/tests/guest/evdev-O0 ]; then
             mkdir -p "$RFS/data/local/tmp"
             cp build/tests/guest/evdev-O0 "$RFS"/data/local/tmp/evdev
+        fi
+        # The binder freezer ioctls (docs/demo.md, P1): tests/guest/binder-freeze.c.
+        if [ -f build/tests/guest/binder-freeze-O0 ]; then
+            mkdir -p "$RFS/data/local/tmp"
+            cp build/tests/guest/binder-freeze-O0 "$RFS"/data/local/tmp/binder-freeze
         fi
         for name in $PROP_CASES; do
             prop_argv "$name"
@@ -796,25 +827,37 @@ root_lane() {
     # of continuous idleness, and that is not idleness here), so stderr must have no deadlock line. idle-hang: a
     # real hang (tests/guest/futex-hang.c, no deadline anywhere) must be reported on stderr; the run ends at
     # --init-timeout, so its exit status is not checked. Engine and Node.
+    # idle-sleep is also the idle check (docs/demo.md, P1): the run is mostly sleeps, so the engine's host CPU time
+    # (user + system, bash's time) must be under half of its wall time. Emscripten's nanosleep spun, which kept the
+    # Node and browser engines at 100% of a core while every guest thread slept; host_sleep_ns waits in Atomics.wait.
     if [ -d build/rootfs/system/bin ] && [ -f build/tests/guest/futex-hang-O0 ]; then
         mkdir -p "$RFS/data/local/tmp"
         cp build/tests/guest/futex-hang-O0 "$RFS"/data/local/tmp/futex-hang
     fi
     for runner in engine node; do
+        TIMEFORMAT='%R %U %S'
         if [ "$runner" = engine ]; then
-            "$ENGINE" --init tests/init/idle-sleep.rc --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
+            { time "$ENGINE" --init tests/init/idle-sleep.rc --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"; } 2>"$OUT/init-idle-sleep.$runner.time"
         elif [ -f "$NODE_JS" ]; then
-            node "$NODE_JS" --init tests/init/idle-sleep.rc --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"
+            { time node "$NODE_JS" --init tests/init/idle-sleep.rc --root "$RFS" --init-timeout 90 --init-stdio host >"$OUT/init-idle-sleep.$runner.out" 2>"$OUT/init-idle-sleep.$runner.err"; } 2>"$OUT/init-idle-sleep.$runner.time"
         else
             continue
         fi
         rc=$?
+        # real, user, system: CPU under half of the wall time
+        cpu_ok=$(awk '{ print ($2 + $3 < 0.5 * $1) ? 1 : 0 }' "$OUT/init-idle-sleep.$runner.time")
+        cpu_note=$(awk '{ printf "%.1f s CPU in %.1f s", $2 + $3, $1 }' "$OUT/init-idle-sleep.$runner.time")
         if [ "$rc" = 0 ] && cmp -s "$OUT/init-idle-sleep.$runner.out" tests/expect/init-idle-sleep.out &&
             ! grep -q "deadlock\|nothing has run" "$OUT/init-idle-sleep.$runner.err"; then
             echo "PASS  init-idle-sleep $runner"
         else
             echo "FAIL  init-idle-sleep $runner (exit $rc)"
             grep "deadlock\|nothing has run" "$OUT/init-idle-sleep.$runner.err" | head -n 3 | sed 's/^/        /'
+        fi
+        if [ "$cpu_ok" = 1 ]; then
+            echo "PASS  init-idle-sleep idle cpu $runner ($cpu_note)"
+        else
+            echo "FAIL  init-idle-sleep idle cpu $runner ($cpu_note: the idle engine should not spin)"
         fi
         if [ "$runner" = engine ]; then
             "$ENGINE" --init tests/init/idle-hang.rc --root "$RFS" --init-timeout 9 --init-stdio host >"$OUT/init-idle-hang.$runner.out" 2>"$OUT/init-idle-hang.$runner.err"
@@ -1078,7 +1121,7 @@ for bin in build/tests/guest/*-O0 build/tests/guest/*-O2; do
     # they are expectation cases (PROP_CASES below), not oracle cases. futex-hang blocks forever by
     # design: it is run only by the deadlock cases (idle-hang, below), never as a case here.
     # bpfpin-* runs as the system user with the graphics group, as an init service (init-bpf, B15): not an oracle case.
-    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-gl-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*|evdev-*) continue ;; esac
+    case "$name" in prop-*|initsock-*|futex-hang-*|goldfish-pipe-*|goldfish-gl-*|goldfish-as-*|sensors-*|ashmem-*|bpfpin-*|evdev-*|binder-freeze-*) continue ;; esac
     cases=$((cases + 1))
     case " ${XIAOJI_SKIP:-} " in *" ${name%-O?} "*) continue ;; esac
     UNIT_NAME+=("$name")

@@ -1,0 +1,6 @@
+open ok
+version 0
+protocol 8
+get frozen info -22
+freeze -22
+done

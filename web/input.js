@@ -71,6 +71,7 @@ export function ringPush(ring, dev, type, code, value) {
   ring[at + 2] = code;
   ring[at + 3] = value;
   Atomics.store(ring, 0, (head + 1) & 0x7fffffff);
+  Atomics.notify(ring, 0); // an idle engine waits on the head (engine/host.c, host_sleep_ns): the event wakes it
   return true;
 }
 

@@ -130,6 +130,7 @@ addToLibrary({
   // Returns a malloc'd blob (its length at *lenp), or 0 when there is no context.
   xj_gl_snap_save__deps: ['$GL', 'malloc'],
   xj_gl_snap_save: function (lenp) {
+    lenp >>>= 0; // a pointer at or above 2 GB arrives negative (docs/demo.md, P1)
     var gl = GL.currentContext ? GL.currentContext.GLctx : null;
     if (!gl) return 0;
     var parts = [], plen = 0;
@@ -320,7 +321,7 @@ addToLibrary({
 
     var json = new TextEncoder().encode(JSON.stringify(out));
     var total = 4 + json.length + plen;
-    var p = _malloc(total);
+    var p = _malloc(total) >>> 0;
     if (!p) return 0;
     HEAPU8[p] = json.length & 255;
     HEAPU8[p + 1] = (json.length >> 8) & 255;
@@ -332,7 +333,7 @@ addToLibrary({
       HEAPU8.set(u8, at);
       at += u8.length;
     });
-    HEAP32[lenp >> 2] = total;
+    HEAP32[lenp >>> 2] = total;
     // What was kept, by format (stderr: the page's log): levels with their pixels, and levels without (not readable).
     var byFmt = {};
     out.textures.forEach(function (t) {
@@ -345,6 +346,26 @@ addToLibrary({
       out.programs.length + ' programs, ' + out.shaders.length + ' shaders, ' + out.framebuffers.length + ' framebuffers, ' +
       out.renderbuffers.length + ' renderbuffers, ' + out.vaos.length + ' vertex arrays; levels by internal format: ' +
       JSON.stringify(byFmt));
+    // The largest textures (their kept pixels), which make the blob's size (docs/demo.md, P1).
+    var sizes = out.textures.map(function (t) {
+      var n = 0, dims = '';
+      t.lv.forEach(function (L) {
+        n += (L.px ? L.px[1] : 0) + (L.raw ? L.raw[1] : 0);
+        if (!dims) dims = L.w + 'x' + L.h;
+      });
+      return { id: t.id, n: n, dims: dims };
+    }).sort(function (a, b) {
+      return b.n - a.n;
+    });
+    var big = sizes.filter(function (s) {
+      return s.n >= 1048576;
+    });
+    err('xiaoji: gl(webgl): snapshot: ' + big.length + ' textures of 1 MiB or more (' +
+      (big.reduce(function (a, s) {
+        return a + s.n;
+      }, 0) / 1048576).toFixed(1) + ' MiB): ' + sizes.slice(0, 12).map(function (s) {
+        return '#' + s.id + ' ' + s.dims + ' ' + (s.n / 1048576).toFixed(1) + ' MiB';
+      }).join(', '));
     return p;
   },
 
@@ -352,6 +373,7 @@ addToLibrary({
   // 1, or 0 (no canvas, or no context).
   xj_gl_snap_load__deps: ['$GL', '$xjSnap'],
   xj_gl_snap_load: function (blob, len) {
+    blob >>>= 0; // a pointer at or above 2 GB arrives negative (docs/demo.md, P1)
     var canvas = globalThis.xjCanvas;
     if (!canvas) return 0;
     var jl = HEAPU8[blob] | (HEAPU8[blob + 1] << 8) | (HEAPU8[blob + 2] << 16) | (HEAPU8[blob + 3] << 24);

@@ -23,6 +23,8 @@ int sched_is_init_mode(void);
 /* The census at a snapshot: live threads by wait state (runnable, futex, sleep, sigwait, restart, vfork, suspend)
  * and the processes with a live thread. */
 void sched_census(uint64_t counts[7], uint64_t *procs);
+/* The processes with the largest resident sets, on stderr (the snapshot's census). */
+void sched_census_rss(void);
 
 /* init mode (init.c): no thread for the initial process. tick runs between slices and when
  * nothing is runnable; deadline gives the host time of init's next timer (0 for none). Returns

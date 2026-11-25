@@ -301,7 +301,9 @@ Five problems the browser runs found, fixed:
 - **The download is not cached yet:** the packs are fetched with `fetch` but not put into the chunk store's Cache
   Storage as the boot packs are (docs/loading.md).
 - After a restore the tree's chunks are read on demand, synchronously (the boot packs are not fetched). On localhost
-  that costs nothing; over a network each first read of a chunk is a round trip.
+  each read cost about 2.5 ms (fetch and inflate; 0.7 s for a drawer's first open); over a network each would be a
+  round trip. Since P1 the chunks a recorded first minute reads are prefetched in the background (above); the rest
+  are still read this way.
 - A snapshot pack that fails to download mid-restore is a hard error (memory is already being replaced); there is no
   fallback to a boot at that point.
 - **Native snapshots skip pages `mincore` reports not resident.** On macOS the runs under heavy swap restored correctly;
@@ -316,6 +318,33 @@ Five problems the browser runs found, fixed:
 - The snapshot is made and restored on the same WebGL implementation (SwiftShader in headless Chromium). Emscripten's
   uniform ids are restored as recorded, but limits and extensions the guest cached at boot, and texture formats a GPU
   renders differently, are not checked on other GPUs yet.
+
+## P1. The pre-warmed snapshot and a faster restore (docs/demo.md, P1)
+
+- **Pre-warm.** `make snapshot` opens Files, Calculator and Settings once and sends the phone home before the
+  snapshot, so a visitor's first open of each is a hot start. The image is 916 MiB (765 before) and the download
+  141.8 MiB (115.8).
+- **Images above 2 GB.** The pre-warmed image's top is above 2 GB (0x8155a000). A C pointer reaches JavaScript as a
+  signed number, and the web build's writer posted every extent above 2 GB from the wrong place (`xj_snap_post`); the
+  restored phone drew blank screens at its first app redraw. Every pointer the engine hands to JavaScript is now taken
+  with `>>> 0` (the writer, the GL blob, the JIT, the input ring), and `make test-snapshot-web` checks that Settings is
+  drawn after the restore. The census prints the largest WebGL textures and the processes' resident sets.
+- **The page's restore** (`web/worker.js`, `loadSnapshot`): only the memory the module had before the grow is zeroed
+  (new wasm memory is zero; zeroing the image's whole 2 GB range wrote every page of it); at most 3 packs download at
+  once; four helper workers (`web/inflater.js`, `?inflaters=N`) inflate the chunks in batches and the engine's worker
+  copies them in. Press to the first frame: 2.6 s (median, AC) for 142 MiB, against 6.4 s for 116 MiB with the old loader (5.0 s against
+  12.3 s on battery).
+- **The prefetch** (`tools/prefetch.py`, `web/prefetch.js`, the chunk store's `attachPrefetch`): `snapshot.json` may
+  list `prefetch` packs, the tree's chunks a recorded first minute read after a restore (`image/restore-order.json`),
+  in first-read order. A worker of the engine's worker fills them into a SharedArrayBuffer while the engine runs; the
+  chunk store takes a chunk from there when its pack is in (waiting up to 250 ms for a pack in flight) and otherwise
+  reads it synchronously as before. `tools/snappack.py` removes an old snapshot's prefetch packs with its own.
+- **The pre-hot set**: the snapshot records the guest pcs of the translated blocks (before the clean-page drop), and a
+  restore with `--jit-prehot` (the page passes it; `?prehot=0` does not) queues each for translation at its first run.
+- **The freezer**: the engine's binder answers `BINDER_GET_FROZEN_INFO` and `BINDER_FREEZE` with EINVAL, and
+  ActivityManager runs without the cached-app freezer, which killed cached apps about 10 minutes after they were cached.
+- **Lazy guest pages** (S1, "Format and delivery") are still not done: the restore is eager. With the loader above it
+  did not need to be lazy this round.
 
 ## S4. Tooling
 

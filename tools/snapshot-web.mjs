@@ -21,6 +21,7 @@ import { DIRS, startServer } from '../web/serve.mjs';
 import { drawerLayout } from './ui-points.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+let BROWSER_EXE = null; // set once Playwright is loaded
 const PW = process.env.XN_PLAYWRIGHT ?? '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
 const SHOTS = join(ROOT, 'build', 'web-shots');
 const VIEW = { width: 1280, height: 1000 };
@@ -32,6 +33,29 @@ function check(ok, what) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${what}`);
   if (!ok) failures++;
 }
+
+// A crash of the page or the browser says so, with the browser's processes' resident sets (MiB): the restore of a
+// large snapshot used to end with only "Target page, context or browser has been closed".
+function browserRss() {
+  try {
+    const out = execFileSync('ps', ['-A', '-ww', '-o', 'rss=,command='], { encoding: 'utf8' });
+    return out.split('\n').filter((l) => BROWSER_EXE && l.includes(BROWSER_EXE))
+      .map((l) => Math.round(Number(l.trim().split(/\s+/)[0]) / 1024)).filter((n) => n > 0).sort((a, b) => b - a);
+  } catch {
+    return [];
+  }
+}
+function watch(page, browser, what) {
+  page.on('crash', () => console.log(`    ${what}: the page crashed (browser RSS MiB before: ${watch.last.join(', ')})`));
+  browser.on('disconnected', () => console.log(`    ${what}: the browser disconnected (RSS MiB before: ${watch.last.join(', ')})`));
+  const t = setInterval(() => {
+    watch.last = browserRss();
+    watch.peak = Math.max(watch.peak, watch.last.reduce((a, b) => a + b, 0));
+  }, 2000);
+  t.unref();
+}
+watch.last = [];
+watch.peak = 0;
 
 async function launch(chromium) {
   return chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
@@ -84,7 +108,14 @@ async function prewarm(page, ui, apps) {
       await gesture(page, [ui[app.key], ui[app.key]], 80);
       started = await waitLog(page, new RegExp(`START u0 .*cmp=${esc(app.component)}`), k, 40000);
       if (started) {
-        const shown = await waitLog(page, new RegExp(`Displayed ${esc(app.component)}`), k, 60000);
+        // The app must be drawn (its "Displayed" line), or the snapshot holds a half-started activity and the
+        // visitor's first open is a cold one (P1: one make's Settings was started but not drawn in 60 s).
+        const shown = await waitLog(page, new RegExp(`Displayed ${esc(app.component)}`), k, 150000);
+        if (!shown) {
+          console.log(`    pre-warm: ${app.key} started (try ${tries}) but not drawn in 150 s; again`);
+          started = false;
+          continue;
+        }
         await page.waitForTimeout(10000);
         await page.locator('#phone').screenshot({ path: join(SHOTS, `s1-prewarm-${app.key}.png`) });
         console.log(`    pre-warm: ${app.key} started (try ${tries})${shown ? ', displayed' : ''}`);
@@ -104,6 +135,7 @@ async function make(chromium) {
   const browser = await launch(chromium);
   try {
     const page = await browser.newPage({ viewport: VIEW });
+    watch(page, browser, 'make');
     // The snapshot point (docs/demo.md): the launcher's HOME start, 480 s more (the BOOT_COMPLETED receivers start
     // their processes in that time, and the remote provisioner's, which waits for a network, ends in its ANR about
     // 340 s after HOME), then the first 10 s in which the engine was busy 15% of the time or less (at most 360 s more).
@@ -121,7 +153,7 @@ async function make(chromium) {
     // off because its snapshot (997 MiB of memory, 177 MB of WebGL objects: the apps' windows and task snapshots) did
     // not restore in headless Chromium: the page closed before the first frame.
     const ui = drawerLayout(DIRS.xj);
-    const apps = process.env.XN_SNAP_PREWARM !== 'on' ? [] : PREWARM.filter((a) => ui[a.key]);
+    const apps = process.env.XN_SNAP_PREWARM === 'off' ? [] : PREWARM.filter((a) => ui[a.key]); // on by default (P1)
     // XN_SNAP_AT=log:TEXT: the condition (default: the launcher's HOME start, or the pre-warm's last app).
     const atCond = process.env.XN_SNAP_AT || (apps.length ? `log:cmp=${apps[apps.length - 1].component}` : '');
     const at = atCond ? `&snapat=${encodeURIComponent(atCond)}` : '';
@@ -139,6 +171,8 @@ async function make(chromium) {
     if (failures) throw new Error('make: the pre-warm failed');
     await page.waitForFunction(() => window.xb.status === 'done' || window.xb.status === 'error' || window.xb.error, null,
       { timeout: MAKE_TIMEOUT_MS, polling: 1000 });
+    const top = await page.evaluate(() => (window.xb.all || []).filter((l) => /snapshot: range \d+:/.test(l)).pop() || '');
+    if (/0x[0-9a-f]+\.\.0x([0-9a-f]+)/.test(top)) console.log(`    image top: ${top.replace(/^.*\.\./, '')} (2 GB is 0x80000000)`);
     const r = await page.evaluate(() => ({ done: window.xb.done, error: window.xb.error, ms: window.xb.milestones,
       log: (window.xb.all || window.xb.notes || []).filter((l) => /^xiaoji: (snapshot|gl\(webgl\): snapshot)|HOME.*launcher3/.test(l)) }));
     console.log(`--- make: ${Math.round((Date.now() - t0) / 1000)} s, exit ${r.done ? r.done.exitCode : '-'}`);
@@ -146,13 +180,22 @@ async function make(chromium) {
     if (r.error) console.log('    error: ' + r.error.split('\n')[0]);
     const full = await page.evaluate(() => (window.xb.all || []).join('\n'));
     writeFileSync(join(out, 'web-make-full.log'), full + '\n');
+    // The cached-app freezer (P1: off, the engine's binder says it cannot freeze) and what was killed before the snapshot.
+    for (const l of full.split('\n').filter((x) => /[Ff]reezer|ActivityManager\(\d+\): Killing/.test(x)).slice(0, 12)) {
+      console.log('    ' + l.slice(0, 200));
+    }
+    console.log(`    browser RSS peak during the make: ${watch.peak} MiB (all its processes)`);
     check(r.done && r.done.exitCode === 0, 'make: the web engine wrote its snapshot and stopped (exit 0)');
     // Health: the last system_server started SystemUI once (a crash loop, as in a trial tree, docs/demo.md, would be in
     // the snapshot; a first boot can restart system_server once, which starts SystemUI again).
     const ams = [...full.matchAll(/ActivityManager\((\d+)\): Start proc \d+:com\.android\.systemui\//g)].map((m) => m[1]);
     const lastSs = ams.length ? ams[ams.length - 1] : null;
     const sysui = ams.filter((p) => p === lastSs).length;
-    check(sysui === 1, `make: SystemUI started once by the last system_server (${sysui}; ${ams.length} in the boot)`);
+    // A SystemUI that ActivityManager killed (an ANR on a loaded machine, closed by the pre-warm's tap) and started
+    // again is not the start-order race this check is for.
+    const killed = lastSs ? [...full.matchAll(new RegExp(`ActivityManager\\(${lastSs}\\): Killing \\d+:com\\.android\\.systemui/`, 'g'))].length : 0;
+    check(sysui === 1 || (killed > 0 && sysui <= 1 + killed),
+      `make: SystemUI started once by the last system_server (${sysui}; ${ams.length} in the boot; killed by it ${killed})`);
   } finally {
     await browser.close();
     await srv.close();
@@ -162,6 +205,11 @@ async function make(chromium) {
     console.log(`    build/snap/web.snap: ${(statSync(snap).size / 1048576).toFixed(1)} MiB`);
     execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, DIRS.xj,
       '--tree', join(DIRS.xj, 'manifest-xiaoji-v2.json')], { stdio: 'inherit' });
+    // The restore's prefetch (docs/demo.md, P1): the chunks of the recorded first minute, packed for the page.
+    const order = join(ROOT, 'image', 'restore-order.json');
+    if (existsSync(order)) {
+      execFileSync('python3', ['-I', join(ROOT, 'tools', 'prefetch.py'), 'pack', order, '--xj', DIRS.xj], { stdio: 'inherit' });
+    }
   }
 }
 
@@ -191,6 +239,7 @@ async function restore(chromium) {
   const browser = await launch(chromium);
   try {
     const page = await browser.newPage({ viewport: VIEW });
+    watch(page, browser, 'restore');
     const pageErrors = [];
     page.on('pageerror', (e) => pageErrors.push(String(e)));
     await page.goto(srv.url + '?keeplog=1' + (process.env.XN_SNAP_QUERY || ''), { waitUntil: 'load' });
@@ -240,6 +289,11 @@ async function restore(chromium) {
     }
     await page.waitForTimeout(Number(process.env.XN_SNAP_SETTINGS_WAIT_MS ?? 20000));
     await page.locator('#phone').screenshot({ path: join(SHOTS, 's1-restore-settings.png') });
+    // What the apps draw after the restore (P1: a snapshot whose memory above 2 GB was written from the wrong place
+    // restored, showed its first frame, and then drew blank screens without text): Settings' screen has text and
+    // icons, so many colours.
+    const colours = await page.evaluate(() => (window.xb.frames ? window.xb.frames.distinct : 0));
+    check(colours >= 20, `restore: Settings is drawn after the restore, not blank (${colours} colours in the last frame)`);
     const log = await page.evaluate(() => (window.xb.all || []).join('\n'));
     writeFileSync(join(SHOTS, 's1-restore.log'), log + '\n');
     const bad = log.split('\n').filter((l) => /ANR in|FATAL EXCEPTION|Fatal signal/.test(l));
@@ -247,7 +301,8 @@ async function restore(chromium) {
     check(started, 'restore: a tap on Settings in the drawer starts Settings (ActivityTaskManager START ... com.android.settings/.Settings)');
     check(bad.length === 0, `restore: no ANR, fatal exception or fatal signal in the log${bad.length ? ' (' + bad[0].slice(0, 120) + ')' : ''}`);
     check(pageErrors.length === 0, `restore: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
-    console.log(`    screenshots: ${SHOTS}/s1-restoring.png, s1-restore-{first-frame,allapps,settings}.png`);
+    console.log(`    screenshots: ${SHOTS}/s1-restoring.png, s1-restore-{first-frame,allapps,settings}.png; ` +
+      `browser RSS peak ${watch.peak} MiB (all its processes)`);
   } finally {
     await browser.close();
     await srv.close();
@@ -299,5 +354,6 @@ if (!modes[mode]) {
   process.exit(2);
 }
 const { chromium } = await import(pathToFileURL(PW).href);
+BROWSER_EXE = process.env.XN_CHROME || chromium.executablePath().replace(/\/chromium-\d+\/.*$/, "/chromium_headless_shell-"); // this tool's browsers only (another suite may run its own)
 await modes[mode](chromium);
 process.exit(failures ? 1 : 0);

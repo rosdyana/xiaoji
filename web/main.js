@@ -335,7 +335,7 @@ $('boot').addEventListener('click', async () => {
       onRestore(scr, { loaded: m.loaded || 0, total: m.total });
       render();
     } else if (m.type === 'restore-loaded') {
-      window.xb.restore = { ...window.xb.restore, state: 'loaded', loadedWall: m.wall, loadMs: m.loadMs, bytes: m.bytes };
+      window.xb.restore = { ...window.xb.restore, state: 'loaded', loadedWall: m.wall, loadMs: m.loadMs, bytes: m.bytes, timing: m.timing };
       appendLog(`snapshot: ${fmtBytes(m.bytes)} in ${(m.loadMs / 1000).toFixed(2)} s`);
       setBootStatus('running');
     } else if (m.type === 'restore-refused') {
@@ -438,6 +438,9 @@ $('boot').addEventListener('click', async () => {
     loadEvery: params.get('load'), props: params.getAll('prop'),
     snapQuiet: params.get('snapquiet'), // ?snapshot=make: --snapshot-quiet PCT:WINDOW:MAX (docs/demo.md)
     snapAt: params.get('snapat'), // ?snapshot=make: the condition, log:TEXT (default: the launcher's HOME start)
+    // A restore (docs/demo.md, P1): ?prehot=0 leaves out --jit-prehot; ?inflaters=N sets the helpers that inflate the
+    // snapshot's chunks (0: the engine's worker inflates them itself).
+    prehot: params.get('prehot'), inflaters: params.get('inflaters'), prefetch: params.get('prefetch'),
   });
   if (mode === 'pack' && !snap) {
     // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).

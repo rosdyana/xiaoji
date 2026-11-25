@@ -37,6 +37,7 @@ import { DIRS, startServer } from '../web/serve.mjs';
 import { drawerLayout } from './ui-points.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+let BROWSER_EXE = null; // set once Playwright is loaded
 const PW = process.env.XN_PLAYWRIGHT ?? '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
 const SHOTS = join(ROOT, 'build', 'web-shots');
 const VIEW = { width: 1280, height: 1000 };
@@ -50,15 +51,19 @@ const RUNS = Number(opt('--runs', 3));
 const IDLE_S = Number(opt('--idle', 30));
 const LABEL = opt('--label', 'run');
 const XJ = opt('--xj', null);
+// --wasm DIR serves another engine build (build/wasm by default): a frozen engine with the snapshot it wrote.
+const WASM = opt('--wasm', null);
 const JSON_OUT = opt('--json', null);
 const QUERY = opt('--query', '');
 const WARM = args.includes('--warm');
 const CALC = args.includes('--calc');
+const FILES = args.includes('--files');
 // --summary A.json,B.json: no runs; the table of the runs these files hold (several --runs 1 invocations, one table).
 const SUMMARY = opt('--summary', null);
 // --fetch-log FILE: every request the server answers, with its time (which chunks of which files a step reads).
 const FETCH_LOG = opt('--fetch-log', null);
 if (XJ) DIRS.xj = resolve(XJ);
+if (WASM) DIRS.wasm = resolve(WASM);
 
 // Calculator's keys (ExactCalculator, portrait 540x960).
 const CALC_KEYS = { 1: [70, 715], 2: [189, 715], plus: [440, 865], eq: [307, 858] };
@@ -120,7 +125,7 @@ function installHooks() {
     L.prev = sig;
   };
   window.xbHooks.onLine = (text, now) => {
-    if (/^xiaoji: load: |ActivityTaskManager\(\d+\): (START u0|Displayed)|ActivityManager\(\d+\): (Start proc|Killing)|ANR in|FATAL EXCEPTION|Fatal signal/.test(text)) {
+    if (/^xiaoji: load\+?: |ActivityTaskManager\(\d+\): (START u0|Displayed)|ActivityManager\(\d+\): (Start proc|Killing)|ANR in|FATAL EXCEPTION|Fatal signal/.test(text)) {
       L.lines.push({ t: now, text });
     }
   };
@@ -204,6 +209,14 @@ async function action(page, name, act, { log = null, timeoutMs = 120000, quietMs
   out.timeline = r.frames.filter((f) => up && f.t >= up.t).slice(0, 300)
     .map((f) => [Math.round(f.t - up.t), Number(f.diff.toFixed(3)), f.colors]);
   out.procStarts = r.lines.filter((l) => /Start proc/.test(l.text)).map((l) => l.text.replace(/^.*Start proc \d+:/, '').slice(0, 80));
+  // The engine's view of the action, from its input to the settled frame (+1 s, the report interval): instructions,
+  // busy share, the translator and the chunk reads.
+  const endT = sig.length ? sig[sig.length - 1].t + 1000 : r.now;
+  const during = r.lines.filter((l) => up && l.t >= up.t && l.t <= endT);
+  const ld = loadSummary(during);
+  if (ld) out.load = { mInsn: Number((ld.mInsnPerS * ld.seconds).toFixed(0)), busyPct: ld.busyPct, top: ld.top.slice(0, 4) };
+  out.extra = loadExtra(during);
+  out.killed = r.lines.filter((l) => /Killing/.test(l.text)).map((l) => l.text.replace(/^.*Killing /, '').slice(0, 100));
   return out;
 }
 
@@ -220,6 +233,44 @@ async function openDrawer(page) {
     drawer = await action(page, 'drawer', () => gesture(page, SWIPE, 20), { timeoutMs: 90000 });
   } while ((drawer.changed == null || drawer.changed < 0.5) && tries < 3);
   return { ...drawer, tries };
+}
+
+// The browser's host CPU time (all its processes, seconds): the idle engine used to spin a core (P1).
+function browserCpuS() {
+  try {
+    const out = execFileSync('ps', ['-A', '-ww', '-o', 'time=,command='], { encoding: 'utf8' });
+    let t = 0;
+    for (const l of out.split('\n')) {
+      if (!BROWSER_EXE || !l.includes(BROWSER_EXE)) continue;
+      const m = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)/.exec(l);
+      if (m) t += Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 + Number(m[3]) * 60 + Number(m[4]);
+    }
+    return t;
+  } catch {
+    return null;
+  }
+}
+
+// The load+ lines of an interval (engine/sched.c): the translator's work and the chunk store's reads.
+const LOADX = /^xiaoji: load\+: jit (\d+)% of insn translated, (\d+) blocks in (\d+) modules, (\d+) ms translating \(pre-hot: (\d+) of (\d+) queued\)(?:; chunks: (\d+) read \(([\d.]+) MiB, (\d+) ms fetch, (\d+) ms inflate\), (\d+) from packs(?:, (\d+) prefetched)?)?/;
+function loadExtra(lines) {
+  const r = { reports: 0, blocks: 0, translateMs: 0, chunkReads: 0, chunkMiB: 0, fetchMs: 0, inflateMs: 0, prefetched: 0 };
+  for (const l of lines) {
+    const m = LOADX.exec(l.text);
+    if (!m) continue;
+    r.reports++;
+    r.blocks += Number(m[2]);
+    r.translateMs += Number(m[4]);
+    if (m[7] !== undefined) {
+      r.chunkReads += Number(m[7]);
+      r.chunkMiB += Number(m[8]);
+      r.fetchMs += Number(m[9]);
+      r.inflateMs += Number(m[10]);
+      r.prefetched += Number(m[12] || 0);
+    }
+  }
+  r.chunkMiB = Number(r.chunkMiB.toFixed(1));
+  return r.reports ? r : null;
 }
 
 // The load reports of an interval: the means, the last counts, the processes by instructions.
@@ -259,6 +310,7 @@ async function oneRun(chromium, srv, k, ui) {
   try {
     const ctx = await browser.newContext({ viewport: VIEW });
     const page = await ctx.newPage();
+    page.on('crash', () => console.log(`  run ${k}: the page crashed`));
     const pageErrors = [];
     page.on('pageerror', (e) => pageErrors.push(String(e)));
     await page.goto(srv.url + '?keeplog=1&load=1000' + QUERY, { waitUntil: 'load' });
@@ -278,10 +330,16 @@ async function oneRun(chromium, srv, k, ui) {
     };
     // The idle window: from the first frame, IDLE_S untouched.
     const idleFrom = r0.first;
-    await page.waitForTimeout(IDLE_S * 1000);
+    await page.waitForTimeout(Math.min(5, IDLE_S) * 1000); // the first seconds after the restore are not idle
+    const cpu0 = browserCpuS(), w0 = Date.now();
+    await page.waitForTimeout(Math.max(0, IDLE_S - 5) * 1000);
+    const cpu1 = browserCpuS();
+    if (cpu0 != null && cpu1 != null) run.idleCpuPct = Math.round((100 * (cpu1 - cpu0)) / ((Date.now() - w0) / 1000));
+    run.restoreTiming = r0.restore.timing || null;
     await shot(page, 'home');
     const lines = await page.evaluate(() => window.__lat.lines);
     run.idle = loadSummary(lines.filter((l) => l.t >= idleFrom));
+    run.restoreExtra = loadExtra(lines.filter((l) => l.t < idleFrom + 5000)); // the restore's first seconds
     run.actions = [];
     run.actions.push(await openDrawer(page));
     await shot(page, 'drawer');
@@ -305,6 +363,13 @@ async function oneRun(chromium, srv, k, ui) {
         run.actions.push({ ...(await action(page, 'key', () => tap(page, CALC_KEYS[key]), { timeoutMs: 60000, quietMs: 3000 })), name: `key ${key}` });
       }
       await shot(page, 'calc-result');
+    }
+    if (FILES && ui.files) {
+      await page.click('#btn-home');
+      await page.waitForTimeout(3000);
+      await openDrawer(page);
+      run.actions.push(await action(page, 'files', () => tap(page, ui.files), { log: /START u0 .*cmp=com\.android\.documentsui\//, timeoutMs: 300000, quietMs: APP_QUIET_MS }));
+      await shot(page, 'files');
     }
     const all = await page.evaluate(() => window.__lat.lines.map((l) => l.text));
     run.bad = all.filter((l) => /ANR in|FATAL EXCEPTION|Fatal signal/.test(l)).map((l) => l.slice(0, 160));
@@ -354,14 +419,21 @@ function table(runs, label, idleS) {
     ['snapshot download', `${ok.length ? ok[0].downloadMiB : '-'} MiB`],
     [`idle ${idleS} s: engine busy`, fmt(ok.map((r) => r.idle && r.idle.busyPct), '%', 1)],
     [`idle ${idleS} s: guest instructions`, fmt(ok.map((r) => r.idle && r.idle.mInsnPerS), 'M/s', 1)],
+    [`idle: browser host CPU (one core = 100%)`, fmt(ok.map((r) => r.idleCpuPct), '%', 1)],
     ['processes / threads', [...new Set(ok.filter((r) => r.idle).map((r) => `${r.idle.processes} / ${r.idle.threads}`))].join(', ') || '-'],
     ['drawer: response / settled', pair(opened, 'responseMs', 'settledMs')],
     ['first Settings start: response / settled', pair(fs, 'responseMs', 'settledMs')],
     ['first Settings start: START / Displayed in the log', `${fmt(fs.map((a) => a.startMs))} / ${fmt(fs.map((a) => a.displayedAtMs))}`],
+    ['first Settings start: guest insn, chunk reads (MiB), fetch + inflate ms, translate ms',
+      fs.map((a) => a.extra ? `${a.load ? a.load.mInsn : '-'} M, ${a.extra.chunkReads} (${a.extra.chunkMiB}), ${a.extra.fetchMs} + ${a.extra.inflateMs}, ${a.extra.translateMs}` : '-').join('; ')],
     ['second Settings start: response / settled', ws.length ? pair(ws, 'responseMs', 'settledMs') : '-'],
     ['home: response / settled', pair(homes, 'responseMs', 'settledMs')],
   ];
   if (calcs.length) rows.push(['Calculator start: response / settled', pair(calcs, 'responseMs', 'settledMs')]);
+  const files = ok.flatMap((r) => acts(r, 'files')).filter((a) => a.startMs != null);
+  if (files.length) rows.push(['Files start: response / settled', pair(files, 'responseMs', 'settledMs')]);
+  rows.push(['drawer: chunk reads, fetch + inflate ms, translate ms', opened.map((a) => a.extra ? `${a.extra.chunkReads}, ${a.extra.fetchMs} + ${a.extra.inflateMs}, ${a.extra.translateMs}` : '-').join('; ')]);
+  rows.push(['restore: fetch ms (sum over packs) / helpers', ok.map((r) => r.restoreTiming ? `${Math.round(r.restoreTiming.fetchMs)} / ${r.restoreTiming.helpers}` : '-').join('; ')]);
   if (keys.length) rows.push(['Calculator key: response', fmt(keys.map((a) => a.responseMs))]);
   rows.push(['missed: swipes / Settings taps', `${missedSwipes} / ${missedTaps}`]);
   console.log(`\n| ${label} (${ok.length} of ${runs.length} runs; median, range) | |\n|---|---|`);
@@ -386,6 +458,7 @@ if (SUMMARY) {
 
 mkdirSync(SHOTS, { recursive: true });
 const { chromium } = await import(pathToFileURL(PW).href);
+BROWSER_EXE = process.env.XN_CHROME || chromium.executablePath().replace(/\/chromium-\d+\/.*$/, "/chromium_headless_shell-"); // this tool's browsers only (another suite may run its own)
 const ui = drawerLayout(DIRS.xj);
 const fetchLines = [];
 const srv = await startServer({ port: 0, ...(FETCH_LOG ? { log: (l) => fetchLines.push(`${Date.now()} ${l}`) } : {}) });

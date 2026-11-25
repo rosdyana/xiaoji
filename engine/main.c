@@ -144,6 +144,7 @@ static int usage(FILE *out)
           "  --no-lazy-mmap  fill file mappings at mmap time (as XIAOJI_LAZY=0); the default fills on first access\n"
           "  --debug-faults  report faults, process ends and binder refusals on stderr (as XIAOJI_DEBUG_FAULTS=1)\n"
           "  --dump-at S[,S]  dump every guest thread (pc, wait, frame chain) to stderr at these seconds (up to 8)\n"
+          "  --jit-prehot     (wasm) after --restore, translate a block the snapshot had translated at its first run\n"
           "  --load-every MS  every MS milliseconds, the guest's load on stderr: instructions, the share of time not idle,\n"
           "               processes and threads, the busiest ones (docs/demo.md)\n"
           "  --lazy-window BYTES  the lazy fill window, a power of two from 4096 to 1 MiB (as XIAOJI_LAZY_WINDOW)\n"
@@ -175,6 +176,7 @@ int main(int argc, char **argv)
     const char *dump_at_arg = NULL, *input_script = NULL;
     const char *snap_at = NULL, *snap_out = NULL, *restore_path = NULL, *snap_quiet = NULL;
     uint64_t snap_after = 0, load_every_ms = 0;
+    int jit_prehot = 0;
     int i = 1;
 
     /* A snapshot (docs/snapshot.md) is taken or restored with the engine at fixed addresses: natively that is a run with
@@ -249,6 +251,10 @@ int main(int argc, char **argv)
             if (i + 1 >= argc)
                 return usage(stderr);
             load_every_ms = strtoull(argv[++i], NULL, 10);
+            continue;
+        }
+        if (!strcmp(a, "--jit-prehot")) { /* docs/demo.md, P1: after a restore, translate the image's hot blocks at once */
+            jit_prehot = 1; /* applied after the restore: the image holds the snapshot run's setting (a local is not in it) */
             continue;
         }
         if (!strcmp(a, "--debug-faults")) { /* as XIAOJI_DEBUG_FAULTS=1, for the page (?debug=1), which has no environment */
@@ -352,6 +358,11 @@ int main(int argc, char **argv)
         if (apply_options(stats, logcat, lazy_mmap, lazy_window_arg, debug_faults_arg, stats_at_arg, dump_at_arg,
                           input_script, snap_at, snap_after, snap_quiet, snap_out, load_every_ms) < 0)
             return 2;
+#ifdef __EMSCRIPTEN__
+        jit_set_prehot(jit_prehot);
+#else
+        (void)jit_prehot;
+#endif
         return snap_resume(init_timeout);
     }
     /* --init runs the built-in init (init.c) instead of a program; it needs a root. */
