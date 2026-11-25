@@ -29,6 +29,7 @@
 #include "logd.h"
 #include "memfd.h"
 #include "props.h"
+#include "snap.h"
 #include "sched.h"
 #include "vfs.h"
 
@@ -485,6 +486,7 @@ uint32_t props_set(const char *name, size_t n, const char *value, size_t vlen)
     if (n == 18 && !memcmp(name, "sys.boot_completed", 18) && vlen == 1 && value[0] == '1')
         logd_note("sys.boot_completed=1");
     init_prop_changed(name, n, value, vlen);
+    snap_note_prop(name, n, value, vlen);
     return PROP_SUCCESS;
 }
 

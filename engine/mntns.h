@@ -46,4 +46,8 @@ int mntns_map(mntns_t *ns, const char *guest, char *out, size_t cap, int *ro);
  * *data (malloc'd) and *len, or -1 when out of memory. */
 int mntns_text(mntns_t *ns, int info, uint8_t **data, size_t *len);
 
+/* Snapshots (snap.c): the host directory of the i-th live tmpfs (they are host directories under /tmp), or NULL past
+ * the last. */
+const char *mntns_tmpfs_dir(int i);
+
 #endif

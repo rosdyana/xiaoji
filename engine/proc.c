@@ -58,6 +58,12 @@ proc_t *proc_init(void)
 
 proc_t *proc_cur(void) { return cur; }
 
+void proc_switch_force(proc_t *p)
+{
+    cur = NULL;
+    proc_switch(p);
+}
+
 void proc_switch(proc_t *p)
 {
     if (p == cur)

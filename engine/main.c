@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "cpu_a64.h"
+#include "aslr.h"
 #include "evdev.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -30,6 +31,7 @@ EM_JS(void, xn_run_start, (void), { if (Module.onRunStart) Module.onRunStart(); 
 #include "props.h"
 #include "sched.h"
 #include "signals.h"
+#include "snap.h"
 #include "syscall.h"
 #include "vfs.h"
 
@@ -81,6 +83,49 @@ static void print_stats(void)
 #endif
 }
 
+/* The options that are this run's, not the engine state's: applied at the start, and again after a restore (which
+ * replaced them with the snapshot's). 0, or -1. */
+static int apply_options(int stats, int logcat, int lazy_mmap, const char *lazy_window_arg, int debug_faults_arg,
+                         const char *stats_at_arg, const char *dump_at_arg, const char *input_script, const char *snap_at,
+                         uint64_t snap_after, const char *snap_out)
+{
+    const char *stats_env = getenv("XIAOJI_STATS");
+    stats_on = stats || (stats_env && stats_env[0] == '1');
+    const char *logcat_env = getenv("XIAOJI_LOGCAT");
+    logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
+    /* Lazy file mappings (docs/loading.md, L2): --no-lazy-mmap or XIAOJI_LAZY=0 fills them at mmap time (the
+     * A/B baseline). --lazy-window BYTES, or XIAOJI_LAZY_WINDOW, sets the fill window (a power of two). */
+    const char *lazy_env = getenv("XIAOJI_LAZY");
+    if (lazy_env && lazy_env[0] == '0')
+        lazy_mmap = 0;
+    mem_set_lazy_mmap(lazy_mmap);
+    const char *window_env = lazy_window_arg ? lazy_window_arg : getenv("XIAOJI_LAZY_WINDOW");
+    if (window_env && window_env[0])
+        mem_set_lazy_window((size_t)strtoul(window_env, NULL, 0));
+    const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
+    sig_set_debug_faults(debug_faults_arg || (faults_env && faults_env[0] == '1'));
+    stats_t0 = host_monotonic_ns();
+    stats_at = stats_at_arg ? stats_at_arg : getenv("XIAOJI_STATS_AT");
+    if (stats_at && !stats_at[0])
+        stats_at = NULL;
+    sched_dump_clear();
+    for (const char *t = dump_at_arg; t && *t;) { /* a comma-separated list of times */
+        char *end;
+        sched_dump_at(strtoull(t, &end, 10));
+        t = *end == ',' ? end + 1 : end + strlen(end);
+    }
+    if (evdev_script_restart(input_script) < 0) {
+        fprintf(stderr, "xiaoji: --input-script: cannot read %s\n", input_script);
+        return -1;
+    }
+    if (snap_at) {
+        snap_set_trigger(snap_at);
+        snap_set_after(snap_after);
+        snap_set_out(snap_out);
+    }
+    return 0;
+}
+
 static int usage(FILE *out)
 {
     fputs("usage: xiaoji [--root DIR] [--env K=V]... [--trace] [--stats] [--] /path/in/guest [args...]\n"
@@ -96,6 +141,11 @@ static int usage(FILE *out)
           "  --dump-at S[,S]  dump every guest thread (pc, wait, frame chain) to stderr at these seconds (up to 8)\n"
           "  --lazy-window BYTES  the lazy fill window, a power of two from 4096 to 1 MiB (as XIAOJI_LAZY_WINDOW)\n"
           "  --stats-at TEXT  print the instructions and lazy reads at the first log line containing TEXT (as XIAOJI_STATS_AT)\n"
+          "  --snapshot-at COND  write a snapshot when COND holds, then stop: time:S, icount:N, log:TEXT (a guest log line\n"
+          "               containing TEXT) or prop:NAME=VALUE (docs/snapshot.md); needs --snapshot-out\n"
+          "  --snapshot-after S  wait S more seconds after COND holds\n"
+          "  --snapshot-out FILE  the snapshot file\n"
+          "  --restore FILE  go on from a snapshot (no program, no --init; --input-script times count from the restore)\n"
           "  --gl null|webgl  the GL backend for the guest's GLES calls (default null; webgl is the web build's, gl_webgl.c)\n"
           "  XIAOJI_STATS=1 prints the instruction count and rate on exit\n",
           out);
@@ -113,7 +163,23 @@ int main(int argc, char **argv)
     const char *stats_at_arg = NULL;
     const char *init_config = NULL;
     uint64_t init_timeout = 0;
+    const char *dump_at_arg = NULL, *input_script = NULL;
+    const char *snap_at = NULL, *snap_out = NULL, *restore_path = NULL;
+    uint64_t snap_after = 0;
     int i = 1;
+
+    /* A snapshot (docs/snapshot.md) is taken or restored with the engine at fixed addresses: natively that is a run with
+     * ASLR off, so the engine executes itself again that way first. */
+    for (int k = 1; k < argc && strcmp(argv[k], "--"); k++)
+        if (!strcmp(argv[k], "--snapshot-at") || !strcmp(argv[k], "--restore")) {
+            if (aslr_off(argv) < 0) {
+                fprintf(stderr, "xiaoji: cannot run with a fixed layout (ASLR off), which snapshots need\n");
+                return 2;
+            }
+            break;
+        }
+    /* The engine's exit handlers (snap_atexit) are a list in engine memory, which a restore replaces. */
+    atexit(snap_run_atexit);
 
     for (; i < argc; i++) {
         const char *a = argv[i];
@@ -167,11 +233,7 @@ int main(int argc, char **argv)
         if (!strcmp(a, "--dump-at")) { /* a dump of every guest thread at this many seconds (sched.c) */
             if (i + 1 >= argc)
                 return usage(stderr);
-            for (const char *t = argv[++i]; *t;) { /* a comma-separated list of times */
-                char *end;
-                sched_dump_at(strtoull(t, &end, 10));
-                t = *end == ',' ? end + 1 : end + strlen(end);
-            }
+            dump_at_arg = argv[++i]; /* applied after a restore, which would replace it */
             continue;
         }
         if (!strcmp(a, "--debug-faults")) { /* as XIAOJI_DEBUG_FAULTS=1, for the page (?debug=1), which has no environment */
@@ -181,10 +243,31 @@ int main(int argc, char **argv)
         if (!strcmp(a, "--input-script")) { /* the test source of the input devices (evdev.c, docs/input.md) */
             if (i + 1 >= argc)
                 return usage(stderr);
-            if (evdev_script_load(argv[++i]) < 0) {
-                fprintf(stderr, "xiaoji: --input-script: cannot read %s\n", argv[i]);
-                return 2;
-            }
+            input_script = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--snapshot-at")) { /* docs/snapshot.md */
+            if (i + 1 >= argc || snap_set_trigger(argv[i + 1]) < 0)
+                return usage(stderr);
+            snap_at = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--snapshot-after")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            snap_after = strtoull(argv[++i], NULL, 10);
+            continue;
+        }
+        if (!strcmp(a, "--snapshot-out")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            snap_out = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--restore")) {
+            if (i + 1 >= argc)
+                return usage(stderr);
+            restore_path = argv[++i];
             continue;
         }
         if (!strcmp(a, "--lazy-window")) {
@@ -230,6 +313,26 @@ int main(int argc, char **argv)
             return usage(stderr);
         break; /* PROGRAM starts here; "--" is optional */
     }
+    if (snap_at && !snap_out) {
+        fprintf(stderr, "xiaoji: --snapshot-at needs --snapshot-out FILE\n");
+        return 2;
+    }
+    if (restore_path) {
+        /* The run goes on from the snapshot: no program and no init config of its own. */
+        if (init_config || i < argc) {
+            fprintf(stderr, "xiaoji: --restore takes no program and no --init\n");
+            return 2;
+        }
+        if (snap_restore(restore_path) < 0)
+            return 2;
+        /* The engine's state is the snapshot's now. This run's options are applied to it, then it goes on. */
+        g_root = NULL;
+        stats_at_done = 0;
+        if (apply_options(stats, logcat, lazy_mmap, lazy_window_arg, debug_faults_arg, stats_at_arg, dump_at_arg,
+                          input_script, snap_at, snap_after, snap_out) < 0)
+            return 2;
+        return snap_resume(init_timeout);
+    }
     /* --init runs the built-in init (init.c) instead of a program; it needs a root. */
     static char *no_argv[1] = {NULL};
     if (init_config && !root_given) {
@@ -254,7 +357,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "xiaoji: root path too long\n");
             return 2;
         }
-        atexit(meta_persist_save);
+        snap_atexit(meta_persist_save);
     }
     /* The system properties: the guest's build.prop files, the engine's values, then --prop. */
     if (props_init((const char *const *)props, nprop) < 0) {
@@ -262,27 +365,10 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    const char *stats_env = getenv("XIAOJI_STATS");
-    stats_on = stats || (stats_env && stats_env[0] == '1');
-    const char *logcat_env = getenv("XIAOJI_LOGCAT");
-    logd_set_print(logcat || (logcat_env && logcat_env[0] == '1'));
-    /* Lazy file mappings (docs/loading.md, L2): --no-lazy-mmap or XIAOJI_LAZY=0 fills them at mmap time (the
-     * A/B baseline). --lazy-window BYTES, or XIAOJI_LAZY_WINDOW, sets the fill window (a power of two). */
-    const char *lazy_env = getenv("XIAOJI_LAZY");
-    if (lazy_env && lazy_env[0] == '0')
-        lazy_mmap = 0;
-    mem_set_lazy_mmap(lazy_mmap);
-    const char *window_env = lazy_window_arg ? lazy_window_arg : getenv("XIAOJI_LAZY_WINDOW");
-    if (window_env && window_env[0])
-        mem_set_lazy_window((size_t)strtoul(window_env, NULL, 0));
-    const char *faults_env = getenv("XIAOJI_DEBUG_FAULTS");
-    sig_set_debug_faults(debug_faults_arg || (faults_env && faults_env[0] == '1'));
-    stats_t0 = host_monotonic_ns();
-    stats_at = stats_at_arg ? stats_at_arg : getenv("XIAOJI_STATS_AT");
-    if (stats_at && !stats_at[0])
-        stats_at = NULL;
-    if (stats_on)
-        atexit(print_stats);
+    if (apply_options(stats, logcat, lazy_mmap, lazy_window_arg, debug_faults_arg, stats_at_arg, dump_at_arg,
+                      input_script, snap_at, snap_after, snap_out) < 0)
+        return 2;
+    snap_atexit(print_stats); /* it prints only with --stats (stats_on) */
     prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit
     if (init_config) {
         init_set_trace(trace);

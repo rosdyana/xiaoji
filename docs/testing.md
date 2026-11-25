@@ -6,6 +6,14 @@ present) with native runs of the same guest programs in the OrbStack builder VM,
 browser check (headless Chromium). This page covers how the suite runs locally and on the build machine, the
 job limits, the rules that keep parallel cases apart, and the timings.
 
+## Snapshots
+
+The snapshot cases (docs/snapshot.md, S2) are part of `tests/run.sh`: `snapwait-O0/O2 snapshot` and `... chained` with
+each guest job (native and Node), and `snapshot-binder` and `snapshot-init` in the root lane. They write their snapshot
+files to `build/tests/out` and remove them. A host where the engine cannot run with ASLR off prints a note and skips
+them. The page's side: `node tests/snapshot.mjs` (in `make test-web`: the boot screen's restore phase and
+`tools/snappack.py`), and `make test-snapshot-web` (a real restore in headless Chromium, after `make snapshot`).
+
 ## Local: tests/run.sh
 
 ```sh

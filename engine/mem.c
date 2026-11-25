@@ -134,6 +134,8 @@ mm_t *mem_mm_new(void)
 }
 
 /* Makes m the running address space. The first call installs it without a flush. */
+void mem_tlb_reset(void) { tlb_flush(); }
+
 void mem_mm_switch(mm_t *m)
 {
     if (cur_mm == m)
@@ -512,7 +514,7 @@ static void page_release(uint8_t *p)
         return;
     }
     host_page_changed(p);
-    free(p);
+    mem_page_free(p);
 }
 
 /* Drops the cached translations of vpn in the TLBs and the fetch cache. */
@@ -544,7 +546,7 @@ static void cow_break(uint64_t vpn, uint64_t *slot)
     uint8_t *p = old;
     host_page_changed(old);
     if (share_extra(old)) {
-        p = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
+        p = mem_page_alloc();
         if (!p)
             die_oom();
         memcpy(p, old, MEM_PAGE_SIZE);
@@ -552,6 +554,97 @@ static void cow_break(uint64_t vpn, uint64_t *slot)
     }
     *slot = (uint64_t)(uintptr_t)p | (e & (uint64_t)PTE_FLAGS & ~(uint64_t)PTE_COW);
     tlb_forget(vpn);
+}
+
+/* ---------- the host page pool ----------
+ * Every host page of guest memory and of memfds comes from here (mem_page_alloc). Pages come in slabs of
+ * POOL_SLAB_PAGES, and a freed page goes on a stack of free pages, not back to malloc: so a snapshot can leave the
+ * free pages out (mem_pool_zero_free; docs/snapshot.md), and the pages stay 4 KiB aligned without malloc's
+ * per-block overhead. */
+#define POOL_SLAB_PAGES 256u
+static uint8_t **pool_free;  /* the free pages */
+static size_t pool_nfree, pool_cfree;
+static uint8_t **pool_slabs; /* every slab, for the census */
+static size_t pool_nslabs, pool_cslabs;
+
+uint8_t *mem_page_alloc(void)
+{
+    if (!pool_nfree) {
+        if (pool_nslabs == pool_cslabs) {
+            size_t nc = pool_cslabs ? pool_cslabs * 2 : 64;
+            uint8_t **ns = realloc(pool_slabs, nc * sizeof *ns);
+            if (!ns)
+                return NULL;
+            pool_slabs = ns;
+            pool_cslabs = nc;
+        }
+        if (pool_cfree < POOL_SLAB_PAGES) {
+            uint8_t **nf = realloc(pool_free, (pool_cfree + POOL_SLAB_PAGES) * sizeof *nf);
+            if (!nf)
+                return NULL;
+            pool_free = nf;
+            pool_cfree += POOL_SLAB_PAGES;
+        }
+        uint8_t *slab = aligned_alloc(MEM_PAGE_SIZE, (size_t)POOL_SLAB_PAGES * MEM_PAGE_SIZE);
+        if (!slab)
+            return NULL;
+        pool_slabs[pool_nslabs++] = slab;
+        /* Pushed in reverse, so the slab is handed out from its start. */
+        for (unsigned i = POOL_SLAB_PAGES; i-- > 0;)
+            pool_free[pool_nfree++] = slab + (size_t)i * MEM_PAGE_SIZE;
+    }
+    return pool_free[--pool_nfree];
+}
+
+void mem_page_free(uint8_t *p)
+{
+    if (!p)
+        return;
+    if (pool_nfree == pool_cfree) {
+        size_t nc = pool_cfree * 2 + POOL_SLAB_PAGES;
+        uint8_t **nf = realloc(pool_free, nc * sizeof *nf);
+        if (!nf)
+            return; /* the page is lost to the pool; nothing refers to it */
+        pool_free = nf;
+        pool_cfree = nc;
+    }
+    pool_free[pool_nfree++] = p;
+}
+
+void mem_pool_counts(uint64_t *pages, uint64_t *free_pages)
+{
+    *pages = (uint64_t)pool_nslabs * POOL_SLAB_PAGES;
+    *free_pages = pool_nfree;
+}
+
+uint64_t mem_pool_nonzero(void)
+{
+    uint64_t n = 0;
+    for (size_t i = 0; i < pool_nslabs; i++)
+        for (unsigned k = 0; k < POOL_SLAB_PAGES; k++) {
+            const uint64_t *w = (const uint64_t *)(pool_slabs[i] + (size_t)k * MEM_PAGE_SIZE);
+            for (unsigned j = 0; j < MEM_PAGE_SIZE / 8; j++)
+                if (w[j]) {
+                    n++;
+                    break;
+                }
+        }
+    return n;
+}
+
+int mem_pool_contains(const void *p)
+{
+    const uint8_t *b = p;
+    for (size_t i = 0; i < pool_nslabs; i++)
+        if (b >= pool_slabs[i] && b < pool_slabs[i] + (size_t)POOL_SLAB_PAGES * MEM_PAGE_SIZE)
+            return 1;
+    return 0;
+}
+
+void mem_pool_zero_free(void)
+{
+    for (size_t i = 0; i < pool_nfree; i++)
+        memset(pool_free[i], 0, MEM_PAGE_SIZE);
 }
 
 /* ---------- page access ---------- */
@@ -621,7 +714,7 @@ static uint8_t *lazy_fill(uint64_t vpn, int *is_lazy)
                 bus_vpn1 = vpn + 1;
             continue;
         }
-        uint8_t *pg = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
+        uint8_t *pg = mem_page_alloc();
         if (!pg)
             die_oom();
         size_t cp = have < MEM_PAGE_SIZE ? have : MEM_PAGE_SIZE;
@@ -673,7 +766,7 @@ static uint8_t *page_lookup(uint64_t vpn, unsigned need)
         p = lazy_fill(vpn, &is_lazy);
         if (is_lazy)
             return p; /* a file-backed page: filled, or NULL past the end of the file */
-        p = aligned_alloc(MEM_PAGE_SIZE, MEM_PAGE_SIZE);
+        p = mem_page_alloc();
         if (!p)
             die_oom();
         memset(p, 0, MEM_PAGE_SIZE);
@@ -1115,6 +1208,81 @@ void mem_drop(uint64_t va, uint64_t len)
         *slot = e & PTE_FLAGS & ~(uint64_t)PTE_COW;
     }
     tlb_flush();
+}
+
+/* A snapshot (snap.c) leaves out the pages of private file mappings that are still the file's bytes: each such page is
+ * dropped, as mem_drop does, and the next touch reads it from the file again (lazy_fill). A page is compared with the
+ * file where lazy_fill would read it (the shared file cache first). A page shared by several address spaces is compared
+ * once. */
+void mem_snap_drop_clean(uint64_t *clean_out, uint64_t *dirty_out)
+{
+    static uint8_t fbuf[MEM_PAGE_SIZE];
+    uint64_t clean = 0, dirty = 0;
+    size_t cap = 1024;
+    while (cap < (size_t)pool_nslabs * POOL_SLAB_PAGES * 2)
+        cap <<= 1;
+    /* Pages already compared: the page's address, with bit 0 set when it is clean. */
+    uint64_t *seen = calloc(cap, sizeof *seen);
+    for (mm_t *m = all_mm; m; m = m->next) {
+        for (size_t i = 0; i < m->nregs; i++) {
+            region_t *r = &m->regs[i];
+            if (!r->lazy || r->shm)
+                continue;
+            memfd_t *fc = fc_lookup(r->lazy->dev, r->lazy->ino);
+            for (uint64_t va = r->start; va < r->end; va += MEM_PAGE_SIZE) {
+                if (!m->l1 || !m->l1[(va >> 12) >> 18]) { /* no table for this 1 GiB: skip to its end */
+                    uint64_t next = ((va >> 30) + 1) << 30;
+                    va = (next < r->end ? next : r->end) - MEM_PAGE_SIZE;
+                    continue;
+                }
+                uint64_t *slot = pte_slot_in(m, va >> 12, 0);
+                if (!slot || !(*slot & PTE_MAPPED) || (*slot & PTE_SHARED))
+                    continue;
+                uint64_t e = *slot;
+                uint8_t *p = (uint8_t *)(uintptr_t)(e & ~(uint64_t)PTE_FLAGS);
+                if (!p)
+                    continue;
+                int is_clean = -1;
+                size_t h = 0;
+                if (seen) {
+                    h = (size_t)(((uint64_t)(uintptr_t)p >> 12) * 0x9E3779B97F4A7C15ull >> 20) & (cap - 1);
+                    while (seen[h] && (seen[h] & ~1ull) != (uint64_t)(uintptr_t)p)
+                        h = (h + 1) & (cap - 1);
+                    if (seen[h])
+                        is_clean = (int)(seen[h] & 1);
+                }
+                if (is_clean < 0) {
+                    uint64_t off = r->off + (va - r->start);
+                    size_t got = 0;
+                    if (fc) {
+                        int64_t k = memfd_pread(fc, fbuf, MEM_PAGE_SIZE, off);
+                        got = k > 0 ? (size_t)k : 0;
+                    }
+                    while (!fc && got < MEM_PAGE_SIZE) {
+                        int64_t k = host_pread(r->lazy->hfd, fbuf + got, MEM_PAGE_SIZE - got, off + got);
+                        if (k <= 0)
+                            break;
+                        got += (size_t)k;
+                    }
+                    memset(fbuf + got, 0, MEM_PAGE_SIZE - got);
+                    is_clean = got > 0 && memcmp(fbuf, p, MEM_PAGE_SIZE) == 0;
+                    if (seen)
+                        seen[h] = (uint64_t)(uintptr_t)p | (uint64_t)is_clean;
+                }
+                if (!is_clean) {
+                    dirty++;
+                    continue;
+                }
+                page_release(p);
+                *slot = e & PTE_FLAGS & ~(uint64_t)PTE_COW;
+                clean++;
+            }
+        }
+    }
+    free(seen);
+    tlb_flush();
+    *clean_out = clean;
+    *dirty_out = dirty;
 }
 
 /* ---------- non-faulting copies ---------- */

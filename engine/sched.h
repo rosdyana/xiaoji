@@ -15,6 +15,15 @@ struct proc;
  * exits. Returns the process exit status. */
 int sched_run(cpu_t *main_cpu);
 
+/* Enters the scheduler loop again after a restore (snap.c): the threads and processes are the image's. Returns as
+ * sched_run or sched_run_init would (by the loop's mode, which is in the image). */
+int sched_resume(void);
+/* 1 when the loop runs in init mode (it has a tick). */
+int sched_is_init_mode(void);
+/* The census at a snapshot: live threads by wait state (runnable, futex, sleep, sigwait, restart, vfork, suspend)
+ * and the processes with a live thread. */
+void sched_census(uint64_t counts[7], uint64_t *procs);
+
 /* init mode (init.c): no thread for the initial process. tick runs between slices and when
  * nothing is runnable; deadline gives the host time of init's next timer (0 for none). Returns
  * the initial process's exit status when init sets its exited flag. */
@@ -55,6 +64,8 @@ const char *sched_name(void);
 
 /* --dump-at: a dump of every live thread (stderr) this many seconds of host time from now (0: none). */
 void sched_dump_at(uint64_t seconds);
+/* Forgets the dumps asked for (a restore: the image holds the times of the run that wrote it). */
+void sched_dump_clear(void);
 
 /* Instructions executed by all threads. */
 uint64_t sched_icount(void);

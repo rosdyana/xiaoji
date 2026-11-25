@@ -41,8 +41,10 @@ typedef struct {
     uint8_t *data;   /* SYN_DATA contents */
     size_t dlen;
     uint64_t dpos;
-    void *dir;       /* DIR * for directories, opened by the first getdents64 */
+    void *dir;       /* DIR * for directories, opened by the first getdents64 (valid while dgen == vfs_dir_gen) */
     uint64_t nent;   /* directory entries returned so far */
+    uint64_t dread;  /* readdir results consumed so far (the hidden ones too): where a reopened stream resumes */
+    uint32_t dgen;   /* vfs_dir_gen when dir was opened */
     memfd_t *mfd;    /* VFS_MEMFD: the file */
     pipe_t *pipe;    /* VFS_PIPE: the pipe; lflags (LO_RDONLY or LO_WRONLY) says which end */
     sock_t *sock;    /* VFS_SOCK: the socket (sock.h) */
@@ -94,6 +96,8 @@ void vfs_fdtab_copy_ns(fdtab_t *t);
 void vfs_fdtab_release(fdtab_t *t);
 
 int vfs_init(const char *host_root, const char *prog, int argc, char **argv);
+/* The host directory of the guest root, without a trailing slash ("" for the host root). */
+const char *vfs_host_root(void);
 
 /* Resolves path (relative to dirfd, or the guest cwd for LAT_FDCWD) component by
  * component inside the root. follow=0 leaves a final symlink unresolved. */
@@ -174,5 +178,9 @@ void vfs_desc_drop(vfs_fd *d);
 /* Reads a program or interpreter through the guest namespace. canon receives
  * its canonical guest path. */
 int vfs_load_file(const char *path, uint8_t **data, size_t *len, char *canon, size_t cap);
+
+/* The generation of the host directory streams: a restore (snap.c) bumps it, and a stream opened before it (by the run
+ * that took the snapshot, in another process) is opened again and moved to its position, never used or closed. */
+extern uint32_t vfs_dir_gen;
 
 #endif

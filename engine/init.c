@@ -1154,6 +1154,38 @@ static void boot_run(const boot_act_t *ba)
         fprintf(stderr, "xiaoji: init: symlink %s -> %s failed (error %d)\n", ba->b, ba->a, -rc);
 }
 
+void init_snap_replay(void)
+{
+    vfs_res r;
+    proc_t *was = proc_cur();
+    proc_switch(self); /* the rc's paths are in init's own mount namespace */
+    for (int i = 0; i < nboot_act; i++) {
+        const boot_act_t *ba = &boot_act[i];
+        if (ba->kind == BA_MKDIR) {
+            if (vfs_resolve(-100, ba->a, 1, &r) == 0 && !r.exists && r.syn == SYN_NONE && !cgroupfs_under(r.guest))
+                (void)mkdir(r.host, 0771);
+        } else if (ba->kind == BA_SYMLINK) {
+            if (vfs_resolve(-100, ba->b, 0, &r) == 0 && !r.exists && !r.is_link && r.syn == SYN_NONE)
+                (void)host_symlink(ba->a, r.host);
+        }
+    }
+    proc_switch(was);
+}
+
+int init_resume(uint64_t timeout_s)
+{
+    /* A restored image (snap.c): the services, the control queue and the init process are the image's. The timeout
+     * counts from the restore. */
+    start_ns = host_monotonic_ns();
+    timeout_ns = timeout_s * 1000000000ull;
+    stop_flag = 0;
+    signal(SIGINT, on_sigint);
+    int rc = sched_resume();
+    init_stop_all();
+    active = 0;
+    return rc;
+}
+
 int init_main(const char *config, uint64_t timeout_s)
 {
     uint8_t *buf = NULL;

@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+// The booted snapshot for the page (docs/snapshot.md, S3 and S4), in headless Chromium (Playwright, as tests/web.mjs).
+//
+//   node tools/snapshot-web.mjs make      boots the product tree in the page with ?snapshot=make: the web engine writes
+//                                         a snapshot at the home screen (the launcher's HOME start + 60 s, or
+//                                         XN_SNAP_AFTER seconds) to the dev server (build/snap/web.snap), then
+//                                         tools/snappack.py packs it into the chunk store (build/web/xj/snapshot.json)
+//   node tools/snapshot-web.mjs fallback  the page boots instead when the snapshot is another build's, or missing
+//   node tools/snapshot-web.mjs restore   opens the page, which restores the snapshot, and checks it: the first frame
+//                                         after the restore is the launcher (not one colour), a swipe up and a tap on
+//                                         Settings open Settings (its START in the log); it prints the timings and the
+//                                         download, and saves build/web-shots/s1-*.png
+//
+// Playwright comes from XN_PLAYWRIGHT (default: the xiaonux bench's playwright-core), XN_CHROME picks a browser.
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { startServer } from '../web/serve.mjs';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const PW = process.env.XN_PLAYWRIGHT ?? '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
+const SHOTS = join(ROOT, 'build', 'web-shots');
+const VIEW = { width: 1280, height: 1000 };
+const MAKE_TIMEOUT_MS = Number(process.env.XN_SNAP_TIMEOUT_MS ?? 1800000);
+const SETTINGS = /START u0 .*cmp=com\.android\.settings\/\.Settings/;
+
+let failures = 0;
+function check(ok, what) {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${what}`);
+  if (!ok) failures++;
+}
+
+async function launch(chromium) {
+  return chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
+}
+
+async function make(chromium) {
+  const out = join(ROOT, 'build', 'snap');
+  const srv = await startServer({ port: 0, snapshotUpload: out });
+  const browser = await launch(chromium);
+  try {
+    const page = await browser.newPage({ viewport: VIEW });
+    const after = Number(process.env.XN_SNAP_AFTER ?? 60);
+    await page.goto(srv.url + `?snapshot=make&snapafter=${after}&timeout=1700`, { waitUntil: 'load' });
+    await page.click('#boot');
+    const t0 = Date.now();
+    await page.waitForFunction(() => window.xb.status === 'done' || window.xb.status === 'error' || window.xb.error, null,
+      { timeout: MAKE_TIMEOUT_MS, polling: 1000 });
+    const r = await page.evaluate(() => ({ done: window.xb.done, error: window.xb.error, ms: window.xb.milestones,
+      log: (window.xb.notes || []).filter((l) => /snapshot|HOME.*launcher3/.test(l)) }));
+    console.log(`--- make: ${Math.round((Date.now() - t0) / 1000)} s, exit ${r.done ? r.done.exitCode : '-'}`);
+    for (const l of r.log) console.log('    ' + (/gl\(webgl\)/.test(l) ? l : l.slice(0, 200)));
+    if (r.error) console.log('    error: ' + r.error.split('\n')[0]);
+    check(r.done && r.done.exitCode === 0, 'make: the web engine wrote its snapshot and stopped (exit 0)');
+  } finally {
+    await browser.close();
+    await srv.close();
+  }
+  const snap = join(out, 'web.snap');
+  if (!failures && existsSync(snap)) {
+    console.log(`    build/snap/web.snap: ${(statSync(snap).size / 1048576).toFixed(1)} MiB`);
+    execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, join(ROOT, 'build', 'web', 'xj'),
+      '--tree', join(ROOT, 'build', 'web', 'xj', 'manifest-xiaoji-v2.json')], { stdio: 'inherit' });
+  }
+}
+
+// A pointer gesture on the Android canvas, in display pixels (540x960), through the letterboxed box (web/input.js).
+async function gesture(page, points, stepMs) {
+  const box = await page.evaluate(() => {
+    const el = document.getElementById('android-screen');
+    const r = el.getBoundingClientRect();
+    const s = Math.min(r.width / 540, r.height / 960);
+    return { left: r.left + (r.width - 540 * s) / 2, top: r.top + (r.height - 960 * s) / 2, s };
+  });
+  const at = ([x, y]) => [box.left + x * box.s, box.top + y * box.s];
+  const [x0, y0] = at(points[0]);
+  await page.mouse.move(x0, y0);
+  await page.mouse.down();
+  for (const p of points.slice(1)) {
+    const [x, y] = at(p);
+    await page.mouse.move(x, y);
+    await page.waitForTimeout(stepMs);
+  }
+  await page.mouse.up();
+}
+
+async function restore(chromium) {
+  mkdirSync(SHOTS, { recursive: true });
+  const srv = await startServer({ port: 0 });
+  const browser = await launch(chromium);
+  try {
+    const page = await browser.newPage({ viewport: VIEW });
+    const pageErrors = [];
+    page.on('pageerror', (e) => pageErrors.push(String(e)));
+    await page.goto(srv.url + '?keeplog=1' + (process.env.XN_SNAP_QUERY || ''), { waitUntil: 'load' });
+    const tPress = Date.now();
+    await page.click('#boot');
+    // The boot screen while the snapshot downloads: the restore stage.
+    const restoring = await page.waitForFunction(() => window.xb.screen && window.xb.screen.label === 'Restoring Android', null,
+      { timeout: 60000, polling: 50 }).then(() => true).catch(() => false);
+    if (restoring) await page.locator('#phone').screenshot({ path: join(SHOTS, 's1-restoring.png') });
+    const scr = await page.evaluate(() => window.xb.screen);
+    check(restoring, `restore: the boot screen shows the restore stage ("Restoring Android": ${scr ? scr.detail : '-'})`);
+    await page.waitForFunction(() => window.xb.restore && window.xb.restore.state === 'loaded', null, { timeout: 600000, polling: 100 })
+      .catch(() => {});
+    await page.waitForFunction(() => window.xb.frames && window.xb.frames.frames > 0, null, { timeout: 300000, polling: 100 })
+      .catch(() => {});
+    const tFrame = Date.now();
+    await page.waitForTimeout(1500); // the boot screen's outro
+    const r1 = await page.evaluate(() => ({ restore: window.xb.restore, frames: window.xb.frames, error: window.xb.error }));
+    await page.locator('#phone').screenshot({ path: join(SHOTS, 's1-restore-first-frame.png') });
+    const rs = r1.restore || {};
+    console.log(`--- restore: ${rs.state}; snapshot ${((rs.bytes || 0) / 1048576).toFixed(1)} MiB downloaded and written in ` +
+      `${((rs.loadMs || 0) / 1000).toFixed(2)} s; press to first frame ${((tFrame - tPress) / 1000).toFixed(2)} s ` +
+      `(engine start to first frame ${rs.firstFrameWall && rs.loadedWall ? ((rs.firstFrameWall - rs.loadedWall) / 1000).toFixed(2) : '-'} s)`);
+    if (r1.error) console.log('    error: ' + r1.error.split('\n')[0]);
+    check(rs.state === 'loaded', 'restore: the page restored the snapshot (not a boot)');
+    check(r1.frames && r1.frames.frames > 0 && r1.frames.distinct > 1, `restore: the first frame after the restore is a picture (${r1.frames ? r1.frames.distinct : 0} colours)`);
+    // The launcher's all-apps drawer (a swipe up), then a tap on Settings (docs/boot.md, B18: bounds [141,131][270,311]).
+    // Let the restored launcher settle, then: Home (it closes a menu that a slow first touch opened as a long press),
+    // a swipe up, the drawer's 20 s to open, a tap on Settings. On a loaded machine the engine can be slow enough for a
+    // swipe to read as a long press, so up to three tries.
+    await page.waitForTimeout(Number(process.env.XN_SNAP_SETTLE_MS ?? 5000));
+    const swipe = [];
+    for (let k = 0; k <= 14; k++) swipe.push([270, 860 - k * 45]);
+    let started = false, tries = 0, tTap = 0;
+    while (!started && tries < 3) {
+      tries++;
+      await page.click('#btn-home').catch(() => {});
+      await page.waitForTimeout(3000);
+      await gesture(page, swipe, 20);
+      await page.waitForTimeout(Number(process.env.XN_SNAP_TAP_WAIT_MS ?? 20000));
+      await page.locator('#phone').screenshot({ path: join(SHOTS, 's1-restore-allapps.png') });
+      await gesture(page, [[205, 201], [205, 201]], 80);
+      tTap = Date.now();
+      started = await page.waitForFunction((re) => (window.xb.notes || []).some((l) => new RegExp(re).test(l)), SETTINGS.source,
+        { timeout: 40000, polling: 500 }).then(() => true).catch(() => false);
+    }
+    await page.waitForTimeout(Number(process.env.XN_SNAP_SETTINGS_WAIT_MS ?? 20000));
+    await page.locator('#phone').screenshot({ path: join(SHOTS, 's1-restore-settings.png') });
+    const log = await page.evaluate(() => (window.xb.all || []).join('\n'));
+    writeFileSync(join(SHOTS, 's1-restore.log'), log + '\n');
+    const bad = log.split('\n').filter((l) => /ANR in|FATAL EXCEPTION|Fatal signal/.test(l));
+    console.log(`    tap to Settings START: ${started ? 'seen, try ' + tries : 'not seen in ' + tries + ' tries'}`);
+    check(started, 'restore: a tap on Settings in the drawer starts Settings (ActivityTaskManager START ... com.android.settings/.Settings)');
+    check(bad.length === 0, `restore: no ANR, fatal exception or fatal signal in the log${bad.length ? ' (' + bad[0].slice(0, 120) + ')' : ''}`);
+    check(pageErrors.length === 0, `restore: no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
+    console.log(`    screenshots: ${SHOTS}/s1-restoring.png, s1-restore-{first-frame,allapps,settings}.png`);
+  } finally {
+    await browser.close();
+    await srv.close();
+  }
+}
+
+// The page boots when the snapshot does not fit (another engine build: its manifest's build is altered here) and when
+// there is none (a 404): the boot starts (the tree is built and the engine runs), then it is stopped.
+async function fallback(chromium) {
+  const srv = await startServer({ port: 0 });
+  const browser = await launch(chromium);
+  try {
+    for (const kind of ['other build', 'no snapshot']) {
+      const page = await browser.newPage({ viewport: VIEW });
+      const pageErrors = [];
+      page.on('pageerror', (e) => pageErrors.push(String(e)));
+      await page.route('**/xj/snapshot.json', async (route) => {
+        if (kind === 'no snapshot') return route.fulfill({ status: 404, body: 'not found\n' });
+        const res = await route.fetch();
+        const m = await res.json();
+        m.build = 'web-0000000000000000-0';
+        return route.fulfill({ response: res, body: JSON.stringify(m) });
+      });
+      await page.goto(srv.url, { waitUntil: 'load' });
+      await page.click('#boot');
+      const ok = await page.waitForFunction(() => window.xb.status === 'running', null, { timeout: 300000, polling: 250 })
+        .then(() => true).catch(() => false);
+      const r = await page.evaluate(() => ({ restore: window.xb.restore, status: window.xb.status }));
+      if (kind === 'other build') {
+        check(ok && r.restore && r.restore.state === 'refused' && /another engine/.test(r.restore.text),
+          `fallback: a snapshot of another build is refused and the page boots (${r.restore ? r.restore.text : '-'}; ${r.status})`);
+      } else {
+        check(ok && r.restore === null, `fallback: with no snapshot the page boots (${r.status})`);
+      }
+      check(pageErrors.length === 0, `fallback (${kind}): no page errors${pageErrors.length ? ' (' + pageErrors[0] + ')' : ''}`);
+      await page.click('#stop').catch(() => {});
+      await page.close();
+    }
+  } finally {
+    await browser.close();
+    await srv.close();
+  }
+}
+
+const mode = process.argv[2];
+const modes = { make, restore, fallback };
+if (!modes[mode]) {
+  console.error('usage: node tools/snapshot-web.mjs make|restore|fallback');
+  process.exit(2);
+}
+const { chromium } = await import(pathToFileURL(PW).href);
+await modes[mode](chromium);
+process.exit(failures ? 1 : 0);

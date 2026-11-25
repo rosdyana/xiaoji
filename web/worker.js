@@ -14,7 +14,7 @@
 
 import { BOOT, CASES, ENGINE_ENV_ARGS } from './cases.js';
 import { openTrace } from './trace.js';
-import { ChunkStore, buildChunkTree, earlyPackIndex } from './chunks.js';
+import { ChunkStore, buildChunkTree, earlyPackIndex, inflateNative } from './chunks.js';
 
 // The display the engine presents (engine/display.h, XJ_DISPLAY_W and XJ_DISPLAY_H): the size of the OffscreenCanvas.
 const FB_WIDTH = 540;
@@ -171,6 +171,64 @@ async function run(name, base) {
 // Matches the stamp logd puts in front of each line: "[<ms> ms <insn> insn] ".
 const STAMP = /^\[(\d+) ms (\d+) insn\] /;
 
+// ---- Booted snapshots (docs/snapshot.md, S3) ----
+//
+// xj/snapshot.json (tools/snappack.py) describes a snapshot the web engine wrote at the home screen: its build, the tree
+// it booted, the image's ranges and extents (each a list of chunks), the head (the file's header and writable trees),
+// and the packs that hold the chunks. A restore writes the image into the module's memory before main runs, the head
+// into /snap.head, and starts the engine with --restore /snap.head (engine/snap.c: the image is marked preloaded).
+
+async function sha256Hex(buf) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+  let hex = '';
+  for (const b of d) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+// Checks the snapshot against this engine build and the tree manifest's bytes; returns the reason it cannot be used,
+// or null.
+function snapshotMismatch(Module, snap, treeHex) {
+  const build = Module.UTF8ToString(Module._xj_snap_build());
+  if (snap.build !== build) return `built by another engine (${snap.build}; this is ${build})`;
+  if (snap.tree !== treeHex) return 'made from another tree';
+  return null;
+}
+
+// Downloads the snapshot's packs (in parallel) and writes each chunk where the image has it as soon as it is inflated
+// (a chunk can appear at many places: equal pages are stored once). progress(loaded, total) after each pack. Returns
+// { head, downloadMs, bytes }.
+async function loadSnapshot(Module, snap, base, progress) {
+  const t0 = now();
+  const total = snap.download_bytes;
+  let top = 0;
+  for (const [, hi] of snap.ranges) top = Math.max(top, hi);
+  if (!Module._xj_snap_grow(top)) throw new Error(`snapshot: cannot grow memory to ${top} bytes`);
+  const heap = Module.HEAPU8;
+  for (const [lo, hi] of snap.ranges) heap.fill(0, lo, hi);
+  const head = new Uint8Array(snap.head.bytes);
+  const targets = new Map(); // chunk id -> [[array, offset], ...]
+  const want = (id, arr, off) => {
+    if (!targets.has(id)) targets.set(id, []);
+    targets.get(id).push([arr, off]);
+  };
+  for (const [addr, , ids] of snap.extents) ids.forEach((id, k) => want(id, null, addr + k * snap.chunk_size));
+  snap.head.chunks.forEach((id, k) => want(id, head, k * snap.chunk_size));
+  let loaded = 0;
+  await Promise.all(snap.packs.map(async (p) => {
+    const res = await fetch(base + 'xj/' + p.file);
+    if (!res.ok) throw new Error(`snapshot ${p.file}: HTTP ${res.status}`);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    loaded += buf.length;
+    progress(loaded, total);
+    await Promise.all(p.chunks.map(async ([id, off, zlen, rlen]) => {
+      const c = await inflateNative(buf.subarray(off, off + zlen), rlen);
+      for (const [arr, at] of targets.get(id) || []) (arr || Module.HEAPU8).set(c, at);
+    }));
+  }));
+  Module._xj_snap_preloaded();
+  return { head, downloadMs: now() - t0, bytes: total };
+}
+
 // The Android boot (W1): the same command as the native product boot (docs/boot.md, B7), on the
 // product tree from build/web/manifest-xiaoji.json. Stops when the page stops the worker, or when
 // the engine's --init-timeout (wall clock, in seconds) runs out.
@@ -218,6 +276,10 @@ async function runBoot(base, opts) {
   // mode 'pack' (?boot=pack): the chunk store and boot packs (web/chunks.js); 'manifest': the lazy-file
   // manifest (the page's default, until the pack mode is proven).
   const packMode = opts && opts.mode === 'pack';
+  // ?snapshot=make: the boot writes a snapshot at the home screen to the dev server (web/serve.mjs --snapshot-upload,
+  // make snapshot) and stops. Otherwise a snapshot the page found (opts.snap, main.js) is restored when it matches.
+  const makeSnap = !!(opts && opts.snapshot === 'make');
+  const snap = opts && opts.snap ? opts.snap : null;
   // Manifest mode fetches the manifest here. Pack mode gets it with the layout (see layoutReady above).
   let manifest = null;
   let size = 0;
@@ -275,7 +337,25 @@ async function runBoot(base, opts) {
   // The page's input ring (web/input.js): the engine drains it through xiaoji_input_pop (engine/jit_lib.js, docs/input.md).
   if (opts && opts.input) Module.inputRing = new Int32Array(opts.input);
   let files;
-  if (packMode) {
+  let restored = null;
+  if (snap) {
+    // A restore: the tree's chunks are read on demand (the boot packs are not waited for), the image is written now.
+    const tm = await fetch(base + 'xj/manifest-xiaoji-v2.json', { cache: 'no-store' });
+    const tbuf = await tm.arrayBuffer();
+    const why = snapshotMismatch(Module, snap, await sha256Hex(tbuf));
+    if (why) {
+      post({ type: 'restore-refused', text: why });
+      throw new Error(`snapshot: ${why}`);
+    }
+    manifest = JSON.parse(new TextDecoder().decode(tbuf));
+    size = tbuf.byteLength;
+    store = new ChunkStore(base + 'xj/', manifest.chunk_size);
+    post({ type: 'restore-start', total: snap.download_bytes, image: snap.image_bytes });
+    restored = await loadSnapshot(Module, snap, base, (loaded, total) => post({ type: 'restore-progress', loaded, total }));
+    files = buildChunkTree(Module.FS, manifest, store);
+    Module.FS.writeFile('/snap.head', restored.head);
+    post({ type: 'restore-loaded', wall: now() - t0, loadMs: restored.downloadMs, bytes: restored.bytes });
+  } else if (packMode) {
     // The packs come from the downloader while the module loads. The engine starts once the first pack (or the
     // first opts.early MB) is in; its reads of a later pack wait for that pack. ?nopack, or no layout (the page
     // could not start the downloader): every chunk is read synchronously, with the manifest fetched here.
@@ -304,12 +384,18 @@ async function runBoot(base, opts) {
 
   // ?timeout=S (debugging, B18): the engine's wall-clock limit in seconds instead of BOOT.timeoutS, for slow machines.
   const timeoutS = opts && Number(opts.timeoutS) > 0 ? Math.floor(Number(opts.timeoutS)) : BOOT.timeoutS;
-  const argv = ['--logcat', '--init', '/xiaoji.rc', '--root', '/rootfs', '--init-timeout', String(timeoutS)];
+  const argv = restored ? ['--logcat', '--restore', '/snap.head', '--init-timeout', String(timeoutS)]
+    : ['--logcat', '--init', '/xiaoji.rc', '--root', '/rootfs', '--init-timeout', String(timeoutS)];
+  if (makeSnap) {
+    // The home screen, then a quiet minute (docs/snapshot.md): the launcher's HOME start, 60 s later.
+    argv.push('--snapshot-at', 'log:cmp=com.android.launcher3/', '--snapshot-after', String(Number(opts.snapAfter) || 60),
+      '--snapshot-out', base + '__snap/web.snap');
+  }
   if (opts && opts.lazy === false) argv.push('--no-lazy-mmap');
   if (opts && opts.lazyWindow) argv.push('--lazy-window', String(Number(opts.lazyWindow)));
   // ?statsat: the engine prints its instruction count and lazy reads at phase 100 (for the A/B runs).
   if (opts && opts.statsAt) argv.push('--stats-at', 'Starting phase 100');
-  if (webgl) argv.push('--gl', 'webgl');
+  if (webgl && !restored) argv.push('--gl', 'webgl'); // a restore keeps the snapshot's backend
   // ?debug=1: the engine's fault reports (XIAOJI_DEBUG_FAULTS, which the page cannot set) go to the log.
   if (opts && opts.debugFaults) argv.push('--debug-faults');
   // ?dumpat=SECONDS: a dump of every guest thread at that time (the engine's --dump-at).
@@ -361,6 +447,7 @@ self.onmessage = async (ev) => {
         trace: msg.trace, mode: msg.mode, lazy: msg.lazy !== false, lazyWindow: msg.lazyWindow,
         statsAt: !!msg.statsAt, early: msg.early, gl: msg.gl, frameSab: msg.frameSab,
         input: msg.input || null, debugFaults: !!msg.debugFaults, dumpAt: msg.dumpAt || 0, timeoutS: msg.timeoutS || 0,
+        snapshot: msg.snapshot || null, snap: msg.snap || null, snapAfter: msg.snapAfter || 0,
       });
     }
   } catch (e) {

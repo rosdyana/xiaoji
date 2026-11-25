@@ -28,6 +28,9 @@ void jit_page_changed(const uint8_t *host_page);
 /* Empties the block chain cache; the memory layer calls it on every mapping change. */
 void jit_chain_flush(void);
 
+/* After a restore (snap.c): drops every translated block of the image (they name another instance's table). */
+void jit_snap_reset(void);
+
 /* 1 if the host page holds translated code (any block on it, live or not). */
 int jit_page_is_code(const uint8_t *host_page);
 

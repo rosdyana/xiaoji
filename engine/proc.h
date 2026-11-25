@@ -70,6 +70,8 @@ proc_t *proc_init(void);
 proc_t *proc_cur(void);
 
 void proc_switch(proc_t *p);
+/* As proc_switch, even when p is current: installs its tables again and flushes the TLBs (after a restore). */
+void proc_switch_force(proc_t *p);
 
 /* A child of cur (the running process) with a new pid. vfork shares cur's address
  * space; otherwise the address space is copied copy-on-write. Its fd table shares the

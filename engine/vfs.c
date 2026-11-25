@@ -43,6 +43,7 @@ static const char *fd_link_text(const vfs_fd *f, char *buf, size_t n);
 #define NAME_MAX_LEN 255
 #define RESOLVE_BUF (2 * VFS_PATH_MAX)
 
+uint32_t vfs_dir_gen;
 static char root[VFS_PATH_MAX];  /* host directory for guest "/", no trailing '/' */
 /* One process's file state: its fd table, cwd, program name and argv. The host root
  * is shared by all processes and stays global. */
@@ -540,7 +541,7 @@ static void desc_unref(vfs_fd *f)
     free(f->guest);
     free(f->host);
     free(f->data);
-    if (f->dir)
+    if (f->dir && f->dgen == vfs_dir_gen)
         closedir((DIR *)f->dir);
     memfd_unref(f->mfd);
     free(f);
@@ -828,6 +829,8 @@ void vfs_fdtab_release(fdtab_t *t)
     free(t->cmdline);
     free(t);
 }
+
+const char *vfs_host_root(void) { return root; }
 
 int vfs_init(const char *host_root, const char *prog_guest, int argc, char **argv)
 {
@@ -1409,9 +1412,12 @@ int64_t vfs_lseek(int fd, int64_t off, int whence)
         return -LE_SPIPE;
     case VFS_DIR:
         if (whence == 0 && off == 0) { /* SEEK_SET 0 rewinds */
-            if (f->dir)
+            if (f->dir && f->dgen == vfs_dir_gen)
                 rewinddir((DIR *)f->dir);
+            else
+                f->dir = NULL; /* a stream from before a restore: opened again from the start */
             f->nent = 0;
+            f->dread = 0;
             return 0;
         }
         return -LE_INVAL;
@@ -1539,10 +1545,16 @@ int64_t vfs_getdents(int fd, uint8_t *buf, size_t cap)
         return -LE_BADF;
     if (f->kind != VFS_DIR)
         return -LE_NOTDIR;
+    if (f->dir && f->dgen != vfs_dir_gen)
+        f->dir = NULL; /* opened before a restore: its DIR is not in this process */
     if (!f->dir) {
         f->dir = opendir(f->host);
         if (!f->dir)
             return -host_linux_errno(errno);
+        f->dgen = vfs_dir_gen;
+        for (uint64_t k = 0; k < f->dread; k++) /* resume where the stream was */
+            if (!readdir((DIR *)f->dir))
+                break;
     }
     size_t w = 0;
     for (;;) {
@@ -1554,12 +1566,14 @@ int64_t vfs_getdents(int fd, uint8_t *buf, size_t cap)
                 return -host_linux_errno(errno);
             break;
         }
+        f->dread++;
         if (!strcmp(f->guest, "/") && (!strcmp(de->d_name, ".xiaoji-meta") || !strcmp(de->d_name, ".xiaoji-meta.tmp")))
             continue; /* the metadata sidecar (meta.c) is hidden from the guest's root */
         size_t nl = strlen(de->d_name);
         size_t reclen = (19 + nl + 1 + 7) & ~(size_t)7;
         if (w + reclen > cap) {
             seekdir((DIR *)f->dir, pos); /* leave this entry for the next call */
+            f->dread--;
             if (w == 0)
                 return -LE_INVAL;
             break;

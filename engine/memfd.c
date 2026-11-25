@@ -1,4 +1,5 @@
 #include "memfd.h"
+#include "mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,7 +67,7 @@ void memfd_unref(memfd_t *m)
         if (m->pages[i])
             jit_page_changed(m->pages[i]);
 #endif
-        free(m->pages[i]);
+        mem_page_free(m->pages[i]);
     }
     free(m->pages);
     free(m);
@@ -96,7 +97,7 @@ uint8_t *memfd_page(memfd_t *m, uint64_t idx)
     if (grow(m, idx) < 0)
         return NULL;
     if (!m->pages[idx]) {
-        uint8_t *p = aligned_alloc(MFD_PAGE, MFD_PAGE);
+        uint8_t *p = mem_page_alloc();
         if (!p)
             return NULL;
         memset(p, 0, MFD_PAGE);

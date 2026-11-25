@@ -177,6 +177,11 @@ def main(argv):
     for name in os.listdir(pack_dir):
         if name not in keep:
             os.unlink(os.path.join(pack_dir, name))
+    # A booted snapshot (tools/snappack.py, docs/snapshot.md) belongs to the tree it was made from: its packs went with
+    # the line above, and its manifest goes too (make snapshot makes a new one).
+    snap = os.path.join(a.out, "snapshot.json")
+    if os.path.exists(snap):
+        os.unlink(snap)
     manifest_entries = []
     for e in entries:
         if e["type"] == "file":

@@ -103,7 +103,7 @@ async function runDownloadShot(chromium) {
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   try {
     await page.emulateMedia({ reducedMotion: 'reduce' });
-    await page.goto(slow.url + '?boot=pack', { waitUntil: 'load' });
+    await page.goto(slow.url + '?boot=pack&snapshot=off', { waitUntil: 'load' });
     await page.click('#boot');
     const spin = await page.evaluate(() => getComputedStyle(document.querySelector('.l-spin')).animationName);
     check(spin === 'none', 'boot screen: the arc does not spin with prefers-reduced-motion');
@@ -135,7 +135,7 @@ async function runBoot(chromium, baseUrl) {
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   try {
     // The chunk store and boot packs are the page's default (docs/loading.md); ?boot=pack says so explicitly.
-    await page.goto(baseUrl + '?boot=pack', { waitUntil: 'load' });
+    await page.goto(baseUrl + '?boot=pack&snapshot=off', { waitUntil: 'load' });
     check(await page.isHidden('#devlog'), 'boot screen: the log is hidden by default');
     const t0 = Date.now();
     await page.click('#boot');
@@ -321,7 +321,7 @@ async function runFrames(chromium, baseUrl) {
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   const FRAME_TIMEOUT_MS = Number(process.env.XN_FRAME_TIMEOUT_MS ?? 900000);
   try {
-    await page.goto(baseUrl + '?boot=pack&gl=webgl', { waitUntil: 'load' });
+    await page.goto(baseUrl + '?boot=pack&gl=webgl&snapshot=off', { waitUntil: 'load' });
     await page.click('#boot');
     const t0 = Date.now();
     await page.waitForFunction(() => window.xb.frames && window.xb.frames.frames > 0, null, {

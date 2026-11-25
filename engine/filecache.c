@@ -1,4 +1,5 @@
 #include "filecache.h"
+#include "snap.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -99,7 +100,7 @@ static void fc_register(void)
 {
     if (!registered) {
         registered = 1;
-        atexit(fc_flush_all);
+        snap_atexit(fc_flush_all);
     }
 }
 

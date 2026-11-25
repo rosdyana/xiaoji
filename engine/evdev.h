@@ -48,5 +48,8 @@ void evdev_pump(void);
 /* The native / Node test source: a --input-script file, one event per line: "<ms> <dev> <type> <code> <value>". ms is
  * from the first open of a device. Returns 0 on success, -1 if the file can't be read. */
 int evdev_script_load(const char *path);
+/* Replaces the test script with the one at path (NULL: none; the environment's XIAOJI_INPUT_SCRIPT is looked at again).
+ * When a device is already open (after a restore), the script's times count from now. 0, or -1 (unreadable). */
+int evdev_script_restart(const char *path);
 
 #endif

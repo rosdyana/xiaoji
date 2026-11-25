@@ -491,6 +491,25 @@ static void jit_flush_all(void)
     st_flushes++;
 }
 
+/* After a restore (snap.c): the image's blocks name table slots of the instance that wrote it. This instance's table
+ * has none of them, so every block, page entry, queued pc and chain entry is dropped, and the table base is taken
+ * again at the next batch. */
+void jit_snap_reset(void)
+{
+    memset(fast, 0, sizeof fast);
+    for (int i = 0; i < JIT_BHASH; i++)
+        bhash[i] = -1;
+    memset(pages, 0, sizeof pages);
+    memset(cnt, 0, sizeof cnt);
+    npages = 0;
+    blk_hwm = 0;
+    blk_free_head = -1;
+    nlive = 0;
+    qlen = 0;
+    running = 0;
+    tbase = -1;
+}
+
 int jit_page_is_code(const uint8_t *host_page)
 {
     PageEnt *pe = page_find((uintptr_t)host_page, 0);

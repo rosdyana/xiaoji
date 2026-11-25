@@ -72,6 +72,12 @@ const gl_host_t *gl_host_webgl(void);
 /* --gl null|webgl (main.c): which backend the streams use. The default is null. */
 int gl_host_select(const char *name);
 
+/* Snapshots (docs/snapshot.md): the WebGL backend turns its WebGL objects into a blob in engine memory before the image
+ * is taken, and makes them again after a restore (then posts the last frame again). Nothing in the other builds, whose
+ * GL state is all in engine memory. resume: 1 when it restored the WebGL objects, 0 when there were none, -1 on failure. */
+void gl_host_snap_save(void);
+int gl_host_snap_resume(void);
+
 /* The backend the next request goes to: the selected one, or null when the selected one is not available. */
 const gl_host_t *gl_host_current(void);
 

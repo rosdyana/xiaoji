@@ -238,6 +238,7 @@ int evdev_script_load(const char *path)
     (void)path;
     return -1;
 }
+int evdev_script_restart(const char *path) { return path ? -1 : 0; }
 #else
 typedef struct {
     uint64_t at_ns; /* from the origin */
@@ -280,6 +281,22 @@ int evdev_script_load(const char *path)
         nscript++;
     }
     fclose(fp);
+    return 0;
+}
+
+int evdev_script_restart(const char *path)
+{
+    /* A restored image may hold the script of the run that wrote it: this run's (or none) replaces it. */
+    free(script);
+    script = NULL;
+    nscript = script_pos = 0;
+    script_tried = 0;
+    if (!path)
+        return 0;
+    if (evdev_script_load(path) < 0)
+        return -1;
+    if (origin_set) /* a device is open already (a restore): the times count from now */
+        origin_ns = host_monotonic_ns();
     return 0;
 }
 

@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
@@ -225,9 +226,14 @@ int host_rmdir(const char *path)
     return rmdir(path) == 0 ? 0 : neg_errno();
 }
 
+static void fdrec_renamed(const char *from, const char *to);
+
 int host_rename(const char *from, const char *to)
 {
-    return rename(from, to) == 0 ? 0 : neg_errno();
+    if (rename(from, to) != 0)
+        return neg_errno();
+    fdrec_renamed(from, to);
+    return 0;
 }
 
 /* A hard link. The caller resolves from (sysfs.c sys_linkat), so a final symlink is linked as it is unless the caller follows it. */
@@ -260,6 +266,68 @@ int64_t host_readlink(const char *path, char *buf, size_t cap)
     return (int64_t)n;
 }
 
+/* ---------- the host descriptors the engine holds (docs/snapshot.md) ----------
+ * Each host fd from host_open and host_dup has a record: its path (kept current across host_rename) and its open
+ * flags. A snapshot stores the records in its image; a restore opens each path again at the same descriptor number
+ * and offset (host_snap_reopen). A file whose path no longer names it (unlinked, or replaced) has its bytes kept in
+ * the record at snapshot time, and the restore makes an unlinked copy of them. */
+typedef struct {
+    char *path;      /* NULL: the slot is not in use */
+    uint32_t lflags; /* the Linux open flags, less O_CREAT, O_EXCL and O_TRUNC */
+    int64_t pos;     /* snapshot: the file offset */
+    uint8_t *data;   /* snapshot: the bytes of a file its path no longer names; NULL otherwise */
+    uint64_t dlen;
+} fdrec_t;
+static fdrec_t *fdrecs;
+static int nfdrecs;
+
+static void fdrec_clear(int fd)
+{
+    if (fd < 0 || fd >= nfdrecs)
+        return;
+    free(fdrecs[fd].path);
+    free(fdrecs[fd].data);
+    memset(&fdrecs[fd], 0, sizeof fdrecs[fd]);
+}
+
+static void fdrec_set(int fd, const char *path, uint32_t lflags)
+{
+    if (fd < 0)
+        return;
+    if (fd >= nfdrecs) {
+        int nc = nfdrecs ? nfdrecs : 64;
+        while (nc <= fd)
+            nc *= 2;
+        fdrec_t *nr = realloc(fdrecs, (size_t)nc * sizeof *nr);
+        if (!nr)
+            return; /* not recorded: a snapshot refuses (host_snap_prepare counts the descriptors) */
+        memset(nr + nfdrecs, 0, (size_t)(nc - nfdrecs) * sizeof *nr);
+        fdrecs = nr;
+        nfdrecs = nc;
+    }
+    fdrec_clear(fd);
+    fdrecs[fd].path = path ? strdup(path) : NULL;
+    fdrecs[fd].lflags = lflags & ~(uint32_t)(LO_CREAT | LO_EXCL | LO_TRUNC);
+}
+
+static void fdrec_renamed(const char *from, const char *to)
+{
+    size_t fl = strlen(from);
+    for (int i = 0; i < nfdrecs; i++) {
+        char *p = fdrecs[i].path;
+        if (!p || strncmp(p, from, fl) != 0 || (p[fl] != 0 && p[fl] != '/'))
+            continue;
+        size_t tl = strlen(to), rest = strlen(p + fl);
+        char *np = malloc(tl + rest + 1);
+        if (!np)
+            continue;
+        memcpy(np, to, tl);
+        memcpy(np + tl, p + fl, rest + 1);
+        free(p);
+        fdrecs[i].path = np;
+    }
+}
+
 /* ---------- files ---------- */
 
 int host_open(const char *path, uint32_t lflags, uint32_t mode)
@@ -267,11 +335,13 @@ int host_open(const char *path, uint32_t lflags, uint32_t mode)
     int fd = open(path, host_open_flags(lflags), (mode_t)(mode & 07777));
     if (fd < 0)
         return neg_errno();
+    fdrec_set(fd, path, lflags);
     return fd;
 }
 
 int host_close(int fd)
 {
+    fdrec_clear(fd);
     if (close(fd) != 0)
         return neg_errno();
     return 0;
@@ -310,7 +380,103 @@ int64_t host_lseek(int fd, int64_t off, int whence)
 int host_dup(int fd)
 {
     int n = dup(fd);
-    return n < 0 ? neg_errno() : n;
+    if (n < 0)
+        return neg_errno();
+    if (fd < nfdrecs && fdrecs[fd].path)
+        fdrec_set(n, fdrecs[fd].path, fdrecs[fd].lflags);
+    return n;
+}
+
+int host_snap_prepare(uint64_t *kept_files, uint64_t *kept_bytes)
+{
+    *kept_files = *kept_bytes = 0;
+    for (int fd = 0; fd < nfdrecs; fd++) {
+        fdrec_t *r = &fdrecs[fd];
+        if (!r->path)
+            continue;
+        free(r->data);
+        r->data = NULL;
+        r->dlen = 0;
+        off_t pos = lseek(fd, 0, SEEK_CUR);
+        r->pos = pos < 0 ? 0 : (int64_t)pos;
+        struct stat a, b;
+        if (fstat(fd, &a) != 0)
+            return -1;
+        if (!S_ISREG(a.st_mode) || (stat(r->path, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino))
+            continue;
+        /* The path no longer names this file: keep its bytes. */
+        uint64_t len = (uint64_t)a.st_size;
+        r->data = malloc(len ? len : 1);
+        if (!r->data)
+            return -1;
+        for (uint64_t got = 0; got < len;) {
+            ssize_t k = pread(fd, r->data + got, len - got, (off_t)got);
+            if (k <= 0)
+                return -1;
+            got += (uint64_t)k;
+        }
+        r->dlen = len;
+        (*kept_files)++;
+        *kept_bytes += len;
+    }
+    return 0;
+}
+
+/* Puts the open file nfd at descriptor fd. Returns 0, or -1. */
+static int move_fd(int nfd, int fd)
+{
+    if (nfd == fd)
+        return 0;
+    int rc = dup2(nfd, fd) == fd ? 0 : -1;
+    close(nfd);
+    return rc;
+}
+
+int host_snap_reopen(const char *tmpdir)
+{
+    int bad = 0;
+    for (int fd = 0; fd < nfdrecs; fd++) {
+        fdrec_t *r = &fdrecs[fd];
+        if (!r->path)
+            continue;
+        int nfd;
+        if (r->data) {
+            /* An unlinked copy of the kept bytes, open as the file was. */
+            char tmp[512];
+            snprintf(tmp, sizeof tmp, "%s/xiaoji-snap-%d-%d", tmpdir, (int)getpid(), fd);
+            nfd = open(tmp, O_RDWR | O_CREAT | O_EXCL, 0600);
+            if (nfd >= 0) {
+                for (uint64_t put = 0; put < r->dlen;) {
+                    ssize_t k = pwrite(nfd, r->data + put, r->dlen - put, (off_t)put);
+                    if (k <= 0)
+                        break;
+                    put += (uint64_t)k;
+                }
+                unlink(tmp);
+            }
+            free(r->data);
+            r->data = NULL;
+            r->dlen = 0;
+        } else {
+            nfd = open(r->path, host_open_flags(r->lflags));
+        }
+        if (nfd < 0 || move_fd(nfd, fd) < 0) {
+            fprintf(stderr, "xiaoji: restore: cannot open %s again (fd %d)\n", r->path, fd);
+            bad++;
+            continue;
+        }
+        if (r->pos)
+            lseek(fd, (off_t)r->pos, SEEK_SET);
+    }
+    return bad ? -1 : 0;
+}
+
+int host_snap_fd_count(void)
+{
+    int n = 0;
+    for (int fd = 0; fd < nfdrecs; fd++)
+        n += fdrecs[fd].path != NULL;
+    return n;
 }
 
 int host_fd_flags(int fd)
@@ -333,12 +499,20 @@ static uint64_t ns_of(const struct timespec *ts)
     return (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
 }
 
-uint64_t host_monotonic_ns(void)
+/* The engine's monotonic clock is the host's plus mono_off. A restore sets the offset so that the clock goes on from
+ * the snapshot's time (host_snap_clock): every deadline the image holds stays where it was. */
+static int64_t mono_off;
+
+static uint64_t raw_monotonic_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ns_of(&ts);
 }
+
+uint64_t host_monotonic_ns(void) { return raw_monotonic_ns() + (uint64_t)mono_off; }
+
+void host_snap_clock(uint64_t snap_mono_ns) { mono_off = (int64_t)(snap_mono_ns - raw_monotonic_ns()); }
 
 uint64_t host_realtime_ns(void)
 {

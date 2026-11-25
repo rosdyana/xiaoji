@@ -9,6 +9,7 @@
 #include "loader.h"
 #include "mem.h"
 #include "sched.h"
+#include "snap.h"
 #include "syscall.h"
 
 /* Syscall numbers (asm-generic, as in syscall.c). */
@@ -450,5 +451,5 @@ void prof_init(const char *root)
             strcpy(root_prefix, root);
     }
     prof_on = 1;
-    atexit(report);
+    snap_atexit(report);
 }

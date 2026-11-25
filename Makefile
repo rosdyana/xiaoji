@@ -13,6 +13,10 @@ ENGINE_HDR := $(wildcard engine/*.h) $(wildcard engine/*.inc)
 # The block translator is wasm-only: the native build leaves engine/jit.c out.
 NATIVE_SRC := $(filter-out engine/jit.c,$(ENGINE_SRC))
 JIT_LIB := engine/jit_lib.js
+# The WebGL objects of a snapshot (docs/snapshot.md): the web build's GL backend.
+GL_SNAP_LIB := engine/gl_snap.js
+# The native heap's allocator (engine/arena.c includes it).
+DLMALLOC := third_party/dlmalloc/malloc.c
 .DEFAULT_GOAL := all
 # The GL decoders, generated from gfxstream's protocol specs (Apache-2.0, vendored in third_party/gfxstream;
 # tools/gen-glproto.py; docs/graphics.md, G1). tools/fetch-remote-protocols.sh checks them against the guest encoders.
@@ -23,10 +27,15 @@ $(GEN_SRC): build/gen/gen_report.txt
 
 GL_SPECS := $(wildcard third_party/gfxstream/*/*)
 
+# The engine build's identity, which a snapshot records and a restore checks (docs/snapshot.md): a hash of everything the
+# engines are built from. Each build adds its flavor (native, node, web) and its data layout (engine/snap.c).
+XJ_BUILD_ID := $(shell cat $(sort $(ENGINE_SRC) $(ENGINE_HDR)) $(JIT_LIB) $(GL_SNAP_LIB) $(DLMALLOC) $(GL_SPECS) tools/gen-glproto.py Makefile | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)
+XJ_DEFS := -DXJ_BUILD_ID=\"$(XJ_BUILD_ID)\"
+
 build/gen/gen_report.txt: tools/gen-glproto.py $(GL_SPECS)
 	python3 -I tools/gen-glproto.py third_party/gfxstream build/gen
 
-.PHONY: all engine wasm wasm-node guest-tests test test-web test-chunks serve image oracle clean reset-data help
+.PHONY: all engine wasm wasm-node guest-tests test test-web test-chunks serve image oracle clean reset-data help snapshot snapshot-native test-snapshot-web
 
 all: engine     ## default: native engine
 
@@ -35,26 +44,26 @@ help:           ## list targets
 
 engine: build/xiaoji          ## native engine -> build/xiaoji
 
-build/xiaoji: $(NATIVE_SRC) $(GEN_SRC) $(ENGINE_HDR)
+build/xiaoji: $(NATIVE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(DLMALLOC)
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(GEN_INC) -o $@ $(NATIVE_SRC) $(GEN_SRC) -lm
+	$(CC) $(CFLAGS) $(GEN_INC) $(XJ_DEFS) -o $@ $(NATIVE_SRC) $(GEN_SRC) -lm
 
 wasm: build/wasm/xiaoji.mjs   ## wasm engine -> build/wasm/xiaoji.{mjs,wasm}
 
 # The web build: a module for a Web Worker (web/worker.js), with the guest
 # filesystem built by the worker in MEMFS (createLazyFile over HTTP).
-build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
+build/wasm/xiaoji.mjs: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB) $(GL_SNAP_LIB)
 	@mkdir -p build/wasm
-	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMAX_WEBGL_VERSION=2 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
-	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain -sEXIT_RUNTIME=1 \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) $(XJ_DEFS) -DXIAOJI_WEB=1 -DXIAOJI_LAZY_FS=1 -sMAX_WEBGL_VERSION=2 -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=web,worker \
+	    -sINVOKE_RUN=0 -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,callMain,HEAPU8,UTF8ToString -sEXIT_RUNTIME=1 \
 	    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB \
-	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
+	    --js-library $(JIT_LIB) --js-library $(GL_SNAP_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
 
 wasm-node: build/wasm-node/xiaoji.js   ## wasm engine for Node (reads host files directly)
 
 build/wasm-node/xiaoji.js: $(ENGINE_SRC) $(GEN_SRC) $(ENGINE_HDR) $(JIT_LIB)
 	@mkdir -p build/wasm-node
-	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) -sNODERAWFS=1 -sENVIRONMENT=node -sALLOW_MEMORY_GROWTH \
+	$(EMENV) emcc -O3 -std=c11 $(GEN_INC) $(XJ_DEFS) -sNODERAWFS=1 -sENVIRONMENT=node -sALLOW_MEMORY_GROWTH \
 	    -sALLOW_TABLE_GROWTH -sMAXIMUM_MEMORY=4GB -sEXIT_RUNTIME=1 \
 	    --js-library $(JIT_LIB) -o $@ $(ENGINE_SRC) $(GEN_SRC)
 
@@ -98,6 +107,30 @@ test-web: wasm build/web/manifest.json   ## run the web build in headless Chromi
 	node tests/web.mjs hello-jit hello-int
 	node tests/input.mjs
 	node tests/bootanim.mjs
+	node tests/snapshot.mjs
+
+# Booted snapshots (docs/snapshot.md). snapshot: the page's, for the current tree and web engine: the product boots in
+# headless Chromium (WebGL2) with ?snapshot=make, the engine writes its snapshot at the launcher's HOME start + 60 s
+# (XN_SNAP_AFTER) to the dev server (build/snap/web.snap), and tools/snappack.py packs it into the chunk store
+# (build/web/xj/snapshot.json, chunks and packs beside the tree's). The page restores it when it matches its engine and
+# tree. snapshot-native: the native engine's (null GL backend), from a fresh /data -> build/snap/native.snap, for
+# build/xiaoji --restore. test-snapshot-web: the page restores the snapshot, shows the launcher and opens Settings.
+# Long runs keep a Mac awake (caffeinate); other hosts run them as they are.
+CAFFEINATE := $(if $(filter Darwin,$(shell uname -s)),caffeinate -dims,)
+
+snapshot: wasm build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json   ## the page's booted snapshot -> build/web/xj/snapshot.json
+	$(CAFFEINATE) node tools/snapshot-web.mjs make
+
+snapshot-native: engine   ## a native booted snapshot (null GL) -> build/snap/native.snap
+	@mkdir -p build/snap
+	python3 -I tools/reset-data.py build/rootfs-xiaoji
+	XIAOJI_STAMP=1 $(CAFFEINATE) build/xiaoji --logcat --init image/xiaoji.rc --root build/rootfs-xiaoji --init-timeout 900 \
+	    --snapshot-at log:cmp=com.android.launcher3/ --snapshot-after 60 --snapshot-out build/snap/native.snap 2>build/snap/native.log
+	@grep "snapshot:" build/snap/native.log
+
+test-snapshot-web: wasm   ## the page restores build/web/xj/snapshot.json, shows the launcher, opens Settings; boots when it does not fit
+	$(CAFFEINATE) node tools/snapshot-web.mjs restore
+	$(CAFFEINATE) node tools/snapshot-web.mjs fallback
 
 serve: wasm build/web/manifest.json   ## dev server for the web page (web/serve.mjs), port 8080
 	@if [ -d build/rootfs-xiaoji ]; then $(MAKE) build/web/manifest-xiaoji.json build/web/xj/manifest-xiaoji-v2.json; else echo "serve: no build/rootfs-xiaoji, Boot Android is off"; fi

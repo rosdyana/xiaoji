@@ -68,6 +68,15 @@ int host_ftruncate(int fd, uint64_t len);
 int64_t host_readlink(const char *path, char *buf, size_t cap);
 
 /* Reads a whole host file into a malloc'd buffer. Returns 0 or -1. */
+/* Snapshots (snap.c, docs/snapshot.md). prepare records each host descriptor's offset, and keeps the bytes of a file
+ * its path no longer names (counted in *kept_files and *kept_bytes); 0, or -1. reopen, after a restore, opens every
+ * recorded descriptor again at its number and offset (an unlinked copy in tmpdir for kept bytes); 0, or -1 if any
+ * failed. fd_count: the descriptors recorded. clock: the monotonic clock goes on from snap_mono_ns. */
+int host_snap_prepare(uint64_t *kept_files, uint64_t *kept_bytes);
+int host_snap_reopen(const char *tmpdir);
+int host_snap_fd_count(void);
+void host_snap_clock(uint64_t snap_mono_ns);
+
 int host_read_file(const char *path, uint8_t **data, size_t *len);
 
 #endif

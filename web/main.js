@@ -3,13 +3,14 @@
 // for the product boot; window.xb holds its state, and window.xb.screen what the screen shows.
 //
 // Query parameters: ?theme=<name> (web/theme-<name>.json), ?log=1 (the log panel open), ?cases=1 (the ART
-// cases panel, for the tests), ?boot=manifest and ?trace, ?nopack (docs/web-preview.md).
+// cases panel, for the tests), ?boot=manifest and ?trace, ?nopack (docs/web-preview.md), ?snapshot=off (always boot)
+// and ?snapshot=make (boot, and write a snapshot at the home screen: make snapshot; docs/snapshot.md).
 
 import { BOOT, RESTART } from './cases.js';
 import { DEFAULT_THEME, loadTheme } from './theme.js';
 import { newFrameView } from './frame.js';
 import {
-  newScreen, startRun, onDownload, onBootTree, onMilestone, onRestart, onError, onEnd, onStop, render as renderScreen,
+  newScreen, startRun, onDownload, onRestore, onBootTree, onMilestone, onRestart, onError, onEnd, onStop, render as renderScreen,
   onShown, onAnimRun, onFrame, animPhase, animTimings, animNextMs,
 } from './bootscreen.js';
 import { createRing, attachInput, ensureScreen } from './input.js';
@@ -250,6 +251,8 @@ function stopBoot(status) {
   render();
 }
 
+let snapshotRefused = null; // why the snapshot was refused (then this page load boots)
+
 $('boot').addEventListener('click', async () => {
   await themeReady;
   $('blog').textContent = '';
@@ -275,6 +278,19 @@ $('boot').addEventListener('click', async () => {
   const frameSab = self.crossOriginIsolated ? new SharedArrayBuffer(8) : null;
   const frames = newFrameView($('android-screen'), frameSab ? new Int32Array(frameSab) : null);
   const glBackend = params.get('gl') === 'null' ? 'null' : 'webgl';
+  // A booted snapshot (docs/snapshot.md): xj/snapshot.json, restored by the worker when it matches the engine build
+  // and the tree. Only with the WebGL backend and the chunk store; ?snapshot=off boots, ?snapshot=make makes one.
+  const snapParam = params.get('snapshot');
+  let snap = null;
+  if (!snapshotRefused && snapParam !== 'off' && snapParam !== 'make' && glBackend === 'webgl' && params.get('boot') !== 'manifest' && self.crossOriginIsolated) {
+    try {
+      const r = await fetch(base + 'xj/snapshot.json', { cache: 'no-store' });
+      if (r.ok) snap = await r.json();
+    } catch {
+      snap = null;
+    }
+  }
+  window.xb.restore = snap ? { state: 'trying', bytes: snap.download_bytes } : snapshotRefused ? { state: 'refused', text: snapshotRefused } : null;
   setControls();
   render();
   // The packs (pack mode) come from a second worker, so the engine's worker can block on a pack while the rest
@@ -315,7 +331,21 @@ $('boot').addEventListener('click', async () => {
   worker.onmessage = (ev) => {
     const m = ev.data;
     const now = performance.now();
-    if (m.type === 'boot-start') {
+    if (m.type === 'restore-start' || m.type === 'restore-progress') {
+      onRestore(scr, { loaded: m.loaded || 0, total: m.total });
+      render();
+    } else if (m.type === 'restore-loaded') {
+      window.xb.restore = { ...window.xb.restore, state: 'loaded', loadedWall: m.wall, loadMs: m.loadMs, bytes: m.bytes };
+      appendLog(`snapshot: ${fmtBytes(m.bytes)} in ${(m.loadMs / 1000).toFixed(2)} s`);
+      setBootStatus('running');
+    } else if (m.type === 'restore-refused') {
+      // The snapshot is another build's or another tree's: boot instead (this page load does not try it again).
+      appendLog(`snapshot not used: ${m.text}; booting`);
+      snapshotRefused = m.text;
+      worker.onmessage = null;
+      stopBoot('snapshot refused');
+      setTimeout(() => $('boot').click(), 0);
+    } else if (m.type === 'boot-start') {
       // The machine status stays 'loading' (Stop depends on it); only the display text changes.
       $('bstatus').textContent = `loading ${m.files} entries`;
     } else if (m.type === 'download') {
@@ -325,6 +355,12 @@ $('boot').addEventListener('click', async () => {
       setBootStatus('running');
     } else if (m.type === 'bootline') {
       appendLog(m.text);
+      // Activity starts (a tap that opens an app, tools/snapshot-web.mjs) and the engine's snapshot lines, kept apart from
+      // the log panel, which keeps only its last lines.
+      if (params.has('keeplog')) (window.xb.all = window.xb.all || []).push(m.text); // the whole log (?keeplog, tests)
+      if (/ActivityTaskManager\(\d+\): START u0 |^xiaoji: (snapshot|restore|gl\(webgl\): snapshot)/.test(m.text)) {
+        (window.xb.notes = window.xb.notes || []).push(m.text);
+      }
       if (m.text.startsWith('xiaoji: Starting phase 100')) window.xb.statsAt = m.text; // ?statsat (A/B runs)
       if (RESTART.test(m.text)) {
         onRestart(scr);
@@ -368,6 +404,7 @@ $('boot').addEventListener('click', async () => {
       if (!$('phone').dataset.frame) {
         // The first frame: the boot animation's outro (W3) fades the boot screen into the picture.
         $('phone').dataset.frame = '1';
+        if (window.xb.restore && window.xb.restore.state === 'loaded') window.xb.restore.firstFrameWall = now - bootT0;
         onFrame(scr, now);
         render();
       }
@@ -391,8 +428,9 @@ $('boot').addEventListener('click', async () => {
     lazy: params.get('lazy') !== '0', lazyWindow: params.get('lazywin'), statsAt: params.has('statsat'),
     early: params.get('early'), gl: glBackend, frameSab, debugFaults: params.get('debug') === '1', dumpAt: params.get('dumpat'),
     timeoutS: params.get('timeout'),
+    snapshot: snapParam, snap, snapAfter: params.get('snapafter'),
   });
-  if (mode === 'pack') {
+  if (mode === 'pack' && !snap) {
     // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).
     if (self.crossOriginIsolated) {
       const packer = new Worker(new URL('./packloader.js', location.href), { type: 'module' });

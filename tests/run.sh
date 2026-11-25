@@ -213,6 +213,53 @@ check_icount() {
     fi
 }
 
+# Snapshots (docs/snapshot.md, S2): the case runs with --snapshot-at time:0.3 (it writes a snapshot and stops), then
+# with --restore, which goes on from there; the two outputs, one after the other, must be the oracle's, with its exit
+# code. The restore runs with two extra host descriptors open (7 and 8), so the engine's own descriptors must be put
+# back at their numbers, not found free by luck. Then the chain: the restored run takes a second snapshot 0.1 s on,
+# and a third run restores that one. A host where the engine cannot run with a fixed layout (ASLR off) skips them.
+run_engine() {
+    if [ "$1" = engine ]; then
+        shift
+        "$ENGINE" "$@"
+    else
+        shift
+        node "$NODE_JS" "$@"
+    fi
+}
+
+check_snapshot() {
+    local runner=$1 name=$2 bin=$3
+    local tag="$name snapshot $runner" base="$OUT/$name.snap.$runner"
+    local expect_rc
+    expect_rc=$(cat "$ORACLE/$name.rc")
+    rm -f "$base".a "$base".b
+    run_engine "$runner" --snapshot-at time:0.3 --snapshot-out "$base.a" "$bin" >"$base.1" 2>"$base.1.err"
+    local rc1=$?
+    if grep -q "cannot run with a fixed layout" "$base.1.err"; then
+        echo "note: $tag skipped (no fixed layout on this host)"
+        return 0
+    fi
+    run_engine "$runner" --restore "$base.a" >"$base.2" 2>"$base.2.err" 7<Makefile 8</dev/null
+    local rc2=$?
+    run_engine "$runner" --restore "$base.a" --snapshot-at time:0.1 --snapshot-out "$base.b" >"$base.3" 2>"$base.3.err"
+    local rc3=$?
+    run_engine "$runner" --restore "$base.b" >"$base.4" 2>"$base.4.err"
+    local rc4=$?
+    if [ "$rc1" = 0 ] && [ "$rc2" = "$expect_rc" ] && cat "$base.1" "$base.2" | cmp -s - "$ORACLE/$name.out"; then
+        echo "PASS  $tag"
+    else
+        echo "FAIL  $tag (snapshot exit $rc1, restore exit $rc2; stderr: $(tail -n 1 "$base.2.err"))"
+        cat "$base.1" "$base.2" | diff "$ORACLE/$name.out" - | head -n 6 | sed 's/^/        /'
+    fi
+    if [ "$rc3" = 0 ] && [ "$rc4" = "$expect_rc" ] && cat "$base.1" "$base.3" "$base.4" | cmp -s - "$ORACLE/$name.out"; then
+        echo "PASS  $tag chained"
+    else
+        echo "FAIL  $tag chained (exits $rc3, $rc4; stderr: $(tail -n 1 "$base.4.err"))"
+    fi
+    rm -f "$base".a "$base".b
+}
+
 run_case() {
     local name=$1 stretch=$2
     local bin="build/tests/guest/$name" args
@@ -236,6 +283,12 @@ run_case() {
         jitstress | jitthreads | control | arith | memory | signals | simd) check_icount "$name" "$bin" "$args" ;;
         esac
     fi
+    case "${name%-O?}" in
+    snapwait)
+        check_snapshot engine "$name" "$bin"
+        [ -f "$NODE_JS" ] && check_snapshot node "$name" "$bin"
+        ;;
+    esac
 }
 
 # One job: the guest units with the given indices (UNIT_NAME, UNIT_STRETCH), in order. Each unit's
@@ -464,6 +517,48 @@ root_lane() {
                 diff tests/expect/init-smoke.out "$OUT/init-smoke.$runner.out" | head -n 6 | sed 's/^/        /'
             fi
         done
+    fi
+
+    # Snapshots under --root (docs/snapshot.md, S2). binder: the binder-sm case with a snapshot while servicemanager
+    # waits in its binder read and the shell sleeps; the restored run's client lists the services. init: the same under
+    # the built-in init (tests/init/snapshot.rc), restored into init's own loop. Each output must be the uninterrupted
+    # run's (binder-sm.out, init-smoke.out). The writable trees of the root are part of the snapshot and are put back
+    # by the restore.
+    if [ -d build/rootfs/system/bin ]; then
+        local SNAP_SH="/system/bin/servicemanager & $SM_WAIT; /system/bin/setprop debug.xiaoji.snap 1; /system/bin/toybox sleep 1; /system/bin/service list; /system/bin/service check manager; kill \$!; wait; exit 0"
+        local snap="$OUT/snap-root.snap" what expect
+        for runner in engine node; do
+            [ "$runner" = node ] && [ ! -f "$NODE_JS" ] && continue
+            for what in binder init; do
+                rm -f "$snap"
+                if [ "$what" = binder ]; then
+                    run_engine "$runner" --snapshot-at prop:debug.xiaoji.snap=1 --snapshot-after 0.3 --snapshot-out "$snap" \
+                        --root "$RFS" "${GUEST_ENV_ARGS[@]}" -- /system/bin/sh -c "$SNAP_SH" \
+                        >"$OUT/snap-$what.$runner.1" 2>"$OUT/snap-$what.$runner.1.err"
+                    expect=tests/expect/binder-sm.out
+                else
+                    run_engine "$runner" --snapshot-at prop:debug.xiaoji.snap=1 --snapshot-after 0.3 --snapshot-out "$snap" \
+                        --init tests/init/snapshot.rc --root "$RFS" --init-timeout 60 --init-stdio host \
+                        >"$OUT/snap-$what.$runner.1" 2>"$OUT/snap-$what.$runner.1.err"
+                    expect=tests/expect/init-smoke.out
+                fi
+                rc=$?
+                if grep -q "cannot run with a fixed layout" "$OUT/snap-$what.$runner.1.err"; then
+                    echo "note: snapshot-$what $runner skipped (no fixed layout on this host)"
+                    continue
+                fi
+                run_engine "$runner" --restore "$snap" --init-timeout 60 >"$OUT/snap-$what.$runner.2" \
+                    2>"$OUT/snap-$what.$runner.2.err" 7<Makefile 8</dev/null
+                local rc2=$?
+                if [ "$rc" = 0 ] && [ "$rc2" = 0 ] && cat "$OUT/snap-$what.$runner.1" "$OUT/snap-$what.$runner.2" | cmp -s - "$expect"; then
+                    echo "PASS  snapshot-$what $runner"
+                else
+                    echo "FAIL  snapshot-$what $runner (exits $rc, $rc2; stderr: $(tail -n 1 "$OUT/snap-$what.$runner.2.err"))"
+                    cat "$OUT/snap-$what.$runner.1" "$OUT/snap-$what.$runner.2" | diff "$expect" - | head -n 6 | sed 's/^/        /'
+                fi
+            done
+        done
+        rm -f "$snap"
     fi
 
     # Init classpaths (B4a): the four classpath variables init derives from the classpath fragments

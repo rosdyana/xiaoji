@@ -8,6 +8,7 @@
 
 #include "host.h"
 #include "logd.h"
+#include "snap.h"
 #include "proc.h"
 #include "sched.h"
 
@@ -104,11 +105,27 @@ static void *logd_connect(void)
     return calloc(1, 1);
 }
 
+/* The snapshot trigger (snap.c, --snapshot-at log:TEXT) sees every text message, printed or not. */
+static void note_datagram(const uint8_t *buf, size_t n)
+{
+    if (n < LOGD_HDR_LEN + 1 || !text_id(buf[0]))
+        return;
+    size_t tag_end = find_nul(buf, LOGD_HDR_LEN + 1, n);
+    size_t msg_start = tag_end < n ? tag_end + 1 : n;
+    size_t msg_end = find_nul(buf, msg_start, n);
+    char msg[1024];
+    size_t len = msg_end - msg_start < sizeof msg - 1 ? msg_end - msg_start : sizeof msg - 1;
+    memcpy(msg, buf + msg_start, len);
+    msg[len] = 0;
+    snap_note_log(msg);
+}
+
 static int64_t logd_write(void *conn, const uint8_t *buf, size_t n)
 {
     (void)conn;
     if (print_on)
         print_datagram(buf, n);
+    note_datagram(buf, n);
     return (int64_t)n;
 }
 

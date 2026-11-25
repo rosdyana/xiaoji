@@ -25,10 +25,12 @@
 #include "linux.h"
 #include "vfs.h"
 
-typedef struct {
+typedef struct tmpfs {
     int refs;
     char dir[VFS_PATH_MAX];
+    struct tmpfs *next, *prev; /* every live tmpfs (snapshots: mntns_tmpfs_dir) */
 } tmpfs_t;
+static tmpfs_t *all_tfs;
 
 typedef struct {
     int id, parent;
@@ -79,6 +81,12 @@ static void tfs_unref(tmpfs_t *t)
     if (!t || --t->refs > 0)
         return;
     rm_tree(t->dir);
+    if (t->prev)
+        t->prev->next = t->next;
+    else
+        all_tfs = t->next;
+    if (t->next)
+        t->next->prev = t->prev;
     free(t);
 }
 
@@ -89,6 +97,14 @@ static void free_mounts(mntns_t *ns)
     free(ns->m);
     ns->m = NULL;
     ns->n = ns->cap = 0;
+}
+
+const char *mntns_tmpfs_dir(int i)
+{
+    for (tmpfs_t *t = all_tfs; t; t = t->next)
+        if (i-- == 0)
+            return t->dir;
+    return NULL;
 }
 
 mntns_t *mntns_new(void)
@@ -370,6 +386,10 @@ int64_t mntns_mount(mntns_t *ns, const char *src, const char *tgt, const char *f
             free(t);
             return rc;
         }
+        t->next = all_tfs;
+        if (all_tfs)
+            all_tfs->prev = t;
+        all_tfs = t;
         int parent = parent_of(ns, tr.guest);
         mnt_t *m = add_mount(ns);
         if (!m) {

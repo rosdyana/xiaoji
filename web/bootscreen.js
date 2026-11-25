@@ -76,6 +76,14 @@ export function onMilestone(s, id, line, now) {
   if (k > s.stage) enter(s, k, now);
 }
 
+// A booted snapshot is restored instead of a boot (docs/snapshot.md): the 'restore' phase, with the snapshot's download
+// as its progress; it lasts until the first frame (onFrame).
+export function onRestore(s, p) {
+  if (s.phase !== 'download' && s.phase !== 'restore') return;
+  s.phase = 'restore';
+  s.dl = { loaded: p.loaded || 0, total: p.total || 0, fromCache: false, cacheable: false };
+}
+
 // The framework exited and init restarts it: the screen says Android stopped, and it stays so.
 export function onRestart(s) {
   if (s.phase === 'boot') s.restarted = true;
@@ -144,6 +152,13 @@ export function render(s, now) {
       detail = `${mb(d.loaded)} of ${mb(d.total)} MB` + (d.cacheable ? ' · cached next time' : '');
     }
     count = `${Math.floor(pct)}%`;
+  } else if (s.phase === 'restore') {
+    const d = s.dl;
+    raw = d.total ? Math.min(100, (d.loaded / d.total) * 100) : 0;
+    steps[0] = 'now';
+    label = 'Restoring Android';
+    detail = d.total && d.loaded < d.total ? `${mb(d.loaded)} of ${mb(d.total)} MB` : 'Starting from the home screen';
+    count = `${Math.floor(raw)}%`;
   } else if (s.phase === 'boot') {
     if (s.stage >= 0) {
       raw = bootFill(s, now);

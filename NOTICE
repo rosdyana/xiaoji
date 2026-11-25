@@ -8,5 +8,9 @@ This product includes protocol specification files from gfxstream
 Copyright The Android Open Source Project, licensed under the Apache License,
 Version 2.0. See third_party/gfxstream/README.md and third_party/gfxstream/LICENSE.
 
+This product includes dlmalloc 2.8.6 by Doug Lea (public domain, CC0), in the copy
+shipped by Emscripten (MIT / University of Illinois/NCSA licenses for its changes).
+See third_party/dlmalloc/README.md.
+
 Android system images and other guest software are not part of this repository;
 the tools download or build them separately under their own licenses.

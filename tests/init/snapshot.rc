@@ -1,0 +1,16 @@
+# The init snapshot test (docs/snapshot.md, S2): run with --init and --root build/rootfs, and --snapshot-at
+# prop:debug.xiaoji.snap=1. servicemanager is the context manager. The oneshot waits until it answers, sets the property
+# (the snapshot is taken 0.3 s later, inside the sleep, and the engine stops), then, in the restored run, lists the
+# services through binder and stops init through xiaoji.exit. Stdout must be the uninterrupted run's
+# (tests/expect/init-smoke.out).
+export ANDROID_ROOT /system
+export ANDROID_DATA /data
+export ANDROID_ART_ROOT /apex/com.android.art
+
+service servicemanager /system/bin/servicemanager
+    user system
+    group system readproc
+    critical
+
+service snap /system/bin/sh -c "i=0; until /system/bin/service check manager | /system/bin/toybox grep -q found; do i=$((i+1)); [ $i -gt 100 ] && break; /system/bin/toybox sleep 0.1; done; /system/bin/setprop debug.xiaoji.snap 1; /system/bin/toybox sleep 1; /system/bin/service list; /system/bin/setprop xiaoji.exit 1"
+    oneshot

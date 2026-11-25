@@ -28,4 +28,12 @@ void init_ctl_request(const char *action, size_t alen, const char *svc, size_t s
 /* Any property set (name, value). xiaoji.exit stops init. */
 void init_prop_changed(const char *name, size_t nlen, const char *value, size_t vlen);
 
+/* After a restore (snap.c): enters the scheduler loop again in init mode, with the timeout (seconds, 0: none) counted
+ * from now. Returns as init_main does. */
+int init_resume(uint64_t timeout_s);
+
+/* After a restore (snap.c): makes the rc's directories and links again where they are missing (a restored page's tree is
+ * the manifest's, without the ones init made at boot); its mounts are in the image. */
+void init_snap_replay(void);
+
 #endif

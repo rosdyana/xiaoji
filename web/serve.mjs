@@ -14,6 +14,9 @@
 //   /xj/<path>              build/web/xj/<path>: the chunk store (tools/pack.py, docs/loading.md). The chunks
 //                           and packs are named by their hash, so they are served as immutable.
 //   /<name>                 web/<name>, else build/wasm/<name>
+//   POST /__snap/<name>?off=N[&truncate=1]
+//                           only with --snapshot-upload DIR (make snapshot): the web engine's snapshot (engine/snap.c,
+//                           ?snapshot=make), written into DIR/<name> at offset N, part by part
 //
 // COOP and COEP headers (cross-origin isolation) are on by default: the boot's pack downloader shares its buffer
 // with the engine's worker through SharedArrayBuffer (docs/loading.md, L2). --no-coop turns them off; without
@@ -22,7 +25,7 @@
 
 import { createServer } from 'node:http';
 import { createReadStream } from 'node:fs';
-import { stat, realpath } from 'node:fs/promises';
+import { mkdir, open, stat, realpath } from 'node:fs/promises';
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -130,7 +133,25 @@ async function pipeThrottled(src, res, bucket) {
   res.end();
 }
 
-export function createHandler({ coop = true, log = () => {}, throttle = null } = {}) {
+// The snapshot upload (docs/snapshot.md): the body goes to dir/name at the offset. Names are plain file names.
+async function snapUpload(req, res, url, dir, common) {
+  const name = url.pathname.slice('/__snap/'.length);
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) return send(res, 400, common, 'bad name\n');
+  const off = Number(url.searchParams.get('off') || 0);
+  const parts = [];
+  for await (const c of req) parts.push(c);
+  const body = Buffer.concat(parts);
+  await mkdir(dir, { recursive: true });
+  const fh = await open(join(dir, name), url.searchParams.get('truncate') ? 'w' : 'r+');
+  try {
+    if (body.length) await fh.write(body, 0, body.length, off);
+  } finally {
+    await fh.close();
+  }
+  return send(res, 200, common, 'ok\n');
+}
+
+export function createHandler({ coop = true, log = () => {}, throttle = null, snapshotUpload = null } = {}) {
   const limited = throttle && (throttle.mbps > 0 || throttle.rttMs > 0);
   const bucket = { free: 0, bytesPerMs: throttle && throttle.mbps > 0 ? throttle.mbps * 125 : Infinity };
   return async (req, res) => {
@@ -143,6 +164,9 @@ export function createHandler({ coop = true, log = () => {}, throttle = null } =
     if (coop) {
       common['Cross-Origin-Opener-Policy'] = 'same-origin';
       common['Cross-Origin-Embedder-Policy'] = 'require-corp';
+    }
+    if (snapshotUpload && req.method === 'POST' && url.pathname.startsWith('/__snap/')) {
+      return snapUpload(req, res, url, snapshotUpload, common);
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return send(res, 405, { ...common, Allow: 'GET, HEAD' }, 'method not allowed\n');
@@ -192,8 +216,8 @@ export function createHandler({ coop = true, log = () => {}, throttle = null } =
 }
 
 // Starts the server and resolves to { server, port, url, close() }. Port 0 picks a free port.
-export function startServer({ port = 8080, host = '127.0.0.1', coop = true, log, throttle = null } = {}) {
-  const handler = createHandler({ coop, log, throttle });
+export function startServer({ port = 8080, host = '127.0.0.1', coop = true, log, throttle = null, snapshotUpload = null } = {}) {
+  const handler = createHandler({ coop, log, throttle, snapshotUpload });
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
       if (!res.headersSent) send(res, 500, { 'Cache-Control': 'no-store' }, 'server error\n');
@@ -222,6 +246,7 @@ function parseArgs(argv) {
     if (a === '--port') opts.port = Number(argv[++i]);
     else if (a === '--host') opts.host = argv[++i];
     else if (a === '--no-coop') opts.coop = false;
+    else if (a === '--snapshot-upload') opts.snapshotUpload = resolve(argv[++i]);
     else throw new Error(`unknown argument: ${a}`);
   }
   return opts;

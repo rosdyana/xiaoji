@@ -28,6 +28,8 @@
 typedef struct mm mm_t;
 mm_t *mem_mm_new(void);
 void mem_mm_switch(mm_t *m);
+/* Empties the TLBs and the fetch cache (a restore: they belong to the run that wrote the image). */
+void mem_tlb_reset(void);
 /* A new address space for fork: the private pages of m become copy-on-write in both. */
 mm_t *mem_mm_fork(mm_t *m);
 /* The resident set of m in KiB (getrusage's maxrss). */
@@ -39,6 +41,21 @@ void mem_mm_unref(mm_t *m);
 jmp_buf *mem_set_fault_jmp(jmp_buf *jb);
 void mem_fault_info(uint64_t *addr, int *code);
 uint64_t mem_cur_pc(void);
+
+/* The host page pool (mem.c): every host page of guest memory and of memfds (4 KiB, aligned, not zeroed). */
+uint8_t *mem_page_alloc(void);
+void mem_page_free(uint8_t *p);
+/* The pool's pages (in slabs) and how many of them are free. */
+void mem_pool_counts(uint64_t *pages, uint64_t *free_pages);
+/* Snapshot (snap.c): zeroes every free page, so the image carries none of their old bytes. */
+void mem_pool_zero_free(void);
+/* Snapshot: drops the pages of private file mappings that still hold the file's bytes (they are read again on their
+ * next touch), and counts them (*clean) and the file pages that differ from the file (*dirty). */
+void mem_snap_drop_clean(uint64_t *clean, uint64_t *dirty);
+/* The census: the pool's pages that are not all zero. */
+uint64_t mem_pool_nonzero(void);
+/* 1 if p is in one of the pool's slabs (a guest or memfd page, used or free). */
+int mem_pool_contains(const void *p);
 
 /* Mapping. Addresses and lengths must be page aligned. Pages that are already
  * mapped keep their contents and get the new protection. Return 0 or -1. */

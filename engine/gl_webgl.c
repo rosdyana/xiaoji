@@ -149,6 +149,12 @@ static GLuint scratch_vbo[NATTR], scratch_ebo;
 static uint32_t next_handle = 1;
 static int ready = -1; /* -1: not tried; 0: failed; 1: ready */
 static uint32_t frames_posted, frames_dropped;
+static uint32_t last_post_cb; /* the color buffer rcFBPost posted last (a restore posts it again) */
+
+/* engine/gl_snap.js */
+extern void xj_gl_snap_install(void);
+extern uint8_t *xj_gl_snap_save(uint32_t *len);
+extern int xj_gl_snap_load(const uint8_t *blob, uint32_t len);
 
 /* ---------- logs ---------- */
 
@@ -1423,6 +1429,7 @@ static void rc_FBPost(void *ctx, uint32_t colorBuffer)
     cb_t *c = cb_find(colorBuffer);
     if (!c)
         return;
+    last_post_cb = colorBuffer;
     if (!xj_frame_slot_free()) {
         if (++frames_dropped % 300 == 0)
             fprintf(stderr, "xiaoji: gl(webgl): %u frames dropped (the page has not taken the last one)\n",
@@ -3823,6 +3830,40 @@ static gl_custom_backend_t custom_table;
 static gl_host_t host_table;
 static int table_ready;
 
+/* ---------- snapshots (docs/snapshot.md, engine/gl_snap.js) ---------- */
+
+static uint8_t *snap_blob;  /* the WebGL objects as gl_snap.js wrote them, kept in engine memory for the image */
+static uint32_t snap_blob_len;
+
+void gl_host_snap_save(void)
+{
+    if (ready != 1)
+        return;
+    free(snap_blob);
+    snap_blob_len = 0;
+    snap_blob = xj_gl_snap_save(&snap_blob_len);
+    fprintf(stderr, "xiaoji: gl(webgl): snapshot of the WebGL objects: %u bytes\n", (unsigned)snap_blob_len);
+}
+
+int gl_host_snap_resume(void)
+{
+    if (ready != 1 || !snap_blob)
+        return 0;
+    int ok = xj_gl_snap_load(snap_blob, snap_blob_len);
+    free(snap_blob);
+    snap_blob = NULL;
+    snap_blob_len = 0;
+    if (!ok) {
+        fprintf(stderr, "xiaoji: gl(webgl): restore: no WebGL2 context on the worker's canvas\n");
+        return -1;
+    }
+    applied = NULL; /* every context binds its state again on its next call */
+    /* The first frame: the screen as it was posted last (a quiet launcher posts nothing new by itself). */
+    if (last_post_cb)
+        rc_FBPost(NULL, last_post_cb);
+    return 1;
+}
+
 /* The web backend: the null backend's answers, with the calls above in place of their defaults. The gles1 calls
  * stay the null ones (the guest's GLES 1 is not used by the framework). */
 static int init_gl(void)
@@ -3834,6 +3875,7 @@ static int init_gl(void)
         fprintf(stderr, "xiaoji: gl(webgl): no WebGL2 context on the worker's canvas; the null backend answers\n");
         return 0;
     }
+    xj_gl_snap_install();
     glViewport(0, 0, XJ_DISPLAY_W, XJ_DISPLAY_H);
     glScissor(0, 0, XJ_DISPLAY_W, XJ_DISPLAY_H);
     dflt = NULL;
@@ -4066,5 +4108,8 @@ const gl_host_t *gl_host_webgl(void)
 {
     return NULL;
 }
+
+void gl_host_snap_save(void) {}
+int gl_host_snap_resume(void) { return 0; }
 
 #endif

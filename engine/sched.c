@@ -28,6 +28,7 @@
 #include "proc.h"
 #include "timers.h"
 #include "signals.h"
+#include "snap.h"
 
 /* The thread table starts with this many slots and doubles as threads are made (Linux has no fixed cap:
  * the limits are RLIMIT_NPROC per uid and the host memory). */
@@ -444,6 +445,8 @@ static int wait_for_timers(void)
     }
     if (!any)
         return 0;
+    if (snap_deadline(&tdl) && tdl < earliest) /* a snapshot due earlier: the loop takes it at its top */
+        earliest = tdl;
     uint64_t now = host_monotonic_ns();
     if (earliest > now) {
         if (prof_on)
@@ -506,6 +509,8 @@ static void on_dump_signal(int s)
     dump_req = 1;
 }
 #endif
+
+void sched_dump_clear(void) { memset(dump_at_ns, 0, sizeof dump_at_ns); }
 
 void sched_dump_at(uint64_t seconds)
 {
@@ -622,6 +627,8 @@ static void idle_wait(uint64_t (*deadline)(void))
     uint64_t tdl;
     if (timers_next(&tdl) && (!dl || tdl < dl))
         dl = tdl;
+    if (snap_deadline(&tdl) && (!dl || tdl < dl))
+        dl = tdl;
     if (dl && dl <= now)
         return;
     uint64_t wait = IDLE_POLL_NS;
@@ -634,12 +641,24 @@ static void idle_wait(uint64_t (*deadline)(void))
  * (main_cpu NULL) the initial process has no thread: tick runs between slices and whenever
  * nothing is runnable, and deadline gives the host time of init's next timer that can wake a
  * thread (0 for none). The deadlock check reads it: a timer that only stops the run does not count. */
-static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(void))
+/* The loop's hooks, kept for sched_resume (a restored image enters the loop again with them; snap.c). */
+static void (*loop_tick)(void);
+static uint64_t (*loop_deadline)(void);
+
+static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(void), int resume)
 {
     /* Init mode only: idle_since is the start of the current idle streak. A thread that
      * runs ends the streak, so only continuous idleness counts (see the idle branch below). */
     uint64_t idle_since = 0;
     int idle_reported = 0, idle_long_reported = 0;
+    loop_tick = tick;
+    loop_deadline = deadline;
+#ifndef __EMSCRIPTEN__
+    if (sig_debug_faults())
+        signal(SIGUSR1, on_dump_signal);
+#endif
+    if (resume)
+        goto loop; /* a restored image: the threads, the current slot and the initial process are in it */
     if (main_cpu) {
         thread_t *m = add_thread(main_cpu, TID_MAIN, proc_cur());
         if (!m) {
@@ -653,12 +672,11 @@ static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(vo
     cur_slot = 0;
     init_proc = proc_cur();
     init_proc->exited = 0;
-#ifndef __EMSCRIPTEN__
-    if (sig_debug_faults())
-        signal(SIGUSR1, on_dump_signal);
-#endif
 
+loop:
     while (!init_proc->exited) {
+        /* The snapshot point (snap.c): a slice boundary, where every thread is runnable or in a wait the image holds. */
+        snap_point();
         for (int i = 0; i < 8; i++)
             if (dump_at_ns[i] && host_monotonic_ns() >= dump_at_ns[i]) {
                 dump_at_ns[i] = 0;
@@ -749,12 +767,39 @@ static int run_loop(cpu_t *main_cpu, void (*tick)(void), uint64_t (*deadline)(vo
 
 int sched_run(cpu_t *main_cpu)
 {
-    return run_loop(main_cpu, NULL, NULL);
+    return run_loop(main_cpu, NULL, NULL, 0);
 }
 
 int sched_run_init(void (*tick)(void), uint64_t (*deadline)(void))
 {
-    return run_loop(NULL, tick, deadline);
+    return run_loop(NULL, tick, deadline, 0);
+}
+
+int sched_resume(void)
+{
+    /* The image's TLBs and translation caches belong to the run that wrote it: start them empty. */
+    proc_switch_force(proc_cur());
+    return run_loop(NULL, loop_tick, loop_deadline, 1);
+}
+
+int sched_is_init_mode(void) { return loop_tick != NULL; }
+
+void sched_census(uint64_t counts[7], uint64_t *procs)
+{
+    for (int k = 0; k < 7; k++)
+        counts[k] = 0;
+    *procs = 0;
+    for (int i = 0; i < nslots; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->cpu.exited)
+            continue;
+        counts[t->state]++;
+        int first = 1;
+        for (int j = 0; j < i; j++)
+            if (threads[j] && !threads[j]->cpu.exited && threads[j]->proc == t->proc)
+                first = 0;
+        *procs += (uint64_t)first;
+    }
 }
 
 proc_t *sched_proc_new_child(void)
