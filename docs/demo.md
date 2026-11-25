@@ -516,3 +516,18 @@ In order of what a visitor would notice:
 | `tools/remote-test.sh` | the open-file limit is raised to the hard limit for the run: with the build machine's 1,024 the product boot's PackageManager failed to open APKs and system_server died |
 | `tests/input/settings.script` | the tap moved to Settings' new place (340, 201); not run natively in this round (no native snapshot of the new tree) |
 
+
+### P1 on AC power (final engine and snapshot)
+
+AC power, Low Power Mode off, 4.6–5.8 GB swap in use; headless Chromium (SwiftShader), localhost. After (P1) runs alternated
+with before (L1 snapshot and engine, `prehot=0&inflaters=0&prefetch=0`); `build/p1/ac-final.sh`, log `build/p1/ac-final.log`.
+
+| | before (2 runs) | after (3 runs) |
+|---|---|---|
+| press to first frame | 4.6–5.9 s | 2.8–4.2 s |
+| drawer settled | 1.4–2.1 s | 0.8–1.2 s |
+| first Settings start settled | 9.9–13.4 s | **1.7–2.0 s** |
+| home settled | 2.2–3.8 s | 2.3–2.4 s |
+| idle engine busy | 9–19 % | 13–17 % |
+
+The media provider still logs an ANR in two runs (`android.process.media`, a background process: no dialog is shown).
