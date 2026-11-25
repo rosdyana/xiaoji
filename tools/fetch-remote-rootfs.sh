@@ -22,6 +22,15 @@ done
 
 echo "== /apex/<name> from the flattened /system/apex"
 mkdir -p "$DEST/apex"
+# An APEX the product no longer has (com.android.cellbroadcast, docs/demo.md) would stay in /apex and in the list.
+# Links (init's /apex/com.android.vndk.v33, image/xiaoji.rc) are not APEX copies and stay.
+for d in "$DEST"/apex/*/; do
+    n=$(basename "$d")
+    if [ ! -L "$DEST/apex/$n" ] && [ ! -d "$DEST/system/apex/$n" ]; then
+        echo "   removing /apex/$n (not in /system/apex)"
+        rm -rf "${DEST:?}/apex/$n"
+    fi
+done
 for d in "$DEST"/system/apex/*/; do
     n=$(basename "$d")
     rsync -a --delete "$d" "$DEST/apex/$n/"

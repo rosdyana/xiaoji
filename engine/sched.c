@@ -69,6 +69,7 @@ typedef struct thread {
     char comm[16];
     int policy, prio;    /* scheduling policy and priority (sched_policy_get/set) */
     proc_t *proc; /* the process this thread belongs to */
+    uint64_t load_icount; /* its instructions at the last --load-every report */
 } thread_t;
 
 /* sched_wait_kind and sched_wake take a cpu_t pointer and cast it to thread_t. */
@@ -81,6 +82,8 @@ static proc_t *init_proc;     /* the initial process: its exit ends the engine *
 static uint64_t next_tid = TID_FIRST_NEW; /* tids and pids share one number space */
 static uint64_t dead_icount;  /* instructions of threads already reaped */
 static char init_name[16] = "xiaoji";
+static uint64_t idle_ns; /* host time the loop slept with no thread to run (--load-every) */
+static uint64_t load_every_ns, load_next_ns, load_t0_ns, load_idle0_ns, load_icount0; /* --load-every */
 
 static thread_t *cur(void) { return cur_slot < nslots ? threads[cur_slot] : NULL; }
 
@@ -447,11 +450,14 @@ static int wait_for_timers(void)
         return 0;
     if (snap_deadline(&tdl) && tdl < earliest) /* a snapshot due earlier: the loop takes it at its top */
         earliest = tdl;
+    if (load_every_ns && load_next_ns < earliest) /* a --load-every report due earlier */
+        earliest = load_next_ns;
     uint64_t now = host_monotonic_ns();
     if (earliest > now) {
         if (prof_on)
             prof_idle(earliest - now);
         host_sleep_ns(earliest - now);
+        idle_ns += host_monotonic_ns() - now;
     }
     return 1;
 }
@@ -571,6 +577,104 @@ static void dump_threads(void)
     fprintf(stderr, "xiaoji: dump: end\n");
 }
 
+/* --load-every (docs/demo.md): the guest's load per interval of host time. The engine is one host thread, so "busy"
+ * is the share of the interval it did not spend in the loop's idle sleeps, and the instructions are those of every
+ * guest thread. The top processes and threads are by their own instructions in the interval (a thread or process that
+ * ended during it is missed; its instructions are in the total). */
+#define LOAD_TOP 6
+typedef struct {
+    uint64_t n;
+    int pid;
+    const char *name;
+    const char *pname;
+} load_ent_t;
+
+static void load_top_add(load_ent_t *top, int *ntop, load_ent_t e)
+{
+    if (!e.n || (*ntop == LOAD_TOP && top[LOAD_TOP - 1].n >= e.n))
+        return;
+    int i = *ntop < LOAD_TOP ? (*ntop)++ : LOAD_TOP - 1; /* a full list drops its last entry */
+    while (i > 0 && top[i - 1].n < e.n) {
+        top[i] = top[i - 1];
+        i--;
+    }
+    top[i] = e;
+}
+
+/* A process's name: its main thread's (the thread whose tid is its pid), else any thread's, else the last ended one's. */
+static const char *load_proc_name(const proc_t *p)
+{
+    const char *any = NULL;
+    for (int i = 0; i < nslots; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->proc != p)
+            continue;
+        if ((int)t->cpu.tid == p->pid)
+            return t->comm;
+        if (!any)
+            any = t->comm;
+    }
+    return any ? any : p->dbg_comm;
+}
+
+static void load_report(uint64_t now)
+{
+    uint64_t wall = now - load_t0_ns, idle = idle_ns - load_idle0_ns, insn = sched_icount() - load_icount0;
+    if (idle > wall)
+        idle = wall;
+    int nproc = 0, nthr = 0, nrun = 0, ntop = 0, nttop = 0;
+    load_ent_t top[LOAD_TOP], ttop[LOAD_TOP];
+    for (proc_t *p = proc_first(); p; p = proc_next(p)) {
+        if (p->exited || p->zombie)
+            continue;
+        nproc++;
+        uint64_t n = sched_icount_of(p);
+        load_top_add(top, &ntop, (load_ent_t){n >= p->load_icount ? n - p->load_icount : n, p->pid, load_proc_name(p), NULL});
+        p->load_icount = n;
+    }
+    for (int i = 0; i < nslots; i++) {
+        thread_t *t = threads[i];
+        if (!t || t->cpu.exited)
+            continue;
+        nthr++;
+        nrun += t->state == TS_RUNNABLE;
+        uint64_t n = t->cpu.icount;
+        load_top_add(ttop, &nttop, (load_ent_t){n >= t->load_icount ? n - t->load_icount : n, t->proc->pid, t->comm,
+                                                load_proc_name(t->proc)});
+        t->load_icount = n;
+    }
+    double ms = (double)wall / 1e6, share = insn ? 100.0 / (double)insn : 0;
+    fprintf(stderr,
+            "xiaoji: load: %.0f ms, %.2f M insn (%.1f M/s), busy %.0f%%, %d processes, %d threads (%d runnable); top:",
+            ms, (double)insn / 1e6, wall ? (double)insn / ms / 1e3 : 0, wall ? 100.0 * (double)(wall - idle) / (double)wall : 0,
+            nproc, nthr, nrun);
+    for (int i = 0; i < ntop; i++)
+        fprintf(stderr, "%s %s/%d %.0f%%", i ? "," : "", top[i].name, top[i].pid, (double)top[i].n * share);
+    fprintf(stderr, "; threads:");
+    for (int i = 0; i < nttop; i++)
+        fprintf(stderr, "%s %s:%s %.0f%%", i ? "," : "", ttop[i].pname, ttop[i].name, (double)ttop[i].n * share);
+    fputc('\n', stderr);
+    load_t0_ns = now;
+    load_idle0_ns = idle_ns;
+    load_icount0 = sched_icount();
+}
+
+uint64_t sched_idle_ns(void) { return idle_ns; }
+
+void sched_load_every(uint64_t ms)
+{
+    load_every_ns = ms * 1000000ull;
+    load_t0_ns = host_monotonic_ns();
+    load_next_ns = load_t0_ns + load_every_ns;
+    load_idle0_ns = idle_ns;
+    load_icount0 = sched_icount();
+    for (proc_t *p = proc_first(); p; p = proc_next(p))
+        p->load_icount = sched_icount_of(p);
+    for (int i = 0; i < nslots; i++)
+        if (threads[i])
+            threads[i]->load_icount = threads[i]->cpu.icount;
+}
+
 static void report_deadlock(void)
 {
     fflush(stdout);
@@ -635,6 +739,7 @@ static void idle_wait(uint64_t (*deadline)(void))
     if (dl && dl - now < wait)
         wait = dl - now;
     host_sleep_ns(wait);
+    idle_ns += host_monotonic_ns() - now;
 }
 
 /* The scheduler loop. main_cpu starts the initial process's main thread. In init mode
@@ -685,6 +790,13 @@ loop:
         if (dump_req) {
             dump_req = 0;
             dump_threads();
+        }
+        if (load_every_ns) {
+            uint64_t now = host_monotonic_ns();
+            if (now >= load_next_ns) {
+                load_report(now);
+                load_next_ns = now + load_every_ns;
+            }
         }
         expire_timers(host_monotonic_ns());
         if (tick) {

@@ -2,6 +2,9 @@
 # The only change: ranchu gralloc (allocator@3.0-service, mapper@3.0-impl-ranchu) instead of minigbm,
 # because the engine has no DRM device (docs/graphics.md section 3.1, A2). PRODUCT_PACKAGES is additive
 # and this tree has no PRODUCT_PACKAGES_REMOVE, so the minigbm lines cannot be filtered out later.
+# The demo (docs/demo.md) also drops SdkSetup (the emulator's setup wizard: Provision provisions the device, and
+# SdkSetup only adds emulator settings such as auto-rotate), EmulatorRadioConfig (no telephony) and
+# MultiDisplayProvider (one display in a tab).
 
 #
 # Copyright (C) 2018 The Android Open Source Project
@@ -68,11 +71,8 @@ PRODUCT_PACKAGES += \
     libcodec2_goldfish_hevcdec \
     sh_vendor \
     local_time.default \
-    SdkSetup \
-    EmulatorRadioConfig \
     EmulatorConnectivityOverlay \
     EmulatorTetheringConfigOverlay \
-    MultiDisplayProvider \
     libGoldfishProfiler
 
 ifneq ($(EMULATOR_VENDOR_NO_FINGERPRINT), true)

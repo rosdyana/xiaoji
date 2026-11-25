@@ -87,7 +87,7 @@ static void print_stats(void)
  * replaced them with the snapshot's). 0, or -1. */
 static int apply_options(int stats, int logcat, int lazy_mmap, const char *lazy_window_arg, int debug_faults_arg,
                          const char *stats_at_arg, const char *dump_at_arg, const char *input_script, const char *snap_at,
-                         uint64_t snap_after, const char *snap_out)
+                         uint64_t snap_after, const char *snap_quiet, const char *snap_out, uint64_t load_every_ms)
 {
     const char *stats_env = getenv("XIAOJI_STATS");
     stats_on = stats || (stats_env && stats_env[0] == '1');
@@ -109,6 +109,7 @@ static int apply_options(int stats, int logcat, int lazy_mmap, const char *lazy_
     if (stats_at && !stats_at[0])
         stats_at = NULL;
     sched_dump_clear();
+    sched_load_every(load_every_ms);
     for (const char *t = dump_at_arg; t && *t;) { /* a comma-separated list of times */
         char *end;
         sched_dump_at(strtoull(t, &end, 10));
@@ -121,6 +122,10 @@ static int apply_options(int stats, int logcat, int lazy_mmap, const char *lazy_
     if (snap_at) {
         snap_set_trigger(snap_at);
         snap_set_after(snap_after);
+        if (snap_set_quiet(snap_quiet) < 0) {
+            fprintf(stderr, "xiaoji: --snapshot-quiet %s: expected PCT:WINDOW:MAX\n", snap_quiet);
+            return -1;
+        }
         snap_set_out(snap_out);
     }
     return 0;
@@ -139,11 +144,15 @@ static int usage(FILE *out)
           "  --no-lazy-mmap  fill file mappings at mmap time (as XIAOJI_LAZY=0); the default fills on first access\n"
           "  --debug-faults  report faults, process ends and binder refusals on stderr (as XIAOJI_DEBUG_FAULTS=1)\n"
           "  --dump-at S[,S]  dump every guest thread (pc, wait, frame chain) to stderr at these seconds (up to 8)\n"
+          "  --load-every MS  every MS milliseconds, the guest's load on stderr: instructions, the share of time not idle,\n"
+          "               processes and threads, the busiest ones (docs/demo.md)\n"
           "  --lazy-window BYTES  the lazy fill window, a power of two from 4096 to 1 MiB (as XIAOJI_LAZY_WINDOW)\n"
           "  --stats-at TEXT  print the instructions and lazy reads at the first log line containing TEXT (as XIAOJI_STATS_AT)\n"
           "  --snapshot-at COND  write a snapshot when COND holds, then stop: time:S, icount:N, log:TEXT (a guest log line\n"
           "               containing TEXT) or prop:NAME=VALUE (docs/snapshot.md); needs --snapshot-out\n"
           "  --snapshot-after S  wait S more seconds after COND holds\n"
+          "  --snapshot-quiet PCT:W:MAX  then wait for W seconds in which the engine was busy PCT% of the time or less,\n"
+          "               at most MAX seconds (docs/demo.md)\n"
           "  --snapshot-out FILE  the snapshot file\n"
           "  --restore FILE  go on from a snapshot (no program, no --init; --input-script times count from the restore)\n"
           "  --gl null|webgl  the GL backend for the guest's GLES calls (default null; webgl is the web build's, gl_webgl.c)\n"
@@ -164,8 +173,8 @@ int main(int argc, char **argv)
     const char *init_config = NULL;
     uint64_t init_timeout = 0;
     const char *dump_at_arg = NULL, *input_script = NULL;
-    const char *snap_at = NULL, *snap_out = NULL, *restore_path = NULL;
-    uint64_t snap_after = 0;
+    const char *snap_at = NULL, *snap_out = NULL, *restore_path = NULL, *snap_quiet = NULL;
+    uint64_t snap_after = 0, load_every_ms = 0;
     int i = 1;
 
     /* A snapshot (docs/snapshot.md) is taken or restored with the engine at fixed addresses: natively that is a run with
@@ -236,6 +245,12 @@ int main(int argc, char **argv)
             dump_at_arg = argv[++i]; /* applied after a restore, which would replace it */
             continue;
         }
+        if (!strcmp(a, "--load-every")) { /* docs/demo.md */
+            if (i + 1 >= argc)
+                return usage(stderr);
+            load_every_ms = strtoull(argv[++i], NULL, 10);
+            continue;
+        }
         if (!strcmp(a, "--debug-faults")) { /* as XIAOJI_DEBUG_FAULTS=1, for the page (?debug=1), which has no environment */
             debug_faults_arg = 1;
             continue;
@@ -256,6 +271,12 @@ int main(int argc, char **argv)
             if (i + 1 >= argc)
                 return usage(stderr);
             snap_after = strtoull(argv[++i], NULL, 10);
+            continue;
+        }
+        if (!strcmp(a, "--snapshot-quiet")) { /* docs/demo.md */
+            if (i + 1 >= argc)
+                return usage(stderr);
+            snap_quiet = argv[++i];
             continue;
         }
         if (!strcmp(a, "--snapshot-out")) {
@@ -329,7 +350,7 @@ int main(int argc, char **argv)
         g_root = NULL;
         stats_at_done = 0;
         if (apply_options(stats, logcat, lazy_mmap, lazy_window_arg, debug_faults_arg, stats_at_arg, dump_at_arg,
-                          input_script, snap_at, snap_after, snap_out) < 0)
+                          input_script, snap_at, snap_after, snap_quiet, snap_out, load_every_ms) < 0)
             return 2;
         return snap_resume(init_timeout);
     }
@@ -366,7 +387,7 @@ int main(int argc, char **argv)
     }
 
     if (apply_options(stats, logcat, lazy_mmap, lazy_window_arg, debug_faults_arg, stats_at_arg, dump_at_arg,
-                      input_script, snap_at, snap_after, snap_out) < 0)
+                      input_script, snap_at, snap_after, snap_quiet, snap_out, load_every_ms) < 0)
         return 2;
     snap_atexit(print_stats); /* it prints only with --stats (stats_on) */
     prof_init(g_root); // XIAOJI_PROFILE=1: per-thread counts and hot spots at exit

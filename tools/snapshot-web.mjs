@@ -2,8 +2,8 @@
 // The booted snapshot for the page (docs/snapshot.md, S3 and S4), in headless Chromium (Playwright, as tests/web.mjs).
 //
 //   node tools/snapshot-web.mjs make      boots the product tree in the page with ?snapshot=make: the web engine writes
-//                                         a snapshot at the home screen (the launcher's HOME start + 60 s, or
-//                                         XN_SNAP_AFTER seconds) to the dev server (build/snap/web.snap), then
+//                                         a snapshot at the home screen (the launcher's HOME start + 480 s and a quiet
+//                                         window, below) to the dev server (build/snap/web.snap), then
 //                                         tools/snappack.py packs it into the chunk store (build/web/xj/snapshot.json)
 //   node tools/snapshot-web.mjs fallback  the page boots instead when the snapshot is another build's, or missing
 //   node tools/snapshot-web.mjs restore   opens the page, which restores the snapshot, and checks it: the first frame
@@ -17,7 +17,8 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { startServer } from '../web/serve.mjs';
+import { DIRS, startServer } from '../web/serve.mjs';
+import { drawerLayout } from './ui-points.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PW = process.env.XN_PLAYWRIGHT ?? '/Users/rosdyanakusuma/Ross/projects/xiaonux/bench/node_modules/playwright-core/index.mjs';
@@ -36,24 +37,122 @@ async function launch(chromium) {
   return chromium.launch({ headless: true, ...(process.env.XN_CHROME ? { executablePath: process.env.XN_CHROME } : {}) });
 }
 
+// The demo apps a snapshot is pre-warmed with (docs/demo.md), in order: the drawer's icon (tools/ui-points.mjs) and the
+// component of its START line. Settings is last: it gets the longest warm time before the framework's cached-app freezer
+// (which the engine does not support) kills cached processes, about 10 guest minutes after they leave the screen.
+const PREWARM = [
+  { key: 'files', component: 'com.android.documentsui/' },
+  { key: 'calculator', component: 'com.android.calculator2/' },
+  { key: 'settings', component: 'com.android.settings/.Settings' },
+];
+const logHas = (page, re, from) => page.evaluate(([src, k]) => (window.xb.all || []).slice(k).some((l) => new RegExp(src).test(l)),
+  [re.source, from]);
+const logLen = (page) => page.evaluate(() => (window.xb.all || []).length);
+async function waitLog(page, re, from, ms) {
+  const t = Date.now();
+  while (Date.now() - t < ms) {
+    if (await logHas(page, re, from)) return true;
+    if (await page.evaluate(() => window.xb.status === 'done' || !!window.xb.error)) return false;
+    await page.waitForTimeout(2000);
+  }
+  return false;
+}
+const esc = (t) => t.replace(/[./[\]]/g, (c) => '\\' + c);
+// Each app: Home, a swipe up, the icon; its START line (else Home and again, up to three tries); then its Displayed
+// line or 60 s, a screenshot (build/web-shots/s1-prewarm-<app>.png), 10 s more, and the next. An app that does not
+// start fails the make. The last app's START line is the snapshot's condition (+ XN_SNAP_AFTER, default 120 s, and
+// the quiet window).
+async function prewarm(page, ui, apps) {
+  const delay = Number(process.env.XN_PREWARM_DELAY ?? 240) * 1000;
+  if (!(await waitLog(page, /START u0 .*HOME.*cmp=com\.android\.launcher3\//, 0, MAKE_TIMEOUT_MS))) {
+    throw new Error('pre-warm: the launcher never became home');
+  }
+  console.log(`    pre-warm: the launcher is home; ${delay / 1000} s, then ${apps.map((a) => a.key).join(', ')}`);
+  await page.waitForTimeout(delay);
+  const swipe = [];
+  for (let k = 0; k <= 14; k++) swipe.push([270, 860 - k * 45]);
+  mkdirSync(SHOTS, { recursive: true });
+  for (const app of apps) {
+    let started = false, tries = 0;
+    while (!started && tries < 3) {
+      tries++;
+      await page.click('#btn-home').catch(() => {});
+      await page.waitForTimeout(5000);
+      const k = await logLen(page);
+      await gesture(page, swipe, 20);
+      await page.waitForTimeout(15000);
+      await gesture(page, [ui[app.key], ui[app.key]], 80);
+      started = await waitLog(page, new RegExp(`START u0 .*cmp=${esc(app.component)}`), k, 40000);
+      if (started) {
+        const shown = await waitLog(page, new RegExp(`Displayed ${esc(app.component)}`), k, 60000);
+        await page.waitForTimeout(10000);
+        await page.locator('#phone').screenshot({ path: join(SHOTS, `s1-prewarm-${app.key}.png`) });
+        console.log(`    pre-warm: ${app.key} started (try ${tries})${shown ? ', displayed' : ''}`);
+      }
+    }
+    if (!started) throw new Error(`pre-warm: ${app.key} did not start in 3 tries`);
+  }
+  await page.click('#btn-home').catch(() => {});
+}
+
+// XN_XJ=DIR: another chunk store (a frozen tree, docs/demo.md): the page boots its tree, and its snapshot is packed there.
+if (process.env.XN_XJ) DIRS.xj = resolve(process.env.XN_XJ);
+
 async function make(chromium) {
   const out = join(ROOT, 'build', 'snap');
   const srv = await startServer({ port: 0, snapshotUpload: out });
   const browser = await launch(chromium);
   try {
     const page = await browser.newPage({ viewport: VIEW });
-    const after = Number(process.env.XN_SNAP_AFTER ?? 60);
-    await page.goto(srv.url + `?snapshot=make&snapafter=${after}&timeout=1700`, { waitUntil: 'load' });
+    // The snapshot point (docs/demo.md): the launcher's HOME start, 480 s more (the BOOT_COMPLETED receivers start
+    // their processes in that time, and the remote provisioner's, which waits for a network, ends in its ANR about
+    // 340 s after HOME), then the first 10 s in which the engine was busy 15% of the time or less (at most 360 s more).
+    // XN_SNAP_AFTER and XN_SNAP_QUIET change them (XN_SNAP_QUIET=off: no quiet wait).
+    const after = Number(process.env.XN_SNAP_AFTER ?? 480);
+    // The whole log goes to build/snap/web-make-full.log, with the engine's load report every 5 s (docs/demo.md: when
+    // the system is quiet after the launcher's start). XN_SNAP_QUERY adds page parameters (?prop=K=V for A/B runs).
+    // XN_SNAP_QUIET=PCT:WINDOW:MAX: then a quiet window (--snapshot-quiet, docs/demo.md).
+    const quietArg = process.env.XN_SNAP_QUIET ?? '15:10:360';
+    const quiet = quietArg !== 'off' ? `&snapquiet=${quietArg}` : '';
+    // Pre-warm (XN_SNAP_PREWARM=on, docs/demo.md; off by default): before the snapshot, each demo app is opened once
+    // from the drawer and left with Home, so the snapshot holds their processes, started and drawn. The condition
+    // becomes the last app's START line, + 120 s (its start, Home, then the quiet window); XN_PREWARM_DELAY is the wait
+    // after the launcher's HOME start before the first app (default 240 s, the BOOT_COMPLETED receivers' time). It is
+    // off because its snapshot (997 MiB of memory, 177 MB of WebGL objects: the apps' windows and task snapshots) did
+    // not restore in headless Chromium: the page closed before the first frame.
+    const ui = drawerLayout(DIRS.xj);
+    const apps = process.env.XN_SNAP_PREWARM !== 'on' ? [] : PREWARM.filter((a) => ui[a.key]);
+    // XN_SNAP_AT=log:TEXT: the condition (default: the launcher's HOME start, or the pre-warm's last app).
+    const atCond = process.env.XN_SNAP_AT || (apps.length ? `log:cmp=${apps[apps.length - 1].component}` : '');
+    const at = atCond ? `&snapat=${encodeURIComponent(atCond)}` : '';
+    const afterArg = apps.length && !process.env.XN_SNAP_AFTER ? 120 : after;
+    await page.goto(srv.url + `?snapshot=make&snapafter=${afterArg}&timeout=1700&keeplog=1&load=5000${quiet}${at}` +
+      (process.env.XN_SNAP_QUERY || ''), { waitUntil: 'load' });
     await page.click('#boot');
     const t0 = Date.now();
+    if (apps.length) {
+      await prewarm(page, ui, apps).catch((e) => {
+        console.log('    ' + String(e));
+        failures++;
+      });
+    }
+    if (failures) throw new Error('make: the pre-warm failed');
     await page.waitForFunction(() => window.xb.status === 'done' || window.xb.status === 'error' || window.xb.error, null,
       { timeout: MAKE_TIMEOUT_MS, polling: 1000 });
     const r = await page.evaluate(() => ({ done: window.xb.done, error: window.xb.error, ms: window.xb.milestones,
-      log: (window.xb.notes || []).filter((l) => /snapshot|HOME.*launcher3/.test(l)) }));
+      log: (window.xb.all || window.xb.notes || []).filter((l) => /^xiaoji: (snapshot|gl\(webgl\): snapshot)|HOME.*launcher3/.test(l)) }));
     console.log(`--- make: ${Math.round((Date.now() - t0) / 1000)} s, exit ${r.done ? r.done.exitCode : '-'}`);
     for (const l of r.log) console.log('    ' + (/gl\(webgl\)/.test(l) ? l : l.slice(0, 200)));
     if (r.error) console.log('    error: ' + r.error.split('\n')[0]);
+    const full = await page.evaluate(() => (window.xb.all || []).join('\n'));
+    writeFileSync(join(out, 'web-make-full.log'), full + '\n');
     check(r.done && r.done.exitCode === 0, 'make: the web engine wrote its snapshot and stopped (exit 0)');
+    // Health: the last system_server started SystemUI once (a crash loop, as in a trial tree, docs/demo.md, would be in
+    // the snapshot; a first boot can restart system_server once, which starts SystemUI again).
+    const ams = [...full.matchAll(/ActivityManager\((\d+)\): Start proc \d+:com\.android\.systemui\//g)].map((m) => m[1]);
+    const lastSs = ams.length ? ams[ams.length - 1] : null;
+    const sysui = ams.filter((p) => p === lastSs).length;
+    check(sysui === 1, `make: SystemUI started once by the last system_server (${sysui}; ${ams.length} in the boot)`);
   } finally {
     await browser.close();
     await srv.close();
@@ -61,8 +160,8 @@ async function make(chromium) {
   const snap = join(out, 'web.snap');
   if (!failures && existsSync(snap)) {
     console.log(`    build/snap/web.snap: ${(statSync(snap).size / 1048576).toFixed(1)} MiB`);
-    execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, join(ROOT, 'build', 'web', 'xj'),
-      '--tree', join(ROOT, 'build', 'web', 'xj', 'manifest-xiaoji-v2.json')], { stdio: 'inherit' });
+    execFileSync('python3', ['-I', join(ROOT, 'tools', 'snappack.py'), snap, DIRS.xj,
+      '--tree', join(DIRS.xj, 'manifest-xiaoji-v2.json')], { stdio: 'inherit' });
   }
 }
 
@@ -118,7 +217,7 @@ async function restore(chromium) {
     if (r1.error) console.log('    error: ' + r1.error.split('\n')[0]);
     check(rs.state === 'loaded', 'restore: the page restored the snapshot (not a boot)');
     check(r1.frames && r1.frames.frames > 0 && r1.frames.distinct > 1, `restore: the first frame after the restore is a picture (${r1.frames ? r1.frames.distinct : 0} colours)`);
-    // The launcher's all-apps drawer (a swipe up), then a tap on Settings (docs/boot.md, B18: bounds [141,131][270,311]).
+    // The launcher's all-apps drawer (a swipe up), then a tap on Settings (tools/ui-points.mjs).
     // Let the restored launcher settle, then: Home (it closes a menu that a slow first touch opened as a long press),
     // a swipe up, the drawer's 20 s to open, a tap on Settings. On a loaded machine the engine can be slow enough for a
     // swipe to read as a long press, so up to three tries.
@@ -133,7 +232,8 @@ async function restore(chromium) {
       await gesture(page, swipe, 20);
       await page.waitForTimeout(Number(process.env.XN_SNAP_TAP_WAIT_MS ?? 20000));
       await page.locator('#phone').screenshot({ path: join(SHOTS, 's1-restore-allapps.png') });
-      await gesture(page, [[205, 201], [205, 201]], 80);
+      const at = drawerLayout(DIRS.xj).settings; // Settings' place in the drawer depends on the tree's apps
+      await gesture(page, [at, at], 80);
       tTap = Date.now();
       started = await page.waitForFunction((re) => (window.xb.notes || []).some((l) => new RegExp(re).test(l)), SETTINGS.source,
         { timeout: 40000, polling: 500 }).then(() => true).catch(() => false);

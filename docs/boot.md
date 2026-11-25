@@ -4946,3 +4946,8 @@ Files (from `git status --short`): changed `Makefile`, `engine/bpf.c`, `engine/e
    Settings' search needs `com.android.settings.intelligence`, which the product does not include.
 4. **`/proc/cpuinfo`** is not served (libvintf warns; not part of the check).
 5. The B17 blockers not touched here remain (B16 `txn_build`, `IStoraged`, QC of the saturating narrows).
+
+## B19: the demo product
+
+The demo product (Calculator, the lean list of B16 applied, AOT for the demo apps, the snapshot taken when the phone is
+idle) and its measurements are in docs/demo.md.

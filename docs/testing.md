@@ -8,7 +8,8 @@ job limits, the rules that keep parallel cases apart, and the timings.
 
 ## Snapshots
 
-The snapshot cases (docs/snapshot.md, S2) are part of `tests/run.sh`: `snapwait-O0/O2 snapshot` and `... chained` with
+The snapshot cases (docs/snapshot.md, S2) are part of `tests/run.sh`: `snapwait-O0/O2 snapshot` and `... chained`,
+`snapwait-O0/O2 snapshot quiet` and `snapwait-O0/O2 load` (the quiet snapshot point and the load report, docs/demo.md) with
 each guest job (native and Node), and `snapshot-binder` and `snapshot-init` in the root lane. They write their snapshot
 files to `build/tests/out` and remove them. A host where the engine cannot run with ASLR off prints a note and skips
 them. The page's side: `node tests/snapshot.mjs` (in `make test-web`: the boot screen's restore phase and

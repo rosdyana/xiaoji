@@ -1,0 +1,41 @@
+// AOSP Calculator (packages/apps/ExactCalculator, Apache-2.0) for the demo (docs/demo.md).
+//
+// The app left the AOSP manifest after Android 9, so the Android 13 tree has no copy. Its sources are not kept in
+// this repository (Android components are fetched or built, never redistributed): tools/remote-build.sh clones the
+// last platform release (pie-platform-release, pinned commit in that script) into upstream/ on the build machine and
+// deletes its Android.mk and CleanSpec.mk, so this file is the only build rule. The 2019 sources build unchanged
+// against SDK "current" with the androidx libraries and crcalc (external/crcalc, the "cr" library) of the 13 tree.
+
+package {
+    default_applicable_licenses: ["device_xiaoji_exactcalculator_license"],
+}
+
+license {
+    name: "device_xiaoji_exactcalculator_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-Apache-2.0"],
+    license_text: ["upstream/NOTICE"],
+}
+
+android_app {
+    name: "ExactCalculator",
+    manifest: "upstream/AndroidManifest.xml",
+    srcs: ["upstream/src/**/*.java"],
+    resource_dirs: ["upstream/res"],
+    asset_dirs: ["upstream/assets"],
+    sdk_version: "current",
+    // The 2019 manifest has no android:exported, which targets of Android 12 (31) and later must declare; the app
+    // targets 30, as it did then, instead of a patched manifest.
+    target_sdk_version: "30",
+    // /system_ext/app: xiaoji_system.mk's artifact path rule keeps product-level modules out of /system.
+    system_ext_specific: true,
+    static_libs: [
+        "cr",
+        "androidx.legacy_legacy-support-v4",
+        "androidx.gridlayout_gridlayout",
+        "androidx.recyclerview_recyclerview",
+    ],
+    optimize: {
+        proguard_flags_files: ["upstream/proguard.flags"],
+    },
+}

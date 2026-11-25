@@ -1,5 +1,6 @@
 # Opens Settings from the launcher's home screen (docs/snapshot.md, S2): a swipe up opens the all-apps drawer, then a tap on
-# the Settings icon at display (205, 201), where B18's runs found it (docs/boot.md, B18: bnds=[141,131][270,311]).
+# the Settings icon at display (340, 201): the drawer's first row is Calculator, Files, Settings in the demo product
+# (docs/demo.md, tools/ui-points.mjs; before Calculator, Settings was second, at (205, 201): docs/boot.md, B18).
 # "ms dev type code value" from the first open of a device, or, after --restore, from the restore (engine/evdev.c).
 # dev 0 is the touchscreen: ABS_MT_SLOT 47, ABS_MT_TRACKING_ID 57, ABS_MT_POSITION_X 53, _Y 54, ABS_MT_PRESSURE 58,
 # BTN_TOUCH 330, SYN_REPORT 0 0 0 (the events web/input.js sends for a pointer).
@@ -87,7 +88,7 @@
 # 20 s later (the drawer's animation is slow in the engine): the tap on Settings.
 22000 0 3 47 0
 22000 0 3 57 2
-22000 0 3 53 205
+22000 0 3 53 340
 22000 0 3 54 201
 22000 0 3 58 128
 22000 0 1 330 1

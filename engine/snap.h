@@ -12,6 +12,10 @@
 int snap_set_trigger(const char *cond);
 /* Seconds to wait after the condition holds (--snapshot-after). */
 void snap_set_after(uint64_t seconds);
+/* --snapshot-quiet PCT:WINDOW:MAX (docs/demo.md): after the condition and the wait, the snapshot waits further for a
+ * quiet window: the first WINDOW seconds in which the engine was busy (not in its idle sleeps) PCT% of the time or
+ * less, or MAX seconds, whichever comes first. NULL: no quiet wait. 0, or -1 for a bad argument. */
+int snap_set_quiet(const char *arg);
 /* The snapshot file (--snapshot-out). */
 void snap_set_out(const char *path);
 

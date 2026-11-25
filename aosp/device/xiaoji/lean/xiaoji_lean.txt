@@ -1,0 +1,3 @@
+# Packages this product leaves out (device/xiaoji/lean/Android.mk, docs/demo.md in the xiaoji repository):
+SecureElement LocalTransport DynamicSystemInstallationService MultiDisplayProvider
+# and, from its own makefiles: SdkSetup EmulatorRadioConfig CalendarProvider

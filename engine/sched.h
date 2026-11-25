@@ -67,6 +67,14 @@ void sched_dump_at(uint64_t seconds);
 /* Forgets the dumps asked for (a restore: the image holds the times of the run that wrote it). */
 void sched_dump_clear(void);
 
+/* --load-every: every ms milliseconds of host time, a line on stderr with the guest's load in that interval: the
+ * instructions run, the share of host time the engine was not idle, the processes and threads, and the processes and
+ * threads that ran the most instructions (docs/demo.md). 0 turns it off. A restore calls it again (the image holds
+ * the run that wrote it). */
+void sched_load_every(uint64_t ms);
+/* Host time the scheduler loop has slept with no thread to run, since the start (the engine's idle time). */
+uint64_t sched_idle_ns(void);
+
 /* Instructions executed by all threads. */
 uint64_t sched_icount(void);
 /* Instructions executed by the threads of process p (reaped threads included). */

@@ -1,5 +1,7 @@
 # xiaoji: forked from build/make/target/product/handheld_system.mk (android13-release).
 # Removed packages (B16: TeleService, the com.android.phone process, loops on the absent radio HAL and ANRs): BasicDreams, BluetoothMidiService, BookmarkProvider, BuiltInPrintService, CameraExtensionsProxy, EasterEgg, ManagedProvisioning, MmsService, MusicFX, NfcNci, PrintRecommendationService, PrintSpooler, SecureElement, SimAppDialog, Traceur, screenrecord, vr.
+# The demo (docs/demo.md) also drops CalendarProvider (process com.android.providers.calendar, started at boot;
+# Calendar is an add-on, docs/features.md).
 # They run persistent processes or features a browser tab has no use for
 # (NFC, SIM toolkit, secure element, printing, dreams, VR, ...).
 
@@ -38,7 +40,6 @@ $(call inherit-product-if-exists, frameworks/webview/chromium/chromium.mk)
 
 PRODUCT_PACKAGES += \
     BlockedNumberProvider \
-    CalendarProvider \
     cameraserver \
     CaptivePortalLogin \
     CertInstaller \

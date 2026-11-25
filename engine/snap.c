@@ -164,6 +164,61 @@ int snap_set_trigger(const char *cond)
 
 void snap_set_after(uint64_t seconds) { trig_after_ns = seconds * 1000000000ull; }
 
+/* --snapshot-quiet: the busy share allowed (PCT), the window it is measured over, the longest wait for one; the
+ * current window's start and the engine's idle time then (sched.c). quiet_win_ns 0: no quiet wait. */
+static unsigned quiet_pct;
+static uint64_t quiet_win_ns, quiet_max_ns, quiet_t0, quiet_idle0;
+
+int snap_set_quiet(const char *arg)
+{
+    quiet_win_ns = 0;
+    quiet_t0 = 0;
+    if (!arg)
+        return 0;
+    char *end;
+    unsigned long pct = strtoul(arg, &end, 10);
+    if (end == arg || *end != ':' || pct > 100)
+        return -1;
+    double win = strtod(end + 1, &end);
+    if (*end != ':' || !(win > 0))
+        return -1;
+    double max = strtod(end + 1, &end);
+    if (*end || !(max >= 0))
+        return -1;
+    quiet_pct = (unsigned)pct;
+    quiet_win_ns = (uint64_t)(win * 1e9);
+    quiet_max_ns = (uint64_t)(max * 1e9);
+    quiet_t0 = 0;
+    return 0;
+}
+
+/* After the condition and the wait: 1 when the snapshot may be taken now (no quiet wait, a quiet window, or the
+ * longest wait over). A window that was too busy starts the next one. */
+static int quiet_now(uint64_t now)
+{
+    if (!quiet_win_ns)
+        return 1;
+    uint64_t ready = trig_hit_ns + trig_after_ns;
+    if (!quiet_t0 || quiet_t0 < ready) {
+        quiet_t0 = now;
+        quiet_idle0 = sched_idle_ns();
+        return 0;
+    }
+    if (now - quiet_t0 < quiet_win_ns)
+        return 0;
+    uint64_t wall = now - quiet_t0, idle = sched_idle_ns() - quiet_idle0;
+    unsigned busy = idle >= wall ? 0 : (unsigned)(100 * (wall - idle) / wall);
+    if (busy <= quiet_pct || now - ready >= quiet_max_ns) {
+        fprintf(stderr, "xiaoji: snapshot: %s: busy %u%% over the last %.1f s, %.1f s after the condition's wait\n",
+                busy <= quiet_pct ? "quiet" : "no quiet window, the longest wait is over", busy, (double)wall / 1e9,
+                (double)(now - ready) / 1e9);
+        return 1;
+    }
+    quiet_t0 = now;
+    quiet_idle0 = sched_idle_ns();
+    return 0;
+}
+
 void snap_set_out(const char *path)
 {
     size_t n = strlen(path);
@@ -723,7 +778,9 @@ int snap_deadline(uint64_t *dl)
 {
     if (trig_kind == T_NONE)
         return 0;
-    if (trig_hit_ns)
+    if (trig_hit_ns && quiet_win_ns && quiet_t0 >= trig_hit_ns + trig_after_ns)
+        *dl = quiet_t0 + quiet_win_ns; /* the end of the quiet window being measured */
+    else if (trig_hit_ns)
         *dl = trig_hit_ns + trig_after_ns;
     else if (trig_kind == T_TIME)
         *dl = trig_t0 + trig_n;
@@ -744,7 +801,7 @@ void snap_point(void)
         else
             return;
     }
-    if (now - trig_hit_ns < trig_after_ns)
+    if (now - trig_hit_ns < trig_after_ns || !quiet_now(now))
         return;
     trig_kind = T_NONE;
     fflush(stdout);

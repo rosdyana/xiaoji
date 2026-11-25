@@ -239,7 +239,10 @@ labels), a tap on Settings opens Settings.
 `?snapshot=make` boots with `--snapshot-at log:cmp=com.android.launcher3/ --snapshot-after 60` and `--snapshot-out`
 the dev server's `/__snap/web.snap` (`web/serve.mjs --snapshot-upload DIR`): the web build writes its snapshot with
 synchronous POSTs of each part at its offset. `tools/snapshot-web.mjs make` drives this in headless Chromium and then
-runs `tools/snappack.py`.
+runs `tools/snappack.py`. Since the demo product (docs/demo.md, B19) the page also takes `?snapat=log:TEXT` (another
+condition), `?snapafter=S` and `?snapquiet=PCT:WINDOW:MAX` (`--snapshot-quiet`), and `tools/snapshot-web.mjs make` takes
+the snapshot at HOME + 480 s and then waits for a quiet engine (a pre-warm of the demo apps is there, off by default):
+the measurements of this section are of the old point (HOME + 60 s), docs/demo.md has the new one and its numbers.
 
 ### Measurements (headless Chromium, SwiftShader WebGL2, M2 8 GB, AC power, localhost)
 
@@ -318,8 +321,9 @@ Five problems the browser runs found, fixed:
 
 | Command | What |
 |---|---|
-| `make snapshot` | the page's snapshot for the current tree and web engine (`tools/snapshot-web.mjs make`): boots in headless Chromium with `?snapshot=make`, the engine writes `build/snap/web.snap` through the dev server, `tools/snappack.py` packs it into `build/web/xj/snapshot.json` and `build/web/xj/packs/`. About 6 to 7 minutes. Playwright as in `tests/web.mjs` (`XN_PLAYWRIGHT`; `PLAYWRIGHT_BROWSERS_PATH=$PWD/build/pw-browsers` when the cache has no Chromium); `XN_SNAP_AFTER` changes the 60 s |
-| `make test-snapshot-web` | the page restores it: first frame, drawer, Settings (`tools/snapshot-web.mjs restore`), screenshots `build/web-shots/s1-*.png` and the whole log `s1-restore.log` |
+| `make snapshot` | the page's snapshot for the current tree and web engine (`tools/snapshot-web.mjs make`): boots in headless Chromium with `?snapshot=make`, the engine writes `build/snap/web.snap` through the dev server, `tools/snappack.py` packs it into `build/web/xj/snapshot.json` and `build/web/xj/packs/`. About 15 minutes since B19 (HOME + 480 s and the quiet window, docs/demo.md: `XN_SNAP_AFTER`, `XN_SNAP_QUIET`, `XN_SNAP_AT`, `XN_XJ`, and the pre-warm, off by default: `XN_SNAP_PREWARM=on`, `XN_PREWARM_DELAY`); it fails when the last system_server started SystemUI more than once, or a pre-warmed app does not start. Playwright as in `tests/web.mjs` (`XN_PLAYWRIGHT`; `PLAYWRIGHT_BROWSERS_PATH=$PWD/build/pw-browsers` when the cache has no Chromium) |
+| `make test-snapshot-web` | the page restores it: first frame, drawer, Settings (`tools/snapshot-web.mjs restore`; Settings' place in the drawer is the tree's, `tools/ui-points.mjs`), screenshots `build/web-shots/s1-*.png` and the whole log `s1-restore.log` |
+| `node tools/latency.mjs` | the demo's yardstick: press to first frame, the idle load, drawer, Settings, Home, Calculator (docs/demo.md) |
 | `make snapshot-native` | the native engine's (null GL) from a fresh `/data` -> `build/snap/native.snap`, for `build/xiaoji --restore` |
 | `tools/snappack.py SNAP OUT --tree MANIFEST` | packs any snapshot file: content-addressed zlib chunks of 256 KiB in packs of at most 16 MiB (Cloudflare Pages' 25 MiB file limit), only packs are written (the deployment's file count stays the tree's 10,8xx chunks plus packs); the previous snapshot's packs are removed |
 

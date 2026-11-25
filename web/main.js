@@ -358,6 +358,7 @@ $('boot').addEventListener('click', async () => {
       // Activity starts (a tap that opens an app, tools/snapshot-web.mjs) and the engine's snapshot lines, kept apart from
       // the log panel, which keeps only its last lines.
       if (params.has('keeplog')) (window.xb.all = window.xb.all || []).push(m.text); // the whole log (?keeplog, tests)
+      if (window.xbHooks && window.xbHooks.onLine) window.xbHooks.onLine(m.text, now); // measurement (tools/latency.mjs)
       if (/ActivityTaskManager\(\d+\): START u0 |^xiaoji: (snapshot|restore|gl\(webgl\): snapshot)/.test(m.text)) {
         (window.xb.notes = window.xb.notes || []).push(m.text);
       }
@@ -401,6 +402,9 @@ $('boot').addEventListener('click', async () => {
     } else if (m.type === 'frame') {
       // The engine's composed frame (rcFBPost). window.xb.frames is the count and the first and last frame times.
       window.xb.frames = frames.show(m, now - bootT0);
+      // A measurement hook (tools/latency.mjs; window.xbHooks outlives the boot's new window.xb): the frame's pixels
+      // and its arrival time on the page.
+      if (window.xbHooks && window.xbHooks.onFrame) window.xbHooks.onFrame(m, now);
       if (!$('phone').dataset.frame) {
         // The first frame: the boot animation's outro (W3) fades the boot screen into the picture.
         $('phone').dataset.frame = '1';
@@ -429,6 +433,11 @@ $('boot').addEventListener('click', async () => {
     early: params.get('early'), gl: glBackend, frameSab, debugFaults: params.get('debug') === '1', dumpAt: params.get('dumpat'),
     timeoutS: params.get('timeout'),
     snapshot: snapParam, snap, snapAfter: params.get('snapafter'),
+    // ?load=MS: the engine's load report every MS ms (--load-every, docs/demo.md); ?prop=K=V (repeatable): a system
+    // property for a boot (--prop; a restore keeps the snapshot's), for A/B runs of the product's settings.
+    loadEvery: params.get('load'), props: params.getAll('prop'),
+    snapQuiet: params.get('snapquiet'), // ?snapshot=make: --snapshot-quiet PCT:WINDOW:MAX (docs/demo.md)
+    snapAt: params.get('snapat'), // ?snapshot=make: the condition, log:TEXT (default: the launcher's HOME start)
   });
   if (mode === 'pack' && !snap) {
     // ?early=MB: the engine starts once the first MB of packs is in (default: the first pack).

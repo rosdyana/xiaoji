@@ -11,7 +11,7 @@ There is no guest kernel, MMU or virtual hardware to emulate, which is why xiaoj
 
 ## Status
 
-Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`, with Wi-Fi, Bluetooth, telephony, NFC and UWB off) boots in a browser tab to the launcher. You can open the app drawer, start Settings, and type into the launcher's search.
+Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`, with Wi-Fi, Bluetooth, telephony, NFC and UWB off) boots in a browser tab to the launcher. You can open the app drawer, start Settings, Files and Calculator (1 + 2 = 3), and type into the launcher's search. The demo apps are compiled ahead of time (docs/demo.md).
 
 | | Native engine (M2) | Browser (headless Chromium, M2) |
 |---|---|---|
@@ -20,18 +20,19 @@ Android 13 (our own trimmed AOSP product, `aosp/device/xiaoji`, with Wi-Fi, Blue
 
 The browser numbers were measured on an 8 GB machine that was swapping, on battery.
 
-A booted snapshot skips the boot (docs/snapshot.md): the page restores Android at the home screen from a snapshot the web engine wrote. On localhost, Boot Android shows the launcher about 6 s after the press (a 115 MiB download, written into the engine's memory; the engine itself needs about 0.3 s to its first frame), against about 6.5 min for a boot. `make snapshot` makes it for the current tree and engine; natively, `build/xiaoji --restore` resumes a snapshot in under a second.
+A booted snapshot skips the boot (docs/snapshot.md): the page restores Android at the home screen from a snapshot the web engine wrote. On localhost, Boot Android shows the launcher about 6 s after the press (a 116 MiB download, written into the engine's memory; the engine itself needs about 0.3 s to its first frame), against about 6.5 min for a boot. `make snapshot` makes it for the current tree and engine, once the booted phone is idle: after the restore the engine is busy about 17% of the time (70% with the earlier snapshot point), Home settles in about 2.5 s, a second start of Settings takes about 2 s and a first one 10 to 16 s (docs/demo.md: headless Chromium on the M2, AC power). Natively, `build/xiaoji --restore` resumes a snapshot in under a second.
 
 Milestone notes:
 
 | Doc | What |
 |---|---|
 | [docs/spike-0.md](docs/spike-0.md) | the first question: ART (`dalvikvm64`) on the engine, natively and in wasm |
-| [docs/boot.md](docs/boot.md) | the boot, milestone by milestone (B1 to B18): init, binder, zygote, system_server, HALs, the product, the launcher |
+| [docs/boot.md](docs/boot.md) | the boot, milestone by milestone (B1 to B19): init, binder, zygote, system_server, HALs, the product, the launcher |
 | [docs/graphics.md](docs/graphics.md) | the goldfish pipe, the gfxstream decoders, the null and WebGL2 backends (G1 to G4) |
 | [docs/input.md](docs/input.md) | the touchscreen and keyboard (evdev) and how the page feeds them |
 | [docs/loading.md](docs/loading.md) | chunks, boot packs, early start and caching |
 | [docs/snapshot.md](docs/snapshot.md) | booted snapshots: the design, `--snapshot-at` and `--restore`, the WebGL objects, the page's restore (S1 to S4) |
+| [docs/demo.md](docs/demo.md) | the demo product (B19): its apps, what was removed, AOT, the snapshot point, and `tools/latency.mjs`, the yardstick, with the numbers |
 | [docs/web-preview.md](docs/web-preview.md) | the browser page and its boot screen |
 | [docs/testing.md](docs/testing.md) | the test suite, parallel runs, the remote runner |
 | [docs/features.md](docs/features.md) | draft: which Android features are base, add-on, engine-backed or never |
@@ -49,7 +50,7 @@ make oracle          # reference runs in the VM -> build/oracle
 make guest-tests     # the guest test programs, built in the VM
 make test            # the suite: every case natively and in Node, against the oracle
 make serve           # the page at http://127.0.0.1:8080/ (needs build/rootfs-xiaoji)
-make snapshot        # the page's booted snapshot (headless Chromium, about 7 min; docs/snapshot.md)
+make snapshot        # the page's booted snapshot (headless Chromium, about 15 min; docs/snapshot.md, docs/demo.md)
 make help            # every target
 ```
 

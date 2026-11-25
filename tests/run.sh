@@ -260,6 +260,65 @@ check_snapshot() {
     rm -f "$base".a "$base".b
 }
 
+# The load meter (--load-every, docs/demo.md): snapwait runs with a report every 100 ms. Its stdout must still be the
+# oracle's (the reports go to stderr); there must be at least three reports in the line's format; one, inside the
+# main thread's 600 ms sleep, must count the 2 processes and 5 threads with none runnable and the engine mostly idle
+# (busy 50% or less, which leaves room for a loaded host); one must name the program as the busiest process. Then a
+# snapshot at 0.3 s (written without the meter) and a restore with it: the restored run reports too (a restore applies
+# the option again), with the same processes and threads.
+LOAD_RE='^xiaoji: load: [0-9]+ ms, [0-9.]+ M insn \([0-9.]+ M/s\), busy [0-9]+%, [0-9]+ processes, [0-9]+ threads \([0-9]+ runnable\); top:.*; threads:'
+check_load() {
+    local runner=$1 name=$2 bin=$3
+    local tag="$name load $runner" base="$OUT/$name.load.$runner" why=""
+    run_engine "$runner" --load-every 100 "$bin" >"$base.out" 2>"$base.err"
+    local rc=$? expect_rc n
+    expect_rc=$(cat "$ORACLE/$name.rc")
+    n=$(grep -cE "$LOAD_RE" "$base.err")
+    [ "$rc" = "$expect_rc" ] && cmp -s "$base.out" "$ORACLE/$name.out" || why="stdout/exit differ (exit $rc)"
+    [ "$n" -ge 3 ] || why="$why; $n reports"
+    grep -E "$LOAD_RE" "$base.err" | grep 'busy \([0-9]\|[1-4][0-9]\|50\)%, 2 processes, 5 threads (0 runnable)' >/dev/null ||
+        why="$why; no quiet report with 2 processes and 5 threads"
+    grep -E "$LOAD_RE" "$base.err" | grep "top: ${name}/1000 " >/dev/null || why="$why; ${name} is not the busiest process"
+    if run_engine "$runner" --snapshot-at time:0.3 --snapshot-out "$base.snap" "$bin" >/dev/null 2>"$base.err2" &&
+        [ -s "$base.snap" ]; then
+        run_engine "$runner" --restore "$base.snap" --load-every 100 >/dev/null 2>"$base.err3"
+        grep -E "$LOAD_RE" "$base.err3" | grep '2 processes, 5 threads' >/dev/null || why="$why; no report after a restore"
+    elif ! grep -q 'fixed layout' "$base.err2"; then
+        why="$why; the snapshot failed"
+    fi
+    rm -f "$base.snap"
+    if [ -z "$why" ]; then
+        echo "PASS  $tag ($n reports)"
+    else
+        echo "FAIL  $tag (${why#; })"
+        grep 'xiaoji: load:' "$base.err" | head -n 3 | cut -c1-160 | sed 's/^/        /'
+    fi
+}
+
+# The quiet snapshot (--snapshot-quiet, docs/demo.md): snapwait with the condition at 0.05 s and a quiet window of
+# 0.2 s at 50% busy or less: the window falls in the main thread's 600 ms sleep, so the snapshot says "quiet" and is
+# taken inside the sleep; the restore goes on, and the two outputs are the oracle's.
+check_quiet() {
+    local runner=$1 name=$2 bin=$3
+    local tag="$name snapshot quiet $runner" base="$OUT/$name.quiet.$runner"
+    run_engine "$runner" --snapshot-at time:0.05 --snapshot-quiet 50:0.2:5 --snapshot-out "$base.snap" "$bin" \
+        >"$base.1" 2>"$base.1.err"
+    local rc1=$?
+    if grep -q "cannot run with a fixed layout" "$base.1.err"; then
+        echo "note: $tag skipped (no fixed layout on this host)"
+        return 0
+    fi
+    run_engine "$runner" --restore "$base.snap" >"$base.2" 2>"$base.2.err"
+    local rc2=$?
+    if [ "$rc1" = 0 ] && [ "$rc2" = "$(cat "$ORACLE/$name.rc")" ] && grep -q 'snapshot: quiet: busy' "$base.1.err" &&
+        cat "$base.1" "$base.2" | cmp -s - "$ORACLE/$name.out"; then
+        echo "PASS  $tag"
+    else
+        echo "FAIL  $tag (exits $rc1, $rc2; $(grep 'snapshot: \(quiet\|no quiet\)' "$base.1.err" | head -n 1))"
+    fi
+    rm -f "$base.snap"
+}
+
 run_case() {
     local name=$1 stretch=$2
     local bin="build/tests/guest/$name" args
@@ -287,6 +346,10 @@ run_case() {
     snapwait)
         check_snapshot engine "$name" "$bin"
         [ -f "$NODE_JS" ] && check_snapshot node "$name" "$bin"
+        check_load engine "$name" "$bin"
+        [ -f "$NODE_JS" ] && check_load node "$name" "$bin"
+        check_quiet engine "$name" "$bin"
+        [ -f "$NODE_JS" ] && check_quiet node "$name" "$bin"
         ;;
     esac
 }

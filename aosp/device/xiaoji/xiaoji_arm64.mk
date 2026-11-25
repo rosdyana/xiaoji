@@ -50,6 +50,29 @@ PRODUCT_PACKAGES += vndservicemanager
 # packages/services/Telephony, so the property is set for the request, and has no effect on the platform.
 PRODUCT_PROPERTY_OVERRIDES += ro.radio.noril=yes
 
+# The demo (docs/demo.md): launcher, SystemUI, Settings, Files (DocumentsUI) and Calculator.
+# ExactCalculator: AOSP's Calculator (device/xiaoji/apps/ExactCalculator, sources fetched by tools/remote-build.sh).
+# xiaoji_lean: overrides the inherited packages the demo does not use (device/xiaoji/lean/Android.mk).
+PRODUCT_PACKAGES += \
+    ExactCalculator \
+    xiaoji_lean
+
+# AOT (docs/demo.md): apps without a profile are preopted with "verify" (dexpreopt.go: no profile, no default
+# filter: "quicken", which is "verify" since Android 12), so ART interprets and JIT-compiles them at run time, on the
+# engine's one core. The demo apps are compiled in full ("speed") at build time instead. system_server (services.jar
+# and the APEX system server jars) is already "speed" (dexpreopt's default for system server jars), as is
+# SettingsProvider (a system server app).
+PRODUCT_DEXPREOPT_SPEED_APPS += \
+    Launcher3QuickStep \
+    SystemUI \
+    Settings \
+    DocumentsUI \
+    ExactCalculator
+
+# No background dexopt (BackgroundDexOptService): the demo apps are compiled already, and a dexopt job would run
+# dex2oat on the engine's one core while a visitor uses the phone.
+PRODUCT_PROPERTY_OVERRIDES += pm.dexopt.disable_bg_dexopt=true
+
 PRODUCT_BRAND := Android
 PRODUCT_NAME := xiaoji_arm64
 PRODUCT_DEVICE := xiaoji_arm64

@@ -143,7 +143,10 @@ do_run() {
     # mounts (a boot killed at its timeout leaves them): start from none, and leave none behind.
     ssh "$HOST" "rm -rf /tmp/xiaoji-*" 2>/dev/null || true
     rc=0
-    ssh "$HOST" "cd $RDIR && env PATH=\$HOME/$RDIR/tools/node/bin:\$PATH XIAOJI_ORACLE=recorded XIAOJI_JOBS=$JOBS$pass_env tests/run.sh" \
+    # The open-file limit: the product boot keeps about 1,800 host files open (the guest's files and mappings), and the
+    # build machine's soft limit is 1,024 (the Mac's shells have 1,048,576): with it the boot's PackageManager failed
+    # to open APKs (EMFILE) and system_server died ("There must be exactly one installer"). It is raised to the hard limit.
+    ssh "$HOST" "cd $RDIR && ulimit -n \$(ulimit -Hn) && env PATH=\$HOME/$RDIR/tools/node/bin:\$PATH XIAOJI_ORACLE=recorded XIAOJI_JOBS=$JOBS$pass_env tests/run.sh" \
         >"$LOCAL_OUT/report.txt" 2>&1 || rc=$?
     ssh "$HOST" "rm -rf /tmp/xiaoji-*" 2>/dev/null || true
     cat "$LOCAL_OUT/report.txt"

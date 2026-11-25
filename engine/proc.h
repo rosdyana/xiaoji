@@ -58,6 +58,7 @@ typedef struct proc {
     /* Accounting for getrusage. Instructions and syscalls are this process's own;
      * the cu_ fields are the totals of its reaped children (and their children). */
     uint64_t dead_icount; /* instructions of its threads already reaped */
+    uint64_t load_icount; /* its instructions at the last --load-every report (sched.c) */
     uint64_t nsys;        /* syscalls made */
     uint64_t maxrss_kib;  /* peak resident set, as recorded at exit or getrusage */
     uint64_t cu_icount, cu_nsys, cu_maxrss_kib;

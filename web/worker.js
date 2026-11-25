@@ -388,8 +388,12 @@ async function runBoot(base, opts) {
     : ['--logcat', '--init', '/xiaoji.rc', '--root', '/rootfs', '--init-timeout', String(timeoutS)];
   if (makeSnap) {
     // The home screen, then a quiet minute (docs/snapshot.md): the launcher's HOME start, 60 s later.
-    argv.push('--snapshot-at', 'log:cmp=com.android.launcher3/', '--snapshot-after', String(Number(opts.snapAfter) || 60),
+    // ?snapat=log:TEXT: another condition (docs/demo.md: the pre-warm's last app).
+    const at = opts.snapAt && /^log:[^\n]{1,200}$/.test(opts.snapAt) ? opts.snapAt : 'log:cmp=com.android.launcher3/';
+    argv.push('--snapshot-at', at, '--snapshot-after', String(Number(opts.snapAfter) || 60),
       '--snapshot-out', base + '__snap/web.snap');
+    // ?snapquiet=PCT:WINDOW:MAX: then a quiet window (docs/demo.md), so the restored phone is not busy finishing its boot.
+    if (opts.snapQuiet && /^\d+:[\d.]+:[\d.]+$/.test(opts.snapQuiet)) argv.push('--snapshot-quiet', opts.snapQuiet);
   }
   if (opts && opts.lazy === false) argv.push('--no-lazy-mmap');
   if (opts && opts.lazyWindow) argv.push('--lazy-window', String(Number(opts.lazyWindow)));
@@ -400,6 +404,11 @@ async function runBoot(base, opts) {
   if (opts && opts.debugFaults) argv.push('--debug-faults');
   // ?dumpat=SECONDS: a dump of every guest thread at that time (the engine's --dump-at).
   if (opts && opts.dumpAt) argv.push('--dump-at', String(opts.dumpAt).replace(/[^0-9,]/g, ''));
+  // ?load=MS: the engine's load report (docs/demo.md); ?prop=K=V: a property for a boot (not a restore).
+  if (opts && Number(opts.loadEvery) > 0) argv.push('--load-every', String(Math.floor(Number(opts.loadEvery))));
+  if (opts && opts.props && !restored) {
+    for (const p of opts.props) if (/^[A-Za-z0-9._-]+=[^\n]*$/.test(p)) argv.push('--prop', p);
+  }
   let exitCode;
   try {
     exitCode = Module.callMain(argv);
@@ -448,6 +457,7 @@ self.onmessage = async (ev) => {
         statsAt: !!msg.statsAt, early: msg.early, gl: msg.gl, frameSab: msg.frameSab,
         input: msg.input || null, debugFaults: !!msg.debugFaults, dumpAt: msg.dumpAt || 0, timeoutS: msg.timeoutS || 0,
         snapshot: msg.snapshot || null, snap: msg.snap || null, snapAfter: msg.snapAfter || 0,
+        loadEvery: msg.loadEvery || 0, props: msg.props || [], snapQuiet: msg.snapQuiet || null, snapAt: msg.snapAt || null,
       });
     }
   } catch (e) {
