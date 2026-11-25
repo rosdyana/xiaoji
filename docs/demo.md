@@ -528,6 +528,7 @@ with before (L1 snapshot and engine, `prehot=0&inflaters=0&prefetch=0`); `build/
 | drawer settled | 1.4–2.1 s | 0.8–1.2 s |
 | first Settings start settled | 9.9–13.4 s | **1.7–2.0 s** |
 | home settled | 2.2–3.8 s | 2.3–2.4 s |
+| first Calculator start settled | 7.1–7.8 s | 1.7–2.6 s |
 | idle engine busy | 9–19 % | 13–17 % |
 
 The media provider still logs an ANR in two runs (`android.process.media`, a background process: no dialog is shown).
